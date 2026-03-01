@@ -378,7 +378,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement "open in external editor" keybinding
 
 ### Window & Pane Management
-- [ ] Fix: Window doesn't get focused on creation
+- [x] Fix: Window doesn't get focused on creation
 - [x] Add window keybindings (Cmd+W close, Cmd+M minimize, Cmd+Q quit)
 - [x] Implement left/right two-pane layout (resizable, with pane focus tracking)
 - [x] Implement pane view switching for terminals (Cmd-1 Claude, Cmd-2 General, Cmd-[/] focus)

@@ -28,9 +28,12 @@ pub fn run(state: AppState) {
     };
 
     cx.open_window(opts, |window, cx| {
+      window.activate_window();
       let view = cx.new(|cx| Workspace::new(state, window, cx));
       cx.new(|cx| gpui_component::Root::new(view, window, cx))
     })
     .expect("failed to open window");
+
+    cx.activate(true);
   });
 }

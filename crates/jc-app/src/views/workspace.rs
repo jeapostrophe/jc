@@ -67,6 +67,8 @@ impl Workspace {
       )
     });
 
+    left_pane.read(cx).focus_content(window);
+
     Self {
       left_pane,
       right_pane,
