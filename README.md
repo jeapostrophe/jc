@@ -2,6 +2,36 @@
 
 A native macOS Rust application for orchestrating multiple Claude Code sessions across projects. It provides a keyboard-driven workflow for managing tasks, reviewing diffs, annotating code, and sending instructions to Claude --- all from a single app.
 
+## Getting Started
+
+```bash
+# Build
+cargo build -p jc-app
+
+# Run (opens GUI with existing state)
+cargo run -p jc-app
+
+# Register a project directory and open GUI
+cargo run -p jc-app -- .
+
+# Run the minimal GPUI example
+cargo run -p jc-app --example basic_window
+```
+
+Config and state live in `~/.config/jc/` (`config.toml` and `state.toml`).
+
+### Project Structure
+
+```
+Cargo.toml                          # workspace root
+crates/
+  jc-core/                          # data model + config persistence
+    src/lib.rs, config.rs, model.rs
+  jc-app/                           # binary: CLI + GPUI app
+    src/main.rs, app.rs, views/
+    examples/basic_window.rs
+```
+
 ## Design Principles
 
 - **macOS only.** No cross-platform concerns.
@@ -296,11 +326,11 @@ It is deliberately *not* a full code editor on mobile.
 ## Task Checklist
 
 ### Core Infrastructure
-- [ ] Set up Rust workspace (crates: `jc-app`, `jc-terminal`, `jc-editor`, `jc-git`, `jc-claude`, `jc-mobile`)
-- [ ] Integrate `gpui` 0.2.x + `gpui-component` and get a basic window rendering
-- [ ] Implement `~/.config/jc/` config and state persistence
-- [ ] Implement project and task data model
-- [ ] Implement `jc` CLI for adding projects from the command line
+- [x] Set up Rust workspace (`jc-app`, `jc-core`)
+- [x] Integrate `gpui` 0.2.x + `gpui-component` and get a basic window rendering
+- [x] Implement `~/.config/jc/` config and state persistence
+- [x] Implement project and task data model
+- [x] Implement `jc` CLI for adding projects from the command line
 - [ ] Implement git worktree creation/deletion via `git2` worktree API
 
 ### Terminal Emulator

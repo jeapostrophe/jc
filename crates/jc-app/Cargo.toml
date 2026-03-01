@@ -1,0 +1,12 @@
+[package]
+name = "jc-app"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+jc-core = { path = "../jc-core" }
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+clap.workspace = true
+anyhow.workspace = true
