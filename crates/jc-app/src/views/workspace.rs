@@ -223,12 +223,14 @@ impl Render for Workspace {
 
     let left_wrapper = div()
       .size_full()
-      .when(left_active, |d: Div| d.border_l_2().border_color(active_border))
+      .border_l_2()
+      .border_color(if left_active { active_border } else { gpui::transparent_black() })
       .child(self.left_pane.clone());
 
     let right_wrapper = div()
       .size_full()
-      .when(right_active, |d: Div| d.border_l_2().border_color(active_border))
+      .border_l_2()
+      .border_color(if right_active { active_border } else { gpui::transparent_black() })
       .child(self.right_pane.clone());
 
     div()

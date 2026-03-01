@@ -56,6 +56,8 @@ pub fn paint_terminal(
   font_family: &SharedString,
   font_size: Pixels,
   line_height: f32,
+  focused: bool,
+  cursor_visible: bool,
   window: &mut Window,
   cx: &mut App,
 ) {
@@ -136,28 +138,49 @@ pub fn paint_terminal(
     let cursor_color = palette.cursor;
     let x = origin.x + layout.width * cursor.column.0 as f32;
     let y = origin.y + layout.height * cursor.line.0 as f32;
+    let cursor_bounds = Bounds::new(point(x, y), size(layout.width, layout.height));
 
-    match cursor_shape {
-      CursorShape::Block => {
-        let mut color = cursor_color;
-        color.a = 0.5;
-        window.paint_quad(fill(Bounds::new(point(x, y), size(layout.width, layout.height)), color));
-      }
-      CursorShape::Beam => {
-        window
-          .paint_quad(fill(Bounds::new(point(x, y), size(px(2.0), layout.height)), cursor_color));
-      }
-      CursorShape::Underline => {
-        let underline_y = y + layout.height - px(2.0);
-        window.paint_quad(fill(
-          Bounds::new(point(x, underline_y), size(layout.width, px(2.0))),
-          cursor_color,
-        ));
-      }
-      _ => {
-        let mut color = cursor_color;
-        color.a = 0.5;
-        window.paint_quad(fill(Bounds::new(point(x, y), size(layout.width, layout.height)), color));
+    if !focused {
+      // Unfocused: hollow rectangle outline
+      let border = px(1.0);
+      // Top edge
+      window.paint_quad(fill(Bounds::new(point(x, y), size(layout.width, border)), cursor_color));
+      // Bottom edge
+      window.paint_quad(fill(
+        Bounds::new(point(x, y + layout.height - border), size(layout.width, border)),
+        cursor_color,
+      ));
+      // Left edge
+      window.paint_quad(fill(Bounds::new(point(x, y), size(border, layout.height)), cursor_color));
+      // Right edge
+      window.paint_quad(fill(
+        Bounds::new(point(x + layout.width - border, y), size(border, layout.height)),
+        cursor_color,
+      ));
+    } else if cursor_visible {
+      // Focused + visible blink phase: solid cursor
+      match cursor_shape {
+        CursorShape::Block => {
+          let mut color = cursor_color;
+          color.a = 0.5;
+          window.paint_quad(fill(cursor_bounds, color));
+        }
+        CursorShape::Beam => {
+          window
+            .paint_quad(fill(Bounds::new(point(x, y), size(px(2.0), layout.height)), cursor_color));
+        }
+        CursorShape::Underline => {
+          let underline_y = y + layout.height - px(2.0);
+          window.paint_quad(fill(
+            Bounds::new(point(x, underline_y), size(layout.width, px(2.0))),
+            cursor_color,
+          ));
+        }
+        _ => {
+          let mut color = cursor_color;
+          color.a = 0.5;
+          window.paint_quad(fill(cursor_bounds, color));
+        }
       }
     }
   }

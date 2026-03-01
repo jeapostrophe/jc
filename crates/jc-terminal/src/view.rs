@@ -5,12 +5,15 @@ use crate::render::{CellLayout, measure_cell, paint_terminal};
 use crate::terminal::TerminalState;
 use gpui::{
   App, AsyncApp, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
-  KeyDownEvent, ParentElement, Pixels, Render, SharedString, Styled, WeakEntity, Window, canvas,
-  div, px,
+  KeyDownEvent, ParentElement, Pixels, Render, SharedString, Styled, Timer, WeakEntity, Window,
+  canvas, div, px,
 };
 use parking_lot::Mutex;
 use std::io::Read;
 use std::sync::Arc;
+use std::time::Duration;
+
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Configuration for a terminal view.
 pub struct TerminalConfig {
@@ -41,6 +44,7 @@ pub struct TerminalView {
   config: TerminalConfig,
   focus: FocusHandle,
   last_size: Arc<Mutex<(u16, u16)>>,
+  cursor_visible: bool,
 }
 
 impl TerminalView {
@@ -105,6 +109,30 @@ impl TerminalView {
     })
     .detach();
 
+    // Cursor blink timer
+    cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+      loop {
+        Timer::after(CURSOR_BLINK_INTERVAL).await;
+        let Ok(should_continue) = cx.update(|cx: &mut App| {
+          if let Some(entity) = this.upgrade() {
+            entity.update(cx, |view, cx| {
+              view.cursor_visible = !view.cursor_visible;
+              cx.notify();
+            });
+            true
+          } else {
+            false
+          }
+        }) else {
+          break;
+        };
+        if !should_continue {
+          break;
+        }
+      }
+    })
+    .detach();
+
     Self {
       state,
       pty,
@@ -112,7 +140,12 @@ impl TerminalView {
       config,
       focus: cx.focus_handle(),
       last_size: Arc::new(Mutex::new((cols, rows))),
+      cursor_visible: true,
     }
+  }
+
+  fn reset_cursor_blink(&mut self) {
+    self.cursor_visible = true;
   }
 }
 
@@ -123,12 +156,14 @@ impl Focusable for TerminalView {
 }
 
 impl Render for TerminalView {
-  fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+  fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let font_family = self.config.font_family.clone();
     let font_size = self.config.font_size;
     let line_height = self.config.line_height;
     let palette_fg = self.palette.foreground;
     let palette_bg = self.palette.background;
+    let focused = self.focus.is_focused(window);
+    let cursor_visible = self.cursor_visible;
 
     div()
       .id("terminal")
@@ -140,6 +175,7 @@ impl Render for TerminalView {
       .on_key_down(cx.listener({
         let pty = self.pty.clone();
         move |this, event: &KeyDownEvent, _window, _cx| {
+          this.reset_cursor_blink();
           let mode = this.state.with_term(|t| *t.mode());
           if let Some(bytes) = keystroke_to_bytes(&event.keystroke, mode) {
             let _ = pty.write_all(&bytes);
@@ -169,16 +205,16 @@ impl Render for TerminalView {
             // Detect and apply resize
             let new_cols = (prep_bounds.size.width / layout.width).floor() as u16;
             let new_rows = (prep_bounds.size.height / layout.height).floor() as u16;
-            let mut size = last_size.lock();
-            if new_cols > 0 && new_rows > 0 && (new_cols != size.0 || new_rows != size.1) {
-              *size = (new_cols, new_rows);
+            let mut last = last_size.lock();
+            if new_cols > 0 && new_rows > 0 && (new_cols != last.0 || new_rows != last.1) {
+              *last = (new_cols, new_rows);
               let _ = pty_for_resize.resize(new_cols, new_rows);
               term.resize(crate::terminal::TermDimensions {
                 cols: new_cols as usize,
                 rows: new_rows as usize,
               });
             }
-            drop(size);
+            drop(last);
 
             paint_terminal(
               &term,
@@ -188,6 +224,8 @@ impl Render for TerminalView {
               &font_family,
               font_size,
               line_height,
+              focused,
+              cursor_visible,
               window,
               cx,
             );
