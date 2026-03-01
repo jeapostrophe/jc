@@ -34,7 +34,7 @@ crates/
     src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
     examples/terminal_window.rs
   jc-app/                           # binary: CLI + GPUI app
-    src/main.rs, app.rs, views/
+    src/main.rs, app.rs, views/{workspace,pane,project_view}.rs
     examples/basic_window.rs
 ```
 
@@ -380,8 +380,8 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement "open in external editor" keybinding
 
 ### Window & Pane Management
-- [ ] Add window keybindings (Cmd+W close, Cmd+M minimize, Cmd+Q quit)
-- [ ] Implement left/right two-pane layout
+- [x] Add window keybindings (Cmd+W close, Cmd+M minimize, Cmd+Q quit)
+- [x] Implement left/right two-pane layout (resizable, with pane focus tracking)
 - [ ] Implement view switching per pane (Claude, terminal, diff, TODO, code, reply)
 - [ ] Implement independent scroll positions per pane
 - [ ] Implement multi-window with shared session state

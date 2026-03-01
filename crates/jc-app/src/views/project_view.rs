@@ -4,11 +4,18 @@ use jc_core::config::AppState;
 
 pub struct ProjectView {
   state: AppState,
+  focus: FocusHandle,
 }
 
 impl ProjectView {
-  pub fn with_state(state: AppState) -> Self {
-    Self { state }
+  pub fn with_state(state: AppState, cx: &mut Context<Self>) -> Self {
+    Self { state, focus: cx.focus_handle() }
+  }
+}
+
+impl Focusable for ProjectView {
+  fn focus_handle(&self, _: &App) -> FocusHandle {
+    self.focus.clone()
   }
 }
 
@@ -75,6 +82,8 @@ impl Render for ProjectView {
     };
 
     div()
+      .id("project-view")
+      .track_focus(&self.focus)
       .flex()
       .size_full()
       .justify_center()

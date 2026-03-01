@@ -1,4 +1,4 @@
-use crate::views::project_view::ProjectView;
+use crate::views::workspace::{self, Workspace};
 use gpui::*;
 use jc_core::config::AppState;
 
@@ -7,6 +7,7 @@ pub fn run(state: AppState) {
 
   app.run(move |cx| {
     gpui_component::init(cx);
+    workspace::init(cx);
 
     let opts = WindowOptions {
       window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -19,7 +20,7 @@ pub fn run(state: AppState) {
     };
 
     cx.open_window(opts, |window, cx| {
-      let view = cx.new(|_cx| ProjectView::with_state(state));
+      let view = cx.new(|cx| Workspace::new(state, window, cx));
       cx.new(|cx| gpui_component::Root::new(view, window, cx))
     })
     .expect("failed to open window");
