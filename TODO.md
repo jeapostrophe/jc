@@ -17,4 +17,32 @@ Questions:
 8. By "vim", I do NOT mean the full gambit of Vim features. I really just mean that it is primarily keyboard based. I tend to actually use more emacs style bindings.
 9. The app has its own state somewhere (~/.config/jc) that has a file where the active projects are. The user can use a command in the app to add another project and then tasks. The user can also run a command-line tool like 'jc .' to add a project.
 10. The app manages the git worktrees
+### Message 2
+Review @README.md and launch parallel sub-agents to perform all of the '### Research' tasks. Take their input and add commentary to README about those tasks and potentially modify the overall tasklist. If you need to ask questions for direction, do so.
+### Message 3
+start building the core infrastructure
+### Message 4
+I don't think it is necessary to build any of the git worktree management yet. That is a long-term feature. In the beginning, we'll just have tasks share the same worktree.
+***
+Adjust the README to note that the 'git worktree' functionality is not core and is coherent that will be implemented later
+### Message 5
+Review @README.md and identify the next task to work on. Check with me for what it is before making a detailed plan.
+### Message 6
+My comments on the design decisions
+1. Own crate --- I agree
+2. Why not the Zed fork? What's different about them? What is the downside of using it vs not? Is the Zed one old and they have stuck to it for stability or have they improved it in incompatible ways?
+3. PTY --- Agree on all that
+4. Batching --- Good
+5. canvas --- Good
+### Message 7
+Update the README with the completed work
+
+Add these things to the task list (some of them are minor and may need a special notation)
+* The window doesn't get focused when it is created
+* The theme should be in a file
+* There should be a light theme
+* The theme should automatically change with the system dark mode
+* The window doesn't have any keybinding, such as for minimize or close
+
+Commit
 ### WAIT XXX
