@@ -7,7 +7,7 @@ A native macOS Rust application for orchestrating multiple Claude Code sessions 
 - **macOS only.** No cross-platform concerns.
 - **Rust.** Follow Zed's GUI practices (GPUI) where possible.
 - **Keyboard-first.** Single key, Emacs-style bindings with modal ideas. Not a full vim emulator, just efficient keyboard-driven navigation.
-- **Claude Code directly.** Run the real Claude Code CLI, not the Agent SDK, so we get upstream improvements for free.
+- **Claude Code directly.** Run the real Claude Code CLI in an embedded terminal so we get upstream improvements for free. Use Claude Code's hooks system (HTTP hooks) and session JSONL files for structured status events and reply capture alongside the raw terminal.
 - **Minimal but functional.** Not a full IDE. Opens files in Zed (or another editor) for serious editing.
 
 ## Core Concepts
@@ -86,13 +86,13 @@ Syntax-highlighted source viewer with light editing capability (not a full edito
 
 ### Claude Reply Viewer
 
-When Claude produces a long response, a keybinding sends `/copy` to Claude and writes the Markdown result to a temporary file (`./reply/<id>.md`). The user scrolls through it and can annotate inline. Modifications are tracked and written as comments into TODO.md.
+When Claude produces a long response, a keybinding extracts it from the session JSONL transcript (`~/.claude/projects/.../<session>.jsonl`) and writes the Markdown result to a temporary file (`./reply/<id>.md`). The user scrolls through it and can annotate inline. Modifications are tracked and written as comments into TODO.md.
 
 ## Status & Usage Tracking
 
 ### Task Status Indicators
 
-A persistent indicator shows which tasks have Claude responses waiting for review. The app detects "waiting" by observing that the Claude terminal has stopped producing output.
+A persistent indicator shows which tasks have Claude responses waiting for review. The app detects "waiting" via Claude Code's hooks system (HTTP hooks fire on `Stop` and `Notification` events) with `terminal_bell` as a lightweight backup signal.
 
 A fuzzy picker (keybinding) lets the user jump between projects and tasks. A modifier key filters to only waiting tasks or same-project tasks.
 
@@ -127,17 +127,21 @@ It is deliberately *not* a full code editor on mobile.
 
 | Component | Approach |
 |---|---|
-| GUI framework | GPUI (from Zed) |
-| Terminal emulator | Zed's terminal crate (alacritty_terminal or similar) --- needs enough fidelity for Claude Code's TUI |
-| Markdown editor | Custom source editor with light rendering |
-| Syntax highlighting | tree-sitter |
-| Symbol navigation | tree-sitter (with optional LSP for richer info) |
-| Git diff | libgit2 via `git2` crate, custom rendering |
-| Git worktrees | Managed by the app via `git2` or CLI |
+| GUI framework | `gpui` 0.2.x (from Zed) + `gpui-component` (Longbridge, 60+ widgets) |
+| Terminal emulator | `alacritty_terminal` (Zed's fork) --- full escape sequence support for Claude Code's TUI |
+| Markdown editor | `gpui-component` editor widget + `ropey` + `tree-sitter-md`, custom TODO.md highlight pass |
+| Syntax highlighting | `tree-sitter` 0.26.x + `tree-sitter-highlight` + per-language grammar crates |
+| Symbol navigation | tree-sitter custom `outline.scm` queries (with optional LSP for richer info) |
+| Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff` for word-level highlighting |
+| Git worktrees | `git2` worktree API (create/list/prune) |
+| Claude idle detection | Claude Code hooks system (HTTP endpoint) + `terminal_bell` config + silence heuristic fallback |
+| Claude reply capture | Read session JSONL from `~/.claude/projects/` (replaces fragile `/copy` approach) |
+| Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
 | Persistent state | `~/.config/jc/` --- project list, task state, window layout |
-| Mobile server | Built-in TLS server, QR-code pairing |
+| Mobile server | `axum` + `axum-server` (tls-rustls) + `rcgen` (self-signed certs) |
+| Mobile QR pairing | `fast_qr` (ECL Q, render as GPUI quads) |
 | Mobile app | Separate project (Swift/native iOS likely) |
-| Desktop notifications | macOS native APIs |
+| Desktop notifications | `objc2-user-notifications` (modern UNUserNotificationCenter, requires app bundling) |
 
 ## Workflow Walkthrough
 
@@ -149,7 +153,7 @@ It is deliberately *not* a full code editor on mobile.
 4. Highlight a region (with mouse or keybindings) in the diff, press the comment key, type a note. It appears in TODO.md under `### WAIT`.
 5. Mark reviewed files as done (they collapse).
 6. Switch to the general terminal to run tests or inspect behavior. Highlight output, press comment key.
-7. If Claude's textual response was long, press a key to capture it via `/copy` into a reply file. Scroll and annotate.
+7. If Claude's textual response was long, press a key to extract it from the session JSONL transcript into a reply file. Scroll and annotate.
 
 ### Navigating Code
 
@@ -172,56 +176,164 @@ It is deliberately *not* a full code editor on mobile.
 2. Create a task within a project. Choose whether it gets its own git worktree or shares the main tree.
 3. Use the fuzzy picker to switch between projects and tasks.
 
+## Research Findings
+
+### GPUI (GUI Framework)
+
+**Verdict: Go.** Published on crates.io as `gpui` v0.2.2. Usable standalone --- 38+ community projects exist (Loungy, Longbridge Pro, etc.). Metal rendering on macOS targets 120 FPS.
+
+**Key asset:** `gpui-component` (Longbridge, 10.3k GitHub stars) provides 60+ production-ready widgets including a code editor component, 20+ themes, buttons, inputs, lists, tables. This dramatically reduces UI work.
+
+**Risks:** Pre-1.0 with breaking changes. Zed deprioritized standalone GPUI development in late 2025 --- a community fork `gpui-ce` exists (480 stars) as a hedge. Pin to a specific version and use `gpui-component` for standard widgets.
+
+**Alternatives considered:** Iced (safer but less performant), egui (simpler but immediate-mode), Slint (stable but less flexible).
+
+### Terminal Emulator
+
+**Verdict: Use `alacritty_terminal`.** It is the only production-quality Rust terminal emulator state machine available as a standalone library. Zed uses a fork pinned to a specific commit (`github.com/zed-industries/alacritty`).
+
+**Claude Code compatibility:** Full support for all escape sequences Claude Code uses (truecolor, alternate screen, SGR styling, synchronized updates, mouse modes, Kitty keyboard protocol).
+
+**GPUI integration proven:** The zTerm project (github.com/zerx-lab/zTerm) demonstrates standalone GPUI + alacritty_terminal integration. Key lesson: use a ~4ms batching interval to coalesce PTY events before rendering. Integration requires ~500-1000 lines of glue code (custom `Element` that paints terminal cells, input routing, PTY management).
+
+**Recommendation:** Use Zed's fork rather than the crates.io version (v0.25.1) to benefit from Zed-specific fixes.
+
+### tree-sitter
+
+**Verdict: Go.** v0.26.6, actively maintained. Rich grammar ecosystem with crates for all major languages (Rust, Python, JS/TS, Go, C/C++, Java, Markdown, etc.).
+
+**Architecture:** Follow Zed's query-driven model. Define `highlights.scm` and `outline.scm` per language. Use `tree-sitter-highlight` for syntax highlighting event streams, custom `outline.scm` queries for symbol navigation with hierarchy context (e.g., which `impl` block a method belongs to). Skip `tree-sitter-tags` --- custom queries give more control.
+
+**Performance:** Initial parse ~80ms for a 6K-line file. Incremental re-parse sub-millisecond. Fast enough for keystroke-level responsiveness.
+
+**Gotcha:** Version coupling between `tree-sitter` core and grammar crates. Pin all tree-sitter-related crates carefully. Use `tree-sitter-language` `LanguageFn` pattern to avoid conflicts.
+
+### Markdown Editor
+
+**Verdict: Use `gpui-component` editor widget.** This provides a rope-backed (`ropey`) code editor with tree-sitter integration, line numbers, search, soft/hard wrap, and multi-cursor support out of the box.
+
+**Approach:** Configure with `tree-sitter-md` for markdown highlighting, then add a custom post-processing pass for TODO.md-specific constructs (`### WAIT` markers, `### Message N` headers, `* <file>:<line> --- comment` annotations). Estimated effort: 2-4 weeks vs 6-12 weeks for building from scratch.
+
+**Prior art:** Aster (github.com/kumarUjjawal/aster) is a GPUI-based markdown editor using the same ropey + tree-sitter-md stack. Good reference implementation.
+
+### git2
+
+**Verdict: Go.** v0.20.4, actively maintained (used by Cargo itself). Vendored libgit2 avoids macOS system library conflicts.
+
+**Diff:** Full line-level diff API via `diff_tree_to_workdir_with_index()`. Supports unified, raw, name-only formats. Context lines, whitespace options, patience/minimal algorithms, rename detection all available. For **word-level inline highlighting** within changed lines, supplement with `similar` (ergonomic) or `imara-diff` (30x faster, used by Helix).
+
+**Worktrees:** Complete API --- create (`repo.worktree()`), list (`repo.worktrees()`), validate, lock/unlock, prune. Sufficient for our task management model.
+
+**Shell out to git CLI for:** clone, fetch, gc, shallow clones, sparse checkout, hook execution. These operations are either unsupported or significantly slower in libgit2.
+
+### macOS Notifications
+
+**Verdict: Use `objc2-user-notifications` (modern API).** Since the app will be a bundled `.app` anyway (required by GPUI/Metal), the code-signing requirement is not a burden. This gives us action buttons ("Switch to Task"), notification grouping via `threadIdentifier`, async delegate callbacks, and future-proofing (Apple's current API, not deprecated).
+
+**Fallback:** `mac-notification-sys` v0.6.9 works today without code signing but uses deprecated `NSUserNotificationCenter`. Fine for prototyping.
+
+**Simplest possible:** `osascript -e 'display notification ...'` for zero-dependency MVP.
+
+### Claude Code Idle Detection
+
+**Verdict: Use Claude Code's hooks system.** This is purpose-built for exactly our use case.
+
+**Primary mechanism:** Configure HTTP hooks in `~/.claude/settings.json` that POST to a local port our app listens on:
+- `Stop` hook fires when Claude finishes responding (definitive completion signal)
+- `Notification` hook with `idle_prompt` matcher fires when waiting for input
+- `Notification` hook with `permission_prompt` matcher fires when tool approval needed
+- `PermissionRequest` hook fires with full tool details for permission dialogs
+
+**Secondary signal:** Set `preferredNotifChannel` to `terminal_bell` --- Claude emits BEL character (`\x07`) on task completion, easily detected from PTY monitoring.
+
+**Combine with:** Brief silence heuristic as a tertiary fallback (2+ seconds of PTY silence AND a Stop hook = confident idle state).
+
+**Known issues:** `idle_prompt` fires after EVERY response, not just genuine wait states (bug tracked in Claude Code issues). The `Stop` hook is more reliable.
+
+### Claude Reply Capture
+
+**Verdict: Read session JSONL files.** The `/copy` approach is fragile (interactive picker for code blocks, clipboard race conditions). Better alternatives:
+
+**Primary:** Claude Code persists all conversations to `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`. Each line is a JSON object with types `user`, `assistant`, `tool_use`, `tool_result`. Extract the latest assistant message(s) and write as Markdown to `./reply/<id>.md`.
+
+**Path encoding:** Slashes become hyphens, e.g., `/Users/jay/Dev/project` becomes `-Users-jay-Dev-project`.
+
+**Alternative considered:** Agent SDK provides structured streaming output, but we chose to run the real Claude Code CLI for upstream improvements.
+
+### TLS Server (Mobile Connection)
+
+**Verdict: `axum` + `axum-server` (tls-rustls) + `rcgen`.** Pure Rust, no system dependencies, WebSocket-over-TLS built in.
+
+- `rcgen` generates self-signed certs at pairing time with IP address SANs
+- `axum-server` binds with `bind_rustls()` using the generated cert
+- `axum` serves both REST and WebSocket over TLS from a single binding
+- Mobile app pins the cert's SHA-256 public key fingerprint (received via QR code)
+
+**QR pairing payload:** `{"host": "192.168.1.x", "port": 8443, "fp": "sha256/base64fingerprint=="}` --- fits easily in a Version 10-15 QR code.
+
+### QR Code Generation
+
+**Verdict: `fast_qr`.** 6-7x faster than alternatives (though all are fast enough). Clean API with direct matrix access via public `data` field --- ideal for rendering as GPUI quads. Default ECL Q (25% recovery) is right for screen-to-camera scanning. Zero image dependencies when used with `default-features = false`.
+
+### Claude Usage Dashboard
+
+**Verdict: Poll the undocumented OAuth usage API.** `GET https://api.anthropic.com/api/oauth/usage` returns exactly what we need:
+
+```json
+{
+  "five_hour": { "utilization": 37.0, "resets_at": "2026-02-08T04:59:59Z" },
+  "seven_day": { "utilization": 26.0, "resets_at": "2026-02-12T14:59:59Z" },
+  "extra_usage": { "is_enabled": true, "monthly_limit": 5000, "used_credits": 1234, "utilization": 24.68 }
+}
+```
+
+**Token access:** Read from macOS Keychain via `security find-generic-password -s "Claude Code-credentials" -w`, parse JSON, extract `claudeAiOauth.accessToken`. Poll every 30-60 seconds.
+
+**Par calculation:** Compare `seven_day.utilization` against `(elapsed_working_seconds / total_working_seconds_in_window) * 100`, adjusted for configured working hours.
+
+**Risk:** Undocumented endpoint, could change. A `claude-usage` Rust crate already exists on crates.io. Community tools (bash scripts, Python dashboards) demonstrate the pattern is stable.
+
 ## Task Checklist
 
-### Research
-- [ ] Evaluate GPUI: can we use it outside of Zed? What's the extraction story?
-- [ ] Evaluate Zed's terminal emulator crate: can it be used standalone? Does it handle Claude Code's output correctly?
-- [ ] Survey tree-sitter Rust bindings and available grammars
-- [ ] Determine the best approach for the Markdown editor (custom on GPUI vs adapting an existing component)
-- [ ] Research `git2` crate capabilities for diff display and worktree management
-- [ ] Investigate macOS notification APIs from Rust (e.g., `mac-notification-sys` or direct objc calls)
-- [ ] Determine how to detect Claude Code "idle" state (terminal output silence heuristic, PTY monitoring)
-- [ ] Research how Claude Code `/copy` works and how to programmatically invoke it. [Could just be literally sending `/copy\n` using the terminal and then `pbpaste` to get the content.]
-- [ ] Evaluate TLS server crates for the mobile connection (rustls, native-tls)
-- [ ] Research QR code generation crates
-- [ ] Investigate Claude usage API or scraping approach for the usage dashboard [Could just be having another hidden `claude` session where you send `/usage` periodically]
-
 ### Core Infrastructure
-- [ ] Set up Rust project structure (workspace with crates)
-- [ ] Integrate GPUI and get a basic window rendering
+- [ ] Set up Rust workspace (crates: `jc-app`, `jc-terminal`, `jc-editor`, `jc-git`, `jc-claude`, `jc-mobile`)
+- [ ] Integrate `gpui` 0.2.x + `gpui-component` and get a basic window rendering
 - [ ] Implement `~/.config/jc/` config and state persistence
 - [ ] Implement project and task data model
 - [ ] Implement `jc` CLI for adding projects from the command line
-- [ ] Implement git worktree creation/deletion for tasks
+- [ ] Implement git worktree creation/deletion via `git2` worktree API
 
 ### Terminal Emulator
-- [ ] Integrate terminal emulator library
+- [ ] Integrate `alacritty_terminal` (Zed's fork) with GPUI custom Element
+- [ ] Implement PTY management and ~4ms event batching for rendering
 - [ ] Run Claude Code inside the embedded terminal
 - [ ] Run general-purpose shell in a second terminal per task
-- [ ] Detect terminal output idle (for "Claude is waiting" notifications)
-- [ ] Implement `/copy` capture: send command to Claude, intercept response, write to reply file
+- [ ] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
+- [ ] Configure `preferredNotifChannel = terminal_bell` as backup idle signal
+- [ ] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
 - [ ] Implement Quake-style drop-down terminal toggle
 
 ### TODO.md System
-- [ ] Implement Markdown source editor with light rendering (bold, headings, highlights)
-- [ ] Build library for managing TODO.md representation
+- [ ] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
+- [ ] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
+- [ ] Build library for managing TODO.md representation (ropey-backed)
 - [ ] Parse TODO.md format (agents, messages, WAIT markers)
 - [ ] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] Implement comment insertion from other views into the WAIT section
-- [ ] Detect external file modifications and show visual indicator
+- [ ] Detect external file modifications (file watcher) and show visual indicator
 - [ ] Implement conflict resolution (git-style merge of buffer vs disk)
 
 ### Git Diff View
-- [ ] Render git diff with syntax-aware highlighting
+- [ ] Render git diff via `git2` with `tree-sitter` syntax-aware highlighting
+- [ ] Add word-level inline highlighting via `similar` or `imara-diff`
 - [ ] Implement region selection and comment keybinding
 - [ ] Implement per-file "mark as reviewed" with collapse
 - [ ] Support scrolling through multi-file diffs
 
 ### Code Viewer
-- [ ] Implement syntax-highlighted file viewer (tree-sitter)
+- [ ] Implement syntax-highlighted file viewer (`tree-sitter` + `tree-sitter-highlight`)
 - [ ] Implement fuzzy file picker (search repo files)
-- [ ] Implement symbol picker with hierarchy context
+- [ ] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
 - [ ] Implement light editing (basic text modification, not full editor)
 - [ ] Implement "open in external editor" keybinding
 
@@ -240,18 +352,19 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement keybinding system (configurable, emacs-style defaults)
 
 ### Notifications & Status
-- [ ] Implement in-app status bar showing waiting tasks
-- [ ] Implement macOS desktop notifications on Claude idle
-- [ ] Implement Claude usage dashboard (5-hour window %, weekly %, par calculation)
+- [ ] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
+- [ ] Implement in-app status bar showing waiting tasks (driven by hook events)
+- [ ] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Task")
+- [ ] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] Implement configurable working hours for par calculation
 
 ### Mobile App
-- [ ] Design mobile app protocol (what data is sent, what commands are available)
-- [ ] Implement TLS server on desktop
-- [ ] Implement QR code pairing flow
+- [ ] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
+- [ ] Implement TLS server (`axum` + `axum-server` + `rcgen` self-signed certs)
+- [ ] Implement QR code pairing flow (`fast_qr`, encode host + port + cert fingerprint)
 - [ ] Build mobile app: dashboard view
 - [ ] Build mobile app: TODO review and note-taking
-- [ ] Build mobile app: Claude permission handling
+- [ ] Build mobile app: Claude permission handling (relay from hooks)
 - [ ] Build mobile app: send commands to Claude
 
 ### Polish & Integration
@@ -259,3 +372,4 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Persistent state: survive app restart without losing task state or terminal sessions
 - [ ] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
+- [ ] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
