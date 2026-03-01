@@ -344,6 +344,10 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement keystroke-to-bytes conversion (special keys, Ctrl, Alt, APP_CURSOR mode)
 - [x] Implement terminal cell painting (backgrounds, text with bold/italic, cursor shapes)
 - [x] Implement terminal resize detection and PTY resize propagation
+- [ ] Fix: terminal window doesn't get focused on creation
+- [ ] Extract terminal color palette to a theme file
+- [ ] Add a light terminal theme
+- [ ] Auto-switch terminal theme with system dark mode
 - [ ] Run Claude Code inside the embedded terminal
 - [ ] Run general-purpose shell in a second terminal per task
 - [ ] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
@@ -376,6 +380,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement "open in external editor" keybinding
 
 ### Window & Pane Management
+- [ ] Add window keybindings (Cmd+W close, Cmd+M minimize, Cmd+Q quit)
 - [ ] Implement left/right two-pane layout
 - [ ] Implement view switching per pane (Claude, terminal, diff, TODO, code, reply)
 - [ ] Implement independent scroll positions per pane
