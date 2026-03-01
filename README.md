@@ -48,7 +48,7 @@ A project corresponds to a code repository. The app tracks active projects in `~
 
 ### Tasks
 
-Each project has one or more tasks. A task represents a unit of work being done, possibly with its own git worktree (managed by the app) or sharing the project's main tree. Each task has:
+Each project has one or more tasks. A task represents a unit of work being done, sharing the project's main working tree. Git worktree support (giving each task its own isolated tree) is planned for later. Each task has:
 - A Claude Code session (terminal)
 - A general-purpose terminal
 - Access to the shared project TODO.md
@@ -331,7 +331,6 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement `~/.config/jc/` config and state persistence
 - [x] Implement project and task data model
 - [x] Implement `jc` CLI for adding projects from the command line
-- [ ] Implement git worktree creation/deletion via `git2` worktree API
 
 ### Terminal Emulator
 - [ ] Integrate `alacritty_terminal` (Zed's fork) with GPUI custom Element
@@ -396,6 +395,9 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Build mobile app: TODO review and note-taking
 - [ ] Build mobile app: Claude permission handling (relay from hooks)
 - [ ] Build mobile app: send commands to Claude
+
+### Git Worktrees
+- [ ] Implement git worktree creation/deletion via `git2` worktree API
 
 ### Polish & Integration
 - [ ] End-to-end test: full workflow from project creation to Claude review cycle
