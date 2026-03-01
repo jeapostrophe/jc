@@ -2,6 +2,7 @@ use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
+use gpui_component::TitleBar;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use jc_core::config::AppState;
 use jc_terminal::TerminalView;
@@ -14,7 +15,6 @@ actions!(
     Quit,
     FocusLeftPane,
     FocusRightPane,
-    CyclePaneFocus,
     ShowClaudeTerminal,
     ShowGeneralTerminal,
   ]
@@ -102,13 +102,6 @@ impl Workspace {
     cx.notify();
   }
 
-  fn cycle_pane_focus(&mut self, _: &CyclePaneFocus, window: &mut Window, cx: &mut Context<Self>) {
-    match self.active_pane {
-      ActivePane::Left => self.focus_right_pane(&FocusRightPane, window, cx),
-      ActivePane::Right => self.focus_left_pane(&FocusLeftPane, window, cx),
-    }
-  }
-
   fn active_pane_entity(&self) -> &Entity<Pane> {
     match self.active_pane {
       ActivePane::Left => &self.left_pane,
@@ -157,6 +150,61 @@ impl Workspace {
   ) {
     self.set_active_pane_view(PaneContentKind::GeneralTerminal, window, cx);
   }
+
+  fn pane_label(&self, pane: &Entity<Pane>, cx: &App) -> &'static str {
+    pane.read(cx).content_kind().map_or("Empty", PaneContentKind::label)
+  }
+
+  fn render_title_bar(&self, cx: &mut Context<Self>) -> TitleBar {
+    let theme = cx.theme();
+
+    let left_label = self.pane_label(&self.left_pane, cx);
+    let right_label = self.pane_label(&self.right_pane, cx);
+    let left_active = self.active_pane == ActivePane::Left;
+    let right_active = self.active_pane == ActivePane::Right;
+
+    let project_name =
+      self.state.projects.first().map(|p| p.name.clone()).unwrap_or_else(|| "No project".into());
+
+    let pane_tab = |label: &'static str, active: bool| {
+      div()
+        .px_3()
+        .py_1()
+        .text_sm()
+        .when(active, |d| d.text_color(theme.foreground).font_weight(FontWeight::SEMIBOLD))
+        .when(!active, |d| d.text_color(theme.muted_foreground))
+        .child(label)
+    };
+
+    TitleBar::new()
+      // left: project > task
+      .child(
+        div()
+          .flex()
+          .items_center()
+          .gap_1()
+          .mr_auto()
+          .child(div().text_sm().text_color(theme.foreground).child(project_name)),
+      )
+      // center: pane labels
+      .child(
+        div()
+          .flex()
+          .items_center()
+          .gap_1()
+          .child(pane_tab(left_label, left_active))
+          .child(div().text_sm().text_color(theme.muted_foreground).child("|"))
+          .child(pane_tab(right_label, right_active)),
+      )
+      // right: usage placeholder
+      .child(
+        div()
+          .flex()
+          .items_center()
+          .ml_auto()
+          .child(div().text_sm().text_color(theme.muted_foreground).child("Usage")),
+      )
+  }
 }
 
 impl Focusable for Workspace {
@@ -194,9 +242,9 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::quit))
       .on_action(cx.listener(Self::focus_left_pane))
       .on_action(cx.listener(Self::focus_right_pane))
-      .on_action(cx.listener(Self::cycle_pane_focus))
       .on_action(cx.listener(Self::show_claude_terminal))
       .on_action(cx.listener(Self::show_general_terminal))
+      .child(self.render_title_bar(cx))
       .child(
         h_resizable("main-split")
           .child(resizable_panel().size(px(600.0)).child(left_wrapper))
@@ -214,6 +262,5 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-]", FocusRightPane, Some("Workspace")),
     KeyBinding::new("cmd-1", ShowClaudeTerminal, Some("Workspace")),
     KeyBinding::new("cmd-2", ShowGeneralTerminal, Some("Workspace")),
-    KeyBinding::new("ctrl-`", CyclePaneFocus, Some("Workspace")),
   ]);
 }

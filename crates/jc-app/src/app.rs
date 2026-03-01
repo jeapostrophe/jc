@@ -1,5 +1,6 @@
 use crate::views::workspace::{self, Workspace};
 use gpui::*;
+use gpui_component::TitleBar;
 use jc_core::config::AppState;
 
 pub fn run(state: AppState) {
@@ -9,13 +10,20 @@ pub fn run(state: AppState) {
     gpui_component::init(cx);
     workspace::init(cx);
 
+    cx.on_window_closed(|cx| {
+      if cx.windows().is_empty() {
+        cx.quit();
+      }
+    })
+    .detach();
+
     let opts = WindowOptions {
       window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
         None,
         size(px(1200.0), px(800.0)),
         cx,
       ))),
-      titlebar: Some(TitlebarOptions { title: Some("jc".into()), ..Default::default() }),
+      titlebar: Some(TitleBar::title_bar_options()),
       ..Default::default()
     };
 

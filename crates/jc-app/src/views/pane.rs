@@ -7,6 +7,15 @@ pub enum PaneContentKind {
   GeneralTerminal,
 }
 
+impl PaneContentKind {
+  pub fn label(self) -> &'static str {
+    match self {
+      Self::ClaudeTerminal => "Claude",
+      Self::GeneralTerminal => "Terminal",
+    }
+  }
+}
+
 pub struct PaneContent {
   pub kind: PaneContentKind,
   pub view: AnyView,
@@ -26,6 +35,10 @@ impl Pane {
   pub fn set_content(&mut self, content: PaneContent, cx: &mut Context<Self>) {
     self.content = Some(content);
     cx.notify();
+  }
+
+  pub fn content_kind(&self) -> Option<PaneContentKind> {
+    self.content.as_ref().map(|c| c.kind)
   }
 
   pub fn focus_content(&self, window: &mut Window) {
