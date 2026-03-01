@@ -16,6 +16,9 @@ cargo run -p jc-app -- .
 
 # Run the minimal GPUI example
 cargo run -p jc-app --example basic_window
+
+# Run the standalone terminal emulator
+cargo run -p jc-terminal --example terminal_window
 ```
 
 Config and state live in `~/.config/jc/` (`config.toml` and `state.toml`).
@@ -27,6 +30,9 @@ Cargo.toml                          # workspace root
 crates/
   jc-core/                          # data model + config persistence
     src/lib.rs, config.rs, model.rs
+  jc-terminal/                      # embedded terminal emulator
+    src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
+    examples/terminal_window.rs
   jc-app/                           # binary: CLI + GPUI app
     src/main.rs, app.rs, views/
     examples/basic_window.rs
@@ -158,7 +164,7 @@ It is deliberately *not* a full code editor on mobile.
 | Component | Approach |
 |---|---|
 | GUI framework | `gpui` 0.2.x (from Zed) + `gpui-component` (Longbridge, 60+ widgets) |
-| Terminal emulator | `alacritty_terminal` (Zed's fork) --- full escape sequence support for Claude Code's TUI |
+| Terminal emulator | `alacritty_terminal` 0.25 + `portable-pty` 0.9 --- full escape sequence support for Claude Code's TUI |
 | Markdown editor | `gpui-component` editor widget + `ropey` + `tree-sitter-md`, custom TODO.md highlight pass |
 | Syntax highlighting | `tree-sitter` 0.26.x + `tree-sitter-highlight` + per-language grammar crates |
 | Symbol navigation | tree-sitter custom `outline.scm` queries (with optional LSP for richer info) |
@@ -226,7 +232,7 @@ It is deliberately *not* a full code editor on mobile.
 
 **GPUI integration proven:** The zTerm project (github.com/zerx-lab/zTerm) demonstrates standalone GPUI + alacritty_terminal integration. Key lesson: use a ~4ms batching interval to coalesce PTY events before rendering. Integration requires ~500-1000 lines of glue code (custom `Element` that paints terminal cells, input routing, PTY management).
 
-**Recommendation:** Use Zed's fork rather than the crates.io version (v0.25.1) to benefit from Zed-specific fixes.
+**Current approach:** Using crates.io `alacritty_terminal` v0.25.1 + `portable-pty` v0.9.0 in the `jc-terminal` crate. PTY reading runs on a dedicated std::thread, with bytes forwarded via flume channel to a GPUI async task that processes VTE escape sequences and triggers re-renders. Rendering uses GPUI's `canvas()` element to paint terminal cells directly.
 
 ### tree-sitter
 
@@ -333,8 +339,11 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement `jc` CLI for adding projects from the command line
 
 ### Terminal Emulator
-- [ ] Integrate `alacritty_terminal` (Zed's fork) with GPUI custom Element
-- [ ] Implement PTY management and ~4ms event batching for rendering
+- [x] Integrate `alacritty_terminal` with GPUI rendering (`jc-terminal` crate)
+- [x] Implement PTY management (`portable-pty`) with background reader thread
+- [x] Implement keystroke-to-bytes conversion (special keys, Ctrl, Alt, APP_CURSOR mode)
+- [x] Implement terminal cell painting (backgrounds, text with bold/italic, cursor shapes)
+- [x] Implement terminal resize detection and PTY resize propagation
 - [ ] Run Claude Code inside the embedded terminal
 - [ ] Run general-purpose shell in a second terminal per task
 - [ ] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection

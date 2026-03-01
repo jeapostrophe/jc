@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 jc-core = { path = "../jc-core" }
+jc-terminal = { path = "../jc-terminal" }
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true

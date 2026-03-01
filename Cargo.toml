@@ -16,3 +16,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
+alacritty_terminal = "0.25"
+portable-pty = "0.9"
+parking_lot = "0.12"
+flume = "0.11"

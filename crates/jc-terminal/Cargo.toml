@@ -1,0 +1,12 @@
+[package]
+name = "jc-terminal"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+gpui.workspace = true
+alacritty_terminal.workspace = true
+portable-pty.workspace = true
+parking_lot.workspace = true
+flume.workspace = true
+anyhow.workspace = true

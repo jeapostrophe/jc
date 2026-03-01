@@ -1,0 +1,76 @@
+use alacritty_terminal::term::TermMode;
+use gpui::Keystroke;
+
+/// Convert a GPUI keystroke into terminal byte sequences.
+pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
+  let key = keystroke.key_char.as_deref().unwrap_or("");
+
+  // Handle Ctrl+key combos
+  if keystroke.modifiers.control
+    && let Some(ch) = key.chars().next()
+  {
+    let byte = match ch {
+      'a'..='z' => Some(ch as u8 - b'a' + 1),
+      '@' => Some(0),
+      '[' => Some(0x1B),
+      '\\' => Some(0x1C),
+      ']' => Some(0x1D),
+      '^' => Some(0x1E),
+      '_' => Some(0x1F),
+      _ => None,
+    };
+    if let Some(b) = byte {
+      return Some(vec![b]);
+    }
+  }
+
+  // Handle special named keys
+  let app_cursor = mode.contains(TermMode::APP_CURSOR);
+  let bytes: Option<Vec<u8>> = match keystroke.key.as_str() {
+    "enter" => Some(b"\r".to_vec()),
+    "escape" => Some(b"\x1b".to_vec()),
+    "tab" => Some(b"\t".to_vec()),
+    "backspace" => Some(vec![0x7f]),
+    "delete" => Some(b"\x1b[3~".to_vec()),
+    "up" => Some(if app_cursor { b"\x1bOA".to_vec() } else { b"\x1b[A".to_vec() }),
+    "down" => Some(if app_cursor { b"\x1bOB".to_vec() } else { b"\x1b[B".to_vec() }),
+    "right" => Some(if app_cursor { b"\x1bOC".to_vec() } else { b"\x1b[C".to_vec() }),
+    "left" => Some(if app_cursor { b"\x1bOD".to_vec() } else { b"\x1b[D".to_vec() }),
+    "home" => Some(if app_cursor { b"\x1bOH".to_vec() } else { b"\x1b[H".to_vec() }),
+    "end" => Some(if app_cursor { b"\x1bOF".to_vec() } else { b"\x1b[F".to_vec() }),
+    "pageup" => Some(b"\x1b[5~".to_vec()),
+    "pagedown" => Some(b"\x1b[6~".to_vec()),
+    "insert" => Some(b"\x1b[2~".to_vec()),
+    "f1" => Some(b"\x1bOP".to_vec()),
+    "f2" => Some(b"\x1bOQ".to_vec()),
+    "f3" => Some(b"\x1bOR".to_vec()),
+    "f4" => Some(b"\x1bOS".to_vec()),
+    "f5" => Some(b"\x1b[15~".to_vec()),
+    "f6" => Some(b"\x1b[17~".to_vec()),
+    "f7" => Some(b"\x1b[18~".to_vec()),
+    "f8" => Some(b"\x1b[19~".to_vec()),
+    "f9" => Some(b"\x1b[20~".to_vec()),
+    "f10" => Some(b"\x1b[21~".to_vec()),
+    "f11" => Some(b"\x1b[23~".to_vec()),
+    "f12" => Some(b"\x1b[24~".to_vec()),
+    "space" => Some(b" ".to_vec()),
+    _ => None,
+  };
+
+  if let Some(b) = bytes {
+    return Some(b);
+  }
+
+  // Regular character input
+  if !keystroke.modifiers.control && !key.is_empty() {
+    let mut bytes = Vec::new();
+    // Alt prefix
+    if keystroke.modifiers.alt {
+      bytes.push(0x1b);
+    }
+    bytes.extend_from_slice(key.as_bytes());
+    return Some(bytes);
+  }
+
+  None
+}
