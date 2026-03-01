@@ -3,14 +3,11 @@ use gpui_component::ActiveTheme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneContentKind {
-  ProjectList,
-  Terminal,
-  #[allow(dead_code)]
-  Empty,
+  ClaudeTerminal,
+  GeneralTerminal,
 }
 
 pub struct PaneContent {
-  #[allow(dead_code)]
   pub kind: PaneContentKind,
   pub view: AnyView,
   pub focus: FocusHandle,
@@ -26,9 +23,9 @@ impl Pane {
     Self { content: Some(content), focus: cx.focus_handle() }
   }
 
-  #[allow(dead_code)]
-  pub fn set_content(&mut self, content: PaneContent) {
+  pub fn set_content(&mut self, content: PaneContent, cx: &mut Context<Self>) {
     self.content = Some(content);
+    cx.notify();
   }
 
   pub fn focus_content(&self, window: &mut Window) {

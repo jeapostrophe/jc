@@ -1,5 +1,4 @@
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
-use crate::views::project_view::ProjectView;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -9,7 +8,16 @@ use jc_terminal::TerminalView;
 
 actions!(
   workspace,
-  [CloseWindow, MinimizeWindow, Quit, FocusLeftPane, FocusRightPane, CyclePaneFocus,]
+  [
+    CloseWindow,
+    MinimizeWindow,
+    Quit,
+    FocusLeftPane,
+    FocusRightPane,
+    CyclePaneFocus,
+    ShowClaudeTerminal,
+    ShowGeneralTerminal,
+  ]
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +30,8 @@ pub struct Workspace {
   left_pane: Entity<Pane>,
   right_pane: Entity<Pane>,
   active_pane: ActivePane,
+  claude_terminal: Entity<TerminalView>,
+  general_terminal: Entity<TerminalView>,
   #[allow(dead_code)]
   state: AppState,
   focus: FocusHandle,
@@ -29,35 +39,43 @@ pub struct Workspace {
 
 impl Workspace {
   pub fn new(state: AppState, window: &mut Window, cx: &mut Context<Self>) -> Self {
-    let project_view = cx.new(|cx| ProjectView::with_state(state.clone(), cx));
-    let project_focus = project_view.read(cx).focus_handle(cx);
+    let claude_terminal = cx.new(|cx| TerminalView::new(Default::default(), None, window, cx));
+    let general_terminal = cx.new(|cx| TerminalView::new(Default::default(), None, window, cx));
+
+    let claude_focus = claude_terminal.read(cx).focus_handle(cx);
+    let general_focus = general_terminal.read(cx).focus_handle(cx);
 
     let left_pane = cx.new(|cx| {
       Pane::with_content(
         PaneContent {
-          kind: PaneContentKind::ProjectList,
-          view: project_view.into(),
-          focus: project_focus,
+          kind: PaneContentKind::ClaudeTerminal,
+          view: claude_terminal.clone().into(),
+          focus: claude_focus,
         },
         cx,
       )
     });
-
-    let terminal_view = cx.new(|cx| TerminalView::new(Default::default(), None, window, cx));
-    let terminal_focus = terminal_view.read(cx).focus_handle(cx);
 
     let right_pane = cx.new(|cx| {
       Pane::with_content(
         PaneContent {
-          kind: PaneContentKind::Terminal,
-          view: terminal_view.into(),
-          focus: terminal_focus,
+          kind: PaneContentKind::GeneralTerminal,
+          view: general_terminal.clone().into(),
+          focus: general_focus,
         },
         cx,
       )
     });
 
-    Self { left_pane, right_pane, active_pane: ActivePane::Left, state, focus: cx.focus_handle() }
+    Self {
+      left_pane,
+      right_pane,
+      active_pane: ActivePane::Left,
+      claude_terminal,
+      general_terminal,
+      state,
+      focus: cx.focus_handle(),
+    }
   }
 
   fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _cx: &mut Context<Self>) {
@@ -89,6 +107,55 @@ impl Workspace {
       ActivePane::Left => self.focus_right_pane(&FocusRightPane, window, cx),
       ActivePane::Right => self.focus_left_pane(&FocusLeftPane, window, cx),
     }
+  }
+
+  fn active_pane_entity(&self) -> &Entity<Pane> {
+    match self.active_pane {
+      ActivePane::Left => &self.left_pane,
+      ActivePane::Right => &self.right_pane,
+    }
+  }
+
+  fn set_active_pane_view(
+    &mut self,
+    kind: PaneContentKind,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let (view, focus) = match kind {
+      PaneContentKind::ClaudeTerminal => {
+        let focus = self.claude_terminal.read(cx).focus_handle(cx);
+        (self.claude_terminal.clone().into(), focus)
+      }
+      PaneContentKind::GeneralTerminal => {
+        let focus = self.general_terminal.read(cx).focus_handle(cx);
+        (self.general_terminal.clone().into(), focus)
+      }
+    };
+
+    let pane = self.active_pane_entity().clone();
+    pane.update(cx, |p, cx| {
+      p.set_content(PaneContent { kind, view, focus: focus.clone() }, cx);
+    });
+    focus.focus(window);
+  }
+
+  fn show_claude_terminal(
+    &mut self,
+    _: &ShowClaudeTerminal,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.set_active_pane_view(PaneContentKind::ClaudeTerminal, window, cx);
+  }
+
+  fn show_general_terminal(
+    &mut self,
+    _: &ShowGeneralTerminal,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.set_active_pane_view(PaneContentKind::GeneralTerminal, window, cx);
   }
 }
 
@@ -128,6 +195,8 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::focus_left_pane))
       .on_action(cx.listener(Self::focus_right_pane))
       .on_action(cx.listener(Self::cycle_pane_focus))
+      .on_action(cx.listener(Self::show_claude_terminal))
+      .on_action(cx.listener(Self::show_general_terminal))
       .child(
         h_resizable("main-split")
           .child(resizable_panel().size(px(600.0)).child(left_wrapper))
@@ -141,8 +210,10 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-w", CloseWindow, Some("Workspace")),
     KeyBinding::new("cmd-m", MinimizeWindow, Some("Workspace")),
     KeyBinding::new("cmd-q", Quit, Some("Workspace")),
-    KeyBinding::new("cmd-1", FocusLeftPane, Some("Workspace")),
-    KeyBinding::new("cmd-2", FocusRightPane, Some("Workspace")),
+    KeyBinding::new("cmd-[", FocusLeftPane, Some("Workspace")),
+    KeyBinding::new("cmd-]", FocusRightPane, Some("Workspace")),
+    KeyBinding::new("cmd-1", ShowClaudeTerminal, Some("Workspace")),
+    KeyBinding::new("cmd-2", ShowGeneralTerminal, Some("Workspace")),
     KeyBinding::new("ctrl-`", CyclePaneFocus, Some("Workspace")),
   ]);
 }
