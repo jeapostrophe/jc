@@ -1,7 +1,10 @@
 use crate::views::code_view::CodeView;
 use crate::views::diff_view::DiffView;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
-use crate::views::picker::{FilePickerDelegate, OpenFilePicker, PickerEvent, PickerState};
+use crate::views::picker::{
+  CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, OpenContextPicker,
+  OpenFilePicker, PickerEvent, PickerState, TodoHeaderPickerDelegate,
+};
 use crate::views::todo_view::TodoView;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -281,6 +284,62 @@ impl Workspace {
 
     self.active_picker = Some(picker.clone().into());
     self._picker_subscription = Some(subscription);
+    picker.read(cx).input_focus_handle(cx).focus(window);
+    cx.notify();
+  }
+
+  fn open_context_picker(
+    &mut self,
+    _: &OpenContextPicker,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.active_picker.is_some() {
+      return;
+    }
+
+    let pane = self.active_pane_entity().clone();
+    let kind = pane.read(cx).content_kind();
+
+    match kind {
+      Some(PaneContentKind::GitDiff) => {
+        let delegate = DiffFilePickerDelegate::new(self.diff_view.clone(), cx);
+        self.show_picker(delegate, window, cx);
+      }
+      Some(PaneContentKind::TodoEditor) => {
+        let delegate = TodoHeaderPickerDelegate::new(self.todo_view.clone(), cx);
+        self.show_picker(delegate, window, cx);
+      }
+      Some(PaneContentKind::CodeViewer) => {
+        let delegate = CodeSymbolPickerDelegate::new(self.code_view.clone(), cx);
+        self.show_picker(delegate, window, cx);
+      }
+      _ => {}
+    }
+  }
+
+  fn show_picker<D: crate::views::picker::PickerDelegate>(
+    &mut self,
+    delegate: D,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
+    self.pre_picker_focus = window.focused(cx);
+
+    let subscription =
+      cx.subscribe_in(&picker, window, |this: &mut Self, _, event, window, cx| match event {
+        PickerEvent::Confirmed | PickerEvent::Dismissed => {
+          if let Some(focus) = this.pre_picker_focus.take() {
+            focus.focus(window);
+          }
+          this.dismiss_picker();
+          cx.notify();
+        }
+      });
+
+    self.active_picker = Some(picker.clone().into());
+    self._picker_subscription = Some(subscription);
 
     picker.read(cx).input_focus_handle(cx).focus(window);
     cx.notify();
@@ -397,6 +456,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::show_todo_editor))
       .on_action(cx.listener(Self::open_in_external_editor))
       .on_action(cx.listener(Self::open_file_picker))
+      .on_action(cx.listener(Self::open_context_picker))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable("main-split")

@@ -3,9 +3,15 @@ use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::path::{Path, PathBuf};
 
+use crate::outline::{OutlineItem, compute_outline};
 use crate::views::code_view::CodeView;
+use crate::views::diff_view::DiffView;
+use crate::views::todo_view::TodoView;
 
-actions!(picker, [ConfirmPicker, CancelPicker, SelectNextItem, SelectPrevItem, OpenFilePicker]);
+actions!(
+  picker,
+  [ConfirmPicker, CancelPicker, SelectNextItem, SelectPrevItem, OpenFilePicker, OpenContextPicker]
+);
 
 pub fn init(cx: &mut App) {
   cx.bind_keys([
@@ -17,12 +23,13 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("up", SelectPrevItem, Some("Picker")),
     KeyBinding::new("ctrl-p", SelectPrevItem, Some("Picker")),
     KeyBinding::new("cmd-o", OpenFilePicker, Some("Workspace")),
+    KeyBinding::new("cmd-t", OpenContextPicker, Some("Workspace")),
   ]);
 }
 
 const MAX_VISIBLE_RESULTS: usize = 200;
 
-fn fuzzy_match(query_lower: &[char], candidate: &str) -> Option<i64> {
+pub fn fuzzy_match(query_lower: &[char], candidate: &str) -> Option<i64> {
   if query_lower.is_empty() {
     return Some(0);
   }
@@ -58,12 +65,32 @@ fn fuzzy_match(query_lower: &[char], candidate: &str) -> Option<i64> {
 
 pub trait PickerDelegate: 'static {
   fn items(&self) -> &[String];
-  fn confirm(&mut self, selected: &str, window: &mut Window, cx: &mut Context<PickerState<Self>>)
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>)
   where
     Self: Sized;
   fn dismiss(&mut self, window: &mut Window, cx: &mut Context<PickerState<Self>>)
   where
     Self: Sized;
+
+  /// Return filtered (index, score) pairs. Default: fuzzy match on items().
+  fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
+    let mut result = Vec::new();
+    for (index, item) in self.items().iter().enumerate() {
+      if let Some(score) = fuzzy_match(query_lower, item) {
+        result.push(FilteredItem { index, score });
+      }
+    }
+    result
+  }
+
+  /// Render a single item row. Override for custom formatting (e.g. indentation).
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let label = &self.items()[index];
+    let row = div().px_2().py(px(3.0)).text_sm();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+    row.child(label.clone())
+  }
 }
 
 pub enum PickerEvent {
@@ -73,9 +100,9 @@ pub enum PickerEvent {
 
 impl<D: PickerDelegate> EventEmitter<PickerEvent> for PickerState<D> {}
 
-struct FilteredItem {
-  index: usize,
-  score: i64,
+pub struct FilteredItem {
+  pub index: usize,
+  pub score: i64,
 }
 
 pub struct PickerState<D: PickerDelegate> {
@@ -119,12 +146,7 @@ impl<D: PickerDelegate> PickerState<D> {
   fn refilter(&mut self, cx: &App) {
     let query = self.query_input.read(cx).value().as_ref().to_string();
     let query_lower: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
-    self.filtered.clear();
-    for (index, item) in self.delegate.items().iter().enumerate() {
-      if let Some(score) = fuzzy_match(&query_lower, item) {
-        self.filtered.push(FilteredItem { index, score });
-      }
-    }
+    self.filtered = self.delegate.filter(&query_lower);
     self.filtered.sort_by(|a, b| b.score.cmp(&a.score));
     self.selected_index = 0;
   }
@@ -148,8 +170,8 @@ impl<D: PickerDelegate> PickerState<D> {
 
   fn confirm_selected(&mut self, _: &ConfirmPicker, window: &mut Window, cx: &mut Context<Self>) {
     if let Some(item) = self.filtered.get(self.selected_index) {
-      let selected = self.delegate.items()[item.index].clone();
-      self.delegate.confirm(&selected, window, cx);
+      let index = item.index;
+      self.delegate.confirm(index, window, cx);
       cx.emit(PickerEvent::Confirmed);
     }
   }
@@ -170,8 +192,6 @@ impl<D: PickerDelegate> Render for PickerState<D> {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let theme = cx.theme();
 
-    let items = self.delegate.items();
-
     let results: Vec<Div> = self
       .filtered
       .iter()
@@ -179,14 +199,7 @@ impl<D: PickerDelegate> Render for PickerState<D> {
       .take(MAX_VISIBLE_RESULTS)
       .map(|(i, fi)| {
         let selected = i == self.selected_index;
-        let label = items[fi.index].clone();
-        let row = div().px_2().py(px(3.0)).text_sm();
-        let row = if selected {
-          row.bg(theme.accent).text_color(theme.accent_foreground)
-        } else {
-          row.text_color(theme.foreground)
-        };
-        row.child(label)
+        self.delegate.render_item(fi.index, selected, cx)
       })
       .collect();
 
@@ -255,14 +268,187 @@ impl PickerDelegate for FilePickerDelegate {
     &self.files
   }
 
-  fn confirm(&mut self, selected: &str, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
-    let full_path = self.project_path.join(selected);
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
+    let full_path = self.project_path.join(&self.files[index]);
     self.code_view.update(cx, |v, cx| v.open_file(full_path, window, cx));
   }
 
-  fn dismiss(&mut self, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
-    // Nothing extra needed; workspace handles focus restoration
+  fn dismiss(&mut self, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {}
+}
+
+// ---------------------------------------------------------------------------
+// DiffFilePickerDelegate
+// ---------------------------------------------------------------------------
+
+pub struct DiffFilePickerDelegate {
+  labels: Vec<String>,
+  lines: Vec<u32>,
+  diff_view: Entity<DiffView>,
+}
+
+impl DiffFilePickerDelegate {
+  pub fn new(diff_view: Entity<DiffView>, cx: &App) -> Self {
+    let entries = diff_view.read(cx).file_entries(cx);
+    let mut labels = Vec::with_capacity(entries.len());
+    let mut lines = Vec::with_capacity(entries.len());
+    for (name, line) in entries {
+      labels.push(name);
+      lines.push(line);
+    }
+    Self { labels, lines, diff_view }
   }
+}
+
+impl PickerDelegate for DiffFilePickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
+    let line = self.lines[index];
+    self.diff_view.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+  }
+
+  fn dismiss(&mut self, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {}
+}
+
+// ---------------------------------------------------------------------------
+// TodoHeaderPickerDelegate
+// ---------------------------------------------------------------------------
+
+pub struct TodoHeaderPickerDelegate {
+  labels: Vec<String>,
+  outline: Vec<OutlineItem>,
+  todo_view: Entity<TodoView>,
+}
+
+impl TodoHeaderPickerDelegate {
+  pub fn new(todo_view: Entity<TodoView>, cx: &App) -> Self {
+    let text = todo_view.read(cx).editor_text(cx);
+    let outline = compute_outline(&text, "markdown");
+    let labels = outline
+      .iter()
+      .map(|item| {
+        let indent = "  ".repeat(item.depth);
+        format!("{indent}{}", item.label)
+      })
+      .collect();
+    Self { labels, outline, todo_view }
+  }
+}
+
+impl PickerDelegate for TodoHeaderPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
+    let line = self.outline[index].line;
+    self.todo_view.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+  }
+
+  fn dismiss(&mut self, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {}
+
+  fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
+    hierarchy_preserving_filter(&self.outline, &self.labels, query_lower)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CodeSymbolPickerDelegate
+// ---------------------------------------------------------------------------
+
+pub struct CodeSymbolPickerDelegate {
+  labels: Vec<String>,
+  outline: Vec<OutlineItem>,
+  code_view: Entity<CodeView>,
+}
+
+impl CodeSymbolPickerDelegate {
+  pub fn new(code_view: Entity<CodeView>, cx: &App) -> Self {
+    let text = code_view.read(cx).editor_text(cx);
+    let language = code_view.read(cx).current_language();
+    let outline = compute_outline(&text, language);
+    let labels = outline
+      .iter()
+      .map(|item| {
+        let indent = "  ".repeat(item.depth);
+        format!("{indent}{}", item.label)
+      })
+      .collect();
+    Self { labels, outline, code_view }
+  }
+}
+
+impl PickerDelegate for CodeSymbolPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
+    let line = self.outline[index].line;
+    self.code_view.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+  }
+
+  fn dismiss(&mut self, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {}
+
+  fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
+    hierarchy_preserving_filter(&self.outline, &self.labels, query_lower)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hierarchy-preserving filter
+// ---------------------------------------------------------------------------
+
+/// Filters outline items while preserving ancestor context.
+/// When an item matches, all its ancestors (by depth/range containment) are
+/// also included so the user sees where the match lives in the hierarchy.
+fn hierarchy_preserving_filter(
+  outline: &[OutlineItem],
+  labels: &[String],
+  query_lower: &[char],
+) -> Vec<FilteredItem> {
+  if query_lower.is_empty() {
+    return (0..labels.len()).map(|i| FilteredItem { index: i, score: 0 }).collect();
+  }
+
+  // First pass: score each item against query (match on name, not indented label).
+  let scores: Vec<Option<i64>> =
+    outline.iter().map(|item| fuzzy_match(query_lower, &item.name)).collect();
+
+  // Mark items that matched.
+  let mut included = vec![false; outline.len()];
+  for (i, s) in scores.iter().enumerate() {
+    if s.is_some() {
+      included[i] = true;
+    }
+  }
+
+  // Second pass: include ancestors of matched items.
+  for i in 0..outline.len() {
+    if scores[i].is_some() {
+      // Walk backwards to find ancestors.
+      for j in (0..i).rev() {
+        if outline[j].byte_range.start <= outline[i].byte_range.start
+          && outline[j].byte_range.end >= outline[i].byte_range.end
+        {
+          included[j] = true;
+        }
+      }
+    }
+  }
+
+  // Build result preserving original order. Ancestors get score 0 (sort-neutral),
+  // matched items keep their score.
+  let mut result = Vec::new();
+  for (i, inc) in included.iter().enumerate() {
+    if *inc {
+      result.push(FilteredItem { index: i, score: scores[i].unwrap_or(0) });
+    }
+  }
+
+  result
 }
 
 // ---------------------------------------------------------------------------

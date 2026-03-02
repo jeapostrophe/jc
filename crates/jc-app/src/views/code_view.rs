@@ -107,6 +107,22 @@ impl CodeView {
   }
 }
 
+impl CodeView {
+  pub fn editor_text(&self, cx: &App) -> String {
+    self.editor.read(cx).value().as_ref().to_string()
+  }
+
+  pub fn current_language(&self) -> &'static str {
+    self.current_file.as_deref().map(language_for_extension).unwrap_or("text")
+  }
+
+  pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+    self.editor.update(cx, |editor, cx| {
+      editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
+    });
+  }
+}
+
 impl Focusable for CodeView {
   fn focus_handle(&self, cx: &App) -> FocusHandle {
     self.editor.read(cx).focus_handle(cx)

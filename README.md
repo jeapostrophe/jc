@@ -37,7 +37,8 @@ crates/
     src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
     examples/terminal_window.rs
   jc-app/                           # binary: CLI + GPUI app
-    src/main.rs, app.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view}.rs
+    src/main.rs, app.rs, outline.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view}.rs
+    src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
     examples/basic_window.rs, code_editor_demo.rs
 ```
 
@@ -118,8 +119,8 @@ Shows `git diff` output for the task's working tree. The user scrolls through ch
 ### Code Viewer
 
 Syntax-highlighted source viewer with light editing capability (not a full editor). Features:
-- Fuzzy file picker (searches repository files)
-- Symbol picker (tree-sitter or LSP powered, shows hierarchy context --- e.g., which `impl` block a function belongs to)
+- Fuzzy file picker (Cmd-O, searches repository files)
+- Context picker (Cmd-T) powered by tree-sitter `outline.scm` queries with hierarchy-preserving filter --- shows symbols with their parent context (e.g., which `impl` block a function belongs to). Also works in Diff view (pick modified files) and TODO view (pick markdown headers).
 - Comment keybinding works here too
 - Keybinding to open the file in an external editor (Zed)
 
@@ -169,8 +170,8 @@ It is deliberately *not* a full code editor on mobile.
 | GUI framework | `gpui` 0.2.x (from Zed) + `gpui-component` (Longbridge, 60+ widgets) |
 | Terminal emulator | `alacritty_terminal` 0.25 + `portable-pty` 0.9 --- full escape sequence support for Claude Code's TUI |
 | Markdown editor | `gpui-component` editor widget + `ropey` + `tree-sitter-md`, custom TODO.md highlight pass |
-| Syntax highlighting | `tree-sitter` 0.26.x + `tree-sitter-highlight` + per-language grammar crates |
-| Symbol navigation | tree-sitter custom `outline.scm` queries (with optional LSP for richer info) |
+| Syntax highlighting | `tree-sitter` 0.25.x (via `gpui-component`) + `tree-sitter-highlight` + per-language grammar crates |
+| Symbol navigation | tree-sitter custom `outline.scm` queries (sourced from Zed, updated via `scripts/update-outline-queries.sh`) |
 | Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff` for word-level highlighting |
 | Git worktrees | `git2` worktree API (create/list/prune) |
 | Claude idle detection | Claude Code hooks system (HTTP endpoint) + `terminal_bell` config + silence heuristic fallback |
@@ -377,7 +378,7 @@ It is deliberately *not* a full code editor on mobile.
 ### Code Viewer
 - [x] Implement syntax-highlighted file viewer (`tree-sitter` + `tree-sitter-highlight`)
 - [x] Implement fuzzy file picker (search repo files)
-- [ ] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
+- [x] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
 - [ ] Implement light editing (basic text modification, not full editor)
 - [x] Implement "open in external editor" keybinding (Cmd-Shift-E)
 
@@ -403,7 +404,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement generic fuzzy picker library shared by multiple pickers
 - [ ] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
 - [x] Implement file picker
-- [ ] Implement symbol picker
+- [x] Implement symbol picker
 - [ ] Implement keybinding system (configurable, emacs-style defaults)
 
 ### Notifications & Status

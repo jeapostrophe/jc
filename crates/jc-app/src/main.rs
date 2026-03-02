@@ -1,4 +1,5 @@
 mod app;
+mod outline;
 mod views;
 
 use clap::Parser;

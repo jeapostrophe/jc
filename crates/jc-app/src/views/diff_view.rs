@@ -60,6 +60,27 @@ impl DiffView {
   }
 }
 
+impl DiffView {
+  pub fn file_entries(&self, cx: &App) -> Vec<(String, u32)> {
+    let text = self.editor.read(cx).value();
+    let mut entries = Vec::new();
+    for (line_num, line) in text.as_ref().lines().enumerate() {
+      if let Some(rest) = line.strip_prefix("diff --git a/") {
+        // Format: "diff --git a/path b/path"
+        let name = rest.split(" b/").next().unwrap_or(rest);
+        entries.push((name.to_string(), line_num as u32));
+      }
+    }
+    entries
+  }
+
+  pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+    self.editor.update(cx, |editor, cx| {
+      editor.set_cursor_position(Position::new(line, 0), window, cx);
+    });
+  }
+}
+
 impl Focusable for DiffView {
   fn focus_handle(&self, cx: &App) -> FocusHandle {
     self.editor.read(cx).focus_handle(cx)

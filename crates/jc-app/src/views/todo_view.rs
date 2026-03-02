@@ -140,6 +140,18 @@ impl TodoView {
   }
 }
 
+impl TodoView {
+  pub fn editor_text(&self, cx: &App) -> String {
+    self.editor.read(cx).value().as_ref().to_string()
+  }
+
+  pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+    self.editor.update(cx, |editor, cx| {
+      editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
+    });
+  }
+}
+
 impl Render for TodoView {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let theme = cx.theme();
