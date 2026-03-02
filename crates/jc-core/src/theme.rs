@@ -1,13 +1,19 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+const DEFAULT_THEME_TOML: &str = include_str!("../../../data/default_theme.toml");
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeConfig {
   pub terminal: TerminalTheme,
 }
 
+impl Default for ThemeConfig {
+  fn default() -> Self {
+    toml::from_str(DEFAULT_THEME_TOML).expect("embedded default_theme.toml must be valid")
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct TerminalTheme {
   pub foreground: String,
   pub background: String,
@@ -32,26 +38,6 @@ pub struct TerminalTheme {
 
 impl Default for TerminalTheme {
   fn default() -> Self {
-    Self {
-      foreground: "#C5C8C6".to_string(),
-      background: "#1D1F21".to_string(),
-      cursor: "#C5C8C6".to_string(),
-      black: "#1D1F21".to_string(),
-      red: "#CC6666".to_string(),
-      green: "#B5BD68".to_string(),
-      yellow: "#F0C674".to_string(),
-      blue: "#81A2BE".to_string(),
-      magenta: "#B294BB".to_string(),
-      cyan: "#8ABEB7".to_string(),
-      white: "#C5C8C6".to_string(),
-      bright_black: "#969896".to_string(),
-      bright_red: "#DE935F".to_string(),
-      bright_green: "#B5BD68".to_string(),
-      bright_yellow: "#F0C674".to_string(),
-      bright_blue: "#81A2BE".to_string(),
-      bright_magenta: "#B294BB".to_string(),
-      bright_cyan: "#8ABEB7".to_string(),
-      bright_white: "#FFFFFF".to_string(),
-    }
+    ThemeConfig::default().terminal
   }
 }

@@ -17,9 +17,6 @@ cargo run -p jc-app -- .
 # Run the minimal GPUI example
 cargo run -p jc-app --example basic_window
 
-# Run the code editor demo (InputState code_editor widget)
-cargo run -p jc-app --example code_editor_demo
-
 # Run the standalone terminal emulator
 cargo run -p jc-terminal --example terminal_window
 ```
@@ -30,6 +27,8 @@ Config and state live in `~/.config/jc/` (`config.toml`, `state.toml`, and `them
 
 ```
 Cargo.toml                          # workspace root
+data/
+  default_theme.toml                # default terminal color scheme (Tomorrow Night)
 crates/
   jc-core/                          # data model + config persistence
     src/lib.rs, config.rs, model.rs, theme.rs
@@ -39,7 +38,7 @@ crates/
   jc-app/                           # binary: CLI + GPUI app
     src/main.rs, app.rs, outline.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view}.rs
     src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
-    examples/basic_window.rs, code_editor_demo.rs
+    examples/basic_window.rs
 ```
 
 ## Design Principles
@@ -132,7 +131,7 @@ When Claude produces a long response, a keybinding extracts it from the session 
 
 ### Task Status Indicators
 
-A persistent indicator shows which tasks have Claude responses waiting for review. The app detects "waiting" via Claude Code's hooks system (HTTP hooks fire on `Stop` and `Notification` events) with `terminal_bell` as a lightweight backup signal.
+A persistent indicator shows which tasks have Claude responses waiting for review. The app detects "waiting" via Claude Code's hooks system (HTTP hooks fire on `Stop` and `Notification` events) with BEL character detection as a lightweight backup signal (if Claude Code emits it).
 
 A fuzzy picker (keybinding) lets the user jump between projects and tasks. A modifier key filters to only waiting tasks or same-project tasks.
 
@@ -174,7 +173,7 @@ It is deliberately *not* a full code editor on mobile.
 | Symbol navigation | tree-sitter custom `outline.scm` queries (sourced from Zed, updated via `scripts/update-outline-queries.sh`) |
 | Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff` for word-level highlighting |
 | Git worktrees | `git2` worktree API (create/list/prune) |
-| Claude idle detection | Claude Code hooks system (HTTP endpoint) + `terminal_bell` config + silence heuristic fallback |
+| Claude idle detection | Claude Code hooks system (HTTP endpoint) + BEL detection (if emitted) + silence heuristic fallback |
 | Claude reply capture | Read session JSONL from `~/.claude/projects/` (replaces fragile `/copy` approach) |
 | Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
 | Persistent state | `~/.config/jc/` --- project list, task state, window layout |
@@ -284,7 +283,7 @@ It is deliberately *not* a full code editor on mobile.
 - `Notification` hook with `permission_prompt` matcher fires when tool approval needed
 - `PermissionRequest` hook fires with full tool details for permission dialogs
 
-**Secondary signal:** Set `preferredNotifChannel` to `terminal_bell` --- Claude emits BEL character (`\x07`) on task completion, easily detected from PTY monitoring.
+**Secondary signal (status unknown):** The `preferredNotifChannel = terminal_bell` setting mentioned in earlier research does not exist in the current Claude Code settings schema (as of March 2026). Claude Code may already emit BEL (`\x07`) on task completion in terminal mode --- needs testing. The `jc-terminal` crate already detects `TerminalEvent::Bell` via alacritty, so if BEL is emitted, no extra configuration is needed.
 
 **Combine with:** Brief silence heuristic as a tertiary fallback (2+ seconds of PTY silence AND a Stop hook = confident idle state).
 
@@ -349,7 +348,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement `~/.config/jc/` config and state persistence
 - [x] Implement project and task data model
 - [x] Implement `jc` CLI for adding projects from the command line
-- [ ] [T] Remove code_editor_demo
+- [x] [T] Remove code_editor_demo
 - [ ] [E] Stringly-typed language names vs enum
 - [ ] [E] Move the crates out of './crates' and into the top-level
 
@@ -361,7 +360,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement terminal resize detection and PTY resize propagation
 - [x] Extract terminal color palette to a theme file (`~/.config/jc/theme.toml`)
 - [x] Run general-purpose shell in a second terminal per task
-- [ ] [T] Configure `preferredNotifChannel = terminal_bell` as backup idle signal
+- [ ] [T] Verify whether Claude Code emits BEL (`\x07`) on task completion in terminal mode (replaces earlier `preferredNotifChannel` assumption)
 - [ ] [E] Change the dimensions of the terminal(s) and communicate to the terminal itself
 - [ ] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
 - [ ] [E] Run Claude Code inside the embedded terminal
@@ -415,7 +414,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Disable line numbers in code editor views
 - [ ] [E] Change the size of the split by dragging with a keybinding to make even split
 - [ ] [E] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
-- [ ] [T] Move default theme file to 'data' directory rather than embedding defaults in source
+- [x] [T] Move default theme file to 'data' directory rather than embedding defaults in source
 - [ ] [E] Implement view switching for reply view
 - [ ] [E] Implement independent scroll positions per pane
 - [ ] [D] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting

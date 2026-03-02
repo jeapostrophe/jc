@@ -1,0 +1,24 @@
+# Default terminal color scheme (Tomorrow Night).
+# This file is embedded at compile time via include_str!.
+# User overrides go in ~/.config/jc/theme.toml (all fields required).
+
+[terminal]
+foreground = "#C5C8C6"
+background = "#1D1F21"
+cursor = "#C5C8C6"
+black = "#1D1F21"
+red = "#CC6666"
+green = "#B5BD68"
+yellow = "#F0C674"
+blue = "#81A2BE"
+magenta = "#B294BB"
+cyan = "#8ABEB7"
+white = "#C5C8C6"
+bright_black = "#969896"
+bright_red = "#DE935F"
+bright_green = "#B5BD68"
+bright_yellow = "#F0C674"
+bright_blue = "#81A2BE"
+bright_magenta = "#B294BB"
+bright_cyan = "#8ABEB7"
+bright_white = "#FFFFFF"
