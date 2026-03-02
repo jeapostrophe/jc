@@ -335,15 +335,23 @@ It is deliberately *not* a full code editor on mobile.
 
 ## Task Checklist
 
+> **Difficulty labels** — applied to each unchecked task:
+> - **[T]** Trivial — All trivial tasks can be done together in one Claude invocation
+> - **[E]** Easy — All easy tasks in the same sub-list can be done together in one Claude invocation
+> - **[H]** Hard — Each hard task needs its own Claude invocation but requires no human design input
+> - **[D]** Design — Subtle design issues that need to be resolved with a human first
+>
+> *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]` label after the checkbox.*
+
 ### Core Infrastructure
 - [x] Set up Rust workspace (`jc-app`, `jc-core`)
 - [x] Integrate `gpui` 0.2.x + `gpui-component` and get a basic window rendering
 - [x] Implement `~/.config/jc/` config and state persistence
 - [x] Implement project and task data model
 - [x] Implement `jc` CLI for adding projects from the command line
-- [ ] Remove code_editor_demo
-- [ ] Stringly-typed language names vs enum
-- [ ] Move the crates out of './crates' and into the top-level
+- [ ] [T] Remove code_editor_demo
+- [ ] [E] Stringly-typed language names vs enum
+- [ ] [E] Move the crates out of './crates' and into the top-level
 
 ### Terminal Emulator
 - [x] Integrate `alacritty_terminal` with GPUI rendering (`jc-terminal` crate)
@@ -353,47 +361,48 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement terminal resize detection and PTY resize propagation
 - [x] Extract terminal color palette to a theme file (`~/.config/jc/theme.toml`)
 - [x] Run general-purpose shell in a second terminal per task
-- [ ] Configure `preferredNotifChannel = terminal_bell` as backup idle signal
-- [ ] Change the dimensions of the terminal(s) and communicate to the terminal itself
-- [ ] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
-- [ ] Run Claude Code inside the embedded terminal
-- [ ] Implement Quake-style drop-down terminal toggle
-- [ ] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
-- [ ] Show old replies and plans as well. Provide a picker to scroll through to view. (Ctrl-Shift-O)
+- [ ] [T] Configure `preferredNotifChannel = terminal_bell` as backup idle signal
+- [ ] [E] Change the dimensions of the terminal(s) and communicate to the terminal itself
+- [ ] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
+- [ ] [E] Run Claude Code inside the embedded terminal
+- [ ] [H] Implement Quake-style drop-down terminal toggle
+- [ ] [H] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
+- [ ] [H] Show old replies and plans as well. Provide a picker to scroll through to view. (Ctrl-Shift-O)
 
 ### TODO.md System
 - [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
 - [x] Detect external file modifications (file watcher) and show visual indicator
-- [ ] Automatically reload when the buffer is not dirty, rather than displaying a message
-- [ ] Fix focus to center the target in the middle of the screen
-- [ ] Word wrapping lines to fix the length of lines
-- [ ] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
-- [ ] Parse TODO.md format (agents, messages, WAIT markers)
-- [ ] Build library for managing TODO.md representation (ropey-backed)
-- [ ] Implement comment insertion from other views into the WAIT section
-- [ ] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
-- [ ] Implement conflict resolution (git-style merge of buffer vs disk)
-- [ ] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
+- [ ] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
+- [ ] [E] Fix focus to center the target in the middle of the screen
+- [ ] [E] Word wrapping lines to fix the length of lines
+- [ ] [H] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
+- [ ] [H] Parse TODO.md format (agents, messages, WAIT markers)
+- [ ] [H] Build library for managing TODO.md representation (ropey-backed)
+- [ ] [H] Implement comment insertion from other views into the WAIT section
+- [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
+- [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
+- [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
 
 ### Git Diff View
 - [x] Render git diff via `git2` with `tree-sitter` syntax-aware highlighting
 - [x] Add word-level inline highlighting via `similar`
-- [ ] Fix word-level diff (strange annotations appearing instead of highlight
-- [ ] Word wrapping lines to fix the length of lines
-- [ ] Implement per-file "mark as reviewed" with collapses
-- [ ] Annotate which files have been "marked" in the git diff picker
-- [ ] Show one file at a time rather than raw multi-file output
-- [ ] Implement region selection and comment keybinding
-- [ ] Show git log as well to look at older diffs. Provide a picker to scroll through to view. (Ctrl-Shift-O)
+- [ ] [E] Fix word-level diff (strange annotations appearing instead of highlight
+- [ ] [E] Word wrapping lines to fix the length of lines
+- [ ] [H] Implement per-file "mark as reviewed" with collapses
+- [ ] [E] Annotate which files have been "marked" in the git diff picker
+- [ ] [H] Show one file at a time rather than raw multi-file output
+- [ ] [H] Implement region selection and comment keybinding
+- [ ] [H] Show git log as well to look at older diffs. Provide a picker to scroll through to view. (Ctrl-Shift-O)
 
 ### Code Viewer
 - [x] Implement syntax-highlighted file viewer (`tree-sitter` + `tree-sitter-highlight`)
 - [x] Implement fuzzy file picker (search repo files)
 - [x] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
 - [x] Implement "open in external editor" keybinding (Cmd-Shift-E)
-- [ ] Fix focus to center the target in the middle of the screen
-- [ ] Word wrapping lines to fix the length of lines
-- [ ] Implement light editing (basic text modification, not full editor)
+- [ ] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
+- [ ] [E] Fix focus to center the target in the middle of the screen
+- [ ] [E] Word wrapping lines to fix the length of lines
+- [ ] [D] Implement light editing (basic text modification, not full editor)
 
 ### Window & Pane Management
 - [x] Fix: Window doesn't get focused on creation
@@ -404,55 +413,55 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement view switching for diff, TODO, code views (Cmd-3/4/5)
 - [x] Use a monospace font (Menlo) in code editor views (diff, code, TODO)
 - [x] Disable line numbers in code editor views
-- [ ] Change the size of the split by dragging with a keybinding to make even split
-- [ ] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
-- [ ] Move default theme file to 'data' directory rather than embedding defaults in source
-- [ ] Implement view switching for reply view
-- [ ] Implement independent scroll positions per pane
-- [ ] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting
-- [ ] Add a light theme
-- [ ] Auto-switch themes with system dark mode
-- [ ] Implement Quake-style bottom terminal overlay
-- [ ] Implement multi-window with shared session state
+- [ ] [E] Change the size of the split by dragging with a keybinding to make even split
+- [ ] [E] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
+- [ ] [T] Move default theme file to 'data' directory rather than embedding defaults in source
+- [ ] [E] Implement view switching for reply view
+- [ ] [E] Implement independent scroll positions per pane
+- [ ] [D] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting
+- [ ] [E] Add a light theme
+- [ ] [E] Auto-switch themes with system dark mode
+- [ ] [H] Implement Quake-style bottom terminal overlay
+- [ ] [H] Implement multi-window with shared session state
 
 ### Navigation & Pickers
 - [x] Implement generic fuzzy picker library shared by multiple pickers
 - [x] Implement file picker
 - [x] Implement symbol picker
-- [ ] Improve open_file_picker to use show_picker
-- [ ] Track most recently visited files and put them at the top of file picker
-- [ ] Track modified files (from git) and mark them in the file picker
-- [ ] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
-- [ ] Use syntax highlighting inside of the picker appropriate to the original language
-- [ ] Implement keybinding system (configurable, emacs-style defaults)
+- [ ] [E] Improve open_file_picker to use show_picker
+- [ ] [E] Track most recently visited files and put them at the top of file picker
+- [ ] [E] Track modified files (from git) and mark them in the file picker
+- [ ] [H] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
+- [ ] [H] Use syntax highlighting inside of the picker appropriate to the original language
+- [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 
 ### Notifications & Status
 - [x] Implement Claude usage algorithm
 - [x] Implement configurable working hours for par calculation
-- [ ] Turn usage into a single number/visualization that shows "par"
-- [ ] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
-- [ ] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
-- [ ] Implement in-app status bar showing waiting tasks (driven by hook events)
-- [ ] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Task")
+- [ ] [D] Turn usage into a single number/visualization that shows "par"
+- [ ] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
+- [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
+- [ ] [E] Implement in-app status bar showing waiting tasks (driven by hook events)
+- [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Task")
 
 ### Mobile App
-- [ ] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
-- [ ] Implement TLS server (`axum` + `axum-server` + `rcgen` self-signed certs)
-- [ ] Implement QR code pairing flow (`fast_qr`, encode host + port + cert fingerprint)
-- [ ] Build mobile app: dashboard view
-- [ ] Build mobile app: TODO review and note-taking
-- [ ] Build mobile app: Claude permission handling (relay from hooks)
-- [ ] Build mobile app: send commands to Claude
+- [ ] [D] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
+- [ ] [H] Implement TLS server (`axum` + `axum-server` + `rcgen` self-signed certs)
+- [ ] [H] Implement QR code pairing flow (`fast_qr`, encode host + port + cert fingerprint)
+- [ ] [H] Build mobile app: dashboard view
+- [ ] [H] Build mobile app: TODO review and note-taking
+- [ ] [H] Build mobile app: Claude permission handling (relay from hooks)
+- [ ] [H] Build mobile app: send commands to Claude
 
 ### Git Worktrees
-- [ ] Implement git worktree creation/deletion via `git2` worktree API
+- [ ] [H] Implement git worktree creation/deletion via `git2` worktree API
 
 ### Polish & Integration
-- [ ] Reduce duplication between CodeView and TodoView (consider having TodoView wrap a CodeView)
-- [ ] End-to-end test: full workflow from project creation to Claude review cycle
-- [ ] Persistent state: survive app restart without losing task state or terminal sessions
-- [ ] Performance: handle multiple concurrent terminal sessions smoothly
-- [ ] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
-- [ ] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
+- [ ] [H] Reduce duplication between CodeView and TodoView (consider having TodoView wrap a CodeView)
+- [ ] [H] End-to-end test: full workflow from project creation to Claude review cycle
+- [ ] [H] Persistent state: survive app restart without losing task state or terminal sessions [perhaps use 'tmux' behind the scenes]
+- [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly
+- [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
+- [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
 
 ### Unsorted
