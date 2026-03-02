@@ -17,6 +17,9 @@ cargo run -p jc-app -- .
 # Run the minimal GPUI example
 cargo run -p jc-app --example basic_window
 
+# Run the code editor demo (InputState code_editor widget)
+cargo run -p jc-app --example code_editor_demo
+
 # Run the standalone terminal emulator
 cargo run -p jc-terminal --example terminal_window
 ```
@@ -34,8 +37,8 @@ crates/
     src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
     examples/terminal_window.rs
   jc-app/                           # binary: CLI + GPUI app
-    src/main.rs, app.rs, views/{workspace,pane,project_view}.rs
-    examples/basic_window.rs
+    src/main.rs, app.rs, views/{workspace,pane,project_view,diff_view,code_view,todo_view}.rs
+    examples/basic_window.rs, code_editor_demo.rs
 ```
 
 ## Design Principles
@@ -354,7 +357,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement Quake-style drop-down terminal toggle
 
 ### TODO.md System
-- [ ] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
+- [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
 - [ ] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
 - [ ] Build library for managing TODO.md representation (ropey-backed)
 - [ ] Parse TODO.md format (agents, messages, WAIT markers)
@@ -364,14 +367,15 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement conflict resolution (git-style merge of buffer vs disk)
 
 ### Git Diff View
-- [ ] Render git diff via `git2` with `tree-sitter` syntax-aware highlighting
+- [x] Render git diff via `git2` with `tree-sitter` syntax-aware highlighting
 - [ ] Add word-level inline highlighting via `similar` or `imara-diff`
 - [ ] Implement region selection and comment keybinding
 - [ ] Implement per-file "mark as reviewed" with collapse
 - [ ] Support scrolling through multi-file diffs
+- [ ] Show git log as well to look at older diffs. Provide a picker to scroll through to view.
 
 ### Code Viewer
-- [ ] Implement syntax-highlighted file viewer (`tree-sitter` + `tree-sitter-highlight`)
+- [x] Implement syntax-highlighted file viewer (`tree-sitter` + `tree-sitter-highlight`)
 - [ ] Implement fuzzy file picker (search repo files)
 - [ ] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
 - [ ] Implement light editing (basic text modification, not full editor)
@@ -382,7 +386,9 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Add window keybindings (Cmd+W close, Cmd+M minimize, Cmd+Q quit)
 - [x] Implement left/right two-pane layout (resizable, with pane focus tracking)
 - [x] Implement pane view switching for terminals (Cmd-1 Claude, Cmd-2 General, Cmd-[/] focus)
-- [ ] Implement view switching for remaining views (diff, TODO, code, reply)
+- [ ] Cmd-[/] conflicts with InputState indent/outdent when editor is focused — address separately
+- [x] Implement view switching for diff, TODO, code views (Cmd-3/4/5)
+- [ ] Implement view switching for reply view
 - [ ] Change the size of the split
 - [ ] Implement independent scroll positions per pane
 - [ ] Implement multi-window with shared session state
@@ -402,8 +408,9 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] Implement in-app status bar showing waiting tasks (driven by hook events)
 - [ ] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Task")
-- [ ] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
+- [ ] Implement Claude usage algorithm 
 - [ ] Implement configurable working hours for par calculation
+- [ ] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 
 ### Mobile App
 - [ ] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)

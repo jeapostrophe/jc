@@ -1,4 +1,7 @@
+use crate::views::code_view::CodeView;
+use crate::views::diff_view::DiffView;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
+use crate::views::todo_view::TodoView;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -17,6 +20,9 @@ actions!(
     FocusRightPane,
     ShowClaudeTerminal,
     ShowGeneralTerminal,
+    ShowGitDiff,
+    ShowCodeViewer,
+    ShowTodoEditor,
   ]
 );
 
@@ -32,6 +38,9 @@ pub struct Workspace {
   active_pane: ActivePane,
   claude_terminal: Entity<TerminalView>,
   general_terminal: Entity<TerminalView>,
+  diff_view: Entity<DiffView>,
+  code_view: Entity<CodeView>,
+  todo_view: Entity<TodoView>,
   #[allow(dead_code)]
   state: AppState,
   focus: FocusHandle,
@@ -39,8 +48,17 @@ pub struct Workspace {
 
 impl Workspace {
   pub fn new(state: AppState, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    let project_path = state
+      .projects
+      .first()
+      .map(|p| p.path.clone())
+      .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
     let claude_terminal = cx.new(|cx| TerminalView::new(Default::default(), None, window, cx));
     let general_terminal = cx.new(|cx| TerminalView::new(Default::default(), None, window, cx));
+    let diff_view = cx.new(|cx| DiffView::new(project_path.clone(), window, cx));
+    let code_view = cx.new(|cx| CodeView::new(window, cx));
+    let todo_view = cx.new(|cx| TodoView::new(project_path, window, cx));
 
     let claude_focus = claude_terminal.read(cx).focus_handle(cx);
     let general_focus = general_terminal.read(cx).focus_handle(cx);
@@ -75,6 +93,9 @@ impl Workspace {
       active_pane: ActivePane::Left,
       claude_terminal,
       general_terminal,
+      diff_view,
+      code_view,
+      todo_view,
       state,
       focus: cx.focus_handle(),
     }
@@ -117,7 +138,7 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let (view, focus) = match kind {
+    let (view, focus): (AnyView, FocusHandle) = match kind {
       PaneContentKind::ClaudeTerminal => {
         let focus = self.claude_terminal.read(cx).focus_handle(cx);
         (self.claude_terminal.clone().into(), focus)
@@ -125,6 +146,19 @@ impl Workspace {
       PaneContentKind::GeneralTerminal => {
         let focus = self.general_terminal.read(cx).focus_handle(cx);
         (self.general_terminal.clone().into(), focus)
+      }
+      PaneContentKind::GitDiff => {
+        self.diff_view.update(cx, |v, cx| v.refresh(window, cx));
+        let focus = self.diff_view.read(cx).focus_handle(cx);
+        (self.diff_view.clone().into(), focus)
+      }
+      PaneContentKind::CodeViewer => {
+        let focus = self.code_view.read(cx).focus_handle(cx);
+        (self.code_view.clone().into(), focus)
+      }
+      PaneContentKind::TodoEditor => {
+        let focus = self.todo_view.read(cx).focus_handle(cx);
+        (self.todo_view.clone().into(), focus)
       }
     };
 
@@ -151,6 +185,18 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     self.set_active_pane_view(PaneContentKind::GeneralTerminal, window, cx);
+  }
+
+  fn show_git_diff(&mut self, _: &ShowGitDiff, window: &mut Window, cx: &mut Context<Self>) {
+    self.set_active_pane_view(PaneContentKind::GitDiff, window, cx);
+  }
+
+  fn show_code_viewer(&mut self, _: &ShowCodeViewer, window: &mut Window, cx: &mut Context<Self>) {
+    self.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
+  }
+
+  fn show_todo_editor(&mut self, _: &ShowTodoEditor, window: &mut Window, cx: &mut Context<Self>) {
+    self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
   }
 
   fn pane_label(&self, pane: &Entity<Pane>, cx: &App) -> &'static str {
@@ -248,6 +294,9 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::focus_right_pane))
       .on_action(cx.listener(Self::show_claude_terminal))
       .on_action(cx.listener(Self::show_general_terminal))
+      .on_action(cx.listener(Self::show_git_diff))
+      .on_action(cx.listener(Self::show_code_viewer))
+      .on_action(cx.listener(Self::show_todo_editor))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable("main-split")
@@ -266,5 +315,8 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-]", FocusRightPane, Some("Workspace")),
     KeyBinding::new("cmd-1", ShowClaudeTerminal, Some("Workspace")),
     KeyBinding::new("cmd-2", ShowGeneralTerminal, Some("Workspace")),
+    KeyBinding::new("cmd-3", ShowGitDiff, Some("Workspace")),
+    KeyBinding::new("cmd-4", ShowCodeViewer, Some("Workspace")),
+    KeyBinding::new("cmd-5", ShowTodoEditor, Some("Workspace")),
   ]);
 }
