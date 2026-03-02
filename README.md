@@ -351,7 +351,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Extract terminal color palette to a theme file (`~/.config/jc/theme.toml`)
 - [ ] Change the dimensions of the terminal(s) and communicate to the terminal itself
 - [ ] Run Claude Code inside the embedded terminal
-- [ ] Run general-purpose shell in a second terminal per task
+- [x] Run general-purpose shell in a second terminal per task
 - [ ] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
 - [ ] Configure `preferredNotifChannel = terminal_bell` as backup idle signal
 - [ ] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
@@ -433,3 +433,24 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
 - [ ] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
+
+### Unsorted
+
+* Change the font to https://lilex.myrt.co/ ; this may require downloading and bundling the font with the app. If so, put it into a 'data' directory at the project root.
+* I want a default theme file rather than the defaults embedded in the source; this should also go in the 'data' directory.
+* I don't see the Word-level diff working but I do see a bunch of strange annotations in the git diff view
+* Move the crates out of './crates' and into the top-level. I don't like the extra directory layer
+* Is there too much duplication between CodeView and TodoView w.r.t. hot reloading/etc? Maybe TodoView can wrap a CodeView that also manages the TODO stuff.
+* The watcher should automatically reload when the buffer in question is not dirty on our side, rather displaying a message and making the user interact
+* Word wrapping lines to fix the length of lines in all views
+* Remove code_editor_demo
+* Track the most recently visited files and put them at the top of file picker
+* Track the modified files (from git) and mark them in the file picker and put them at the top after the recently visited
+* Use syntax highlighting inside of the picker appropriate to the original language
+* Right now the focus just puts it on the screen, but it should put it in the middle of the screen
+* The git diff view should show one file at a time, rather than the actual output
+* The git diff picker should annotate which files have been "marked"
+* Have a shared place to get a skill/etc reference (like the "optimize plan" thing)
+* Turn usage into a single number/visualization
+* open_file_picker not using show_picker: should improve
+* Stringly-typed language names vs enum

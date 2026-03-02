@@ -72,4 +72,91 @@ Add these things to the README.md Task Checklist:
 ---
 You misinterpreted the arguments. The "thu 2159" are not the current time; it is the time that the weekly limit resets for Claude.
 
+---
+Review @README.md and identify low-hanging fruit that can be implemented without human design input.
+---
+Implement the following with these notes:
+1. Yes
+2. Yes
+3. Yes, use config.editor
+4. Don't allow the editor to see Cmd-[/], take them over and only give them to the window management layer
+5. Yes, don't put it in the main config, but in a separate theme config in the config directory
+7. Yes
+10. Yes
+
+--
+
+* 
+
+
+### Message 3
+
+* The file watcher should be in CodeView too
+* The code view needs to show the name of the file somewhere
+  > I think the solution is to move the "Diff | Terminal" from the title bar into another bar just below and aligned to the left on each pane that shows what it is
+
+  OLD:
+  Project <> Diff | Terminal <> Usage
+  -----------------------------------
+  Pane     | Pane  
+  
+  NEW:
+  Project                       Usage
+  -----------------------------------
+  Diff              | Terminal  
+  -----------------------------------
+       Pane         |       Pane  
+
+  And when the view is "Code" it will say "Code: <path>" where path is relative to the project root.
+
+---
+
+Make it so the label of the active Pane is bold.
+
+---
+
+* Read @README.md
+* Implement a generic "picker" interface that can be invoked by different things in different contexts
+* It should appear centered in the display atop all of the panels
+* It should take a vector of strings
+* It should show the current filter of those
+* As you type, it does a fuzzy search over them
+* There are crates for this (nucleo and skim) but I don't know if they are worth bringing in
+* Initially, only use it for selecting which file to show
+* In any pane, Cmd-O should open the file picker and upon selection it should focus the CodeView and open that file
+* It should be possible to cancel the picker with Esc or Ctrl-C
+
+---
+
+* Using the arrows to move up and down in the picker list doesn't change the scroll (I can tell the selection is moving, but it isn't on screen)
+
+---
+
+* Read @README.md
+
+Integrate the picker UI into more places:
+* The 'git diff' view to select between modified files
+* The 'TODO' view to select on the hierarchy of headers. These should be on the list including their '#'s (i.e. '# TODO", "# Claude", "## Wait") with indentation to show the structure. If you filter, then the parents should still be shown of matching entries.
+* The 'CodeView' to select between visible symbols. Like the todo, it should show the context i.e. the 'impl' that a symbol is inside of.
+All of these uses of the picker should be bound to Cmd-T
+
+I believe that both the TODO and CodeView constraints (about the structure) are exposed by outline.scm
+
+---
+
+Your TodoHeaderPickerDelegate and CodeSymbolPickerDelegate implementation plans are bad. You should re-read the README about how to use tree-sitter for these tasks.
+
+Add to the plan:
+* Make a bash script to update the outline.scm queries from Zed if necessary 
+
+---
+
+
+
 ### WAIT XXX
+
+
+ 
+Optimize the plan for context window usage and parallelization. Branch and fork the context/tasks into parallel jobs as appropriate.
+
+---

@@ -4,7 +4,8 @@
       "Bash(git ls-tree:*)",
       "Bash(rustc:*)",
       "Bash(curl:*)",
-      "Bash(cargo metadata:*)"
+      "Bash(cargo metadata:*)",
+      "Bash(cargo doc:*)"
     ]
   }
 }
