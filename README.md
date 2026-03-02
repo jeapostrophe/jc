@@ -393,9 +393,11 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement independent scroll positions per pane
 - [ ] Implement multi-window with shared session state
 - [ ] Implement Quake-style bottom terminal overlay
-- [ ] Add a theme system with dark default
+- [ ] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting
 - [ ] Add a light theme
 - [ ] Auto-switch themes with system dark mode
+- [ ] Use a monospace font in code editor views (diff, code, TODO)
+- [ ] Disable line numbers in code editor views
 
 ### Navigation & Pickers
 - [ ] Implement generic fuzzy picker library shared by multiple pickers
@@ -408,8 +410,8 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] Implement in-app status bar showing waiting tasks (driven by hook events)
 - [ ] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Task")
-- [ ] Implement Claude usage algorithm 
-- [ ] Implement configurable working hours for par calculation
+- [x] Implement Claude usage algorithm 
+- [x] Implement configurable working hours for par calculation
 - [ ] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 
 ### Mobile App

@@ -3,7 +3,8 @@
     "allow": [
       "Bash(git ls-tree:*)",
       "Bash(rustc:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(cargo metadata:*)"
     ]
   }
 }
