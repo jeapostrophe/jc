@@ -71,7 +71,7 @@ impl Workspace {
     let general_terminal =
       cx.new(|cx| TerminalView::new(terminal_config(&palette), None, window, cx));
     let diff_view = cx.new(|cx| DiffView::new(project_path.clone(), window, cx));
-    let code_view = cx.new(|cx| CodeView::new(window, cx));
+    let code_view = cx.new(|cx| CodeView::new(project_path.clone(), window, cx));
     let todo_view = cx.new(|cx| TodoView::new(project_path, window, cx));
 
     let claude_focus = claude_terminal.read(cx).focus_handle(cx);
@@ -236,33 +236,29 @@ impl Workspace {
     }
   }
 
-  fn pane_label(&self, pane: &Entity<Pane>, cx: &App) -> &'static str {
-    pane.read(cx).content_kind().map_or("Empty", PaneContentKind::label)
+  fn pane_header_label(&self, pane: &Entity<Pane>, cx: &App) -> String {
+    match pane.read(cx).content_kind() {
+      Some(PaneContentKind::CodeViewer) => {
+        if let Some(path) = self.code_view.read(cx).file_path() {
+          let project_root = self.state.projects.first().map(|p| &p.path);
+          let relative = project_root.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
+          format!("Code: {}", relative.display())
+        } else {
+          "Code".to_string()
+        }
+      }
+      Some(kind) => kind.label().to_string(),
+      None => "Empty".to_string(),
+    }
   }
 
   fn render_title_bar(&self, cx: &mut Context<Self>) -> TitleBar {
     let theme = cx.theme();
 
-    let left_label = self.pane_label(&self.left_pane, cx);
-    let right_label = self.pane_label(&self.right_pane, cx);
-    let left_active = self.active_pane == ActivePane::Left;
-    let right_active = self.active_pane == ActivePane::Right;
-
     let project_name =
       self.state.projects.first().map(|p| p.name.clone()).unwrap_or_else(|| "No project".into());
 
-    let pane_tab = |label: &'static str, active: bool| {
-      div()
-        .px_3()
-        .py_1()
-        .text_sm()
-        .when(active, |d| d.text_color(theme.foreground).font_weight(FontWeight::SEMIBOLD))
-        .when(!active, |d| d.text_color(theme.muted_foreground))
-        .child(label)
-    };
-
     TitleBar::new()
-      // left: project > task
       .child(
         div()
           .flex()
@@ -271,17 +267,6 @@ impl Workspace {
           .mr_auto()
           .child(div().text_sm().text_color(theme.foreground).child(project_name)),
       )
-      // center: pane labels
-      .child(
-        div()
-          .flex()
-          .items_center()
-          .gap_1()
-          .child(pane_tab(left_label, left_active))
-          .child(div().text_sm().text_color(theme.muted_foreground).child("|"))
-          .child(pane_tab(right_label, right_active)),
-      )
-      // right: usage placeholder
       .child(
         div()
           .flex()
@@ -306,17 +291,38 @@ impl Render for Workspace {
     let left_active = self.active_pane == ActivePane::Left;
     let right_active = self.active_pane == ActivePane::Right;
 
+    let left_label = self.pane_header_label(&self.left_pane, cx);
+    let right_label = self.pane_header_label(&self.right_pane, cx);
+
+    let pane_header = |label: String, active: bool| {
+      div()
+        .px_2()
+        .py_1()
+        .text_sm()
+        .text_color(if active { theme.foreground } else { theme.muted_foreground })
+        .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(label)
+    };
+
     let left_wrapper = div()
       .size_full()
+      .flex()
+      .flex_col()
       .border_l_2()
       .border_color(if left_active { active_border } else { gpui::transparent_black() })
-      .child(self.left_pane.clone());
+      .child(pane_header(left_label, left_active))
+      .child(div().flex_1().min_h_0().overflow_hidden().child(self.left_pane.clone()));
 
     let right_wrapper = div()
       .size_full()
+      .flex()
+      .flex_col()
       .border_l_2()
       .border_color(if right_active { active_border } else { gpui::transparent_black() })
-      .child(self.right_pane.clone());
+      .child(pane_header(right_label, right_active))
+      .child(div().flex_1().min_h_0().overflow_hidden().child(self.right_pane.clone()));
 
     div()
       .id("workspace")
