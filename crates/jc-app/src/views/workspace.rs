@@ -11,6 +11,7 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use jc_core::config::{AppConfig, AppState};
 use jc_core::theme::ThemeConfig;
 use jc_terminal::{Palette, TerminalConfig, TerminalView};
+use std::path::PathBuf;
 
 actions!(
   workspace,
@@ -121,6 +122,15 @@ impl Workspace {
       pre_picker_focus: None,
       _picker_subscription: None,
     }
+  }
+
+  fn project_path(&self) -> PathBuf {
+    self
+      .state
+      .projects
+      .first()
+      .map(|p| p.path.clone())
+      .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
   }
 
   fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _cx: &mut Context<Self>) {
@@ -248,14 +258,7 @@ impl Workspace {
       return;
     }
 
-    let project_path = self
-      .state
-      .projects
-      .first()
-      .map(|p| p.path.clone())
-      .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-
-    let delegate = FilePickerDelegate::new(project_path, self.code_view.clone());
+    let delegate = FilePickerDelegate::new(self.project_path(), self.code_view.clone());
     let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
 
     self.pre_picker_focus = window.focused(cx);

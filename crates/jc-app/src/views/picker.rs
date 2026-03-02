@@ -5,10 +5,6 @@ use std::path::{Path, PathBuf};
 
 use crate::views::code_view::CodeView;
 
-// ---------------------------------------------------------------------------
-// Actions
-// ---------------------------------------------------------------------------
-
 actions!(picker, [ConfirmPicker, CancelPicker, SelectNextItem, SelectPrevItem, OpenFilePicker]);
 
 pub fn init(cx: &mut App) {
@@ -24,35 +20,28 @@ pub fn init(cx: &mut App) {
   ]);
 }
 
-// ---------------------------------------------------------------------------
-// Fuzzy match
-// ---------------------------------------------------------------------------
+const MAX_VISIBLE_RESULTS: usize = 200;
 
-fn fuzzy_match(query: &str, candidate: &str) -> Option<i64> {
-  if query.is_empty() {
+fn fuzzy_match(query_lower: &[char], candidate: &str) -> Option<i64> {
+  if query_lower.is_empty() {
     return Some(0);
   }
-
-  let query_lower: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
-  let candidate_chars: Vec<char> = candidate.chars().collect();
-  let candidate_lower: Vec<char> = candidate.chars().flat_map(|c| c.to_lowercase()).collect();
 
   let mut qi = 0;
   let mut score: i64 = 0;
   let mut prev_match = false;
+  let mut prev_char = '/';
 
-  for (ci, &ch) in candidate_lower.iter().enumerate() {
-    if qi < query_lower.len() && ch == query_lower[qi] {
+  for (ci, ch) in candidate.chars().enumerate() {
+    let ch_lower = ch.to_lowercase().next().unwrap_or(ch);
+    if qi < query_lower.len() && ch_lower == query_lower[qi] {
       score += 1;
-      // Consecutive match bonus
       if prev_match {
         score += 5;
       }
-      // Segment-start bonus (after `/` or at index 0)
-      if ci == 0 || candidate_chars[ci - 1] == '/' {
+      if ci == 0 || prev_char == '/' {
         score += 10;
       }
-      // Early match bonus
       if ci < 5 {
         score += 3;
       }
@@ -61,14 +50,11 @@ fn fuzzy_match(query: &str, candidate: &str) -> Option<i64> {
     } else {
       prev_match = false;
     }
+    prev_char = ch;
   }
 
   if qi == query_lower.len() { Some(score) } else { None }
 }
-
-// ---------------------------------------------------------------------------
-// PickerDelegate trait
-// ---------------------------------------------------------------------------
 
 pub trait PickerDelegate: 'static {
   fn items(&self) -> &[String];
@@ -80,10 +66,6 @@ pub trait PickerDelegate: 'static {
     Self: Sized;
 }
 
-// ---------------------------------------------------------------------------
-// PickerEvent
-// ---------------------------------------------------------------------------
-
 pub enum PickerEvent {
   Confirmed,
   Dismissed,
@@ -91,22 +73,13 @@ pub enum PickerEvent {
 
 impl<D: PickerDelegate> EventEmitter<PickerEvent> for PickerState<D> {}
 
-// ---------------------------------------------------------------------------
-// FilteredItem
-// ---------------------------------------------------------------------------
-
 struct FilteredItem {
   index: usize,
   score: i64,
 }
 
-// ---------------------------------------------------------------------------
-// PickerState
-// ---------------------------------------------------------------------------
-
 pub struct PickerState<D: PickerDelegate> {
   delegate: D,
-  query: String,
   query_input: Entity<InputState>,
   filtered: Vec<FilteredItem>,
   selected_index: usize,
@@ -121,15 +94,13 @@ impl<D: PickerDelegate> PickerState<D> {
 
     let subscription = cx.subscribe(&query_input, |this: &mut Self, _, event: &InputEvent, cx| {
       if matches!(event, InputEvent::Change) {
-        this.query = this.query_input.read(cx).value().as_ref().to_string();
-        this.refilter();
+        this.refilter(cx);
         cx.notify();
       }
     });
 
     let mut state = Self {
       delegate,
-      query: String::new(),
       query_input,
       filtered: Vec::new(),
       selected_index: 0,
@@ -137,7 +108,7 @@ impl<D: PickerDelegate> PickerState<D> {
       scroll_handle: ScrollHandle::default(),
       _subscription: subscription,
     };
-    state.refilter();
+    state.refilter(cx);
     state
   }
 
@@ -145,10 +116,12 @@ impl<D: PickerDelegate> PickerState<D> {
     self.query_input.read(cx).focus_handle(cx)
   }
 
-  fn refilter(&mut self) {
+  fn refilter(&mut self, cx: &App) {
+    let query = self.query_input.read(cx).value().as_ref().to_string();
+    let query_lower: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
     self.filtered.clear();
     for (index, item) in self.delegate.items().iter().enumerate() {
-      if let Some(score) = fuzzy_match(&self.query, item) {
+      if let Some(score) = fuzzy_match(&query_lower, item) {
         self.filtered.push(FilteredItem { index, score });
       }
     }
@@ -199,9 +172,11 @@ impl<D: PickerDelegate> Render for PickerState<D> {
 
     let items = self.delegate.items();
 
-    let results: Vec<Div> = self.filtered
+    let results: Vec<Div> = self
+      .filtered
       .iter()
       .enumerate()
+      .take(MAX_VISIBLE_RESULTS)
       .map(|(i, fi)| {
         let selected = i == self.selected_index;
         let label = items[fi.index].clone();
