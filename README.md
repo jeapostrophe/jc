@@ -341,6 +341,9 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement `~/.config/jc/` config and state persistence
 - [x] Implement project and task data model
 - [x] Implement `jc` CLI for adding projects from the command line
+- [ ] Remove code_editor_demo
+- [ ] Stringly-typed language names vs enum
+- [ ] Move the crates out of './crates' and into the top-level
 
 ### Terminal Emulator
 - [x] Integrate `alacritty_terminal` with GPUI rendering (`jc-terminal` crate)
@@ -349,38 +352,48 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement terminal cell painting (backgrounds, text with bold/italic, cursor shapes)
 - [x] Implement terminal resize detection and PTY resize propagation
 - [x] Extract terminal color palette to a theme file (`~/.config/jc/theme.toml`)
-- [ ] Change the dimensions of the terminal(s) and communicate to the terminal itself
-- [ ] Run Claude Code inside the embedded terminal
 - [x] Run general-purpose shell in a second terminal per task
-- [ ] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
 - [ ] Configure `preferredNotifChannel = terminal_bell` as backup idle signal
-- [ ] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
+- [ ] Change the dimensions of the terminal(s) and communicate to the terminal itself
+- [ ] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
+- [ ] Run Claude Code inside the embedded terminal
 - [ ] Implement Quake-style drop-down terminal toggle
+- [ ] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
+- [ ] Show old replies and plans as well. Provide a picker to scroll through to view. (Ctrl-Shift-O)
 
 ### TODO.md System
 - [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
-- [ ] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
-- [ ] Build library for managing TODO.md representation (ropey-backed)
-- [ ] Parse TODO.md format (agents, messages, WAIT markers)
-- [ ] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
-- [ ] Implement comment insertion from other views into the WAIT section
 - [x] Detect external file modifications (file watcher) and show visual indicator
+- [ ] Automatically reload when the buffer is not dirty, rather than displaying a message
+- [ ] Fix focus to center the target in the middle of the screen
+- [ ] Word wrapping lines to fix the length of lines
+- [ ] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
+- [ ] Parse TODO.md format (agents, messages, WAIT markers)
+- [ ] Build library for managing TODO.md representation (ropey-backed)
+- [ ] Implement comment insertion from other views into the WAIT section
+- [ ] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] Implement conflict resolution (git-style merge of buffer vs disk)
+- [ ] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
 
 ### Git Diff View
 - [x] Render git diff via `git2` with `tree-sitter` syntax-aware highlighting
 - [x] Add word-level inline highlighting via `similar`
+- [ ] Fix word-level diff (strange annotations appearing instead of highlight
+- [ ] Word wrapping lines to fix the length of lines
+- [ ] Implement per-file "mark as reviewed" with collapses
+- [ ] Annotate which files have been "marked" in the git diff picker
+- [ ] Show one file at a time rather than raw multi-file output
 - [ ] Implement region selection and comment keybinding
-- [ ] Implement per-file "mark as reviewed" with collapse
-- [ ] Support scrolling through multi-file diffs
-- [ ] Show git log as well to look at older diffs. Provide a picker to scroll through to view.
+- [ ] Show git log as well to look at older diffs. Provide a picker to scroll through to view. (Ctrl-Shift-O)
 
 ### Code Viewer
 - [x] Implement syntax-highlighted file viewer (`tree-sitter` + `tree-sitter-highlight`)
 - [x] Implement fuzzy file picker (search repo files)
 - [x] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
-- [ ] Implement light editing (basic text modification, not full editor)
 - [x] Implement "open in external editor" keybinding (Cmd-Shift-E)
+- [ ] Fix focus to center the target in the middle of the screen
+- [ ] Word wrapping lines to fix the length of lines
+- [ ] Implement light editing (basic text modification, not full editor)
 
 ### Window & Pane Management
 - [x] Fix: Window doesn't get focused on creation
@@ -389,31 +402,38 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement pane view switching for terminals (Cmd-1 Claude, Cmd-2 General, Cmd-[/] focus)
 - [x] Cmd-[/] overrides InputState indent/outdent when editor is focused (bound in Input context)
 - [x] Implement view switching for diff, TODO, code views (Cmd-3/4/5)
-- [ ] Implement view switching for reply view
-- [ ] Change the size of the split
-- [ ] Implement independent scroll positions per pane
-- [ ] Implement multi-window with shared session state
-- [ ] Implement Quake-style bottom terminal overlay
 - [x] Use a monospace font (Menlo) in code editor views (diff, code, TODO)
 - [x] Disable line numbers in code editor views
+- [ ] Change the size of the split by dragging with a keybinding to make even split
+- [ ] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
+- [ ] Move default theme file to 'data' directory rather than embedding defaults in source
+- [ ] Implement view switching for reply view
+- [ ] Implement independent scroll positions per pane
 - [ ] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting
 - [ ] Add a light theme
 - [ ] Auto-switch themes with system dark mode
+- [ ] Implement Quake-style bottom terminal overlay
+- [ ] Implement multi-window with shared session state
 
 ### Navigation & Pickers
 - [x] Implement generic fuzzy picker library shared by multiple pickers
-- [ ] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
 - [x] Implement file picker
 - [x] Implement symbol picker
+- [ ] Improve open_file_picker to use show_picker
+- [ ] Track most recently visited files and put them at the top of file picker
+- [ ] Track modified files (from git) and mark them in the file picker
+- [ ] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
+- [ ] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] Implement keybinding system (configurable, emacs-style defaults)
 
 ### Notifications & Status
+- [x] Implement Claude usage algorithm
+- [x] Implement configurable working hours for par calculation
+- [ ] Turn usage into a single number/visualization that shows "par"
+- [ ] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] Implement in-app status bar showing waiting tasks (driven by hook events)
 - [ ] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Task")
-- [x] Implement Claude usage algorithm 
-- [x] Implement configurable working hours for par calculation
-- [ ] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 
 ### Mobile App
 - [ ] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
@@ -428,6 +448,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement git worktree creation/deletion via `git2` worktree API
 
 ### Polish & Integration
+- [ ] Reduce duplication between CodeView and TodoView (consider having TodoView wrap a CodeView)
 - [ ] End-to-end test: full workflow from project creation to Claude review cycle
 - [ ] Persistent state: survive app restart without losing task state or terminal sessions
 - [ ] Performance: handle multiple concurrent terminal sessions smoothly
@@ -435,22 +456,3 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
 
 ### Unsorted
-
-* Change the font to https://lilex.myrt.co/ ; this may require downloading and bundling the font with the app. If so, put it into a 'data' directory at the project root.
-* I want a default theme file rather than the defaults embedded in the source; this should also go in the 'data' directory.
-* I don't see the Word-level diff working but I do see a bunch of strange annotations in the git diff view
-* Move the crates out of './crates' and into the top-level. I don't like the extra directory layer
-* Is there too much duplication between CodeView and TodoView w.r.t. hot reloading/etc? Maybe TodoView can wrap a CodeView that also manages the TODO stuff.
-* The watcher should automatically reload when the buffer in question is not dirty on our side, rather displaying a message and making the user interact
-* Word wrapping lines to fix the length of lines in all views
-* Remove code_editor_demo
-* Track the most recently visited files and put them at the top of file picker
-* Track the modified files (from git) and mark them in the file picker and put them at the top after the recently visited
-* Use syntax highlighting inside of the picker appropriate to the original language
-* Right now the focus just puts it on the screen, but it should put it in the middle of the screen
-* The git diff view should show one file at a time, rather than the actual output
-* The git diff picker should annotate which files have been "marked"
-* Have a shared place to get a skill/etc reference (like the "optimize plan" thing)
-* Turn usage into a single number/visualization
-* open_file_picker not using show_picker: should improve
-* Stringly-typed language names vs enum
