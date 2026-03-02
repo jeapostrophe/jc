@@ -1,4 +1,5 @@
 use crate::views::code_view;
+use crate::views::picker;
 use crate::views::todo_view;
 use crate::views::workspace::{self, Workspace};
 use gpui::*;
@@ -12,6 +13,7 @@ pub fn run(state: AppState, config: AppConfig, theme: ThemeConfig) {
   app.run(move |cx| {
     gpui_component::init(cx);
     workspace::init(cx);
+    picker::init(cx);
     code_view::init(cx);
     todo_view::init(cx);
 

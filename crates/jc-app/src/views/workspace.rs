@@ -1,6 +1,7 @@
 use crate::views::code_view::CodeView;
 use crate::views::diff_view::DiffView;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
+use crate::views::picker::{FilePickerDelegate, OpenFilePicker, PickerEvent, PickerState};
 use crate::views::todo_view::TodoView;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -46,6 +47,9 @@ pub struct Workspace {
   state: AppState,
   config: AppConfig,
   focus: FocusHandle,
+  active_picker: Option<AnyView>,
+  pre_picker_focus: Option<FocusHandle>,
+  _picker_subscription: Option<Subscription>,
 }
 
 impl Workspace {
@@ -113,6 +117,9 @@ impl Workspace {
       state,
       config,
       focus: cx.focus_handle(),
+      active_picker: None,
+      pre_picker_focus: None,
+      _picker_subscription: None,
     }
   }
 
@@ -236,6 +243,51 @@ impl Workspace {
     }
   }
 
+  fn open_file_picker(&mut self, _: &OpenFilePicker, window: &mut Window, cx: &mut Context<Self>) {
+    if self.active_picker.is_some() {
+      return;
+    }
+
+    let project_path = self
+      .state
+      .projects
+      .first()
+      .map(|p| p.path.clone())
+      .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    let delegate = FilePickerDelegate::new(project_path, self.code_view.clone());
+    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
+
+    self.pre_picker_focus = window.focused(cx);
+
+    let subscription =
+      cx.subscribe_in(&picker, window, |this: &mut Self, _, event, window, cx| match event {
+        PickerEvent::Confirmed => {
+          this.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
+          this.dismiss_picker();
+          cx.notify();
+        }
+        PickerEvent::Dismissed => {
+          if let Some(focus) = this.pre_picker_focus.take() {
+            focus.focus(window);
+          }
+          this.dismiss_picker();
+          cx.notify();
+        }
+      });
+
+    self.active_picker = Some(picker.clone().into());
+    self._picker_subscription = Some(subscription);
+
+    picker.read(cx).input_focus_handle(cx).focus(window);
+    cx.notify();
+  }
+
+  fn dismiss_picker(&mut self) {
+    self.active_picker = None;
+    self._picker_subscription = None;
+  }
+
   fn pane_header_label(&self, pane: &Entity<Pane>, cx: &App) -> String {
     match pane.read(cx).content_kind() {
       Some(PaneContentKind::CodeViewer) => {
@@ -341,12 +393,31 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::show_code_viewer))
       .on_action(cx.listener(Self::show_todo_editor))
       .on_action(cx.listener(Self::open_in_external_editor))
+      .on_action(cx.listener(Self::open_file_picker))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable("main-split")
           .child(resizable_panel().size(px(600.0)).child(left_wrapper))
           .child(resizable_panel().size(px(600.0)).child(right_wrapper)),
       )
+      .when_some(self.active_picker.as_ref(), |el, picker| {
+        el.child(
+          deferred(
+            div()
+              .absolute()
+              .size_full()
+              .top_0()
+              .left_0()
+              .flex()
+              .justify_center()
+              .pt(px(80.0))
+              .bg(hsla(0., 0., 0., 0.3))
+              .on_mouse_down(MouseButton::Left, |_, _, _cx| {})
+              .child(picker.clone()),
+          )
+          .with_priority(1),
+        )
+      })
   }
 }
 

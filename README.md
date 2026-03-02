@@ -37,7 +37,7 @@ crates/
     src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
     examples/terminal_window.rs
   jc-app/                           # binary: CLI + GPUI app
-    src/main.rs, app.rs, views/{workspace,pane,project_view,diff_view,code_view,todo_view}.rs
+    src/main.rs, app.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view}.rs
     examples/basic_window.rs, code_editor_demo.rs
 ```
 
@@ -376,7 +376,7 @@ It is deliberately *not* a full code editor on mobile.
 
 ### Code Viewer
 - [x] Implement syntax-highlighted file viewer (`tree-sitter` + `tree-sitter-highlight`)
-- [ ] Implement fuzzy file picker (search repo files)
+- [x] Implement fuzzy file picker (search repo files)
 - [ ] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
 - [ ] Implement light editing (basic text modification, not full editor)
 - [x] Implement "open in external editor" keybinding (Cmd-Shift-E)
@@ -400,9 +400,9 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Auto-switch themes with system dark mode
 
 ### Navigation & Pickers
-- [ ] Implement generic fuzzy picker library shared by multiple pickers
+- [x] Implement generic fuzzy picker library shared by multiple pickers
 - [ ] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
-- [ ] Implement file picker
+- [x] Implement file picker
 - [ ] Implement symbol picker
 - [ ] Implement keybinding system (configurable, emacs-style defaults)
 
