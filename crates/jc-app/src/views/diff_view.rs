@@ -11,6 +11,7 @@ use similar::{ChangeTag, TextDiff};
 pub struct DiffView {
   editor: Entity<InputState>,
   project_path: PathBuf,
+  file_entries: Vec<(String, u32)>,
 }
 
 struct DiffLine {
@@ -26,13 +27,15 @@ impl DiffView {
     let editor = cx.new(|cx| {
       InputState::new(window, cx).code_editor("diff").soft_wrap(false).line_number(false)
     });
-    let mut view = Self { editor, project_path };
+    let mut view = Self { editor, project_path, file_entries: Vec::new() };
     view.refresh(window, cx);
     view
   }
 
   pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let (diff_text, highlights) = generate_diff(&self.project_path);
+
+    self.file_entries = parse_file_entries(&diff_text);
 
     self.editor.update(cx, |state, cx| {
       state.set_value(diff_text, window, cx);
@@ -61,17 +64,8 @@ impl DiffView {
 }
 
 impl DiffView {
-  pub fn file_entries(&self, cx: &App) -> Vec<(String, u32)> {
-    let text = self.editor.read(cx).value();
-    let mut entries = Vec::new();
-    for (line_num, line) in text.as_ref().lines().enumerate() {
-      if let Some(rest) = line.strip_prefix("diff --git a/") {
-        // Format: "diff --git a/path b/path"
-        let name = rest.split(" b/").next().unwrap_or(rest);
-        entries.push((name.to_string(), line_num as u32));
-      }
-    }
-    entries
+  pub fn file_entries(&self) -> &[(String, u32)] {
+    &self.file_entries
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
@@ -319,4 +313,15 @@ fn record_highlights(
       highlights.push((display_line_start + end_line, 1, end_col, is_addition));
     }
   }
+}
+
+fn parse_file_entries(diff_text: &str) -> Vec<(String, u32)> {
+  let mut entries = Vec::new();
+  for (line_num, line) in diff_text.lines().enumerate() {
+    if let Some(rest) = line.strip_prefix("diff --git a/") {
+      let name = rest.split(" b/").next().unwrap_or(rest);
+      entries.push((name.to_string(), line_num as u32));
+    }
+  }
+  entries
 }

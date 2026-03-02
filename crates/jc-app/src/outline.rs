@@ -5,6 +5,7 @@ pub struct OutlineItem {
   pub name: String,
   pub line: u32,
   pub depth: usize,
+  pub parent: Option<usize>,
   pub byte_range: std::ops::Range<usize>,
 }
 
@@ -66,28 +67,35 @@ pub fn compute_outline(text: &str, language_name: &str) -> Vec<OutlineItem> {
     }
   }
 
-  // Compute depth via range containment: an item is nested in the nearest
-  // prior item whose range fully contains it.
+  // Compute depth and parent via a stack. Items arrive in document order,
+  // so we maintain a stack of ancestors whose ranges contain the current item.
   let mut items: Vec<OutlineItem> = Vec::with_capacity(raw_items.len());
-  for i in 0..raw_items.len() {
-    let mut depth = 0usize;
-    for j in (0..i).rev() {
-      if raw_items[j].3.start <= raw_items[i].3.start && raw_items[j].3.end >= raw_items[i].3.end {
-        depth = items[j].depth + 1;
+  let mut stack: Vec<usize> = Vec::new(); // indices into `items`
+
+  for (i, (name, context, line, range)) in raw_items.iter().enumerate() {
+    // Pop stack entries that don't contain the current item.
+    while let Some(&top) = stack.last() {
+      if items[top].byte_range.end < range.end {
+        stack.pop();
+      } else {
         break;
       }
     }
 
-    let (ref name, ref context, line, ref range) = raw_items[i];
+    let parent = stack.last().copied();
+    let depth = stack.len();
     let label = if context.is_empty() { name.clone() } else { format!("{context} {name}") };
 
     items.push(OutlineItem {
       label,
       name: name.clone(),
-      line,
+      line: *line,
       depth,
+      parent,
       byte_range: range.clone(),
     });
+
+    stack.push(i);
   }
 
   items
