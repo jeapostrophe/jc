@@ -12,3 +12,6 @@ gpui-component-assets.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 git2.workspace = true
+notify.workspace = true
+flume.workspace = true
+similar.workspace = true

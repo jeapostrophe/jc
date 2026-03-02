@@ -1,12 +1,23 @@
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use gpui::Hsla;
+use jc_core::theme::TerminalTheme;
 
 /// Convert r, g, b (0-255) to GPUI Hsla.
 fn rgb_to_hsla(r: u8, g: u8, b: u8) -> Hsla {
   gpui::rgba(((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xFF).into()
 }
 
+/// Parse a hex color string (e.g. "#C5C8C6") to GPUI Hsla.
+pub fn hex_to_hsla(hex: &str) -> Hsla {
+  let hex = hex.trim_start_matches('#');
+  let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+  let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+  let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+  rgb_to_hsla(r, g, b)
+}
+
 /// Standard dark terminal palette.
+#[derive(Clone)]
 pub struct Palette {
   pub foreground: Hsla,
   pub background: Hsla,
@@ -16,26 +27,32 @@ pub struct Palette {
 
 impl Default for Palette {
   fn default() -> Self {
+    Palette::from(&TerminalTheme::default())
+  }
+}
+
+impl From<&TerminalTheme> for Palette {
+  fn from(theme: &TerminalTheme) -> Self {
     let mut ansi = [rgb_to_hsla(0, 0, 0); 256];
 
-    // Standard 16 ANSI colors (dark theme)
-    ansi[NamedColor::Black as usize] = rgb_to_hsla(0x1D, 0x1F, 0x21);
-    ansi[NamedColor::Red as usize] = rgb_to_hsla(0xCC, 0x66, 0x66);
-    ansi[NamedColor::Green as usize] = rgb_to_hsla(0xB5, 0xBD, 0x68);
-    ansi[NamedColor::Yellow as usize] = rgb_to_hsla(0xF0, 0xC6, 0x74);
-    ansi[NamedColor::Blue as usize] = rgb_to_hsla(0x81, 0xA2, 0xBE);
-    ansi[NamedColor::Magenta as usize] = rgb_to_hsla(0xB2, 0x94, 0xBB);
-    ansi[NamedColor::Cyan as usize] = rgb_to_hsla(0x8A, 0xBE, 0xB7);
-    ansi[NamedColor::White as usize] = rgb_to_hsla(0xC5, 0xC8, 0xC6);
+    // Standard 16 ANSI colors from theme
+    ansi[NamedColor::Black as usize] = hex_to_hsla(&theme.black);
+    ansi[NamedColor::Red as usize] = hex_to_hsla(&theme.red);
+    ansi[NamedColor::Green as usize] = hex_to_hsla(&theme.green);
+    ansi[NamedColor::Yellow as usize] = hex_to_hsla(&theme.yellow);
+    ansi[NamedColor::Blue as usize] = hex_to_hsla(&theme.blue);
+    ansi[NamedColor::Magenta as usize] = hex_to_hsla(&theme.magenta);
+    ansi[NamedColor::Cyan as usize] = hex_to_hsla(&theme.cyan);
+    ansi[NamedColor::White as usize] = hex_to_hsla(&theme.white);
     // Bright
-    ansi[NamedColor::BrightBlack as usize] = rgb_to_hsla(0x96, 0x98, 0x96);
-    ansi[NamedColor::BrightRed as usize] = rgb_to_hsla(0xDE, 0x93, 0x5F);
-    ansi[NamedColor::BrightGreen as usize] = rgb_to_hsla(0xB5, 0xBD, 0x68);
-    ansi[NamedColor::BrightYellow as usize] = rgb_to_hsla(0xF0, 0xC6, 0x74);
-    ansi[NamedColor::BrightBlue as usize] = rgb_to_hsla(0x81, 0xA2, 0xBE);
-    ansi[NamedColor::BrightMagenta as usize] = rgb_to_hsla(0xB2, 0x94, 0xBB);
-    ansi[NamedColor::BrightCyan as usize] = rgb_to_hsla(0x8A, 0xBE, 0xB7);
-    ansi[NamedColor::BrightWhite as usize] = rgb_to_hsla(0xFF, 0xFF, 0xFF);
+    ansi[NamedColor::BrightBlack as usize] = hex_to_hsla(&theme.bright_black);
+    ansi[NamedColor::BrightRed as usize] = hex_to_hsla(&theme.bright_red);
+    ansi[NamedColor::BrightGreen as usize] = hex_to_hsla(&theme.bright_green);
+    ansi[NamedColor::BrightYellow as usize] = hex_to_hsla(&theme.bright_yellow);
+    ansi[NamedColor::BrightBlue as usize] = hex_to_hsla(&theme.bright_blue);
+    ansi[NamedColor::BrightMagenta as usize] = hex_to_hsla(&theme.bright_magenta);
+    ansi[NamedColor::BrightCyan as usize] = hex_to_hsla(&theme.bright_cyan);
+    ansi[NamedColor::BrightWhite as usize] = hex_to_hsla(&theme.bright_white);
 
     // 216-color cube (indices 16..232)
     for i in 0..216u8 {
@@ -52,9 +69,9 @@ impl Default for Palette {
     }
 
     Self {
-      foreground: rgb_to_hsla(0xC5, 0xC8, 0xC6),
-      background: rgb_to_hsla(0x1D, 0x1F, 0x21),
-      cursor: rgb_to_hsla(0xC5, 0xC8, 0xC6),
+      foreground: hex_to_hsla(&theme.foreground),
+      background: hex_to_hsla(&theme.background),
+      cursor: hex_to_hsla(&theme.cursor),
       ansi,
     }
   }

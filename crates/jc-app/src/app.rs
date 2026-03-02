@@ -1,14 +1,17 @@
+use crate::views::todo_view;
 use crate::views::workspace::{self, Workspace};
 use gpui::*;
 use gpui_component::TitleBar;
-use jc_core::config::AppState;
+use jc_core::config::{AppConfig, AppState};
+use jc_core::theme::ThemeConfig;
 
-pub fn run(state: AppState) {
+pub fn run(state: AppState, config: AppConfig, theme: ThemeConfig) {
   let app = Application::new().with_assets(gpui_component_assets::Assets);
 
   app.run(move |cx| {
     gpui_component::init(cx);
     workspace::init(cx);
+    todo_view::init(cx);
 
     cx.on_window_closed(|cx| {
       if cx.windows().is_empty() {
@@ -29,7 +32,7 @@ pub fn run(state: AppState) {
 
     cx.open_window(opts, |window, cx| {
       window.activate_window();
-      let view = cx.new(|cx| Workspace::new(state, window, cx));
+      let view = cx.new(|cx| Workspace::new(state, config, theme, window, cx));
       cx.new(|cx| gpui_component::Root::new(view, window, cx))
     })
     .expect("failed to open window");

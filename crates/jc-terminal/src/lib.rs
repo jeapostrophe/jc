@@ -1,8 +1,9 @@
-mod colors;
+pub mod colors;
 mod input;
 mod pty;
 mod render;
 mod terminal;
 mod view;
 
-pub use view::TerminalView;
+pub use colors::Palette;
+pub use view::{TerminalConfig, TerminalView};

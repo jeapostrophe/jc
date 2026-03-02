@@ -24,7 +24,7 @@ cargo run -p jc-app --example code_editor_demo
 cargo run -p jc-terminal --example terminal_window
 ```
 
-Config and state live in `~/.config/jc/` (`config.toml` and `state.toml`).
+Config and state live in `~/.config/jc/` (`config.toml`, `state.toml`, and `theme.toml`).
 
 ### Project Structure
 
@@ -32,7 +32,7 @@ Config and state live in `~/.config/jc/` (`config.toml` and `state.toml`).
 Cargo.toml                          # workspace root
 crates/
   jc-core/                          # data model + config persistence
-    src/lib.rs, config.rs, model.rs
+    src/lib.rs, config.rs, model.rs, theme.rs
   jc-terminal/                      # embedded terminal emulator
     src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
     examples/terminal_window.rs
@@ -347,7 +347,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement keystroke-to-bytes conversion (special keys, Ctrl, Alt, APP_CURSOR mode)
 - [x] Implement terminal cell painting (backgrounds, text with bold/italic, cursor shapes)
 - [x] Implement terminal resize detection and PTY resize propagation
-- [ ] Extract terminal color palette to a theme file
+- [x] Extract terminal color palette to a theme file (`~/.config/jc/theme.toml`)
 - [ ] Change the dimensions of the terminal(s) and communicate to the terminal itself
 - [ ] Run Claude Code inside the embedded terminal
 - [ ] Run general-purpose shell in a second terminal per task
@@ -363,12 +363,12 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Parse TODO.md format (agents, messages, WAIT markers)
 - [ ] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] Implement comment insertion from other views into the WAIT section
-- [ ] Detect external file modifications (file watcher) and show visual indicator
+- [x] Detect external file modifications (file watcher) and show visual indicator
 - [ ] Implement conflict resolution (git-style merge of buffer vs disk)
 
 ### Git Diff View
 - [x] Render git diff via `git2` with `tree-sitter` syntax-aware highlighting
-- [ ] Add word-level inline highlighting via `similar` or `imara-diff`
+- [x] Add word-level inline highlighting via `similar`
 - [ ] Implement region selection and comment keybinding
 - [ ] Implement per-file "mark as reviewed" with collapse
 - [ ] Support scrolling through multi-file diffs
@@ -379,25 +379,25 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] Implement fuzzy file picker (search repo files)
 - [ ] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
 - [ ] Implement light editing (basic text modification, not full editor)
-- [ ] Implement "open in external editor" keybinding
+- [x] Implement "open in external editor" keybinding (Cmd-Shift-E)
 
 ### Window & Pane Management
 - [x] Fix: Window doesn't get focused on creation
 - [x] Add window keybindings (Cmd+W close, Cmd+M minimize, Cmd+Q quit)
 - [x] Implement left/right two-pane layout (resizable, with pane focus tracking)
 - [x] Implement pane view switching for terminals (Cmd-1 Claude, Cmd-2 General, Cmd-[/] focus)
-- [ ] Cmd-[/] conflicts with InputState indent/outdent when editor is focused — address separately
+- [x] Cmd-[/] overrides InputState indent/outdent when editor is focused (bound in Input context)
 - [x] Implement view switching for diff, TODO, code views (Cmd-3/4/5)
 - [ ] Implement view switching for reply view
 - [ ] Change the size of the split
 - [ ] Implement independent scroll positions per pane
 - [ ] Implement multi-window with shared session state
 - [ ] Implement Quake-style bottom terminal overlay
+- [x] Use a monospace font (Menlo) in code editor views (diff, code, TODO)
+- [x] Disable line numbers in code editor views
 - [ ] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting
 - [ ] Add a light theme
 - [ ] Auto-switch themes with system dark mode
-- [ ] Use a monospace font in code editor views (diff, code, TODO)
-- [ ] Disable line numbers in code editor views
 
 ### Navigation & Pickers
 - [ ] Implement generic fuzzy picker library shared by multiple pickers

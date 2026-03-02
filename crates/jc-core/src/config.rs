@@ -57,16 +57,28 @@ pub fn state_path() -> PathBuf {
   config_dir().join("state.toml")
 }
 
-pub fn load_config() -> Result<AppConfig> {
-  let path = config_path();
-  if !path.exists() {
-    return Ok(AppConfig::default());
+pub fn theme_path() -> PathBuf {
+  config_dir().join("theme.toml")
+}
+
+fn load_toml<T: Default + for<'de> serde::de::Deserialize<'de>>(
+  path: &std::path::Path,
+) -> Result<T> {
+  match fs::read_to_string(path) {
+    Ok(contents) => {
+      toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+    }
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+    Err(e) => Err(anyhow::anyhow!("failed to read {}: {e}", path.display())),
   }
-  let contents =
-    fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-  let config: AppConfig =
-    toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
-  Ok(config)
+}
+
+pub fn load_theme() -> Result<crate::theme::ThemeConfig> {
+  load_toml(&theme_path())
+}
+
+pub fn load_config() -> Result<AppConfig> {
+  load_toml(&config_path())
 }
 
 pub fn save_config(config: &AppConfig) -> Result<()> {
@@ -78,15 +90,7 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
 }
 
 pub fn load_state() -> Result<AppState> {
-  let path = state_path();
-  if !path.exists() {
-    return Ok(AppState::default());
-  }
-  let contents =
-    fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-  let state: AppState =
-    toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
-  Ok(state)
+  load_toml(&state_path())
 }
 
 pub fn save_state(state: &AppState) -> Result<()> {

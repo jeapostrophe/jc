@@ -22,6 +22,7 @@ pub struct TerminalConfig {
   pub line_height: f32,
   pub initial_cols: u16,
   pub initial_rows: u16,
+  pub palette: Option<Palette>,
 }
 
 impl Default for TerminalConfig {
@@ -32,6 +33,7 @@ impl Default for TerminalConfig {
       line_height: 1.3,
       initial_cols: 80,
       initial_rows: 24,
+      palette: None,
     }
   }
 }
@@ -49,7 +51,7 @@ pub struct TerminalView {
 
 impl TerminalView {
   pub fn new(
-    config: TerminalConfig,
+    mut config: TerminalConfig,
     working_dir: Option<&std::path::Path>,
     _window: &mut Window,
     cx: &mut Context<Self>,
@@ -133,10 +135,12 @@ impl TerminalView {
     })
     .detach();
 
+    let palette = config.palette.take().unwrap_or_default();
+
     Self {
       state,
       pty,
-      palette: Palette::default(),
+      palette,
       config,
       focus: cx.focus_handle(),
       last_size: Arc::new(Mutex::new((cols, rows))),
@@ -192,7 +196,7 @@ impl Render for TerminalView {
         },
         {
           let term_handle = self.state.term_handle();
-          let palette = Palette::default();
+          let palette = self.palette.clone();
           let pty_for_resize = self.pty.clone();
           let last_size = self.last_size.clone();
 

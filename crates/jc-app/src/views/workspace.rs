@@ -7,8 +7,9 @@ use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::TitleBar;
 use gpui_component::resizable::{h_resizable, resizable_panel};
-use jc_core::config::AppState;
-use jc_terminal::TerminalView;
+use jc_core::config::{AppConfig, AppState};
+use jc_core::theme::ThemeConfig;
+use jc_terminal::{Palette, TerminalConfig, TerminalView};
 
 actions!(
   workspace,
@@ -23,6 +24,7 @@ actions!(
     ShowGitDiff,
     ShowCodeViewer,
     ShowTodoEditor,
+    OpenInExternalEditor,
   ]
 );
 
@@ -41,21 +43,33 @@ pub struct Workspace {
   diff_view: Entity<DiffView>,
   code_view: Entity<CodeView>,
   todo_view: Entity<TodoView>,
-  #[allow(dead_code)]
   state: AppState,
+  config: AppConfig,
   focus: FocusHandle,
 }
 
 impl Workspace {
-  pub fn new(state: AppState, window: &mut Window, cx: &mut Context<Self>) -> Self {
+  pub fn new(
+    state: AppState,
+    config: AppConfig,
+    theme: ThemeConfig,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> Self {
     let project_path = state
       .projects
       .first()
       .map(|p| p.path.clone())
       .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let claude_terminal = cx.new(|cx| TerminalView::new(Default::default(), None, window, cx));
-    let general_terminal = cx.new(|cx| TerminalView::new(Default::default(), None, window, cx));
+    let palette = Palette::from(&theme.terminal);
+    let terminal_config =
+      |palette: &Palette| TerminalConfig { palette: Some(palette.clone()), ..Default::default() };
+
+    let claude_terminal =
+      cx.new(|cx| TerminalView::new(terminal_config(&palette), None, window, cx));
+    let general_terminal =
+      cx.new(|cx| TerminalView::new(terminal_config(&palette), None, window, cx));
     let diff_view = cx.new(|cx| DiffView::new(project_path.clone(), window, cx));
     let code_view = cx.new(|cx| CodeView::new(window, cx));
     let todo_view = cx.new(|cx| TodoView::new(project_path, window, cx));
@@ -97,6 +111,7 @@ impl Workspace {
       code_view,
       todo_view,
       state,
+      config,
       focus: cx.focus_handle(),
     }
   }
@@ -199,6 +214,28 @@ impl Workspace {
     self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
   }
 
+  fn open_in_external_editor(
+    &mut self,
+    _: &OpenInExternalEditor,
+    _window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let pane = self.active_pane_entity().clone();
+    let kind = pane.read(cx).content_kind();
+    let file_path = match kind {
+      Some(PaneContentKind::CodeViewer) => {
+        self.code_view.read(cx).file_path().map(|p| p.to_path_buf())
+      }
+      Some(PaneContentKind::TodoEditor) => Some(self.todo_view.read(cx).file_path().to_path_buf()),
+      _ => None,
+    };
+    if let Some(path) = file_path {
+      let editor =
+        if self.config.editor.is_empty() { "open".to_string() } else { self.config.editor.clone() };
+      let _ = std::process::Command::new(&editor).arg(path).spawn();
+    }
+  }
+
   fn pane_label(&self, pane: &Entity<Pane>, cx: &App) -> &'static str {
     pane.read(cx).content_kind().map_or("Empty", PaneContentKind::label)
   }
@@ -297,6 +334,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::show_git_diff))
       .on_action(cx.listener(Self::show_code_viewer))
       .on_action(cx.listener(Self::show_todo_editor))
+      .on_action(cx.listener(Self::open_in_external_editor))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable("main-split")
@@ -318,5 +356,11 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-3", ShowGitDiff, Some("Workspace")),
     KeyBinding::new("cmd-4", ShowCodeViewer, Some("Workspace")),
     KeyBinding::new("cmd-5", ShowTodoEditor, Some("Workspace")),
+    KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
+  ]);
+
+  cx.bind_keys([
+    KeyBinding::new("cmd-[", FocusLeftPane, Some("Input")),
+    KeyBinding::new("cmd-]", FocusRightPane, Some("Input")),
   ]);
 }

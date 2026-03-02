@@ -9,8 +9,14 @@ pub struct CodeView {
 
 impl CodeView {
   pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-    let editor = cx.new(|cx| InputState::new(window, cx).code_editor("text").soft_wrap(false));
+    let editor = cx.new(|cx| {
+      InputState::new(window, cx).code_editor("text").soft_wrap(false).line_number(false)
+    });
     Self { editor, current_file: None }
+  }
+
+  pub fn file_path(&self) -> Option<&Path> {
+    self.current_file.as_deref()
   }
 
   pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -32,7 +38,9 @@ impl Focusable for CodeView {
 
 impl Render for CodeView {
   fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-    div().size_full().child(Input::new(&self.editor).h_full().appearance(false).bordered(false))
+    div().size_full().font_family("Menlo").child(
+      div().size_full().child(Input::new(&self.editor).h_full().appearance(false).bordered(false)),
+    )
   }
 }
 

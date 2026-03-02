@@ -10,3 +10,4 @@ portable-pty.workspace = true
 parking_lot.workspace = true
 flume.workspace = true
 anyhow.workspace = true
+jc-core = { path = "../jc-core" }
