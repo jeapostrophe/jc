@@ -3,8 +3,10 @@ use crate::views::diff_view::{DiffView, DiffViewEvent};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
-  OpenContextPicker, OpenFilePicker, PickerEvent, PickerState, TodoHeaderPickerDelegate,
+  OpenContextPicker, OpenFilePicker, PickerEvent, PickerState, ReplyHeadingPickerDelegate,
+  ReplyTurnPickerDelegate, TodoHeaderPickerDelegate,
 };
+use crate::views::reply_view::ReplyView;
 use crate::views::todo_view::TodoView;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -34,6 +36,7 @@ actions!(
     OpenInExternalEditor,
     EvenSplit,
     OpenGitLogPicker,
+    ShowReplyViewer,
   ]
 );
 
@@ -60,6 +63,7 @@ pub struct Workspace {
   diff_view: Entity<DiffView>,
   code_view: Entity<CodeView>,
   todo_view: Entity<TodoView>,
+  reply_view: Entity<ReplyView>,
   state: AppState,
   config: AppConfig,
   focus: FocusHandle,
@@ -95,7 +99,8 @@ impl Workspace {
       cx.new(|cx| TerminalView::new(base_config(&palette), Some(&project_path), window, cx));
     let diff_view = cx.new(|cx| DiffView::new(project_path.clone(), window, cx));
     let code_view = cx.new(|cx| CodeView::new(window, cx));
-    let todo_view = cx.new(|cx| TodoView::new(project_path, window, cx));
+    let todo_view = cx.new(|cx| TodoView::new(project_path.clone(), window, cx));
+    let reply_view = cx.new(|cx| ReplyView::new(project_path, window, cx));
 
     let claude_focus = claude_terminal.read(cx).focus_handle(cx);
     let general_focus = general_terminal.read(cx).focus_handle(cx);
@@ -149,6 +154,7 @@ impl Workspace {
       diff_view,
       code_view,
       todo_view,
+      reply_view,
       state,
       config,
       focus: cx.focus_handle(),
@@ -248,6 +254,11 @@ impl Workspace {
         let focus = self.todo_view.read(cx).focus_handle(cx);
         (self.todo_view.clone().into(), focus)
       }
+      PaneContentKind::ReplyViewer => {
+        self.reply_view.update(cx, |v, cx| v.refresh(window, cx));
+        let focus = self.reply_view.read(cx).focus_handle(cx);
+        (self.reply_view.clone().into(), focus)
+      }
     };
 
     let pane = self.active_pane_entity().clone();
@@ -285,6 +296,15 @@ impl Workspace {
 
   fn show_todo_editor(&mut self, _: &ShowTodoEditor, window: &mut Window, cx: &mut Context<Self>) {
     self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
+  }
+
+  fn show_reply_viewer(
+    &mut self,
+    _: &ShowReplyViewer,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.set_active_pane_view(PaneContentKind::ReplyViewer, window, cx);
   }
 
   fn even_split(&mut self, _: &EvenSplit, _window: &mut Window, cx: &mut Context<Self>) {
@@ -354,6 +374,10 @@ impl Workspace {
         let delegate = CodeSymbolPickerDelegate::new(self.code_view.clone(), cx);
         self.show_picker(delegate, window, cx);
       }
+      Some(PaneContentKind::ReplyViewer) => {
+        let delegate = ReplyHeadingPickerDelegate::new(self.reply_view.clone(), cx);
+        self.show_picker(delegate, window, cx);
+      }
       _ => {}
     }
   }
@@ -375,8 +399,17 @@ impl Workspace {
     if self.active_picker.is_some() {
       return;
     }
-    let delegate = GitLogPickerDelegate::new(self.diff_view.clone(), cx);
-    self.show_picker_with_confirm(delegate, Some(PaneContentKind::GitDiff), window, cx);
+
+    let pane = self.active_pane_entity().clone();
+    let kind = pane.read(cx).content_kind();
+
+    if kind == Some(PaneContentKind::ReplyViewer) {
+      let delegate = ReplyTurnPickerDelegate::new(self.reply_view.clone(), cx);
+      self.show_picker(delegate, window, cx);
+    } else {
+      let delegate = GitLogPickerDelegate::new(self.diff_view.clone(), cx);
+      self.show_picker_with_confirm(delegate, Some(PaneContentKind::GitDiff), window, cx);
+    }
   }
 
   /// Show a picker, switching to `switch_pane` on confirm if provided.
@@ -462,6 +495,10 @@ impl Workspace {
         } else {
           format!("Diff [{source_label}] ({reviewed}/{total})")
         }
+      }
+      Some(PaneContentKind::ReplyViewer) => {
+        let label = self.reply_view.read(cx).current_turn_label();
+        format!("Reply: {label}")
       }
       Some(kind) => kind.label().to_string(),
       None => "Empty".to_string(),
@@ -556,6 +593,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::show_git_diff))
       .on_action(cx.listener(Self::show_code_viewer))
       .on_action(cx.listener(Self::show_todo_editor))
+      .on_action(cx.listener(Self::show_reply_viewer))
       .on_action(cx.listener(Self::open_in_external_editor))
       .on_action(cx.listener(Self::open_file_picker))
       .on_action(cx.listener(Self::open_context_picker))
@@ -600,6 +638,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-3", ShowGitDiff, Some("Workspace")),
     KeyBinding::new("cmd-4", ShowCodeViewer, Some("Workspace")),
     KeyBinding::new("cmd-5", ShowTodoEditor, Some("Workspace")),
+    KeyBinding::new("cmd-6", ShowReplyViewer, Some("Workspace")),
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
     KeyBinding::new("cmd-|", EvenSplit, Some("Workspace")),
     KeyBinding::new("cmd-shift-o", OpenGitLogPicker, Some("Workspace")),

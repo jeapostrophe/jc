@@ -32,12 +32,12 @@ data/
   light_theme.toml                  # unified light theme: terminal palette, UI chrome, syntax (Tomorrow)
   fonts/                            # bundled Lilex font (Regular, Bold, Italic, BoldItalic)
 jc-core/                            # data model + config persistence
-  src/lib.rs, config.rs, model.rs, theme.rs
+  src/lib.rs, config.rs, model.rs, session.rs, theme.rs
 jc-terminal/                        # embedded terminal emulator
   src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
   examples/terminal_window.rs
 jc-app/                             # binary: CLI + GPUI app
-  src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view}.rs
+  src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view,reply_view}.rs
   src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
   examples/basic_window.rs
 ```
@@ -59,9 +59,11 @@ A project corresponds to a code repository. The app tracks active projects in `~
 ### Tasks
 
 Each project has one or more tasks. A task represents a unit of work being done, sharing the project's main working tree. Git worktree support (giving each task its own isolated tree) is planned for later. Each task has:
-- A Claude Code session (terminal)
+- A Claude Code session (terminal), bound to a specific `session_id`
 - A general-purpose terminal
 - Access to the shared project TODO.md
+
+Each task always has a `session_id` linking it to a Claude Code session JSONL file in `~/.claude/projects/<encoded-path>/`. When a project is first added to jc, the most recent session is automatically adopted. If no sessions exist, Claude Code is launched fresh and the resulting session is discovered. When Claude Code is launched in the terminal, it resumes the task's bound session via `--resume`. Creating additional tasks (future work) will present a picker with existing sessions and a "new" option.
 
 ### TODO.md
 
@@ -92,7 +94,7 @@ From any view (diff, terminal, code, reply), the user can press a comment keybin
 
 - **From diff or code view:** `* <file>:<start_line>-<end_line> --- Comment text`
 - **From terminal:** `* TERMINAL\n\`\`\`\n[selected content]\n\`\`\`\nComment text`
-- **From a Claude reply:** `* ./reply/<id>.md:<line> --- Comment text`
+- **From a Claude reply:** `* .jc/replies/<turn_file>.md:<line> --- Comment text`
 
 ## Views & Panels
 
@@ -126,7 +128,29 @@ Syntax-highlighted source viewer with light editing capability (not a full edito
 
 ### Claude Reply Viewer
 
-When Claude produces a long response, a keybinding extracts it from the session JSONL transcript (`~/.claude/projects/.../<session>.jsonl`) and writes the Markdown result to a temporary file (`./reply/<id>.md`). The user scrolls through it and can annotate inline. Modifications are tracked and written as comments into TODO.md.
+Reads the task's Claude Code session JSONL file (`~/.claude/projects/<encoded-path>/<session-id>.jsonl`) and presents the conversation as a sequence of **turns**. A turn groups a user request with all subsequent messages (assistant responses, tool use, thinking) until the next user request.
+
+Each turn is rendered as a Markdown document with headings for each message type. Initially only `text` content blocks are rendered:
+
+```markdown
+# Request
+<user message text>
+
+# Reply
+<assistant text content>
+```
+
+Full conversation rendering (tool use summaries, thinking blocks as additional headings) is planned as future work.
+
+This rendering approach means Cmd-T (context picker) works automatically via tree-sitter markdown heading queries, and the existing comment keybinding can annotate any region.
+
+When a turn is viewed, its rendered Markdown is written to `.jc/replies/<turn_file>.md` in the project directory (gitignored). Comments reference this file path so Claude can read the file to understand the context. These files are written automatically --- no manual extraction step.
+
+Navigation:
+- **Cmd-Shift-O** opens a turn picker (newest first) showing the user's request text as a preview
+- **Cmd-T** picks headings within the current turn
+
+The view monitors the JSONL file for changes and reloads when updated (e.g., while Claude is working). JSONL files are append-only so even large sessions (multi-MB) reload quickly.
 
 ## Status & Usage Tracking
 
@@ -175,7 +199,7 @@ It is deliberately *not* a full code editor on mobile.
 | Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff` for word-level highlighting |
 | Git worktrees | `git2` worktree API (create/list/prune) |
 | Claude idle detection | Claude Code hooks system (HTTP endpoint) + BEL detection (if emitted) + silence heuristic fallback |
-| Claude reply capture | Read session JSONL from `~/.claude/projects/` (replaces fragile `/copy` approach) |
+| Claude reply viewer | Parse session JSONL from `~/.claude/projects/`, group into turns, render as Markdown in read-only editor |
 | Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
 | Persistent state | `~/.config/jc/` --- project list, task state, window layout |
 | Mobile server | `axum` + `axum-server` (tls-rustls) + `rcgen` (self-signed certs) |
@@ -193,7 +217,7 @@ It is deliberately *not* a full code editor on mobile.
 4. Highlight a region (with mouse or keybindings) in the diff, press the comment key, type a note. It appears in TODO.md under `### WAIT`.
 5. Mark reviewed files as done (they collapse).
 6. Switch to the general terminal to run tests or inspect behavior. Highlight output, press comment key.
-7. If Claude's textual response was long, press a key to extract it from the session JSONL transcript into a reply file. Scroll and annotate.
+7. Switch to the reply viewer (Cmd-6). Use Cmd-Shift-O to pick a turn. Scroll through the rendered conversation and annotate.
 
 ### Navigating Code
 
@@ -290,15 +314,19 @@ It is deliberately *not* a full code editor on mobile.
 
 **Known issues:** `idle_prompt` fires after EVERY response, not just genuine wait states (bug tracked in Claude Code issues). The `Stop` hook is more reliable.
 
-### Claude Reply Capture
+### Claude Reply Viewer
 
-**Verdict: Read session JSONL files.** The `/copy` approach is fragile (interactive picker for code blocks, clipboard race conditions). Better alternatives:
+**Verdict: Read session JSONL files directly.** No extraction step needed --- render in-app from the JSONL source of truth.
 
-**Primary:** Claude Code persists all conversations to `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`. Each line is a JSON object with types `user`, `assistant`, `tool_use`, `tool_result`. Extract the latest assistant message(s) and write as Markdown to `./reply/<id>.md`.
+**JSONL format:** Claude Code persists all conversations to `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`. Each line is a JSON object with a `type` field (`user`, `assistant`, `file-history-snapshot`, etc.). Messages link via `parentUuid`/`uuid` fields. Assistant messages contain content block arrays with `type: "text"`, `type: "thinking"`, and tool use blocks.
+
+**Turn grouping:** A turn = one `user` message + all subsequent non-user messages until the next `user` message. This groups the request with all of Claude's responses, tool calls, and thinking into a single reviewable unit.
 
 **Path encoding:** Slashes become hyphens, e.g., `/Users/jay/Dev/project` becomes `-Users-jay-Dev-project`.
 
-**Alternative considered:** Agent SDK provides structured streaming output, but we chose to run the real Claude Code CLI for upstream improvements.
+**Session discovery:** List `.jsonl` files in the encoded-path directory, sort by modification time, adopt the most recent. Sessions are bound to tasks via `session_id` in the persisted state.
+
+**Performance:** JSONL files are append-only. A long session might be a few MB. Full re-read on file change is well under 100ms. File watching via `notify` (same as CodeView) detects updates while Claude is working.
 
 ### TLS Server (Mobile Connection)
 
@@ -368,8 +396,11 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
 - [x] [E] Run Claude Code inside the embedded terminal dedicated to Claude
 - [x] [E] Fix the working directory of the terminals
-- [ ] [H] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
-- [ ] [H] Show old replies and plans as well. Provide a picker to scroll through to view. (Ctrl-Shift-O)
+- [ ] [D] Claude appears to create new session_ids "behind the scenes" when it enters and leaves planning mode
+- [ ] [E] Add `session_id` to Task model and persist in `state.toml`
+- [ ] [D] Consider having session state inside of TODO.md rather than having "Task 1"/etc
+- [ ] [E] Implement session discovery: find most recent JSONL in `~/.claude/projects/<encoded-path>/` on project init
+- [ ] [E] Invoke Claude Code with `--resume <session-id>` using the task's bound session
 
 ### TODO.md System
 - [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
@@ -385,6 +416,15 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
 
+### Claude Reply Viewer
+- [ ] [E] Receive session assignment from Task layer
+- [x] [H] Implement JSONL session parser in `jc-core` (parse messages, group into turns)
+- [x] [H] Implement ReplyView (render a turn as Markdown in read-only editor, Cmd-6)
+- [x] [E] Implement turn picker (Cmd-Shift-O, newest first, shows request text as preview)
+- [x] [E] Implement Cmd-T heading picker within rendered turns
+- [x] [E] File watching for JSONL changes (reload turns on update)
+- [ ] [H] Full conversation rendering: tool use summaries, thinking blocks as additional headings
+
 ### Git Diff View
 - [x] Render git diff via `git2` with `tree-sitter` syntax-aware highlighting
 - [ ] [H] Add word-level inline highlighting via `similar` with background highlights NOT diagnostics
@@ -392,7 +432,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [H] Implement per-file "mark as reviewed" with collapses
 - [x] [E] Annotate which files have been "marked" in the git diff picker
 - [x] [H] Show one file at a time rather than raw multi-file output
-- [ ] [H] Implement region selection and comment keybinding [should be sensitive to what diff is shown]
+- [ ] [H] Implement region selection and comment keybinding [should be sensitive to what diff (checksum) is shown]
 - [x] [H] Show git log as well to look at older diffs. Provide a picker to scroll through to view. (Cmd-Shift-O)
 - [x] [H] Implement language syntax highlighting inside of diffs
 
@@ -404,7 +444,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
 - [x] [E] Fix focus to center the target in the middle of the screen
 - [x] [E] Word wrapping lines to fix the length of lines
-- [ ] [D] Implement light editing (basic text modification, not full editor)
+- [ ] [D] Implement light editing (basic text modification, not full editor; mostly for inserting comments into documents)
 
 ### Window & Pane Management
 - [x] Fix: Window doesn't get focused on creation
@@ -418,7 +458,6 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Change the size of the split with a keybinding to make even split (Cmd-|)
 - [x] [E] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
 - [x] [T] Move default theme file to 'data' directory rather than embedding defaults in source
-- [ ] [E] Implement view switching for reply view
 - [ ] [E] Implement independent scroll positions per pane
 - [x] [D] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting
 - [x] [E] Add a light theme (Tomorrow palette in `light_theme.toml`)
@@ -439,6 +478,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
 - [x] [H] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
+- [ ] [E] Implement general searching in all views
 
 ### Notifications & Status
 - [x] Implement Claude usage algorithm
@@ -449,6 +489,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] [E] Implement in-app status bar showing waiting tasks (driven by hook events)
+- [ ] [E] Jump to next waiting task keybinding
 - [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Task")
 
 ### Mobile App
@@ -470,5 +511,6 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
 - [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
+- [ ] [E] Garbage collect stale `.jc/replies/` files (e.g., on app startup, prune files older than N days)
 
 ### Unsorted

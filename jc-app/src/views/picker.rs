@@ -8,6 +8,7 @@ use crate::language::Language;
 use crate::outline::{OutlineItem, compute_outline};
 use crate::views::code_view::CodeView;
 use crate::views::diff_view::{DiffSource, DiffView, GitLogEntry, git_log};
+use crate::views::reply_view::ReplyView;
 use crate::views::todo_view::TodoView;
 
 actions!(
@@ -659,4 +660,77 @@ fn list_project_files_and_modified(path: &Path) -> (Vec<String>, HashSet<String>
     .unwrap_or_default();
 
   (files, modified)
+}
+
+// ---------------------------------------------------------------------------
+// ReplyTurnPickerDelegate
+// ---------------------------------------------------------------------------
+
+pub struct ReplyTurnPickerDelegate {
+  labels: Vec<String>,
+  /// Chronological turn indices corresponding to each label (newest first).
+  turn_indices: Vec<usize>,
+  reply_view: Entity<ReplyView>,
+}
+
+impl ReplyTurnPickerDelegate {
+  pub fn new(reply_view: Entity<ReplyView>, cx: &App) -> Self {
+    let rv = reply_view.read(cx);
+    let turns = rv.turns();
+    let mut labels = Vec::with_capacity(turns.len());
+    let mut turn_indices = Vec::with_capacity(turns.len());
+
+    // Newest first.
+    for turn in turns.iter().rev() {
+      labels.push(format!("Turn {}: {}", turn.index + 1, turn.label()));
+      turn_indices.push(turn.index);
+    }
+
+    Self { labels, turn_indices, reply_view }
+  }
+}
+
+impl PickerDelegate for ReplyTurnPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
+    let turn_index = self.turn_indices[index];
+    self.reply_view.update(cx, |v, cx| v.set_turn_index(turn_index, window, cx));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ReplyHeadingPickerDelegate
+// ---------------------------------------------------------------------------
+
+pub struct ReplyHeadingPickerDelegate {
+  labels: Vec<String>,
+  outline: Vec<OutlineItem>,
+  reply_view: Entity<ReplyView>,
+}
+
+impl ReplyHeadingPickerDelegate {
+  pub fn new(reply_view: Entity<ReplyView>, cx: &App) -> Self {
+    let text = reply_view.read(cx).editor_text(cx);
+    let outline = compute_outline(&text, Language::Markdown);
+    let labels = outline_labels(&outline);
+    Self { labels, outline, reply_view }
+  }
+}
+
+impl PickerDelegate for ReplyHeadingPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
+    let line = self.outline[index].line;
+    self.reply_view.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+  }
+
+  fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
+    hierarchy_preserving_filter(&self.outline, &self.labels, query_lower)
+  }
 }

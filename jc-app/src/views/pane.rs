@@ -8,6 +8,7 @@ pub enum PaneContentKind {
   GitDiff,
   CodeViewer,
   TodoEditor,
+  ReplyViewer,
 }
 
 impl PaneContentKind {
@@ -18,6 +19,7 @@ impl PaneContentKind {
       Self::GitDiff => "Diff",
       Self::CodeViewer => "Code",
       Self::TodoEditor => "TODO",
+      Self::ReplyViewer => "Reply",
     }
   }
 }
