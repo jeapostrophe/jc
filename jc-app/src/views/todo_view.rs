@@ -1,6 +1,5 @@
 use crate::language::Language;
 use gpui::*;
-use gpui_component::ActiveTheme;
 use gpui_component::RopeExt;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -197,21 +196,6 @@ impl Render for TodoView {
       self.load(window, cx);
     }
 
-    let theme = cx.theme();
-
-    let notification = if self.externally_modified {
-      div()
-        .px_2()
-        .py_1()
-        .bg(theme.warning)
-        .text_sm()
-        .text_color(theme.warning_foreground)
-        .child("File changed on disk \u{2014} press Cmd-R to reload")
-        .into_any_element()
-    } else {
-      div().into_any_element()
-    };
-
     div()
       .id("todo-view")
       .key_context("TodoView")
@@ -219,7 +203,7 @@ impl Render for TodoView {
       .size_full()
       .font_family("Lilex")
       .on_action(cx.listener(Self::reload_from_disk))
-      .child(notification)
+      .child(super::external_change_banner(self.externally_modified, cx))
       .child(Input::new(&self.editor).h_full().appearance(false).bordered(false))
   }
 }

@@ -1,7 +1,7 @@
 use crate::colors::Palette;
 use crate::input::keystroke_to_bytes;
 use crate::pty::PtyHandle;
-use crate::render::{CellLayout, measure_cell, paint_terminal};
+use crate::render::{CellLayout, TerminalRenderState, measure_cell, paint_terminal};
 use crate::terminal::TerminalState;
 use gpui::{
   App, AsyncApp, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -68,6 +68,8 @@ pub struct TerminalView {
   focus: FocusHandle,
   last_size: Arc<Mutex<(u16, u16)>>,
   cursor_visible: bool,
+  cached_layout: Option<CellLayout>,
+  was_focused: bool,
 }
 
 impl TerminalView {
@@ -81,7 +83,7 @@ impl TerminalView {
     let rows = config.initial_rows;
 
     let (bytes_tx, bytes_rx) = flume::unbounded::<Vec<u8>>();
-    let (event_tx, _event_rx) = flume::unbounded();
+    let (event_tx, event_rx) = flume::unbounded();
 
     let state = TerminalState::new(cols as usize, rows as usize, event_tx);
 
@@ -113,7 +115,13 @@ impl TerminalView {
 
     // Async task: receive bytes -> process -> notify GPUI
     let term_handle = state.term_handle();
+    let pty_for_write = pty.clone();
     cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+      // Persistent processor retains state for escape sequences spanning reads.
+      let mut processor = alacritty_terminal::vte::ansi::Processor::<
+        alacritty_terminal::vte::ansi::StdSyncHandler,
+      >::default();
+
       while let Ok(bytes) = bytes_rx.recv_async().await {
         let mut all_bytes = bytes;
         while let Ok(more) = bytes_rx.try_recv() {
@@ -121,10 +129,13 @@ impl TerminalView {
         }
         {
           let mut term = term_handle.lock();
-          let mut processor = alacritty_terminal::vte::ansi::Processor::<
-            alacritty_terminal::vte::ansi::StdSyncHandler,
-          >::default();
           processor.advance(&mut *term, &all_bytes);
+        }
+        // Handle terminal events (PtyWrite for DSR responses, etc.)
+        while let Ok(event) = event_rx.try_recv() {
+          if let crate::terminal::TerminalEvent::PtyWrite(s) = event {
+            let _ = pty_for_write.write_all(s.as_bytes());
+          }
         }
         let _ = cx.update(|cx: &mut App| {
           if let Some(entity) = this.upgrade() {
@@ -135,15 +146,17 @@ impl TerminalView {
     })
     .detach();
 
-    // Cursor blink timer
+    // Cursor blink timer — only toggles and notifies when focused.
     cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
       loop {
         Timer::after(CURSOR_BLINK_INTERVAL).await;
         let Ok(should_continue) = cx.update(|cx: &mut App| {
           if let Some(entity) = this.upgrade() {
             entity.update(cx, |view, cx| {
-              view.cursor_visible = !view.cursor_visible;
-              cx.notify();
+              if view.was_focused {
+                view.cursor_visible = !view.cursor_visible;
+                cx.notify();
+              }
             });
             true
           } else {
@@ -171,6 +184,8 @@ impl TerminalView {
       focus: cx.focus_handle(),
       last_size: Arc::new(Mutex::new((cols, rows))),
       cursor_visible: true,
+      cached_layout: None,
+      was_focused: false,
     }
   }
 
@@ -191,6 +206,7 @@ impl TerminalView {
   ) {
     let new_size = self.config.font_size + FONT_SIZE_STEP;
     self.config.font_size = new_size.min(FONT_SIZE_MAX);
+    self.cached_layout = None;
     cx.notify();
   }
 
@@ -202,11 +218,13 @@ impl TerminalView {
   ) {
     let new_size = self.config.font_size - FONT_SIZE_STEP;
     self.config.font_size = new_size.max(FONT_SIZE_MIN);
+    self.cached_layout = None;
     cx.notify();
   }
 
   fn reset_font_size(&mut self, _: &ResetFontSize, _window: &mut Window, cx: &mut Context<Self>) {
     self.config.font_size = self.default_font_size;
+    self.cached_layout = None;
     cx.notify();
   }
 }
@@ -225,7 +243,13 @@ impl Render for TerminalView {
     let palette_fg = self.palette.foreground;
     let palette_bg = self.palette.background;
     let focused = self.focus.is_focused(window);
+    self.was_focused = focused;
     let cursor_visible = self.cursor_visible;
+
+    // Cache cell layout — only re-measure when font config changes.
+    let layout = *self
+      .cached_layout
+      .get_or_insert_with(|| measure_cell(&font_family, font_size, line_height, window));
 
     div()
       .id("terminal")
@@ -250,8 +274,7 @@ impl Render for TerminalView {
       .child(canvas(
         {
           let font_family = font_family.clone();
-          move |bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
-            let layout = measure_cell(&font_family, font_size, line_height, window);
+          move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
             (bounds, layout, font_family)
           }
         },
@@ -281,19 +304,15 @@ impl Render for TerminalView {
             }
             drop(last);
 
-            paint_terminal(
-              &term,
-              prep_bounds,
-              layout,
-              &palette,
-              &font_family,
+            let render_state = TerminalRenderState {
+              palette: &palette,
+              font_family: &font_family,
               font_size,
               line_height,
               focused,
               cursor_visible,
-              window,
-              cx,
-            );
+            };
+            paint_terminal(&term, prep_bounds, layout, &render_state, window, cx);
           }
         },
       ))

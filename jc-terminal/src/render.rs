@@ -46,18 +46,22 @@ pub fn measure_cell(
   CellLayout { width, height }
 }
 
+/// Rendering parameters for a terminal paint pass.
+pub struct TerminalRenderState<'a> {
+  pub palette: &'a Palette,
+  pub font_family: &'a SharedString,
+  pub font_size: Pixels,
+  pub line_height: f32,
+  pub focused: bool,
+  pub cursor_visible: bool,
+}
+
 /// Paint the terminal grid onto a GPUI canvas.
-#[allow(clippy::too_many_arguments)]
 pub fn paint_terminal(
   term: &Term<EventProxy>,
   bounds: Bounds<Pixels>,
   layout: CellLayout,
-  palette: &Palette,
-  font_family: &SharedString,
-  font_size: Pixels,
-  line_height: f32,
-  focused: bool,
-  cursor_visible: bool,
+  state: &TerminalRenderState<'_>,
   window: &mut Window,
   cx: &mut App,
 ) {
@@ -67,6 +71,10 @@ pub fn paint_terminal(
   let cursor = term.grid().cursor.point;
   let cursor_shape = term.cursor_style().shape;
   let show_cursor = term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
+
+  let palette = state.palette;
+  let font_size = state.font_size;
+  let line_height = state.line_height;
 
   let origin = bounds.origin;
   let line_height_px = font_size * line_height;
@@ -104,7 +112,7 @@ pub fn paint_terminal(
       let style =
         if cell.flags.contains(Flags::ITALIC) { FontStyle::Italic } else { FontStyle::Normal };
 
-      let mut f = font(font_family.clone());
+      let mut f = font(state.font_family.clone());
       f.weight = weight;
       f.style = style;
 
@@ -140,7 +148,7 @@ pub fn paint_terminal(
     let y = origin.y + layout.height * cursor.line.0 as f32;
     let cursor_bounds = Bounds::new(point(x, y), size(layout.width, layout.height));
 
-    if !focused {
+    if !state.focused {
       // Unfocused: hollow rectangle outline
       let border = px(1.0);
       // Top edge
@@ -157,7 +165,7 @@ pub fn paint_terminal(
         Bounds::new(point(x + layout.width - border, y), size(border, layout.height)),
         cursor_color,
       ));
-    } else if cursor_visible {
+    } else if state.cursor_visible {
       // Focused + visible blink phase: solid cursor
       match cursor_shape {
         CursorShape::Block => {

@@ -22,6 +22,15 @@ pub struct AppState {
 }
 
 impl AppState {
+  /// The path of the first registered project, falling back to the current directory.
+  pub fn project_path(&self) -> PathBuf {
+    self
+      .projects
+      .first()
+      .map(|p| p.path.clone())
+      .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+  }
+
   /// Find or create a project for the given path. Returns a mutable
   /// reference to the existing project if already registered.
   pub fn register_project(&mut self, path: &Path) -> &mut Project {
@@ -81,12 +90,17 @@ pub fn load_config() -> Result<AppConfig> {
   load_toml(&config_path())
 }
 
-pub fn save_config(config: &AppConfig) -> Result<()> {
+fn save_toml<T: Serialize>(filename: &str, value: &T) -> Result<()> {
   let dir = ensure_config_dir()?;
-  let path = dir.join("config.toml");
-  let contents = toml::to_string_pretty(config).context("failed to serialize config")?;
+  let path = dir.join(filename);
+  let contents =
+    toml::to_string_pretty(value).with_context(|| format!("failed to serialize {filename}"))?;
   fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
   Ok(())
+}
+
+pub fn save_config(config: &AppConfig) -> Result<()> {
+  save_toml("config.toml", config)
 }
 
 pub fn load_state() -> Result<AppState> {
@@ -94,9 +108,5 @@ pub fn load_state() -> Result<AppState> {
 }
 
 pub fn save_state(state: &AppState) -> Result<()> {
-  let dir = ensure_config_dir()?;
-  let path = dir.join("state.toml");
-  let contents = toml::to_string_pretty(state).context("failed to serialize state")?;
-  fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
-  Ok(())
+  save_toml("state.toml", state)
 }

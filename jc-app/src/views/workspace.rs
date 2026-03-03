@@ -78,11 +78,7 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> Self {
-    let project_path = state
-      .projects
-      .first()
-      .map(|p| p.path.clone())
-      .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let project_path = state.project_path();
 
     // Detect the current system appearance and pick the right terminal palette.
     let appearance = appearance_from_window(window.appearance());
@@ -189,12 +185,7 @@ impl Workspace {
   }
 
   fn project_path(&self) -> PathBuf {
-    self
-      .state
-      .projects
-      .first()
-      .map(|p| p.path.clone())
-      .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+    self.state.project_path()
   }
 
   fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _cx: &mut Context<Self>) {

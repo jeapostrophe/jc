@@ -107,11 +107,7 @@ impl DiffView {
   }
 
   pub fn is_reviewed(&self, name: &str) -> bool {
-    if let Some(&stored_checksum) = self.reviewed.get(name) {
-      self.file_diffs.iter().any(|fd| fd.name == name && fd.checksum == stored_checksum)
-    } else {
-      false
-    }
+    self.reviewed.contains_key(name)
   }
 
   pub fn current_file_name(&self) -> Option<&str> {
@@ -193,11 +189,10 @@ fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
       // Flush previous file diff.
       if let Some(name) = current_name.take() {
         let checksum = compute_checksum(&current_content);
-        diffs.push(FileDiff { name, content: current_content.clone(), checksum });
+        diffs.push(FileDiff { name, content: std::mem::take(&mut current_content), checksum });
       }
       let name = rest.split(" b/").next().unwrap_or(rest).to_string();
       current_name = Some(name);
-      current_content.clear();
       current_content.push_str(line);
       current_content.push('\n');
     } else {

@@ -270,8 +270,7 @@ impl FilePickerDelegate {
     code_view: Entity<CodeView>,
     recent_files: Vec<PathBuf>,
   ) -> Self {
-    let files = list_project_files(&project_path);
-    let modified_files = list_modified_files(&project_path);
+    let (files, modified_files) = list_project_files_and_modified(&project_path);
 
     // Map recent_files (absolute paths) to indices in the files list.
     let recent_indices: Vec<usize> = recent_files
@@ -536,40 +535,41 @@ fn hierarchy_preserving_filter(
 // File listing via git index
 // ---------------------------------------------------------------------------
 
-fn list_project_files(path: &Path) -> Vec<String> {
+/// List tracked files and modified files from a single repo open.
+fn list_project_files_and_modified(path: &Path) -> (Vec<String>, HashSet<String>) {
   let Ok(repo) = git2::Repository::open(path) else {
-    return Vec::new();
+    return (Vec::new(), HashSet::new());
   };
-  let Ok(index) = repo.index() else {
-    return Vec::new();
-  };
-  index.iter().filter_map(|entry| String::from_utf8(entry.path.clone()).ok()).collect()
-}
 
-/// Return the set of file paths (relative to the repo root) that are modified
-/// in the working tree or the index compared to HEAD.
-fn list_modified_files(path: &Path) -> HashSet<String> {
-  let Ok(repo) = git2::Repository::open(path) else {
-    return HashSet::new();
-  };
+  let files = repo
+    .index()
+    .ok()
+    .map(|index| {
+      index.iter().filter_map(|entry| String::from_utf8(entry.path.clone()).ok()).collect()
+    })
+    .unwrap_or_default();
 
   let mut opts = git2::StatusOptions::default();
   opts.include_untracked(true).recurse_untracked_dirs(true);
 
-  let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
-    return HashSet::new();
-  };
-
-  statuses
-    .iter()
-    .filter_map(|entry| {
-      let status = entry.status();
-      let dominated_by_clean =
-        status.is_empty() || status == git2::Status::IGNORED || status == git2::Status::CURRENT;
-      if dominated_by_clean {
-        return None;
-      }
-      entry.path().map(|p| p.to_string())
+  let modified = repo
+    .statuses(Some(&mut opts))
+    .ok()
+    .map(|statuses| {
+      statuses
+        .iter()
+        .filter_map(|entry| {
+          let status = entry.status();
+          let dominated_by_clean =
+            status.is_empty() || status == git2::Status::IGNORED || status == git2::Status::CURRENT;
+          if dominated_by_clean {
+            return None;
+          }
+          entry.path().map(|p| p.to_string())
+        })
+        .collect()
     })
-    .collect()
+    .unwrap_or_default();
+
+  (files, modified)
 }
