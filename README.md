@@ -1,6 +1,6 @@
 # jc
 
-A native macOS Rust application for orchestrating multiple Claude Code sessions across projects. It provides a keyboard-driven workflow for managing tasks, reviewing diffs, annotating code, and sending instructions to Claude --- all from a single app.
+A native macOS Rust application for orchestrating multiple Claude Code sessions across projects. It provides a keyboard-driven workflow for managing sessions, reviewing diffs, annotating code, and sending instructions to Claude --- all from a single app.
 
 ## Getting Started
 
@@ -56,31 +56,38 @@ jc-app/                             # binary: CLI + GPUI app
 
 A project corresponds to a code repository. The app tracks active projects in `~/.config/jc/`. Projects are added via an in-app command or from the command line with `jc .`.
 
-### Tasks
+### Sessions
 
-Each project has one or more tasks. A task represents a unit of work being done, sharing the project's main working tree. Git worktree support (giving each task its own isolated tree) is planned for later. Each task has:
-- A Claude Code session (terminal), bound to a specific `session_slug`
+Each project has one or more sessions. A session represents an ongoing Claude Code conversation, identified by a **slug** --- a human-readable identifier assigned by Claude Code (e.g., `"encapsulated-swimming-firefly"`). Sessions are defined in the project's TODO.md file via `## Session <slug>: <label>` headings. Each session has:
+- A Claude Code terminal, resumed via `--resume` using the most recent JSONL file UUID from the slug group
 - A general-purpose terminal
-- Access to the shared project TODO.md
+- Its own message history and notes within TODO.md
 
-Each task has a `session_slug` linking it to a group of Claude Code session JSONL files in `~/.claude/projects/<encoded-path>/`. Claude Code assigns each session a human-readable slug (e.g., `"encapsulated-swimming-firefly"`). When Claude forks a session (e.g., transitioning from planning to execution, or after `/clear` + resume), the new JSONL file shares the same slug as the original. This makes the slug a stable identifier across forks, unlike `session_id` which changes on each fork.
+The slug links a session to a group of Claude Code JSONL files in `~/.claude/projects/<encoded-path>/`. When Claude forks a session (e.g., transitioning from planning to execution, or after `/clear` + resume), the new JSONL file shares the same slug as the original. This makes the slug a stable identifier across forks, unlike `session_id` which changes on each fork.
 
 **Session forking mechanism:** When Claude forks, it creates a new JSONL file. The first `user` entry has `sessionId` set to the **parent** session's ID and `parentUuid` pointing to a message UUID in the parent file (the fork point). Subsequent entries use the new file's own `sessionId`. All entries share the same `slug`.
 
-When a project is first added to jc, the most recent session's slug is automatically adopted. If no sessions exist, Claude Code is launched fresh and the resulting session is discovered. To find all JSONL files for a slug, scan the session directory and match on the `slug` field. The most recently modified file in the group is the "active" one. When Claude Code is launched in the terminal, it resumes using `--resume` with the most recent session file's UUID from the slug group. Creating additional tasks (future work) will present a picker with existing slugs and a "new" option.
+**State model:** `state.toml` holds only a project registry (list of project paths). All session state is derived from TODO.md files. When the user picks between projects and sessions, the picker reads `## Session` headings from each project's TODO.md.
+
+**Creating sessions:** Slugs are assigned by Claude Code, not invented by the user. The app creates sessions programmatically:
+- **Project init:** When a project is first added to jc, the app scans for existing JSONL files. If any exist, the most recent session's slug is adopted and a `## Session` heading is written into TODO.md. If none exist, the app launches Claude Code fresh, waits for the JSONL file to appear, extracts the slug, and writes the heading.
+- **New session:** From the picker, the user selects "New session." The app launches a fresh Claude Code instance, discovers the resulting slug from the new JSONL file, and inserts a `## Session <slug>: <label>` heading into TODO.md (prompting for a label).
+- **Adopt existing:** The picker also lists discovered slugs from the JSONL directory that aren't yet in TODO.md, so the user can adopt an orphaned or external session.
+
+To find all JSONL files for a slug, scan the session directory and match on the `slug` field. The most recently modified file in the group is the "active" one.
 
 ### TODO.md
 
-Each project has a single TODO.md file shared across all its tasks. The app is the sole writer; if the file changes on disk, the app detects it and shows a visual indicator (with optional git-style merge).
+Each project has a single TODO.md file. The app is the sole writer; if the file changes on disk, the app detects it and shows a visual indicator (with optional git-style merge).
 
-The format tracks messages sent to each agent:
+The file serves dual purposes: freeform project notes and session state. Sessions are defined by `## Session` headings under `# Claude`:
 
 ```markdown
 # TODO
-(freeform notes, task planning)
+(freeform notes, project-level planning)
 
 # Claude
-## Agent 1
+## Session encapsulated-swimming-firefly: Refactor auth module
 ### Message 0
 first instruction sent to claude
 ### Message 1
@@ -92,9 +99,11 @@ These become the basis for the next message.
 
 The `### WAIT` marker separates what has been sent from what is being drafted. When the user selects text above `### WAIT` and presses the send key, that text is wrapped in a new `### Message N` heading and sent to the Claude terminal. The `### WAIT` marker moves below it. Unselected text remains as future notes.
 
+The `## Session <slug>: <label>` heading format is parsed by the app. The slug portion must match a valid Claude Code session slug; the app highlights invalid slugs as errors. The label is a freeform description.
+
 ### Comment Format
 
-From any view (diff, terminal, code, reply), the user can press a comment keybinding to annotate a region. Comments are appended to the current agent's future notes (below `### WAIT`) in these formats:
+From any view (diff, terminal, code, reply), the user can press a comment keybinding to annotate a region. Comments are appended to the current session's future notes (below `### WAIT`) in these formats:
 
 - **From diff or code view:** `* <file>:<start_line>-<end_line> --- Comment text`
 - **From terminal:** `* TERMINAL\n\`\`\`\n[selected content]\n\`\`\`\nComment text`
@@ -104,7 +113,7 @@ From any view (diff, terminal, code, reply), the user can press a comment keybin
 
 The window has a **left pane** and a **right pane**. Any view can appear in either pane with independent scroll positions. A **Quake-style terminal** can be toggled at the bottom of the window via a keybinding for quick commands.
 
-Multiple windows can be open simultaneously. Windows share sessions: if two windows show the same task's Claude terminal, scrolling or changes in one are reflected in the other.
+Multiple windows can be open simultaneously. Windows share state: if two windows show the same session's Claude terminal, scrolling or changes in one are reflected in the other.
 
 ### Claude Terminal
 
@@ -112,7 +121,7 @@ The primary view. Shows the Claude Code CLI running in a terminal emulator. The 
 
 ### General Terminal
 
-A separate terminal per task for running arbitrary commands. Tied to the task's working directory (worktree or project root).
+A separate terminal per session for running arbitrary commands. Tied to the session's working directory (worktree or project root).
 
 ### TODO Editor
 
@@ -120,7 +129,7 @@ Source-mode Markdown editing with light rendering (bold, highlights, heading for
 
 ### Git Diff View
 
-Shows `git diff` output for the task's working tree. The user scrolls through changes, highlights regions to comment on, and marks files as reviewed (collapsing them). Comments flow into TODO.md. Should use syntax highlighting, but does not need to perform full LSP-style type annotation.
+Shows `git diff` output for the project's working tree. The user scrolls through changes, highlights regions to comment on, and marks files as reviewed (collapsing them). Comments flow into TODO.md. Should use syntax highlighting, but does not need to perform full LSP-style type annotation.
 
 ### Code Viewer
 
@@ -132,7 +141,7 @@ Syntax-highlighted source viewer with light editing capability (not a full edito
 
 ### Claude Reply Viewer
 
-Reads the task's Claude Code session JSONL file (`~/.claude/projects/<encoded-path>/<session-id>.jsonl`) and presents the conversation as a sequence of **turns**. A turn groups a user request with all subsequent messages (assistant responses, tool use, thinking) until the next user request.
+Reads the session's Claude Code JSONL files (`~/.claude/projects/<encoded-path>/<session-id>.jsonl`) and presents the conversation as a sequence of **turns**. A turn groups a user request with all subsequent messages (assistant responses, tool use, thinking) until the next user request.
 
 Each turn is rendered as a Markdown document with headings for each message type. Initially only `text` content blocks are rendered:
 
@@ -158,11 +167,11 @@ The view monitors the JSONL file for changes and reloads when updated (e.g., whi
 
 ## Status & Usage Tracking
 
-### Task Status Indicators
+### Session Status Indicators
 
-A persistent indicator shows which tasks have Claude responses waiting for review. The app detects "waiting" via Claude Code's hooks system (HTTP hooks fire on `Stop` and `Notification` events) with BEL character detection as a lightweight backup signal (if Claude Code emits it).
+A persistent indicator shows which sessions have Claude responses waiting for review. The app detects "waiting" via Claude Code's hooks system (HTTP hooks fire on `Stop` and `Notification` events) with BEL character detection as a lightweight backup signal (if Claude Code emits it).
 
-A fuzzy picker (keybinding) lets the user jump between projects and tasks. A modifier key filters to only waiting tasks or same-project tasks.
+A fuzzy picker (keybinding) lets the user jump between projects and sessions. A modifier key filters to only waiting sessions or same-project sessions.
 
 ### Claude Usage Dashboard
 
@@ -183,7 +192,7 @@ The desktop app displays a QR code embedding an auth key. The mobile app scans i
 ### Capabilities
 
 The mobile app is optimized for:
-- **Dashboard:** See project/task status, which tasks are waiting, usage stats
+- **Dashboard:** See project/session status, which sessions are waiting, usage stats
 - **Reviewing:** Read Claude responses and diffs (not optimized for code editing)
 - **Note-taking:** Add comments and notes to TODO.md
 - **Permissions:** Handle Claude permission requests (approve/deny tool use)
@@ -205,7 +214,7 @@ It is deliberately *not* a full code editor on mobile.
 | Claude idle detection | Claude Code hooks system (HTTP endpoint) + BEL detection (if emitted) + silence heuristic fallback |
 | Claude reply viewer | Parse session JSONL from `~/.claude/projects/`, group into turns, render as Markdown in read-only editor |
 | Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
-| Persistent state | `~/.config/jc/` --- project list, task state, window layout |
+| Persistent state | `~/.config/jc/` --- project registry, window layout; session state in TODO.md |
 | Mobile server | `axum` + `axum-server` (tls-rustls) + `rcgen` (self-signed certs) |
 | Mobile QR pairing | `fast_qr` (ECL Q, render as GPUI quads) |
 | Mobile app | Separate project (Swift/native iOS likely) |
@@ -238,11 +247,11 @@ It is deliberately *not* a full code editor on mobile.
 3. Select the text to send. Press the send keybinding.
 4. The selected text becomes `### Message N`, is sent to the Claude terminal, and `### WAIT` moves below it. Remaining unselected text stays as future notes.
 
-### Managing Projects and Tasks
+### Managing Projects and Sessions
 
-1. Add a project: run `jc .` from a repo, or use an in-app command.
-2. Create a task within a project. Choose whether it gets its own git worktree or shares the main tree.
-3. Use the fuzzy picker to switch between projects and tasks.
+1. Add a project: run `jc .` from a repo, or use an in-app command. The app discovers or creates a Claude Code session and writes the `## Session` heading into TODO.md.
+2. Create additional sessions from the picker ("New session" launches Claude Code, discovers the slug, inserts the heading). Or adopt an existing orphaned session.
+3. Use the fuzzy picker to switch between projects and sessions.
 
 ## Research Findings
 
@@ -290,13 +299,13 @@ It is deliberately *not* a full code editor on mobile.
 
 **Diff:** Full line-level diff API via `diff_tree_to_workdir_with_index()`. Supports unified, raw, name-only formats. Context lines, whitespace options, patience/minimal algorithms, rename detection all available. For **word-level inline highlighting** within changed lines, supplement with `similar` (ergonomic) or `imara-diff` (30x faster, used by Helix).
 
-**Worktrees:** Complete API --- create (`repo.worktree()`), list (`repo.worktrees()`), validate, lock/unlock, prune. Sufficient for our task management model.
+**Worktrees:** Complete API --- create (`repo.worktree()`), list (`repo.worktrees()`), validate, lock/unlock, prune. Sufficient for our session management model.
 
 **Shell out to git CLI for:** clone, fetch, gc, shallow clones, sparse checkout, hook execution. These operations are either unsupported or significantly slower in libgit2.
 
 ### macOS Notifications
 
-**Verdict: Use `objc2-user-notifications` (modern API).** Since the app will be a bundled `.app` anyway (required by GPUI/Metal), the code-signing requirement is not a burden. This gives us action buttons ("Switch to Task"), notification grouping via `threadIdentifier`, async delegate callbacks, and future-proofing (Apple's current API, not deprecated).
+**Verdict: Use `objc2-user-notifications` (modern API).** Since the app will be a bundled `.app` anyway (required by GPUI/Metal), the code-signing requirement is not a burden. This gives us action buttons ("Switch to Session"), notification grouping via `threadIdentifier`, async delegate callbacks, and future-proofing (Apple's current API, not deprecated).
 
 **Fallback:** `mac-notification-sys` v0.6.9 works today without code signing but uses deprecated `NSUserNotificationCenter`. Fine for prototyping.
 
@@ -330,7 +339,7 @@ It is deliberately *not* a full code editor on mobile.
 
 **Path encoding:** Slashes become hyphens, e.g., `/Users/jay/Dev/project` becomes `-Users-jay-Dev-project`.
 
-**Session discovery:** Scan `.jsonl` files in the encoded-path directory, extract the `slug` from each, and group files by slug. The slug of the most recently modified file becomes the default session for a new project. Sessions are bound to tasks via `session_slug` in the persisted state.
+**Session discovery:** Scan `.jsonl` files in the encoded-path directory, extract the `slug` from each, and group files by slug. The slug of the most recently modified file becomes the default session for a new project. Sessions are defined in TODO.md via `## Session <slug>: <label>` headings.
 
 **Performance:** JSONL files are append-only. A long session might be a few MB. Full re-read on file change is well under 100ms. File watching via `notify` (same as CodeView) detects updates while Claude is working.
 
@@ -403,10 +412,10 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Run Claude Code inside the embedded terminal dedicated to Claude
 - [x] [E] Fix the working directory of the terminals
 - [x] [D] ~~Claude appears to create new session_ids "behind the scenes" when it enters and leaves planning mode~~ Resolved: Claude forks sessions on mode transitions. All forks share the same `slug`. Use slug as stable identifier.
-- [ ] [E] Add `session_slug` to Task model and persist in `state.toml`
-- [ ] [D] Consider having session state inside of TODO.md rather than having "Task 1"/etc
+- [x] [D] ~~Add `session_slug` to Task model and persist in `state.toml`~~ Superseded: session state lives in TODO.md
+- [x] [D] ~~Consider having session state inside of TODO.md rather than having "Task 1"/etc~~ Resolved: sessions defined via `## Session <slug>: <label>` headings in TODO.md
 - [ ] [E] Implement session discovery by slug: scan JSONL files, extract slug, group by slug, adopt most recent slug on project init
-- [ ] [E] Invoke Claude Code with `--resume <session-id>` using the most recent file UUID from the task's slug group
+- [ ] [E] Invoke Claude Code with `--resume <session-id>` using the most recent file UUID from the session's slug group
 
 ### TODO.md System
 - [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
@@ -415,7 +424,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Fix focus to center the target in the middle of the screen
 - [x] [E] Word wrapping lines to fix the length of lines
 - [ ] [H] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
-- [ ] [H] Parse TODO.md format (agents, messages, WAIT markers)
+- [ ] [H] Parse TODO.md format (sessions, messages, WAIT markers)
 - [ ] [H] Build library for managing TODO.md representation (ropey-backed)
 - [ ] [H] Implement comment insertion from other views into the WAIT section
 - [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
@@ -423,7 +432,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
 
 ### Claude Reply Viewer
-- [ ] [E] Receive session slug assignment from Task layer; load turns from all JSONL files sharing the slug
+- [ ] [E] Read session slug from TODO.md; load turns from all JSONL files sharing the slug
 - [x] [H] Implement JSONL session parser in `jc-core` (parse messages, group into turns)
 - [x] [H] Implement ReplyView (render a turn as Markdown in read-only editor, Cmd-6)
 - [x] [E] Implement turn picker (Cmd-Shift-O, newest first, shows request text as preview)
@@ -483,7 +492,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Track most recently visited files and put them at the top of file picker
 - [x] [E] Track modified files (from git) and mark them in the file picker
 - [x] [E] Annotate which files are recently visited in file picker with an R.
-- [ ] [H] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
+- [ ] [H] Implement fuzzy project/session picker with filtering (waiting sessions, same project)
 - [x] [H] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 - [ ] [E] Implement general searching in all views
@@ -496,9 +505,9 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [E] Usage: projected remaining working hours at current burn rate
 - [ ] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
-- [ ] [E] Implement in-app status bar showing waiting tasks (driven by hook events)
-- [ ] [E] Jump to next waiting task keybinding
-- [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Task")
+- [ ] [E] Implement in-app status bar showing waiting sessions (driven by hook events)
+- [ ] [E] Jump to next waiting session keybinding
+- [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
 
 ### Mobile App
 - [ ] [D] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
@@ -515,7 +524,7 @@ It is deliberately *not* a full code editor on mobile.
 ### Polish & Integration
 - [x] [H] Reduce duplication between CodeView and TodoView (consider having TodoView wrap a CodeView)
 - [ ] [H] End-to-end test: full workflow from project creation to Claude review cycle
-- [ ] [H] Persistent state: survive app restart without losing task state or terminal sessions [perhaps use 'tmux' behind the scenes]
+- [ ] [H] Persistent state: survive app restart without losing session state or terminal sessions [perhaps use 'tmux' behind the scenes]
 - [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
 - [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
