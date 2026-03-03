@@ -17,6 +17,10 @@ pub struct Task {
   pub name: String,
   #[serde(default)]
   pub status: TaskStatus,
+  /// The Claude Code session slug binding this task to a session group.
+  /// Stable across session forks (plan->execute, /clear+resume).
+  #[serde(default)]
+  pub session_slug: Option<String>,
   pub created_at: DateTime<Utc>,
 }
 
@@ -26,6 +30,7 @@ impl Task {
       id: Uuid::new_v4(),
       name: name.into(),
       status: TaskStatus::default(),
+      session_slug: None,
       created_at: Utc::now(),
     }
   }

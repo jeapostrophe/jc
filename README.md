@@ -59,11 +59,15 @@ A project corresponds to a code repository. The app tracks active projects in `~
 ### Tasks
 
 Each project has one or more tasks. A task represents a unit of work being done, sharing the project's main working tree. Git worktree support (giving each task its own isolated tree) is planned for later. Each task has:
-- A Claude Code session (terminal), bound to a specific `session_id`
+- A Claude Code session (terminal), bound to a specific `session_slug`
 - A general-purpose terminal
 - Access to the shared project TODO.md
 
-Each task always has a `session_id` linking it to a Claude Code session JSONL file in `~/.claude/projects/<encoded-path>/`. When a project is first added to jc, the most recent session is automatically adopted. If no sessions exist, Claude Code is launched fresh and the resulting session is discovered. When Claude Code is launched in the terminal, it resumes the task's bound session via `--resume`. Creating additional tasks (future work) will present a picker with existing sessions and a "new" option.
+Each task has a `session_slug` linking it to a group of Claude Code session JSONL files in `~/.claude/projects/<encoded-path>/`. Claude Code assigns each session a human-readable slug (e.g., `"encapsulated-swimming-firefly"`). When Claude forks a session (e.g., transitioning from planning to execution, or after `/clear` + resume), the new JSONL file shares the same slug as the original. This makes the slug a stable identifier across forks, unlike `session_id` which changes on each fork.
+
+**Session forking mechanism:** When Claude forks, it creates a new JSONL file. The first `user` entry has `sessionId` set to the **parent** session's ID and `parentUuid` pointing to a message UUID in the parent file (the fork point). Subsequent entries use the new file's own `sessionId`. All entries share the same `slug`.
+
+When a project is first added to jc, the most recent session's slug is automatically adopted. If no sessions exist, Claude Code is launched fresh and the resulting session is discovered. To find all JSONL files for a slug, scan the session directory and match on the `slug` field. The most recently modified file in the group is the "active" one. When Claude Code is launched in the terminal, it resumes using `--resume` with the most recent session file's UUID from the slug group. Creating additional tasks (future work) will present a picker with existing slugs and a "new" option.
 
 ### TODO.md
 
@@ -318,13 +322,15 @@ It is deliberately *not* a full code editor on mobile.
 
 **Verdict: Read session JSONL files directly.** No extraction step needed --- render in-app from the JSONL source of truth.
 
-**JSONL format:** Claude Code persists all conversations to `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`. Each line is a JSON object with a `type` field (`user`, `assistant`, `file-history-snapshot`, etc.). Messages link via `parentUuid`/`uuid` fields. Assistant messages contain content block arrays with `type: "text"`, `type: "thinking"`, and tool use blocks.
+**JSONL format:** Claude Code persists all conversations to `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`. Each line is a JSON object with a `type` field (`user`, `assistant`, `file-history-snapshot`, etc.). Messages link via `parentUuid`/`uuid` fields. Assistant messages contain content block arrays with `type: "text"`, `type: "thinking"`, and tool use blocks. Every message carries a `slug` field (e.g., `"encapsulated-swimming-firefly"`) that is stable across session forks.
 
-**Turn grouping:** A turn = one `user` message + all subsequent non-user messages until the next `user` message. This groups the request with all of Claude's responses, tool calls, and thinking into a single reviewable unit.
+**Session forking:** Claude Code forks sessions when transitioning between modes (e.g., plan to execution) or on `/clear` + resume. A forked session is a new JSONL file whose first `user` entry references the parent session via `sessionId` (parent's ID) and `parentUuid` (fork point in parent). All files in a fork group share the same `slug`. About half of all sessions have at least one fork.
+
+**Turn grouping:** A turn = one `user` message + all subsequent non-user messages until the next `user` message. This groups the request with all of Claude's responses, tool calls, and thinking into a single reviewable unit. For forked sessions, turns are loaded from all JSONL files sharing the same slug, ordered by timestamp.
 
 **Path encoding:** Slashes become hyphens, e.g., `/Users/jay/Dev/project` becomes `-Users-jay-Dev-project`.
 
-**Session discovery:** List `.jsonl` files in the encoded-path directory, sort by modification time, adopt the most recent. Sessions are bound to tasks via `session_id` in the persisted state.
+**Session discovery:** Scan `.jsonl` files in the encoded-path directory, extract the `slug` from each, and group files by slug. The slug of the most recently modified file becomes the default session for a new project. Sessions are bound to tasks via `session_slug` in the persisted state.
 
 **Performance:** JSONL files are append-only. A long session might be a few MB. Full re-read on file change is well under 100ms. File watching via `notify` (same as CodeView) detects updates while Claude is working.
 
@@ -396,11 +402,11 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
 - [x] [E] Run Claude Code inside the embedded terminal dedicated to Claude
 - [x] [E] Fix the working directory of the terminals
-- [ ] [D] Claude appears to create new session_ids "behind the scenes" when it enters and leaves planning mode
-- [ ] [E] Add `session_id` to Task model and persist in `state.toml`
+- [x] [D] ~~Claude appears to create new session_ids "behind the scenes" when it enters and leaves planning mode~~ Resolved: Claude forks sessions on mode transitions. All forks share the same `slug`. Use slug as stable identifier.
+- [ ] [E] Add `session_slug` to Task model and persist in `state.toml`
 - [ ] [D] Consider having session state inside of TODO.md rather than having "Task 1"/etc
-- [ ] [E] Implement session discovery: find most recent JSONL in `~/.claude/projects/<encoded-path>/` on project init
-- [ ] [E] Invoke Claude Code with `--resume <session-id>` using the task's bound session
+- [ ] [E] Implement session discovery by slug: scan JSONL files, extract slug, group by slug, adopt most recent slug on project init
+- [ ] [E] Invoke Claude Code with `--resume <session-id>` using the most recent file UUID from the task's slug group
 
 ### TODO.md System
 - [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
@@ -417,12 +423,13 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
 
 ### Claude Reply Viewer
-- [ ] [E] Receive session assignment from Task layer
+- [ ] [E] Receive session slug assignment from Task layer; load turns from all JSONL files sharing the slug
 - [x] [H] Implement JSONL session parser in `jc-core` (parse messages, group into turns)
 - [x] [H] Implement ReplyView (render a turn as Markdown in read-only editor, Cmd-6)
 - [x] [E] Implement turn picker (Cmd-Shift-O, newest first, shows request text as preview)
 - [x] [E] Implement Cmd-T heading picker within rendered turns
 - [x] [E] File watching for JSONL changes (reload turns on update)
+- [ ] [E] Watch all JSONL files in the slug group (not just one file) for changes
 - [ ] [H] Full conversation rendering: tool use summaries, thinking blocks as additional headings
 
 ### Git Diff View
@@ -464,6 +471,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Auto-switch themes with system dark mode
 - [x] [T] Remove Cmd-Shift-T manual theme toggle
 - [x] [E] Ensure that the theme is used for all parts of the UI. (Right now, the terminal colors don't match the code view colors)
+- [ ] [E] Labels on Diff/Reply/FileViews should be limited to one line, right now they can wrap
 - [ ] [H] Implement Quake-style bottom terminal overlay
 - [ ] [H] Implement multi-window with shared session state
 

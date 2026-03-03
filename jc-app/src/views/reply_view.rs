@@ -1,7 +1,9 @@
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputState};
-use jc_core::session::{Turn, discover_latest_session, parse_session};
+use jc_core::session::{
+  Turn, discover_latest_session_group, discover_session_group, parse_session_group, session_dir,
+};
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -11,10 +13,14 @@ pub fn init(_cx: &mut App) {}
 pub struct ReplyView {
   editor: Entity<InputState>,
   project_path: PathBuf,
-  session_path: Option<PathBuf>,
+  /// The slug identifying the current session group (stable across forks).
+  session_slug: Option<String>,
   turns: Vec<Turn>,
   current_turn_index: usize,
+  /// Hash of the last content written to the turn file on disk.
   last_written_hash: u64,
+  /// Hash of the last content shown in the editor (to skip no-op updates).
+  last_shown_hash: u64,
   _watcher: Option<notify::RecommendedWatcher>,
 }
 
@@ -30,43 +36,54 @@ impl ReplyView {
     let mut view = Self {
       editor,
       project_path,
-      session_path: None,
+      session_slug: None,
       turns: Vec::new(),
       current_turn_index: 0,
       last_written_hash: 0,
+      last_shown_hash: 0,
       _watcher: None,
     };
     view.discover_and_parse();
+    if !view.turns.is_empty() {
+      view.current_turn_index = view.turns.len() - 1;
+    }
     view.show_current_turn(window, cx);
     view.setup_watcher(window, cx);
     view
   }
 
+  /// Re-parse session files. Does NOT touch current_turn_index.
   fn discover_and_parse(&mut self) {
-    if let Some((_session_id, path)) = discover_latest_session(&self.project_path) {
-      self.turns = parse_session(&path);
-      self.session_path = Some(path);
-      if !self.turns.is_empty() {
-        self.current_turn_index = self.turns.len() - 1;
-      }
+    let group = if let Some(slug) = &self.session_slug {
+      discover_session_group(&self.project_path, slug)
+    } else {
+      discover_latest_session_group(&self.project_path)
+    };
+
+    if let Some(group) = group {
+      self.session_slug = Some(group.slug.clone());
+      self.turns = parse_session_group(&group);
     } else {
       self.turns.clear();
-      self.session_path = None;
-      self.current_turn_index = 0;
+      self.session_slug = None;
     }
   }
 
   pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let prev_turn_count = self.turns.len();
     let was_at_latest = self.current_turn_index + 1 >= prev_turn_count || prev_turn_count == 0;
+    let prev_index = self.current_turn_index;
 
     self.discover_and_parse();
 
-    // If the user was viewing the latest turn, follow it.
+    // If the user was viewing the latest turn, follow new turns.
+    // Otherwise preserve their position (clamped to valid range).
     if was_at_latest && !self.turns.is_empty() {
       self.current_turn_index = self.turns.len() - 1;
-    } else if self.current_turn_index >= self.turns.len() {
-      self.current_turn_index = self.turns.len().saturating_sub(1);
+    } else if self.turns.is_empty() {
+      self.current_turn_index = 0;
+    } else {
+      self.current_turn_index = prev_index.min(self.turns.len() - 1);
     }
 
     self.show_current_turn(window, cx);
@@ -81,6 +98,16 @@ impl ReplyView {
       self.write_turn_file(&md);
       md
     };
+
+    // Skip editor update if content hasn't changed to preserve scroll/cursor.
+    let mut hasher = DefaultHasher::default();
+    content.hash(&mut hasher);
+    let hash = hasher.finish();
+    if hash == self.last_shown_hash {
+      return;
+    }
+    self.last_shown_hash = hash;
+
     self.editor.update(cx, |state, cx| {
       state.set_value(content, window, cx);
     });
@@ -94,15 +121,12 @@ impl ReplyView {
   }
 
   fn setup_watcher(&mut self, window: &Window, cx: &mut Context<Self>) {
-    let Some(session_path) = &self.session_path else { return };
-    let watched_file = match session_path.file_name() {
-      Some(f) => f.to_os_string(),
-      None => return,
-    };
-    let parent = match session_path.parent() {
-      Some(p) => p.to_path_buf(),
-      None => return,
-    };
+    // Watch the entire session directory so we catch modifications to any file
+    // in the slug group AND new fork files being created.
+    let dir = session_dir(&self.project_path);
+    if !dir.is_dir() {
+      return;
+    }
 
     let (notify_tx, notify_rx) = flume::unbounded::<()>();
 
@@ -110,7 +134,7 @@ impl ReplyView {
       notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
         if let Ok(event) = res
           && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
-          && event.paths.iter().any(|p| p.ends_with(&watched_file))
+          && event.paths.iter().any(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
         {
           let _ = notify_tx.send(());
         }
@@ -118,7 +142,7 @@ impl ReplyView {
       .ok();
 
     if let Some(ref mut w) = watcher {
-      let _ = w.watch(&parent, RecursiveMode::NonRecursive);
+      let _ = w.watch(&dir, RecursiveMode::NonRecursive);
     }
 
     cx.spawn_in(window, async move |this: WeakEntity<ReplyView>, cx: &mut AsyncWindowContext| {

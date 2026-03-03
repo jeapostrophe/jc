@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
 // Deserialized JSONL types
@@ -24,6 +25,8 @@ struct RawEntry {
   is_meta: bool,
   #[serde(default)]
   timestamp: Option<String>,
+  #[serde(default)]
+  slug: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,93 +102,228 @@ pub fn session_dir(project_path: &Path) -> PathBuf {
     .join(encoded)
 }
 
-pub fn discover_latest_session(project_path: &Path) -> Option<(String, PathBuf)> {
-  let dir = session_dir(project_path);
-  let entries = std::fs::read_dir(&dir).ok()?;
+/// A group of JSONL files sharing the same slug, sorted newest-first by mtime.
+pub struct SessionGroup {
+  pub slug: String,
+  /// JSONL file paths, sorted newest-first by modification time.
+  pub files: Vec<PathBuf>,
+  /// Modification time of the most recent file in the group.
+  pub latest_mtime: SystemTime,
+}
 
-  let (path, _) = entries
+impl SessionGroup {
+  /// The most recently modified file in the group (the "active" session file).
+  pub fn latest_file(&self) -> &Path {
+    &self.files[0]
+  }
+
+  /// The session UUID from the most recent file (for `--resume`).
+  pub fn latest_session_id(&self) -> Option<String> {
+    self.files[0].file_stem().map(|s| s.to_string_lossy().into_owned())
+  }
+}
+
+/// Extract the slug from a JSONL file by reading until we find one.
+/// Only reads the first few KB — slugs appear in early entries.
+fn extract_slug(path: &Path) -> Option<String> {
+  use std::io::{BufRead, BufReader};
+  let file = std::fs::File::open(path).ok()?;
+  let reader = BufReader::new(file);
+  for line in reader.lines().take(20) {
+    let line = line.ok()?;
+    // Fast path: skip lines without "slug" to avoid full JSON parse.
+    if !line.contains("\"slug\"") {
+      continue;
+    }
+    if let Ok(entry) = serde_json::from_str::<RawEntry>(&line)
+      && let Some(slug) = entry.slug
+    {
+      return Some(slug);
+    }
+  }
+  None
+}
+
+/// Collect all JSONL files in the session dir with their mtimes and slugs.
+fn collect_session_files(project_path: &Path) -> Vec<(PathBuf, SystemTime, String)> {
+  let dir = session_dir(project_path);
+  let entries = match std::fs::read_dir(&dir) {
+    Ok(e) => e,
+    Err(_) => return Vec::new(),
+  };
+
+  entries
     .filter_map(|e| e.ok())
     .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
     .filter_map(|e| {
       let mtime = e.metadata().ok()?.modified().ok()?;
-      Some((e.path(), mtime))
+      let slug = extract_slug(&e.path())?;
+      Some((e.path(), mtime, slug))
     })
-    .max_by_key(|(_, mtime)| *mtime)?;
-  let session_id = path.file_stem()?.to_string_lossy().to_string();
-  Some((session_id, path))
+    .collect()
+}
+
+/// Build all session groups from the project's session directory.
+pub fn discover_session_groups(project_path: &Path) -> Vec<SessionGroup> {
+  let files = collect_session_files(project_path);
+
+  // Group by slug, keeping mtimes.
+  let mut slug_groups: HashMap<String, Vec<(PathBuf, SystemTime)>> = HashMap::default();
+  for (path, mtime, slug) in files {
+    slug_groups.entry(slug).or_default().push((path, mtime));
+  }
+
+  let mut groups: Vec<SessionGroup> = slug_groups
+    .into_iter()
+    .map(|(slug, mut entries)| {
+      entries.sort_by(|a, b| b.1.cmp(&a.1));
+      let latest_mtime = entries[0].1;
+      SessionGroup { slug, files: entries.into_iter().map(|(p, _)| p).collect(), latest_mtime }
+    })
+    .collect();
+
+  // Sort groups by most recent file mtime (newest group first).
+  groups.sort_by(|a, b| b.latest_mtime.cmp(&a.latest_mtime));
+
+  groups
+}
+
+/// Find all JSONL files belonging to a specific slug.
+pub fn discover_session_group(project_path: &Path, slug: &str) -> Option<SessionGroup> {
+  let files = collect_session_files(project_path);
+
+  let mut matching: Vec<(PathBuf, SystemTime)> =
+    files.into_iter().filter(|(_, _, s)| s == slug).map(|(p, m, _)| (p, m)).collect();
+
+  if matching.is_empty() {
+    return None;
+  }
+  matching.sort_by(|a, b| b.1.cmp(&a.1));
+  let latest_mtime = matching[0].1;
+  Some(SessionGroup {
+    slug: slug.to_string(),
+    files: matching.into_iter().map(|(p, _)| p).collect(),
+    latest_mtime,
+  })
+}
+
+/// Discover the most recently active session group for a project.
+pub fn discover_latest_session_group(project_path: &Path) -> Option<SessionGroup> {
+  let files = collect_session_files(project_path);
+  if files.is_empty() {
+    return None;
+  }
+
+  // Find the file with the newest mtime to determine which slug is "latest".
+  let (_, _, latest_slug) = files.iter().max_by_key(|(_, mtime, _)| mtime)?;
+  let latest_slug = latest_slug.clone();
+
+  let mut matching: Vec<(PathBuf, SystemTime)> =
+    files.into_iter().filter(|(_, _, s)| *s == latest_slug).map(|(p, m, _)| (p, m)).collect();
+
+  matching.sort_by(|a, b| b.1.cmp(&a.1));
+  let latest_mtime = matching[0].1;
+  Some(SessionGroup {
+    slug: latest_slug,
+    files: matching.into_iter().map(|(p, _)| p).collect(),
+    latest_mtime,
+  })
+}
+
+/// Parse all JSONL files in a slug group into a unified list of turns.
+pub fn parse_session_group(group: &SessionGroup) -> Vec<Turn> {
+  let mut acc = SessionAccumulator::default();
+  // Process files oldest-first so turns are in chronological order.
+  for path in group.files.iter().rev() {
+    acc.ingest(path);
+  }
+  acc.into_turns()
 }
 
 // ---------------------------------------------------------------------------
 // JSONL parsing
 // ---------------------------------------------------------------------------
 
-pub fn parse_session(path: &Path) -> Vec<Turn> {
-  let content = match std::fs::read_to_string(path) {
-    Ok(c) => c,
-    Err(_) => return Vec::new(),
-  };
+/// Accumulator for parsing one or more JSONL session files into turns.
+#[derive(Default)]
+struct SessionAccumulator {
+  user_messages: Vec<UserMessage>,
+  assistant_entries: Vec<(String, AssistantResponse)>,
+  /// Map message_id -> index in assistant_entries for O(1) dedup lookups.
+  assistant_index: HashMap<String, usize>,
+}
 
-  let mut user_messages: Vec<UserMessage> = Vec::new();
-  let mut assistant_entries: Vec<(String, AssistantResponse)> = Vec::new();
-  // Map message_id -> index in assistant_entries for O(1) dedup lookups.
-  let mut assistant_index: HashMap<String, usize> = HashMap::default();
-
-  for line in content.lines() {
-    let entry: RawEntry = match serde_json::from_str(line) {
-      Ok(e) => e,
-      Err(_) => continue,
+impl SessionAccumulator {
+  /// Parse a single JSONL file, appending results to the accumulators.
+  fn ingest(&mut self, path: &Path) {
+    let content = match std::fs::read_to_string(path) {
+      Ok(c) => c,
+      Err(_) => return,
     };
 
-    match entry.entry_type.as_str() {
-      "user" => {
-        if entry.is_meta {
-          continue;
-        }
-        let Some(msg) = entry.message else { continue };
-        if msg.role != "user" {
-          continue;
-        }
-        // Content can be a plain string or an array of content blocks.
-        let text = extract_user_text(&msg.content);
-        if text.is_empty() {
-          continue;
-        }
-        user_messages.push(UserMessage { text, timestamp: entry.timestamp });
-      }
-      "assistant" => {
-        let Some(msg) = entry.message else { continue };
-        if msg.role != "assistant" {
-          continue;
-        }
-        let message_id = msg.id.unwrap_or_default();
-        let text_blocks = extract_assistant_text_blocks(&msg.content);
-        if text_blocks.is_empty() {
-          continue;
-        }
-        // Deduplicate streaming chunks sharing the same message id.
-        // Skip dedup for entries with no message id (empty string).
-        if !message_id.is_empty() {
-          if let Some(&idx) = assistant_index.get(&message_id) {
-            let existing = &mut assistant_entries[idx].1;
-            let existing_len: usize = existing.text_blocks.iter().map(|b| b.len()).sum();
-            let new_len: usize = text_blocks.iter().map(|b| b.len()).sum();
-            if new_len > existing_len {
-              existing.text_blocks = text_blocks;
-            }
+    for line in content.lines() {
+      let entry: RawEntry = match serde_json::from_str(line) {
+        Ok(e) => e,
+        Err(_) => continue,
+      };
+
+      match entry.entry_type.as_str() {
+        "user" => {
+          if entry.is_meta {
             continue;
           }
-          assistant_index.insert(message_id.clone(), assistant_entries.len());
+          let Some(msg) = entry.message else { continue };
+          if msg.role != "user" {
+            continue;
+          }
+          let text = extract_user_text(&msg.content);
+          if text.is_empty() {
+            continue;
+          }
+          self.user_messages.push(UserMessage { text, timestamp: entry.timestamp });
         }
-        assistant_entries.push((message_id.clone(), AssistantResponse { message_id, text_blocks }));
+        "assistant" => {
+          let Some(msg) = entry.message else { continue };
+          if msg.role != "assistant" {
+            continue;
+          }
+          let message_id = msg.id.unwrap_or_default();
+          let text_blocks = extract_assistant_text_blocks(&msg.content);
+          if text_blocks.is_empty() {
+            continue;
+          }
+          // Deduplicate streaming chunks sharing the same message id.
+          // Skip dedup for entries with no message id (empty string).
+          if !message_id.is_empty() {
+            if let Some(&idx) = self.assistant_index.get(&message_id) {
+              let existing = &mut self.assistant_entries[idx].1;
+              let existing_len: usize = existing.text_blocks.iter().map(|b| b.len()).sum();
+              let new_len: usize = text_blocks.iter().map(|b| b.len()).sum();
+              if new_len > existing_len {
+                existing.text_blocks = text_blocks;
+              }
+              continue;
+            }
+            self.assistant_index.insert(message_id.clone(), self.assistant_entries.len());
+          }
+          self
+            .assistant_entries
+            .push((message_id.clone(), AssistantResponse { message_id, text_blocks }));
+        }
+        _ => continue,
       }
-      _ => continue,
     }
   }
 
-  // Group into turns: each user message starts a new turn, followed by
-  // assistant responses until the next user message.
-  // We assign assistant responses based on ordering in the JSONL file.
-  group_into_turns(user_messages, assistant_entries)
+  fn into_turns(self) -> Vec<Turn> {
+    group_into_turns(self.user_messages, self.assistant_entries)
+  }
+}
+
+pub fn parse_session(path: &Path) -> Vec<Turn> {
+  let mut acc = SessionAccumulator::default();
+  acc.ingest(path);
+  acc.into_turns()
 }
 
 fn extract_user_text(content: &serde_json::Value) -> String {

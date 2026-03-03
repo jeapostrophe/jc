@@ -6,7 +6,8 @@
       "Bash(curl:*)",
       "Bash(cargo metadata:*)",
       "Bash(cargo doc:*)",
-      "Bash(cargo tree:*)"
+      "Bash(cargo tree:*)",
+      "Bash(python3:*)"
     ]
   }
 }
