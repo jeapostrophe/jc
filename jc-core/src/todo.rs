@@ -185,6 +185,62 @@ fn finalize_wait_body(session: &mut TodoSession, boundary: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Session heading insertion
+// ---------------------------------------------------------------------------
+
+/// Returns true if the document has at least one session whose slug matches
+/// a JSONL session group on disk.
+pub fn has_valid_sessions(doc: &TodoDocument, project_path: &Path) -> bool {
+  doc
+    .sessions
+    .iter()
+    .any(|s| crate::session::discover_session_group(project_path, &s.slug).is_some())
+}
+
+/// Build new text with a `## Session <slug>: New session` heading inserted.
+/// If a `# Claude` section exists, the heading goes right after it. Otherwise
+/// a `# Claude` section is appended at the end of the text.
+pub fn insert_session_heading(text: &str, doc: &TodoDocument, slug: &str) -> String {
+  let heading = format!("## Session {slug}: New session\n### WAIT\n");
+
+  if let Some(claude_line) = doc.claude_section_line {
+    // Find byte offset right after the `# Claude` line.
+    let mut offset = 0;
+    for (i, line) in text.lines().enumerate() {
+      offset += line.len();
+      // Skip past the newline character(s).
+      if text.as_bytes().get(offset) == Some(&b'\n') {
+        offset += 1;
+      } else if text.as_bytes().get(offset) == Some(&b'\r') {
+        offset += 1;
+        if text.as_bytes().get(offset) == Some(&b'\n') {
+          offset += 1;
+        }
+      }
+      if i as u32 + 1 == claude_line {
+        let mut new_text = String::with_capacity(text.len() + heading.len());
+        new_text.push_str(&text[..offset]);
+        new_text.push_str(&heading);
+        new_text.push_str(&text[offset..]);
+        return new_text;
+      }
+    }
+  }
+
+  // No `# Claude` section; append one at the end.
+  let mut new_text = text.to_string();
+  if !new_text.is_empty() && !new_text.ends_with('\n') {
+    new_text.push('\n');
+  }
+  if !new_text.is_empty() {
+    new_text.push('\n');
+  }
+  new_text.push_str("# Claude\n");
+  new_text.push_str(&heading);
+  new_text
+}
+
+// ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
@@ -430,5 +486,65 @@ wait content
     assert!(body.contains("wait content"));
     // Body should NOT contain the next session heading.
     assert!(!body.contains("## Session b"));
+  }
+
+  #[test]
+  fn insert_session_heading_with_claude_section() {
+    let text = "\
+# TODO
+some notes
+
+# Claude
+";
+    let doc = parse(text);
+    let result = insert_session_heading(text, &doc, "my-slug");
+    assert!(result.contains("# Claude\n## Session my-slug: New session\n### WAIT\n"));
+    // Verify it re-parses correctly.
+    let new_doc = parse(&result);
+    assert_eq!(new_doc.sessions.len(), 1);
+    assert_eq!(new_doc.sessions[0].slug, "my-slug");
+    assert!(new_doc.sessions[0].wait.is_some());
+  }
+
+  #[test]
+  fn insert_session_heading_without_claude_section() {
+    let text = "\
+# TODO
+some notes
+";
+    let doc = parse(text);
+    let result = insert_session_heading(text, &doc, "test-slug");
+    assert!(result.contains("# Claude\n## Session test-slug: New session\n### WAIT\n"));
+    let new_doc = parse(&result);
+    assert_eq!(new_doc.sessions.len(), 1);
+    assert_eq!(new_doc.sessions[0].slug, "test-slug");
+  }
+
+  #[test]
+  fn insert_session_heading_empty_document() {
+    let text = "";
+    let doc = parse(text);
+    let result = insert_session_heading(text, &doc, "fresh");
+    assert_eq!(result, "# Claude\n## Session fresh: New session\n### WAIT\n");
+    let new_doc = parse(&result);
+    assert_eq!(new_doc.sessions.len(), 1);
+    assert_eq!(new_doc.sessions[0].slug, "fresh");
+  }
+
+  #[test]
+  fn insert_session_heading_with_existing_sessions() {
+    let text = "\
+# Claude
+## Session old: Old Session
+### WAIT
+notes
+";
+    let doc = parse(text);
+    let result = insert_session_heading(text, &doc, "new-slug");
+    // New heading should be inserted right after `# Claude`, before the old session.
+    let new_doc = parse(&result);
+    assert_eq!(new_doc.sessions.len(), 2);
+    assert_eq!(new_doc.sessions[0].slug, "new-slug");
+    assert_eq!(new_doc.sessions[1].slug, "old");
   }
 }

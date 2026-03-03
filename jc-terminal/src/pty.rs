@@ -26,15 +26,21 @@ impl PtyHandle {
 
   /// Spawn a specific command in a new PTY.
   ///
-  /// The `program` string is parsed as the executable name (e.g. `"claude"`).
+  /// The `command` string is split on whitespace into the executable name and
+  /// arguments (e.g. `"claude --resume <uuid>"`).
   /// Returns the handle (for writing/resizing) and a reader (moved to a background thread).
   pub fn spawn_command(
-    program: &str,
+    command: &str,
     cols: u16,
     rows: u16,
     working_dir: Option<&Path>,
   ) -> Result<(Self, Box<dyn Read + Send>)> {
-    let cmd = CommandBuilder::new(program);
+    let mut parts = command.split_whitespace();
+    let program = parts.next().unwrap_or(command);
+    let mut cmd = CommandBuilder::new(program);
+    for arg in parts {
+      cmd.arg(arg);
+    }
     Self::spawn_pty(cmd, cols, rows, working_dir)
   }
 

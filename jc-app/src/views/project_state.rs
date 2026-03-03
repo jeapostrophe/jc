@@ -4,8 +4,10 @@ use crate::views::session_state::SessionState;
 use crate::views::todo_view::TodoView;
 use gpui::*;
 use jc_core::problem::Problem;
+use jc_core::session::discover_latest_session_group;
 use jc_core::todo;
 use jc_terminal::Palette;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub struct ProjectState {
@@ -30,10 +32,33 @@ impl ProjectState {
     let code_view = cx.new(|cx| CodeView::new(window, cx));
     let todo_view = cx.new(|cx| TodoView::new(path.clone(), window, cx));
 
-    // Discover sessions from the TODO.md document.
+    // If TODO.md has no valid sessions, try to discover the most recent
+    // JSONL session group and insert a heading automatically.
+    if !todo::has_valid_sessions(todo_view.read(cx).document(), &path)
+      && let Some(group) = discover_latest_session_group(&path)
+    {
+      todo_view.update(cx, |tv, cx| {
+        tv.insert_session_heading(&group.slug, window, cx);
+      });
+    }
+
+    // Build sessions, skipping any with invalid slugs to avoid creating
+    // broken SessionState entries (terminals that can't resume).
     let document = todo_view.read(cx).document().clone();
+    let invalid_slugs: HashSet<String> = todo_view
+      .read(cx)
+      .problems()
+      .iter()
+      .map(|p| match p {
+        todo::TodoProblem::InvalidSessionSlug { slug, .. } => slug.clone(),
+      })
+      .collect();
+
     let mut sessions = Vec::new();
     for todo_session in &document.sessions {
+      if invalid_slugs.contains(&todo_session.slug) {
+        continue;
+      }
       sessions.push(SessionState::create(
         todo_session.slug.clone(),
         todo_session.label.clone(),
