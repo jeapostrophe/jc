@@ -447,11 +447,11 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [H] On startup, if TODO.md has no valid sessions (all slugs are invalid or no `## Session` headings exist), discover the most recent JSONL session group and insert a `## Session <slug>: <label>` heading into TODO.md
 - [x] [E] Skip sessions with invalid slugs during `ProjectState::create` instead of creating broken `SessionState` entries (currently creates terminals that can't resume)
 - [ ] [D] Implement interactive correction of invalid session slugs in TODO.md (e.g., picker showing discovered slugs to replace an invalid one)
-- [ ] [H] Implement comment insertion from other views into the WAIT section
+- [x] [H] Implement comment insertion from other views into the WAIT section
 - [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
-- [ ] [E] Switching to TODO view should automatically scroll to the WAIT section of the active session
+- [x] [E] Switching to TODO view should automatically scroll to the WAIT section of the active session
 
 ### Claude Reply Viewer
 - [x] Read session slug from TODO.md; load turns from all JSONL files sharing the slug
@@ -470,7 +470,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [H] Implement per-file "mark as reviewed" with collapses
 - [x] [E] Annotate which files have been "marked" in the git diff picker
 - [x] [H] Show one file at a time rather than raw multi-file output
-- [ ] [H] Implement region selection and comment keybinding [should be sensitive to what diff (checksum) is shown]
+- [x] [H] Implement region selection and comment keybinding [should be sensitive to what diff (checksum) is shown]
 - [x] [H] Show git log as well to look at older diffs. Provide a picker to scroll through to view. (Cmd-Shift-O)
 - [x] [H] Implement language syntax highlighting inside of diffs
 
@@ -482,8 +482,8 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
 - [x] [E] Fix focus to center the target in the middle of the screen
 - [x] [E] Word wrapping lines to fix the length of lines
-- [ ] [E] Focus into the text area on view selection so keybindings work
-- [ ] [D] Implement light editing (basic text modification, not full editor; mostly for inserting comments into documents)
+- [x] [E] Focus into the text area on view selection so keybindings work
+- [x] [D] Implement light editing (basic text modification, not full editor; mostly for inserting comments into documents)
 
 ### Window & Pane Management
 - [x] Fix: Window doesn't get focused on creation
@@ -519,8 +519,10 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [H] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 - [x] [E] Implement general searching in all views with Cmd-F (picker on lines)
-- [ ] [H] Cmd-F line search: fix keybinding capture (editor's built-in find UI intercepts Cmd-F) and ensure selected line scrolls to center of screen
-- [ ] [E] Allow page up/down in pickers
+- [x] [H] Cmd-F line search: ensure selected line scrolls to center of screen
+- [x] [E] Allow page up/down in pickers
+- [x] [E] Allow clicking in picker and to select something
+- [x] [E] Press up in the picker doesn't change the focus to show the things at the bottom
 
 ### Notifications & Status
 - [x] Implement Claude usage algorithm

@@ -21,6 +21,8 @@ actions!(
     CancelPicker,
     SelectNextItem,
     SelectPrevItem,
+    SelectPageDown,
+    SelectPageUp,
     OpenFilePicker,
     OpenContextPicker,
     ShowSessionPicker,
@@ -37,6 +39,8 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("ctrl-n", SelectNextItem, Some("Picker")),
     KeyBinding::new("up", SelectPrevItem, Some("Picker")),
     KeyBinding::new("ctrl-p", SelectPrevItem, Some("Picker")),
+    KeyBinding::new("pagedown", SelectPageDown, Some("Picker")),
+    KeyBinding::new("pageup", SelectPageUp, Some("Picker")),
     KeyBinding::new("cmd-o", OpenFilePicker, Some("Workspace")),
     KeyBinding::new("cmd-t", OpenContextPicker, Some("Workspace")),
     KeyBinding::new("cmd-f", SearchLines, Some("Workspace")),
@@ -195,6 +199,22 @@ impl<D: PickerDelegate> PickerState<D> {
     }
   }
 
+  fn select_page_down(&mut self, _: &SelectPageDown, _window: &mut Window, cx: &mut Context<Self>) {
+    if !self.filtered.is_empty() {
+      self.selected_index = (self.selected_index + 10).min(self.filtered.len() - 1);
+      self.scroll_handle.scroll_to_item(self.selected_index);
+      cx.notify();
+    }
+  }
+
+  fn select_page_up(&mut self, _: &SelectPageUp, _window: &mut Window, cx: &mut Context<Self>) {
+    if !self.filtered.is_empty() {
+      self.selected_index = self.selected_index.saturating_sub(10);
+      self.scroll_handle.scroll_to_item(self.selected_index);
+      cx.notify();
+    }
+  }
+
   fn confirm_selected(&mut self, _: &ConfirmPicker, window: &mut Window, cx: &mut Context<Self>) {
     if let Some(item) = self.filtered.get(self.selected_index) {
       let index = item.index;
@@ -219,14 +239,22 @@ impl<D: PickerDelegate> Render for PickerState<D> {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let theme = cx.theme();
 
-    let results: Vec<Div> = self
+    let results: Vec<Stateful<Div>> = self
       .filtered
       .iter()
       .enumerate()
       .take(MAX_VISIBLE_RESULTS)
       .map(|(i, fi)| {
         let selected = i == self.selected_index;
-        self.delegate.render_item(fi.index, selected, cx)
+        self
+          .delegate
+          .render_item(fi.index, selected, cx)
+          .id(("picker-item", i))
+          .cursor_pointer()
+          .on_click(cx.listener(move |this, _, window, cx| {
+            this.selected_index = i;
+            this.confirm_selected(&ConfirmPicker, window, cx);
+          }))
       })
       .collect();
 
@@ -238,6 +266,8 @@ impl<D: PickerDelegate> Render for PickerState<D> {
       .on_action(cx.listener(Self::cancel))
       .on_action(cx.listener(Self::select_next))
       .on_action(cx.listener(Self::select_prev))
+      .on_action(cx.listener(Self::select_page_down))
+      .on_action(cx.listener(Self::select_page_up))
       .font_family("Lilex")
       .w(px(500.0))
       .max_h(px(400.0))

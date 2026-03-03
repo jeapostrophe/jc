@@ -37,23 +37,10 @@ pub fn scroll_editor_to_line<V: 'static>(
   window: &mut Window,
   cx: &mut Context<V>,
 ) {
-  let line_height = window.line_height();
-  let viewport_height = window.viewport_size().height;
-  let half_viewport_lines =
-    if line_height > px(0.) { (viewport_height / line_height / 2.0).floor() as u32 } else { 15 };
-
-  let pre_line = line.saturating_sub(half_viewport_lines);
   editor.update(cx, |editor, cx| {
-    editor.set_cursor_position(gpui_component::input::Position::new(pre_line, 0), window, cx);
+    editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
+    editor.scroll_to_center_line(line, cx);
   });
-
-  let editor = editor.clone();
-  cx.spawn_in(window, async move |_this: WeakEntity<V>, cx: &mut AsyncWindowContext| {
-    let _ = editor.update_in(cx, |editor, window, cx| {
-      editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
-    });
-  })
-  .detach();
 }
 
 /// Renders a warning banner when a file has been externally modified.

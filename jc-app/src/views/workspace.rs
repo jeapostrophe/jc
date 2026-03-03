@@ -328,6 +328,20 @@ impl Workspace {
         p.set_content(PaneContent { kind, view, focus: focus.clone() }, cx);
       });
       focus.focus(window);
+
+      // When switching to the TODO editor, auto-scroll to the end of the active session's WAIT body.
+      if kind == PaneContentKind::TodoEditor {
+        let project = &self.projects[self.active_project_index];
+        let tv = project.todo_view.read(cx);
+        if let Some(slug) = project.active_slug() {
+          let text = tv.editor_text(cx);
+          if let Some(wait_line) = tv.document().wait_body_end_line(slug, &text) {
+            let wait_line_0 = wait_line.saturating_sub(1);
+            drop(tv);
+            project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
+          }
+        }
+      }
     }
   }
 
@@ -637,9 +651,9 @@ impl Workspace {
             this.recent_files.truncate(50);
           }
           if let Some(kind) = switch_pane {
+            // set_active_pane_view focuses the new view; don't override with pre_picker_focus.
             this.set_active_pane_view(kind, window, cx);
-          }
-          if let Some(focus) = this.pre_picker_focus.take() {
+          } else if let Some(focus) = this.pre_picker_focus.take() {
             focus.focus(window);
           }
           this.dismiss_picker();

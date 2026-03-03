@@ -1386,6 +1386,28 @@ impl InputState {
     cx.notify();
   }
 
+  /// Scroll so the given 0-based line is approximately centered vertically.
+  pub fn scroll_to_center_line(&mut self, line: u32, cx: &mut Context<Self>) {
+    let Some(last_layout) = self.last_layout.as_ref() else { return };
+    let line_height = last_layout.line_height;
+    let viewport_height = self.input_bounds.size.height;
+
+    // Compute the Y offset of the target line by summing wrapped line heights.
+    let mut row_offset_y = px(0.);
+    for (ix, wrap_line) in self.text_wrapper.lines.iter().enumerate() {
+      if ix == line as usize {
+        break;
+      }
+      row_offset_y += wrap_line.height(line_height);
+    }
+
+    // Center: offset so the line is at viewport_height/2.
+    let centered_y = -(row_offset_y - viewport_height / 2.0 + line_height / 2.0);
+    let scroll_offset = point(self.scroll_handle.offset().x, centered_y.min(px(0.)));
+    self.deferred_scroll_offset = Some(scroll_offset);
+    cx.notify();
+  }
+
   pub(super) fn show_character_palette(
     &mut self,
     _: &ShowCharacterPalette,

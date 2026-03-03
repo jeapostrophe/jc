@@ -58,6 +58,21 @@ impl TodoDocument {
     self.sessions.iter().map(|s| s.slug.as_str()).collect()
   }
 
+  /// Returns the 1-based line number of the last line of the WAIT body for the
+  /// given session slug. This is the line where a user would type new content.
+  /// If the WAIT body is empty, returns the line right after the heading.
+  pub fn wait_body_end_line(&self, slug: &str, text: &str) -> Option<u32> {
+    let wait = self.session_by_slug(slug)?.wait.as_ref()?;
+    let body = &text[wait.body_byte_range.clone()];
+    // Count newlines in the body to find how many lines it spans.
+    let body_lines = body.chars().filter(|&c| c == '\n').count() as u32;
+    // The body starts on the line after the WAIT heading.
+    // If body is empty or only whitespace, place cursor on the line after heading.
+    // Otherwise, place on the last non-empty line of the body.
+    let last_line = wait.line + body_lines.max(1);
+    Some(last_line)
+  }
+
   /// Returns the byte offset at the end of the WAIT body for the given
   /// session. This is where comments should be inserted. If the session has
   /// no WAIT, returns `None`.
