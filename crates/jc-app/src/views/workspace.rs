@@ -30,6 +30,7 @@ actions!(
     ShowCodeViewer,
     ShowTodoEditor,
     OpenInExternalEditor,
+    EvenSplit,
   ]
 );
 
@@ -54,6 +55,8 @@ pub struct Workspace {
   active_picker: Option<AnyView>,
   pre_picker_focus: Option<FocusHandle>,
   _picker_subscription: Option<Subscription>,
+  split_generation: usize,
+  recent_files: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -71,13 +74,13 @@ impl Workspace {
       .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     let palette = Palette::from(&theme.terminal);
-    let terminal_config =
+    let base_config =
       |palette: &Palette| TerminalConfig { palette: Some(palette.clone()), ..Default::default() };
 
-    let claude_terminal =
-      cx.new(|cx| TerminalView::new(terminal_config(&palette), None, window, cx));
-    let general_terminal =
-      cx.new(|cx| TerminalView::new(terminal_config(&palette), None, window, cx));
+    let claude_config =
+      TerminalConfig { command: Some("claude".to_string()), ..base_config(&palette) };
+    let claude_terminal = cx.new(|cx| TerminalView::new(claude_config, None, window, cx));
+    let general_terminal = cx.new(|cx| TerminalView::new(base_config(&palette), None, window, cx));
     let diff_view = cx.new(|cx| DiffView::new(project_path.clone(), window, cx));
     let code_view = cx.new(|cx| CodeView::new(project_path.clone(), window, cx));
     let todo_view = cx.new(|cx| TodoView::new(project_path, window, cx));
@@ -124,6 +127,8 @@ impl Workspace {
       active_picker: None,
       pre_picker_focus: None,
       _picker_subscription: None,
+      split_generation: 0,
+      recent_files: Vec::new(),
     }
   }
 
@@ -234,6 +239,13 @@ impl Workspace {
     self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
   }
 
+  fn even_split(&mut self, _: &EvenSplit, _window: &mut Window, cx: &mut Context<Self>) {
+    // Bump the generation counter to force a fresh ResizableState with equal
+    // initial sizes the next time the workspace renders.
+    self.split_generation += 1;
+    cx.notify();
+  }
+
   fn open_in_external_editor(
     &mut self,
     _: &OpenInExternalEditor,
@@ -261,31 +273,12 @@ impl Workspace {
       return;
     }
 
-    let delegate = FilePickerDelegate::new(self.project_path(), self.code_view.clone());
-    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
-
-    self.pre_picker_focus = window.focused(cx);
-
-    let subscription =
-      cx.subscribe_in(&picker, window, |this: &mut Self, _, event, window, cx| match event {
-        PickerEvent::Confirmed => {
-          this.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
-          this.dismiss_picker();
-          cx.notify();
-        }
-        PickerEvent::Dismissed => {
-          if let Some(focus) = this.pre_picker_focus.take() {
-            focus.focus(window);
-          }
-          this.dismiss_picker();
-          cx.notify();
-        }
-      });
-
-    self.active_picker = Some(picker.clone().into());
-    self._picker_subscription = Some(subscription);
-    picker.read(cx).input_focus_handle(cx).focus(window);
-    cx.notify();
+    let delegate = FilePickerDelegate::new(
+      self.project_path(),
+      self.code_view.clone(),
+      self.recent_files.clone(),
+    );
+    self.show_picker_with_confirm(delegate, Some(PaneContentKind::CodeViewer), window, cx);
   }
 
   fn open_context_picker(
@@ -318,9 +311,12 @@ impl Workspace {
     }
   }
 
-  fn show_picker<D: crate::views::picker::PickerDelegate>(
+  /// Show a picker, switching to `switch_pane` on confirm if provided.
+  /// Also tracks recently opened files when confirming a file picker.
+  fn show_picker_with_confirm<D: crate::views::picker::PickerDelegate>(
     &mut self,
     delegate: D,
+    switch_pane: Option<PaneContentKind>,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -328,8 +324,26 @@ impl Workspace {
     self.pre_picker_focus = window.focused(cx);
 
     let subscription =
-      cx.subscribe_in(&picker, window, |this: &mut Self, _, event, window, cx| match event {
-        PickerEvent::Confirmed | PickerEvent::Dismissed => {
+      cx.subscribe_in(&picker, window, move |this: &mut Self, _, event, window, cx| match event {
+        PickerEvent::Confirmed => {
+          // Track recently opened file from the code view.
+          if let Some(path) = this.code_view.read(cx).file_path() {
+            let path = path.to_path_buf();
+            this.recent_files.retain(|p| p != &path);
+            this.recent_files.insert(0, path);
+            // Keep at most 50 recent files.
+            this.recent_files.truncate(50);
+          }
+          if let Some(kind) = switch_pane {
+            this.set_active_pane_view(kind, window, cx);
+          }
+          if let Some(focus) = this.pre_picker_focus.take() {
+            focus.focus(window);
+          }
+          this.dismiss_picker();
+          cx.notify();
+        }
+        PickerEvent::Dismissed => {
           if let Some(focus) = this.pre_picker_focus.take() {
             focus.focus(window);
           }
@@ -343,6 +357,15 @@ impl Workspace {
 
     picker.read(cx).input_focus_handle(cx).focus(window);
     cx.notify();
+  }
+
+  fn show_picker<D: crate::views::picker::PickerDelegate>(
+    &mut self,
+    delegate: D,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.show_picker_with_confirm(delegate, None, window, cx);
   }
 
   fn dismiss_picker(&mut self) {
@@ -457,9 +480,10 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::open_in_external_editor))
       .on_action(cx.listener(Self::open_file_picker))
       .on_action(cx.listener(Self::open_context_picker))
+      .on_action(cx.listener(Self::even_split))
       .child(self.render_title_bar(cx))
       .child(
-        h_resizable("main-split")
+        h_resizable(("main-split", self.split_generation))
           .child(resizable_panel().size(px(600.0)).child(left_wrapper))
           .child(resizable_panel().size(px(600.0)).child(right_wrapper)),
       )
@@ -497,6 +521,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-4", ShowCodeViewer, Some("Workspace")),
     KeyBinding::new("cmd-5", ShowTodoEditor, Some("Workspace")),
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
+    KeyBinding::new("cmd-shift-=", EvenSplit, Some("Workspace")),
   ]);
 
   cx.bind_keys([

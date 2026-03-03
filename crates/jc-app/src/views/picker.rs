@@ -1,6 +1,7 @@
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputEvent, InputState};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::outline::{OutlineItem, compute_outline};
@@ -256,12 +257,32 @@ pub struct FilePickerDelegate {
   files: Vec<String>,
   code_view: Entity<CodeView>,
   project_path: PathBuf,
+  /// Set of relative paths that have been modified in the git working tree.
+  modified_files: HashSet<String>,
+  /// Indices of recently opened files (in recency order, most recent first).
+  recent_indices: Vec<usize>,
 }
 
 impl FilePickerDelegate {
-  pub fn new(project_path: PathBuf, code_view: Entity<CodeView>) -> Self {
+  pub fn new(
+    project_path: PathBuf,
+    code_view: Entity<CodeView>,
+    recent_files: Vec<PathBuf>,
+  ) -> Self {
     let files = list_project_files(&project_path);
-    Self { files, code_view, project_path }
+    let modified_files = list_modified_files(&project_path);
+
+    // Map recent_files (absolute paths) to indices in the files list.
+    let recent_indices: Vec<usize> = recent_files
+      .iter()
+      .filter_map(|abs_path| {
+        let rel = abs_path.strip_prefix(&project_path).ok()?;
+        let rel_str = rel.to_str()?;
+        files.iter().position(|f| f == rel_str)
+      })
+      .collect();
+
+    Self { files, code_view, project_path, modified_files, recent_indices }
   }
 }
 
@@ -273,6 +294,43 @@ impl PickerDelegate for FilePickerDelegate {
   fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
     let full_path = self.project_path.join(&self.files[index]);
     self.code_view.update(cx, |v, cx| v.open_file(full_path, window, cx));
+  }
+
+  fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
+    let mut result = Vec::new();
+    for (index, item) in self.files.iter().enumerate() {
+      if let Some(score) = fuzzy_match(query_lower, item) {
+        // Boost score for recently opened files so they sort to the top.
+        let recency_boost = self
+          .recent_indices
+          .iter()
+          .position(|&ri| ri == index)
+          .map(|pos| 1000_i64 - pos as i64)
+          .unwrap_or(0);
+        result.push(FilteredItem { index, score: score + recency_boost });
+      }
+    }
+    result
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let label = &self.files[index];
+    let is_modified = self.modified_files.contains(label);
+
+    let row = div().px_2().py(px(3.0)).text_sm().flex().items_center().gap_1();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+
+    if is_modified {
+      // Show "M" marker for git-modified files.
+      let marker_color =
+        if selected { theme.accent_foreground } else { gpui::hsla(30. / 360., 0.8, 0.5, 1.0) };
+      row
+        .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("M"))
+        .child(label.clone())
+    } else {
+      row.child(div().text_xs().w(px(10.0))).child(label.clone())
+    }
   }
 }
 
@@ -449,4 +507,32 @@ fn list_project_files(path: &Path) -> Vec<String> {
     return Vec::new();
   };
   index.iter().filter_map(|entry| String::from_utf8(entry.path.clone()).ok()).collect()
+}
+
+/// Return the set of file paths (relative to the repo root) that are modified
+/// in the working tree or the index compared to HEAD.
+fn list_modified_files(path: &Path) -> HashSet<String> {
+  let Ok(repo) = git2::Repository::open(path) else {
+    return HashSet::new();
+  };
+
+  let mut opts = git2::StatusOptions::default();
+  opts.include_untracked(true).recurse_untracked_dirs(true);
+
+  let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+    return HashSet::new();
+  };
+
+  statuses
+    .iter()
+    .filter_map(|entry| {
+      let status = entry.status();
+      let dominated_by_clean =
+        status.is_empty() || status == git2::Status::IGNORED || status == git2::Status::CURRENT;
+      if dominated_by_clean {
+        return None;
+      }
+      entry.path().map(|p| p.to_string())
+    })
+    .collect()
 }
