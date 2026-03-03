@@ -4,6 +4,8 @@ use jc_terminal::TerminalView;
 fn main() {
   let app = Application::new();
   app.run(|cx| {
+    jc_terminal::init(cx);
+
     let opts = WindowOptions {
       window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
         None,

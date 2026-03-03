@@ -12,6 +12,7 @@ pub fn run(state: AppState, config: AppConfig, theme: ThemeConfig) {
 
   app.run(move |cx| {
     gpui_component::init(cx);
+    jc_terminal::init(cx);
     workspace::init(cx);
     picker::init(cx);
     code_view::init(cx);

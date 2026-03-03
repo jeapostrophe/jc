@@ -5,8 +5,8 @@ use crate::render::{CellLayout, measure_cell, paint_terminal};
 use crate::terminal::TerminalState;
 use gpui::{
   App, AsyncApp, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
-  KeyDownEvent, ParentElement, Pixels, Render, SharedString, Styled, Timer, WeakEntity, Window,
-  canvas, div, px,
+  KeyBinding, KeyDownEvent, ParentElement, Pixels, Render, SharedString, Styled, Timer, WeakEntity,
+  Window, actions, canvas, div, px,
 };
 use parking_lot::Mutex;
 use std::io::Read;
@@ -14,6 +14,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const FONT_SIZE_STEP: Pixels = px(2.0);
+const FONT_SIZE_MIN: Pixels = px(8.0);
+const FONT_SIZE_MAX: Pixels = px(72.0);
+
+actions!(terminal, [IncreaseFontSize, DecreaseFontSize, ResetFontSize]);
+
+/// Register terminal keybindings. Call once during app initialization.
+pub fn init(cx: &mut App) {
+  cx.bind_keys([
+    KeyBinding::new("cmd-=", IncreaseFontSize, Some("Terminal")),
+    KeyBinding::new("cmd-+", IncreaseFontSize, Some("Terminal")),
+    KeyBinding::new("cmd--", DecreaseFontSize, Some("Terminal")),
+    KeyBinding::new("cmd-0", ResetFontSize, Some("Terminal")),
+  ]);
+}
 
 /// Configuration for a terminal view.
 pub struct TerminalConfig {
@@ -44,6 +59,7 @@ pub struct TerminalView {
   pty: Arc<PtyHandle>,
   palette: Palette,
   config: TerminalConfig,
+  default_font_size: Pixels,
   focus: FocusHandle,
   last_size: Arc<Mutex<(u16, u16)>>,
   cursor_visible: bool,
@@ -136,12 +152,14 @@ impl TerminalView {
     .detach();
 
     let palette = config.palette.take().unwrap_or_default();
+    let default_font_size = config.font_size;
 
     Self {
       state,
       pty,
       palette,
       config,
+      default_font_size,
       focus: cx.focus_handle(),
       last_size: Arc::new(Mutex::new((cols, rows))),
       cursor_visible: true,
@@ -150,6 +168,33 @@ impl TerminalView {
 
   fn reset_cursor_blink(&mut self) {
     self.cursor_visible = true;
+  }
+
+  fn increase_font_size(
+    &mut self,
+    _: &IncreaseFontSize,
+    _window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let new_size = self.config.font_size + FONT_SIZE_STEP;
+    self.config.font_size = new_size.min(FONT_SIZE_MAX);
+    cx.notify();
+  }
+
+  fn decrease_font_size(
+    &mut self,
+    _: &DecreaseFontSize,
+    _window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let new_size = self.config.font_size - FONT_SIZE_STEP;
+    self.config.font_size = new_size.max(FONT_SIZE_MIN);
+    cx.notify();
+  }
+
+  fn reset_font_size(&mut self, _: &ResetFontSize, _window: &mut Window, cx: &mut Context<Self>) {
+    self.config.font_size = self.default_font_size;
+    cx.notify();
   }
 }
 
@@ -176,6 +221,9 @@ impl Render for TerminalView {
       .size_full()
       .bg(palette_bg)
       .text_color(palette_fg)
+      .on_action(cx.listener(Self::increase_font_size))
+      .on_action(cx.listener(Self::decrease_font_size))
+      .on_action(cx.listener(Self::reset_font_size))
       .on_key_down(cx.listener({
         let pty = self.pty.clone();
         move |this, event: &KeyDownEvent, _window, _cx| {

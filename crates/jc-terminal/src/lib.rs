@@ -6,4 +6,4 @@ mod terminal;
 mod view;
 
 pub use colors::Palette;
-pub use view::{TerminalConfig, TerminalView};
+pub use view::{TerminalConfig, TerminalView, init};
