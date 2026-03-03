@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use crate::language::Language;
 use git2::DiffFormat;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -65,12 +66,14 @@ impl DiffView {
   }
 
   fn show_current_file(&self, window: &mut Window, cx: &mut Context<Self>) {
-    let content = if self.file_diffs.is_empty() {
-      String::default()
+    let (content, language) = if self.file_diffs.is_empty() {
+      (String::default(), Language::default())
     } else {
-      self.file_diffs[self.current_file_index].content.clone()
+      let fd = &self.file_diffs[self.current_file_index];
+      (fd.content.clone(), Language::from_path(Path::new(&fd.name)))
     };
     self.editor.update(cx, |state, cx| {
+      state.set_highlighter(language.name(), cx);
       state.set_value(content, window, cx);
     });
   }

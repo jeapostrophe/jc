@@ -91,7 +91,7 @@ pub trait PickerDelegate: 'static {
   fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
     let theme = cx.theme();
     let label = &self.items()[index];
-    let row = div().px_2().py(px(3.0)).text_sm();
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex");
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
     row.child(label.clone())
   }
@@ -319,7 +319,7 @@ impl PickerDelegate for FilePickerDelegate {
     let is_modified = self.modified_files.contains(label);
     let is_recent = self.recent_indices.contains(&index);
 
-    let row = div().px_2().py(px(3.0)).text_sm().flex().items_center().gap_1();
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
     let marker = if is_modified {
@@ -389,7 +389,7 @@ impl PickerDelegate for DiffFilePickerDelegate {
     let label = &self.labels[index];
     let is_reviewed = self.reviewed[index];
 
-    let row = div().px_2().py(px(3.0)).text_sm().flex().items_center().gap_1();
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
     if is_reviewed {
@@ -470,6 +470,34 @@ impl PickerDelegate for CodeSymbolPickerDelegate {
 
   fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
     hierarchy_preserving_filter(&self.outline, &self.labels, query_lower)
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let item = &self.outline[index];
+    let indent = "  ".repeat(item.depth);
+
+    let row = div().px_2().py(px(3.0)).text_sm().flex().items_center().font_family("Lilex");
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+
+    let keyword_color =
+      if selected { None } else { theme.highlight_theme.style("keyword").and_then(|s| s.color) };
+    let function_color =
+      if selected { None } else { theme.highlight_theme.style("function").and_then(|s| s.color) };
+
+    if item.context.is_empty() {
+      let name_el = div().child(item.name.clone());
+      let name_el =
+        if let Some(color) = function_color { name_el.text_color(color) } else { name_el };
+      row.child(indent).child(name_el)
+    } else {
+      let ctx_el = div().child(format!("{} ", item.context));
+      let ctx_el = if let Some(color) = keyword_color { ctx_el.text_color(color) } else { ctx_el };
+      let name_el = div().child(item.name.clone());
+      let name_el =
+        if let Some(color) = function_color { name_el.text_color(color) } else { name_el };
+      row.child(indent).child(ctx_el).child(name_el)
+    }
   }
 }
 

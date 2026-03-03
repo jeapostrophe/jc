@@ -4,6 +4,7 @@ use tree_sitter::{Language as TsLanguage, Parser, Query, QueryCursor, StreamingI
 pub struct OutlineItem {
   pub label: String,
   pub name: String,
+  pub context: String,
   pub line: u32,
   pub depth: usize,
   pub parent: Option<usize>,
@@ -90,6 +91,7 @@ pub fn compute_outline(text: &str, language: Language) -> Vec<OutlineItem> {
     items.push(OutlineItem {
       label,
       name: name.clone(),
+      context: context.clone(),
       line: *line,
       depth,
       parent,
