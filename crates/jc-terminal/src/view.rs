@@ -174,6 +174,11 @@ impl TerminalView {
     }
   }
 
+  /// Update the terminal color palette at runtime.
+  pub fn set_palette(&mut self, palette: Palette) {
+    self.palette = palette;
+  }
+
   fn reset_cursor_blink(&mut self) {
     self.cursor_visible = true;
   }

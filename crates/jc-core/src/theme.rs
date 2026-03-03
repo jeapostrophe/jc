@@ -1,6 +1,21 @@
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_THEME_TOML: &str = include_str!("../../../data/default_theme.toml");
+const DARK_THEME_TOML: &str = include_str!("../../../data/default_theme.toml");
+const LIGHT_THEME_TOML: &str = include_str!("../../../data/light_theme.toml");
+
+/// Which appearance variant is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Appearance {
+  #[default]
+  Dark,
+  Light,
+}
+
+impl Appearance {
+  pub fn is_dark(self) -> bool {
+    matches!(self, Self::Dark)
+  }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeConfig {
@@ -9,7 +24,27 @@ pub struct ThemeConfig {
 
 impl Default for ThemeConfig {
   fn default() -> Self {
-    toml::from_str(DEFAULT_THEME_TOML).expect("embedded default_theme.toml must be valid")
+    Self::dark()
+  }
+}
+
+impl ThemeConfig {
+  /// The built-in dark terminal theme (Tomorrow Night).
+  pub fn dark() -> Self {
+    toml::from_str(DARK_THEME_TOML).expect("embedded dark theme TOML must be valid")
+  }
+
+  /// The built-in light terminal theme (Tomorrow).
+  pub fn light() -> Self {
+    toml::from_str(LIGHT_THEME_TOML).expect("embedded light theme TOML must be valid")
+  }
+
+  /// Return the theme for the given appearance.
+  pub fn for_appearance(appearance: Appearance) -> Self {
+    match appearance {
+      Appearance::Dark => Self::dark(),
+      Appearance::Light => Self::light(),
+    }
   }
 }
 

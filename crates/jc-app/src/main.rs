@@ -18,7 +18,6 @@ fn main() -> anyhow::Result<()> {
   let cli = Cli::parse();
 
   let config = config::load_config()?;
-  let theme = config::load_theme()?;
   let mut state = config::load_state()?;
 
   if let Some(path) = &cli.path {
@@ -26,6 +25,6 @@ fn main() -> anyhow::Result<()> {
     config::save_state(&state)?;
   }
 
-  app::run(state, config, theme);
+  app::run(state, config);
   Ok(())
 }
