@@ -341,8 +341,9 @@ It is deliberately *not* a full code editor on mobile.
 > - **[E]** Easy — All easy tasks in the same sub-list can be done together in one Claude invocation
 > - **[H]** Hard — Each hard task needs its own Claude invocation but requires no human design input
 > - **[D]** Design — Subtle design issues that need to be resolved with a human first
+> - **[?]** Unclassified — Needs triage. When you encounter a `[?]` task, read the task description, examine the relevant code, and replace `[?]` with the correct label (`[T]`/`[E]`/`[H]`/`[D]`). Do this before starting any other work.
 >
-> *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]` label after the checkbox.*
+> *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox.*
 
 ### Core Infrastructure
 - [x] Set up Rust workspace (`jc-app`, `jc-core`)
@@ -422,6 +423,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Add a light theme (Tomorrow palette in `light_theme.toml`)
 - [x] [E] Auto-switch themes with system dark mode
 - [ ] [T] Remove Cmd-Shift-T manual theme toggle
+- [ ] [?] Ensure that the theme is used for all parts of the UI. (Right now, the terminal colors don't match the code view colors)
 - [ ] [H] Implement Quake-style bottom terminal overlay
 - [ ] [H] Implement multi-window with shared session state
 
