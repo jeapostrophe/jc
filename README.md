@@ -523,6 +523,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [E] Implement in-app status bar showing waiting sessions (driven by hook events)
 - [ ] [E] Jump to next waiting session keybinding
 - [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
+- [ ] [D] Expand the concept of "problems" (Claude is asking for permission, a session is idle, there are messages in the wait section that haven't been sent, the project has non-filled-in-checklist items)
 
 ### Mobile App
 - [ ] [D] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
@@ -544,5 +545,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
 - [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
 - [ ] [E] Garbage collect stale `.jc/replies/` files (e.g., on app startup, prune files older than N days)
+- [ ] [H] Allow projects to have a special `./status.sh` script that reports problems in the form `file:line - problem`
 
-### Unsorted
+### Automation
+- [ ] [D] Manage automations; i.e. creating sessions and running them automatically
