@@ -177,14 +177,13 @@ impl DiffView {
   pub fn comment_context(&self, cx: &App) -> Option<CommentContext> {
     let file_name = self.current_file_name()?;
     let (start, end) = super::selection_line_range(&self.editor, cx);
-    let line_part = if start == end { format!("{start}") } else { format!("{start}-{end}") };
+    let lines = super::format_line_range(start, end);
     let source_prefix = match &self.source {
       DiffSource::WorkingTree => String::default(),
       DiffSource::Commit { oid, .. } => format!("{:.7}:", oid),
     };
-    let prefilled = format!("* git-diff:{source_prefix}{file_name}:{line_part} \u{2014} ",);
-    let cursor_offset = prefilled.len();
-    Some(CommentContext { prefilled, cursor_offset })
+    let prefilled = format!("* git-diff:{source_prefix}{file_name}:{lines} \u{2014} ");
+    Some(CommentContext { prefilled })
   }
 
   pub fn current_file_language(&self) -> Language {

@@ -1,6 +1,6 @@
 use gpui::*;
 use gpui_component::ActiveTheme;
-use gpui_component::input::{Input, InputEvent, InputState, RopeExt as _};
+use gpui_component::input::{Input, InputState, RopeExt as _};
 
 actions!(comment_panel, [ConfirmComment, DismissComment]);
 
@@ -14,7 +14,6 @@ pub fn init(cx: &mut App) {
 
 pub struct CommentContext {
   pub prefilled: String,
-  pub cursor_offset: usize,
 }
 
 pub enum CommentPanelEvent {
@@ -27,7 +26,6 @@ impl EventEmitter<CommentPanelEvent> for CommentPanel {}
 pub struct CommentPanel {
   input: Entity<InputState>,
   focus: FocusHandle,
-  _subscription: Subscription,
 }
 
 impl CommentPanel {
@@ -36,17 +34,12 @@ impl CommentPanel {
       let mut state = InputState::new(window, cx).placeholder("Type comment...");
       state.set_value(&context.prefilled, window, cx);
       // Place cursor at the end of the prefilled text.
-      let position = state.text().offset_to_position(context.cursor_offset);
+      let position = state.text().offset_to_position(context.prefilled.len());
       state.set_cursor_position(position, window, cx);
       state
     });
 
-    let subscription = cx.subscribe(&input, |_this: &mut Self, _, event: &InputEvent, _cx| {
-      // Just observe changes; no special behavior needed.
-      let _ = event;
-    });
-
-    Self { input, focus: cx.focus_handle(), _subscription: subscription }
+    Self { input, focus: cx.focus_handle() }
   }
 
   pub fn input_focus_handle(&self, cx: &App) -> FocusHandle {

@@ -9,7 +9,6 @@ use crate::views::picker::{
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
-use crate::views::todo_view::TodoViewEvent;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -76,7 +75,6 @@ pub struct Workspace {
   recent_files: Vec<PathBuf>,
   _appearance_subscription: Subscription,
   _diff_view_subscription: Option<Subscription>,
-  _todo_view_subscription: Option<Subscription>,
 }
 
 impl Workspace {
@@ -148,7 +146,6 @@ impl Workspace {
       recent_files: Vec::new(),
       _appearance_subscription: appearance_subscription,
       _diff_view_subscription: None,
-      _todo_view_subscription: None,
     };
 
     ws.subscribe_active_project(window, cx);
@@ -200,16 +197,6 @@ impl Workspace {
         DiffViewEvent::Reviewed => {
           this.open_diff_picker(window, cx);
         }
-      },
-    ));
-
-    let todo_view = project.todo_view.clone();
-    self._todo_view_subscription = Some(cx.subscribe_in(
-      &todo_view,
-      window,
-      |_this: &mut Self, _, _event: &TodoViewEvent, _window, _cx| {
-        // With per-session reply views, we no longer need to sync slug here.
-        // The reply views are pre-bound to their session slugs.
       },
     ));
   }
@@ -724,32 +711,24 @@ impl Workspace {
     self.pre_comment_focus = window.focused(cx);
     let panel = cx.new(|cx| CommentPanel::new(context, window, cx));
 
-    let subscription =
-      cx.subscribe_in(&panel, window, |this: &mut Self, _, event, window, cx| match event {
-        CommentPanelEvent::Confirmed(text) => {
-          // Insert comment into active session's WAIT section.
-          let project = &this.projects[this.active_project_index];
-          if let Some(session) = project.active_session() {
-            let comment = format!("{text}\n");
-            project.todo_view.update(cx, |tv, cx| {
-              tv.insert_comment(&session.slug, &comment, window, cx);
-              tv.save(cx);
-            });
-          }
-          if let Some(focus) = this.pre_comment_focus.take() {
-            focus.focus(window);
-          }
-          this.dismiss_comment_panel();
-          cx.notify();
+    let subscription = cx.subscribe_in(&panel, window, |this: &mut Self, _, event, window, cx| {
+      if let CommentPanelEvent::Confirmed(text) = event {
+        // Insert comment into active session's WAIT section.
+        let project = &this.projects[this.active_project_index];
+        if let Some(session) = project.active_session() {
+          let comment = format!("{text}\n");
+          project.todo_view.update(cx, |tv, cx| {
+            tv.insert_comment(&session.slug, &comment, window, cx);
+            tv.save(cx);
+          });
         }
-        CommentPanelEvent::Dismissed => {
-          if let Some(focus) = this.pre_comment_focus.take() {
-            focus.focus(window);
-          }
-          this.dismiss_comment_panel();
-          cx.notify();
-        }
-      });
+      }
+      if let Some(focus) = this.pre_comment_focus.take() {
+        focus.focus(window);
+      }
+      this.dismiss_comment_panel();
+      cx.notify();
+    });
 
     self.active_comment_panel = Some(panel.clone().into());
     self._comment_subscription = Some(subscription);
@@ -954,43 +933,26 @@ impl Render for Workspace {
           .child(resizable_panel().size(px(600.0)).child(left_wrapper))
           .child(resizable_panel().size(px(600.0)).child(right_wrapper)),
       )
-      .when_some(self.active_picker.as_ref(), |el, picker| {
-        el.child(
-          deferred(
-            div()
-              .absolute()
-              .size_full()
-              .top_0()
-              .left_0()
-              .flex()
-              .justify_center()
-              .pt(px(80.0))
-              .bg(hsla(0., 0., 0., 0.3))
-              .on_mouse_down(MouseButton::Left, |_, _, _cx| {})
-              .child(picker.clone()),
-          )
-          .with_priority(1),
-        )
-      })
-      .when_some(self.active_comment_panel.as_ref(), |el, panel| {
-        el.child(
-          deferred(
-            div()
-              .absolute()
-              .size_full()
-              .top_0()
-              .left_0()
-              .flex()
-              .justify_center()
-              .pt(px(80.0))
-              .bg(hsla(0., 0., 0., 0.3))
-              .on_mouse_down(MouseButton::Left, |_, _, _cx| {})
-              .child(panel.clone()),
-          )
-          .with_priority(1),
-        )
-      })
+      .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
+      .when_some(self.active_comment_panel.as_ref(), |el, v| el.child(modal_overlay(v)))
   }
+}
+
+fn modal_overlay(content: &AnyView) -> Deferred {
+  deferred(
+    div()
+      .absolute()
+      .size_full()
+      .top_0()
+      .left_0()
+      .flex()
+      .justify_center()
+      .pt(px(80.0))
+      .bg(hsla(0., 0., 0., 0.3))
+      .on_mouse_down(MouseButton::Left, |_, _, _cx| {})
+      .child(content.clone()),
+  )
+  .with_priority(1)
 }
 
 pub fn init(cx: &mut App) {

@@ -5,12 +5,6 @@ use gpui_component::input::{InputEvent, Position, Rope};
 use jc_core::todo::{self, TodoDocument, TodoProblem};
 use std::path::{Path, PathBuf};
 
-pub enum TodoViewEvent {
-  DocumentChanged,
-}
-
-impl EventEmitter<TodoViewEvent> for TodoView {}
-
 /// TodoView wraps a [`CodeView`] opened on the project's `TODO.md` file,
 /// adding parsing, highlighting, validation, and event emission on changes.
 pub struct TodoView {
@@ -41,7 +35,7 @@ impl TodoView {
           let text = this.code_view.read(cx).editor_text(cx);
           this.document = todo::parse(&text);
           // Skip re-validation on every keystroke (it scans the filesystem).
-          cx.emit(TodoViewEvent::DocumentChanged);
+          cx.notify();
         }
       });
 

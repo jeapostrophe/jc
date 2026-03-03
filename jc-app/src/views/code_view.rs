@@ -186,10 +186,9 @@ impl CodeView {
     let file_path = self.current_file.as_ref()?;
     let relative = file_path.strip_prefix(project_path).ok().unwrap_or(file_path);
     let (start, end) = super::selection_line_range(&self.editor, cx);
-    let line_part = if start == end { format!("{start}") } else { format!("{start}-{end}") };
-    let prefilled = format!("* {}:{} \u{2014} ", relative.display(), line_part);
-    let cursor_offset = prefilled.len();
-    Some(CommentContext { prefilled, cursor_offset })
+    let prefilled =
+      format!("* {}:{} \u{2014} ", relative.display(), super::format_line_range(start, end));
+    Some(CommentContext { prefilled })
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {

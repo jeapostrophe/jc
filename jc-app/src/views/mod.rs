@@ -25,6 +25,11 @@ pub fn selection_line_range(editor: &Entity<InputState>, cx: &App) -> (u32, u32)
   (start.line + 1, end.line + 1)
 }
 
+/// Formats a line range as "N" (single line) or "N-M" (multi-line).
+pub fn format_line_range(start: u32, end: u32) -> String {
+  if start == end { format!("{start}") } else { format!("{start}-{end}") }
+}
+
 /// Scrolls an editor widget so the given 0-based `line` is approximately centered.
 pub fn scroll_editor_to_line<V: 'static>(
   editor: &Entity<InputState>,
