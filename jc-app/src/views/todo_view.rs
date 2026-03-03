@@ -1,215 +1,53 @@
-use crate::language::Language;
+use crate::views::code_view::CodeView;
 use gpui::*;
-use gpui_component::RopeExt;
-use gpui_component::input::{Input, InputEvent, InputState, Position};
-use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-actions!(todo, [ReloadTodoFromDisk]);
-
-pub fn init(cx: &mut App) {
-  cx.bind_keys([KeyBinding::new("cmd-r", ReloadTodoFromDisk, Some("TodoView"))]);
-}
-
+/// TodoView wraps a [`CodeView`] opened on the project's `TODO.md` file,
+/// adding save functionality. All editor, file-watching, reload, dirty
+/// tracking, and rendering behaviour is delegated to the inner CodeView.
 pub struct TodoView {
-  editor: Entity<InputState>,
+  code_view: Entity<CodeView>,
   file_path: PathBuf,
-  dirty: bool,
-  externally_modified: bool,
-  /// Set when the file changes on disk and the buffer is clean; cleared after
-  /// the auto-reload is performed during the next render pass (which provides
-  /// the required `Window` reference).
-  pending_auto_reload: bool,
-  saving: Arc<AtomicBool>,
-  _subscription: Subscription,
-  _watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl TodoView {
   pub fn new(project_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-    let editor = cx.new(|cx| {
-      InputState::new(window, cx)
-        .code_editor(Language::Markdown.name())
-        .soft_wrap(true)
-        .line_number(false)
-    });
-
-    let subscription = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, _cx| {
-      if matches!(event, InputEvent::Change) {
-        this.dirty = true;
-      }
-    });
-
     let file_path = project_path.join("TODO.md");
-    let saving = Arc::new(AtomicBool::new(false));
+    let open_path = file_path.clone();
+    let code_view = cx.new(|cx| {
+      let mut cv = CodeView::new(window, cx);
+      cv.open_file(open_path, window, cx);
+      cv
+    });
 
-    // Set up file watcher on the parent directory (more reliable on macOS)
-    let watcher = if let Some(parent) = file_path.parent() {
-      let parent = parent.to_path_buf();
-      let saving_clone = saving.clone();
-      let (notify_tx, notify_rx) = flume::unbounded::<()>();
-
-      let mut watcher =
-        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-          if let Ok(event) = res {
-            match event.kind {
-              EventKind::Modify(_) | EventKind::Create(_) => {
-                if event.paths.iter().any(|p| p.ends_with("TODO.md"))
-                  && !saving_clone.load(Ordering::Relaxed)
-                {
-                  let _ = notify_tx.send(());
-                }
-              }
-              _ => {}
-            }
-          }
-        })
-        .ok();
-
-      if let Some(ref mut w) = watcher {
-        let _ = w.watch(&parent, RecursiveMode::NonRecursive);
-      }
-
-      // Bridge notify events to GPUI
-      cx.spawn(async move |this: WeakEntity<TodoView>, cx: &mut AsyncApp| {
-        while notify_rx.recv_async().await.is_ok() {
-          // Drain any additional queued notifications
-          while notify_rx.try_recv().is_ok() {}
-          let _ = cx.update(|cx| {
-            if let Some(entity) = this.upgrade() {
-              entity.update(cx, |view, cx| {
-                if view.dirty {
-                  // User has unsaved edits -- show the reload banner.
-                  view.externally_modified = true;
-                } else {
-                  // Buffer is clean -- schedule an auto-reload on the next
-                  // render pass (we need a Window reference for set_value).
-                  view.pending_auto_reload = true;
-                }
-                cx.notify();
-              });
-            }
-          });
-        }
-      })
-      .detach();
-
-      watcher
-    } else {
-      None
-    };
-
-    let mut view = Self {
-      editor,
-      file_path,
-      dirty: false,
-      externally_modified: false,
-      pending_auto_reload: false,
-      saving,
-      _subscription: subscription,
-      _watcher: watcher,
-    };
-    view.load(window, cx);
-    view
+    Self { code_view, file_path }
   }
 
   pub fn file_path(&self) -> &Path {
     &self.file_path
   }
 
-  pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    let content = std::fs::read_to_string(&self.file_path).unwrap_or_default();
-    self.editor.update(cx, |state, cx| {
-      state.set_value(content, window, cx);
-    });
-    self.dirty = false;
-    self.externally_modified = false;
-    self.pending_auto_reload = false;
-  }
-
-  pub fn save(&mut self, cx: &mut Context<Self>) {
-    self.saving.store(true, Ordering::Relaxed);
-    let content = self.editor.read(cx).value();
-    if let Err(e) = std::fs::write(&self.file_path, content.as_ref()) {
-      eprintln!("Failed to save TODO.md: {e}");
-    }
-    self.dirty = false;
-
-    // Clear saving flag after a brief delay to suppress self-triggered watcher event
-    let saving = self.saving.clone();
-    cx.spawn(async move |_this: WeakEntity<TodoView>, _cx: &mut AsyncApp| {
-      Timer::after(std::time::Duration::from_millis(200)).await;
-      saving.store(false, Ordering::Relaxed);
-    })
-    .detach();
-  }
-
-  fn reload_from_disk(
-    &mut self,
-    _: &ReloadTodoFromDisk,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    self.load(window, cx);
-    cx.notify();
-  }
-}
-
-impl TodoView {
   pub fn editor_text(&self, cx: &App) -> String {
-    self.editor.read(cx).value().as_ref().to_string()
+    self.code_view.read(cx).editor_text(cx)
+  }
+
+  pub fn save(&self, cx: &mut Context<Self>) {
+    self.code_view.update(cx, |cv, cx| cv.save(cx));
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
-    self.editor.update(cx, |editor, cx| {
-      // Estimate the number of visible lines in the editor viewport.
-      // We use the window height and line height as an approximation,
-      // scaled down because the editor doesn't fill the entire window.
-      let line_height = window.line_height();
-      let window_height = window.bounds().size.height;
-      let estimated_visible = ((window_height / line_height) * 0.6) as u32;
-      let half_page = estimated_visible / 2;
-
-      let total_lines = editor.text().lines_len() as u32;
-
-      // Two-step cursor move to center the target line:
-      // 1) Jump to a line ~half a viewport below the target so the
-      //    viewport scrolls past it.
-      // 2) Jump back to the target; since it is now above the viewport
-      //    the scroll logic places it at the top -- roughly centered.
-      let lookahead = (line + half_page).min(total_lines.saturating_sub(1));
-      if lookahead != line {
-        editor.set_cursor_position(Position::new(lookahead, 0), window, cx);
-      }
-      editor.set_cursor_position(Position::new(line, 0), window, cx);
-    });
+    self.code_view.update(cx, |cv, cx| cv.scroll_to_line(line, window, cx));
   }
 }
 
 impl Render for TodoView {
-  fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    // Perform deferred auto-reload (requires the Window reference that only
-    // render provides).
-    if self.pending_auto_reload {
-      self.load(window, cx);
-    }
-
-    div()
-      .id("todo-view")
-      .key_context("TodoView")
-      .track_focus(&self.editor.read(cx).focus_handle(cx))
-      .size_full()
-      .font_family("Lilex")
-      .on_action(cx.listener(Self::reload_from_disk))
-      .child(super::external_change_banner(self.externally_modified, cx))
-      .child(Input::new(&self.editor).h_full().appearance(false).bordered(false))
+  fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    div().id("todo-view").size_full().child(self.code_view.clone())
   }
 }
 
 impl Focusable for TodoView {
   fn focus_handle(&self, cx: &App) -> FocusHandle {
-    self.editor.read(cx).focus_handle(cx)
+    self.code_view.read(cx).focus_handle(cx)
   }
 }

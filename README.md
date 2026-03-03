@@ -464,7 +464,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Implement git worktree creation/deletion via `git2` worktree API
 
 ### Polish & Integration
-- [ ] [H] Reduce duplication between CodeView and TodoView (consider having TodoView wrap a CodeView)
+- [x] [H] Reduce duplication between CodeView and TodoView (consider having TodoView wrap a CodeView)
 - [ ] [H] End-to-end test: full workflow from project creation to Claude review cycle
 - [ ] [H] Persistent state: survive app restart without losing task state or terminal sessions [perhaps use 'tmux' behind the scenes]
 - [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly

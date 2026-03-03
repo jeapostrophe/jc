@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::views::code_view;
 use crate::views::diff_view;
 use crate::views::picker;
-use crate::views::todo_view;
 use crate::views::workspace::{self, Workspace};
 use gpui::*;
 use gpui_component::TitleBar;
@@ -150,7 +149,6 @@ pub fn run(state: AppState, config: AppConfig) {
     picker::init(cx);
     code_view::init(cx);
     diff_view::init(cx);
-    todo_view::init(cx);
 
     // Register the bundled Lilex font family.
     cx.text_system()

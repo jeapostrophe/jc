@@ -3,6 +3,8 @@ use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 actions!(code_view, [ReloadCodeFromDisk]);
 
@@ -13,15 +15,15 @@ pub fn init(cx: &mut App) {
 pub struct CodeView {
   editor: Entity<InputState>,
   current_file: Option<PathBuf>,
-  project_path: PathBuf,
   dirty: bool,
   externally_modified: bool,
+  saving: Arc<AtomicBool>,
   _subscription: Subscription,
   _watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl CodeView {
-  pub fn new(project_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+  pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
     let editor = cx.new(|cx| {
       InputState::new(window, cx)
         .code_editor(Language::default().name())
@@ -38,9 +40,9 @@ impl CodeView {
     Self {
       editor,
       current_file: None,
-      project_path,
       dirty: false,
       externally_modified: false,
+      saving: Arc::new(AtomicBool::new(false)),
       _subscription: subscription,
       _watcher: None,
     }
@@ -67,13 +69,16 @@ impl CodeView {
     };
 
     let (notify_tx, notify_rx) = flume::unbounded::<()>();
+    let saving = self.saving.clone();
 
     let mut watcher =
       notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
         if let Ok(event) = res {
           match event.kind {
             EventKind::Modify(_) | EventKind::Create(_) => {
-              if event.paths.iter().any(|p| p.ends_with(&watched_file)) {
+              if event.paths.iter().any(|p| p.ends_with(&watched_file))
+                && !saving.load(Ordering::Relaxed)
+              {
                 let _ = notify_tx.send(());
               }
             }
@@ -129,8 +134,30 @@ impl CodeView {
 }
 
 impl CodeView {
+  pub fn is_dirty(&self) -> bool {
+    self.dirty
+  }
+
   pub fn editor_text(&self, cx: &App) -> String {
     self.editor.read(cx).value().as_ref().to_string()
+  }
+
+  pub fn save(&mut self, cx: &mut Context<Self>) {
+    let Some(path) = self.current_file.as_ref() else { return };
+    self.saving.store(true, Ordering::Relaxed);
+    let content = self.editor.read(cx).value();
+    if let Err(e) = std::fs::write(path, content.as_ref()) {
+      eprintln!("Failed to save {}: {e}", path.display());
+    }
+    self.dirty = false;
+
+    // Clear saving flag after a brief delay to suppress self-triggered watcher event.
+    let saving = self.saving.clone();
+    cx.spawn(async move |_this: WeakEntity<CodeView>, _cx: &mut AsyncApp| {
+      Timer::after(std::time::Duration::from_millis(200)).await;
+      saving.store(false, Ordering::Relaxed);
+    })
+    .detach();
   }
 
   pub fn current_language(&self) -> Language {

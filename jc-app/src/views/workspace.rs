@@ -93,7 +93,7 @@ impl Workspace {
     let general_terminal =
       cx.new(|cx| TerminalView::new(base_config(&palette), Some(&project_path), window, cx));
     let diff_view = cx.new(|cx| DiffView::new(project_path.clone(), window, cx));
-    let code_view = cx.new(|cx| CodeView::new(project_path.clone(), window, cx));
+    let code_view = cx.new(|cx| CodeView::new(window, cx));
     let todo_view = cx.new(|cx| TodoView::new(project_path, window, cx));
 
     let claude_focus = claude_terminal.read(cx).focus_handle(cx);
