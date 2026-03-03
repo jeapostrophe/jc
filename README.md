@@ -87,12 +87,6 @@ Key design points:
 - Session picker (Cmd-P) shows all sessions across all projects with `>` for active and `!` for sessions with problems
 - Title bar shows `project > session` with problem indicators
 
-Checklist:
-- [x] [D] Implement App -> Projects -> Sessions hierarchy (active project, active session tracking)
-- [x] [H] Per-session terminal pairs with shared TODO file
-- [x] [H] Session picker to switch active session within a project
-- [x] [E] Track and display "problems" (invalid slugs, dirty buffers, dirty working directories, etc.) in status bar
-
 ### TODO.md
 
 Each project has a single TODO.md file. The app is the sole writer; if the file changes on disk, the app detects it and shows a visual indicator (with optional git-style merge).
@@ -125,6 +119,50 @@ From any view (diff, terminal, code, reply), the user can press a comment keybin
 - **From diff or code view:** `* <file>:<start_line>-<end_line> --- Comment text`
 - **From terminal:** `* TERMINAL\n\`\`\`\n[selected content]\n\`\`\`\nComment text`
 - **From a Claude reply:** `* .jc/replies/<turn_file>.md:<line> --- Comment text`
+
+## Research
+
+### macOS Notifications
+
+**Verdict: Use `objc2-user-notifications` (modern API).** Since the app will be a bundled `.app` anyway (required by GPUI/Metal), the code-signing requirement is not a burden. This gives us action buttons ("Switch to Session"), notification grouping via `threadIdentifier`, async delegate callbacks, and future-proofing (Apple's current API, not deprecated).
+
+**Fallback:** `mac-notification-sys` v0.6.9 works today without code signing but uses deprecated `NSUserNotificationCenter`. Fine for prototyping.
+
+**Simplest possible:** `osascript -e 'display notification ...'` for zero-dependency MVP.
+
+### Claude Code Idle Detection
+
+**Verdict: Use Claude Code's hooks system.** This is purpose-built for exactly our use case.
+
+**Primary mechanism:** Configure HTTP hooks in `~/.claude/settings.json` that POST to a local port our app listens on:
+- `Stop` hook fires when Claude finishes responding (definitive completion signal)
+- `Notification` hook with `idle_prompt` matcher fires when waiting for input
+- `Notification` hook with `permission_prompt` matcher fires when tool approval needed
+- `PermissionRequest` hook fires with full tool details for permission dialogs
+
+**Secondary signal (status unknown):** The `preferredNotifChannel = terminal_bell` setting mentioned in earlier research does not exist in the current Claude Code settings schema (as of March 2026). Claude Code may already emit BEL (`\x07`) on task completion in terminal mode --- needs testing. The `jc-terminal` crate already detects `TerminalEvent::Bell` via alacritty, so if BEL is emitted, no extra configuration is needed.
+
+**Combine with:** Brief silence heuristic as a tertiary fallback (2+ seconds of PTY silence AND a Stop hook = confident idle state).
+
+**Known issues:** `idle_prompt` fires after EVERY response, not just genuine wait states (bug tracked in Claude Code issues). The `Stop` hook is more reliable.
+
+### Claude Usage Dashboard
+
+**Verdict: Poll the undocumented OAuth usage API.** `GET https://api.anthropic.com/api/oauth/usage` returns exactly what we need:
+
+```json
+{
+  "five_hour": { "utilization": 37.0, "resets_at": "2026-02-08T04:59:59Z" },
+  "seven_day": { "utilization": 26.0, "resets_at": "2026-02-12T14:59:59Z" },
+  "extra_usage": { "is_enabled": true, "monthly_limit": 5000, "used_credits": 1234, "utilization": 24.68 }
+}
+```
+
+**Token access:** Read from macOS Keychain via `security find-generic-password -s "Claude Code-credentials" -w`, parse JSON, extract `claudeAiOauth.accessToken`. Poll every 30-60 seconds.
+
+**Par calculation:** Compare `seven_day.utilization` against `(elapsed_working_seconds / total_working_seconds_in_window) * 100`, adjusted for configured working hours.
+
+**Risk:** Undocumented endpoint, could change. A `claude-usage` Rust crate already exists on crates.io. Community tools (bash scripts, Python dashboards) demonstrate the pattern is stable.
 
 ## Views & Panels
 
@@ -270,129 +308,6 @@ It is deliberately *not* a full code editor on mobile.
 2. Create additional sessions from the picker ("New session" launches Claude Code, discovers the slug, inserts the heading). Or adopt an existing orphaned session.
 3. Use the fuzzy picker to switch between projects and sessions.
 
-## Research Findings
-
-### GPUI (GUI Framework)
-
-**Verdict: Go.** Published on crates.io as `gpui` v0.2.2. Usable standalone --- 38+ community projects exist (Loungy, Longbridge Pro, etc.). Metal rendering on macOS targets 120 FPS.
-
-**Key asset:** `gpui-component` (Longbridge, 10.3k GitHub stars) provides 60+ production-ready widgets including a code editor component, 20+ themes, buttons, inputs, lists, tables. This dramatically reduces UI work.
-
-**Risks:** Pre-1.0 with breaking changes. Zed deprioritized standalone GPUI development in late 2025 --- a community fork `gpui-ce` exists (480 stars) as a hedge. Pin to a specific version and use `gpui-component` for standard widgets.
-
-**Alternatives considered:** Iced (safer but less performant), egui (simpler but immediate-mode), Slint (stable but less flexible).
-
-### Terminal Emulator
-
-**Verdict: Use `alacritty_terminal`.** It is the only production-quality Rust terminal emulator state machine available as a standalone library. Zed uses a fork pinned to a specific commit (`github.com/zed-industries/alacritty`).
-
-**Claude Code compatibility:** Full support for all escape sequences Claude Code uses (truecolor, alternate screen, SGR styling, synchronized updates, mouse modes, Kitty keyboard protocol).
-
-**GPUI integration proven:** The zTerm project (github.com/zerx-lab/zTerm) demonstrates standalone GPUI + alacritty_terminal integration. Key lesson: use a ~4ms batching interval to coalesce PTY events before rendering. Integration requires ~500-1000 lines of glue code (custom `Element` that paints terminal cells, input routing, PTY management).
-
-**Current approach:** Using crates.io `alacritty_terminal` v0.25.1 + `portable-pty` v0.9.0 in the `jc-terminal` crate. PTY reading runs on a dedicated std::thread, with bytes forwarded via flume channel to a GPUI async task that processes VTE escape sequences and triggers re-renders. Rendering uses GPUI's `canvas()` element to paint terminal cells directly.
-
-### tree-sitter
-
-**Verdict: Go.** v0.26.6, actively maintained. Rich grammar ecosystem with crates for all major languages (Rust, Python, JS/TS, Go, C/C++, Java, Markdown, etc.).
-
-**Architecture:** Follow Zed's query-driven model. Define `highlights.scm` and `outline.scm` per language. Use `tree-sitter-highlight` for syntax highlighting event streams, custom `outline.scm` queries for symbol navigation with hierarchy context (e.g., which `impl` block a method belongs to). Skip `tree-sitter-tags` --- custom queries give more control.
-
-**Performance:** Initial parse ~80ms for a 6K-line file. Incremental re-parse sub-millisecond. Fast enough for keystroke-level responsiveness.
-
-**Gotcha:** Version coupling between `tree-sitter` core and grammar crates. Pin all tree-sitter-related crates carefully. Use `tree-sitter-language` `LanguageFn` pattern to avoid conflicts.
-
-### Markdown Editor
-
-**Verdict: Use `gpui-component` editor widget.** This provides a rope-backed (`ropey`) code editor with tree-sitter integration, line numbers, search, soft/hard wrap, and multi-cursor support out of the box.
-
-**Approach:** Configure with `tree-sitter-md` for markdown highlighting, then add a custom post-processing pass for TODO.md-specific constructs (`### WAIT` markers, `### Message N` headers, `* <file>:<line> --- comment` annotations). Estimated effort: 2-4 weeks vs 6-12 weeks for building from scratch.
-
-**Prior art:** Aster (github.com/kumarUjjawal/aster) is a GPUI-based markdown editor using the same ropey + tree-sitter-md stack. Good reference implementation.
-
-### git2
-
-**Verdict: Go.** v0.20.4, actively maintained (used by Cargo itself). Vendored libgit2 avoids macOS system library conflicts.
-
-**Diff:** Full line-level diff API via `diff_tree_to_workdir_with_index()`. Supports unified, raw, name-only formats. Context lines, whitespace options, patience/minimal algorithms, rename detection all available. For **word-level inline highlighting** within changed lines, supplement with `similar` (ergonomic) or `imara-diff` (30x faster, used by Helix).
-
-**Worktrees:** Complete API --- create (`repo.worktree()`), list (`repo.worktrees()`), validate, lock/unlock, prune. Sufficient for our session management model.
-
-**Shell out to git CLI for:** clone, fetch, gc, shallow clones, sparse checkout, hook execution. These operations are either unsupported or significantly slower in libgit2.
-
-### macOS Notifications
-
-**Verdict: Use `objc2-user-notifications` (modern API).** Since the app will be a bundled `.app` anyway (required by GPUI/Metal), the code-signing requirement is not a burden. This gives us action buttons ("Switch to Session"), notification grouping via `threadIdentifier`, async delegate callbacks, and future-proofing (Apple's current API, not deprecated).
-
-**Fallback:** `mac-notification-sys` v0.6.9 works today without code signing but uses deprecated `NSUserNotificationCenter`. Fine for prototyping.
-
-**Simplest possible:** `osascript -e 'display notification ...'` for zero-dependency MVP.
-
-### Claude Code Idle Detection
-
-**Verdict: Use Claude Code's hooks system.** This is purpose-built for exactly our use case.
-
-**Primary mechanism:** Configure HTTP hooks in `~/.claude/settings.json` that POST to a local port our app listens on:
-- `Stop` hook fires when Claude finishes responding (definitive completion signal)
-- `Notification` hook with `idle_prompt` matcher fires when waiting for input
-- `Notification` hook with `permission_prompt` matcher fires when tool approval needed
-- `PermissionRequest` hook fires with full tool details for permission dialogs
-
-**Secondary signal (status unknown):** The `preferredNotifChannel = terminal_bell` setting mentioned in earlier research does not exist in the current Claude Code settings schema (as of March 2026). Claude Code may already emit BEL (`\x07`) on task completion in terminal mode --- needs testing. The `jc-terminal` crate already detects `TerminalEvent::Bell` via alacritty, so if BEL is emitted, no extra configuration is needed.
-
-**Combine with:** Brief silence heuristic as a tertiary fallback (2+ seconds of PTY silence AND a Stop hook = confident idle state).
-
-**Known issues:** `idle_prompt` fires after EVERY response, not just genuine wait states (bug tracked in Claude Code issues). The `Stop` hook is more reliable.
-
-### Claude Reply Viewer
-
-**Verdict: Read session JSONL files directly.** No extraction step needed --- render in-app from the JSONL source of truth.
-
-**JSONL format:** Claude Code persists all conversations to `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`. Each line is a JSON object with a `type` field (`user`, `assistant`, `file-history-snapshot`, etc.). Messages link via `parentUuid`/`uuid` fields. Assistant messages contain content block arrays with `type: "text"`, `type: "thinking"`, and tool use blocks. Every message carries a `slug` field (e.g., `"encapsulated-swimming-firefly"`) that is stable across session forks.
-
-**Session forking:** Claude Code forks sessions when transitioning between modes (e.g., plan to execution) or on `/clear` + resume. A forked session is a new JSONL file whose first `user` entry references the parent session via `sessionId` (parent's ID) and `parentUuid` (fork point in parent). All files in a fork group share the same `slug`. About half of all sessions have at least one fork.
-
-**Turn grouping:** A turn = one `user` message + all subsequent non-user messages until the next `user` message. This groups the request with all of Claude's responses, tool calls, and thinking into a single reviewable unit. For forked sessions, turns are loaded from all JSONL files sharing the same slug, ordered by timestamp.
-
-**Path encoding:** Slashes become hyphens, e.g., `/Users/jay/Dev/project` becomes `-Users-jay-Dev-project`.
-
-**Session discovery:** Scan `.jsonl` files in the encoded-path directory, extract the `slug` from each, and group files by slug. The slug of the most recently modified file becomes the default session for a new project. Sessions are defined in TODO.md via `## Session <slug>: <label>` headings.
-
-**Performance:** JSONL files are append-only. A long session might be a few MB. Full re-read on file change is well under 100ms. File watching via `notify` (same as CodeView) detects updates while Claude is working.
-
-### TLS Server (Mobile Connection)
-
-**Verdict: `axum` + `axum-server` (tls-rustls) + `rcgen`.** Pure Rust, no system dependencies, WebSocket-over-TLS built in.
-
-- `rcgen` generates self-signed certs at pairing time with IP address SANs
-- `axum-server` binds with `bind_rustls()` using the generated cert
-- `axum` serves both REST and WebSocket over TLS from a single binding
-- Mobile app pins the cert's SHA-256 public key fingerprint (received via QR code)
-
-**QR pairing payload:** `{"host": "192.168.1.x", "port": 8443, "fp": "sha256/base64fingerprint=="}` --- fits easily in a Version 10-15 QR code.
-
-### QR Code Generation
-
-**Verdict: `fast_qr`.** 6-7x faster than alternatives (though all are fast enough). Clean API with direct matrix access via public `data` field --- ideal for rendering as GPUI quads. Default ECL Q (25% recovery) is right for screen-to-camera scanning. Zero image dependencies when used with `default-features = false`.
-
-### Claude Usage Dashboard
-
-**Verdict: Poll the undocumented OAuth usage API.** `GET https://api.anthropic.com/api/oauth/usage` returns exactly what we need:
-
-```json
-{
-  "five_hour": { "utilization": 37.0, "resets_at": "2026-02-08T04:59:59Z" },
-  "seven_day": { "utilization": 26.0, "resets_at": "2026-02-12T14:59:59Z" },
-  "extra_usage": { "is_enabled": true, "monthly_limit": 5000, "used_credits": 1234, "utilization": 24.68 }
-}
-```
-
-**Token access:** Read from macOS Keychain via `security find-generic-password -s "Claude Code-credentials" -w`, parse JSON, extract `claudeAiOauth.accessToken`. Poll every 30-60 seconds.
-
-**Par calculation:** Compare `seven_day.utilization` against `(elapsed_working_seconds / total_working_seconds_in_window) * 100`, adjusted for configured working hours.
-
-**Risk:** Undocumented endpoint, could change. A `claude-usage` Rust crate already exists on crates.io. Community tools (bash scripts, Python dashboards) demonstrate the pattern is stable.
-
 ## Task Checklist
 
 > **Difficulty labels** — applied to each unchecked task:
@@ -404,130 +319,32 @@ It is deliberately *not* a full code editor on mobile.
 >
 > *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox. If the item doesn't fit under an existing section, create a new `###` section for it.*
 
-### Core Infrastructure
-- [x] Set up Rust workspace (`jc-app`, `jc-core`)
-- [x] Integrate `gpui` 0.2.x + `gpui-component` and get a basic window rendering
-- [x] Implement `~/.config/jc/` config and state persistence
-- [x] Implement project and task data model
-- [x] Implement `jc` CLI for adding projects from the command line
-- [x] [T] Remove code_editor_demo
-- [x] [E] Stringly-typed language names vs enum (`Language` enum in `language.rs`)
-- [x] [E] Move the crates out of './crates' and into the top-level
-- [x] [E] Starting with no project should initialize to a project in the cwd
-
 ### Terminal Emulator
-- [x] Integrate `alacritty_terminal` with GPUI rendering (`jc-terminal` crate)
-- [x] Implement PTY management (`portable-pty`) with background reader thread
-- [x] Implement keystroke-to-bytes conversion (special keys, Ctrl, Alt, APP_CURSOR mode)
-- [x] Implement terminal cell painting (backgrounds, text with bold/italic, cursor shapes)
-- [x] Implement terminal resize detection and PTY resize propagation
-- [x] Extract terminal color palette to a theme file (`~/.config/jc/theme.toml`)
-- [x] Run general-purpose shell in a second terminal per task
-- [ ] [T] Verify whether Claude Code emits BEL (`\x07`) on task completion in terminal mode (replaces earlier `preferredNotifChannel` assumption)
-- [x] [E] Change the font size of the terminal(s) via font size keybindings (Cmd-+/-/0)
+- [ ] [T] Verify whether Claude Code emits BEL (`\x07`) on task completion in terminal mode
 - [ ] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
-- [x] [E] Run Claude Code inside the embedded terminal dedicated to Claude
-- [x] [E] Fix the working directory of the terminals
-- [x] [D] ~~Claude appears to create new session_ids "behind the scenes" when it enters and leaves planning mode~~ Resolved: Claude forks sessions on mode transitions. All forks share the same `slug`. Use slug as stable identifier.
-- [x] [D] ~~Add `session_slug` to Task model and persist in `state.toml`~~ Superseded: session state lives in TODO.md
-- [x] [D] ~~Consider having session state inside of TODO.md rather than having "Task 1"/etc~~ Resolved: sessions defined via `## Session <slug>: <label>` headings in TODO.md
-- [x] [E] Implement session discovery by slug: scan JSONL files, extract slug, group by slug, adopt most recent slug on project init
-- [x] [E] Invoke Claude Code with `--resume <session-id>` using the most recent file UUID from the session's slug group
 - [ ] [H] Cursor not blinking properly in the Claude terminal — Claude Code does its own cursor management; need to properly signal focus state and respect its cursor escape sequences
 
 ### TODO.md System
-- [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
-- [x] Detect external file modifications (file watcher) and show visual indicator
-- [x] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
-- [x] [E] Fix focus to center the target in the middle of the screen
-- [x] [E] Word wrapping lines to fix the length of lines
-- [x] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers)
-- [x] Parse TODO.md format (sessions, messages, WAIT markers)
-- [x] Build library for managing TODO.md representation
-- [x] [H] On startup, if TODO.md has no valid sessions (all slugs are invalid or no `## Session` headings exist), discover the most recent JSONL session group and insert a `## Session <slug>: <label>` heading into TODO.md
-- [x] [E] Skip sessions with invalid slugs during `ProjectState::create` instead of creating broken `SessionState` entries (currently creates terminals that can't resume)
 - [ ] [D] Implement interactive correction of invalid session slugs in TODO.md (e.g., picker showing discovered slugs to replace an invalid one)
-- [x] [H] Implement comment insertion from other views into the WAIT section
 - [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
-- [x] [E] Switching to TODO view should automatically scroll to the WAIT section of the active session
 
 ### Claude Reply Viewer
-- [x] Read session slug from TODO.md; load turns from all JSONL files sharing the slug
-- [x] [H] Implement JSONL session parser in `jc-core` (parse messages, group into turns)
-- [x] [H] Implement ReplyView (render a turn as Markdown in read-only editor, Cmd-6)
-- [x] [E] Implement turn picker (Cmd-Shift-O, newest first, shows request text as preview)
-- [x] [E] Implement Cmd-T heading picker within rendered turns
-- [x] [E] File watching for JSONL changes (reload turns on update)
-- [x] [E] Watch all JSONL files in the slug group (not just one file) for changes
 - [ ] [H] Full conversation rendering: tool use summaries, thinking blocks as additional headings
 
 ### Git Diff View
-- [x] Render git diff via `git2` with `tree-sitter` syntax-aware highlighting
 - [ ] [H] Add word-level inline highlighting via `similar` with background highlights NOT diagnostics
-- [x] [E] Word wrapping lines to fix the length of lines
-- [x] [H] Implement per-file "mark as reviewed" with collapses
-- [x] [E] Annotate which files have been "marked" in the git diff picker
-- [x] [H] Show one file at a time rather than raw multi-file output
-- [x] [H] Implement region selection and comment keybinding [should be sensitive to what diff (checksum) is shown]
-- [x] [H] Show git log as well to look at older diffs. Provide a picker to scroll through to view. (Cmd-Shift-O)
-- [x] [H] Implement language syntax highlighting inside of diffs
-
-### Code Viewer
-- [x] Implement syntax-highlighted file viewer (`tree-sitter` + `tree-sitter-highlight`)
-- [x] Implement fuzzy file picker (search repo files)
-- [x] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
-- [x] Implement "open in external editor" keybinding (Cmd-Shift-E)
-- [x] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
-- [x] [E] Fix focus to center the target in the middle of the screen
-- [x] [E] Word wrapping lines to fix the length of lines
-- [x] [E] Focus into the text area on view selection so keybindings work
-- [x] [D] Implement light editing (basic text modification, not full editor; mostly for inserting comments into documents)
 
 ### Window & Pane Management
-- [x] Fix: Window doesn't get focused on creation
-- [x] Add window keybindings (Cmd+W close, Cmd+M minimize, Cmd+Q quit)
-- [x] Implement left/right two-pane layout (resizable, with pane focus tracking)
-- [x] Implement pane view switching for terminals (Cmd-1 Claude, Cmd-2 General, Cmd-[/] focus)
-- [x] Cmd-[/] overrides InputState indent/outdent when editor is focused (bound in Input context)
-- [x] Implement view switching for diff, TODO, code views (Cmd-3/4/5)
-- [x] Use a monospace font (Lilex) in code editor views (diff, code, TODO)
-- [x] Disable line numbers in code editor views
-- [x] [E] Change the size of the split with a keybinding to make even split (Cmd-|)
-- [x] [E] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
-- [x] [T] Move default theme file to 'data' directory rather than embedding defaults in source
 - [ ] [E] Implement independent scroll positions per pane
-- [x] [D] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting
-- [x] [E] Add a light theme (Tomorrow palette in `light_theme.toml`)
-- [x] [E] Auto-switch themes with system dark mode
-- [x] [T] Remove Cmd-Shift-T manual theme toggle
-- [x] [E] Ensure that the theme is used for all parts of the UI. (Right now, the terminal colors don't match the code view colors)
-- [x] [E] Labels on Diff/Reply/FileViews should be limited to one line, right now they can wrap
 - [ ] [H] Implement Quake-style bottom terminal overlay
 - [ ] [H] Implement multi-window with shared session state
 
 ### Navigation & Pickers
-- [x] Implement generic fuzzy picker library shared by multiple pickers
-- [x] Implement file picker
-- [x] Implement symbol picker
-- [x] [E] Improve open_file_picker to use show_picker
-- [x] [E] Track most recently visited files and put them at the top of file picker
-- [x] [E] Track modified files (from git) and mark them in the file picker
-- [x] [E] Annotate which files are recently visited in file picker with an R.
-- [x] [H] Implement fuzzy project/session picker with filtering (waiting sessions, same project)
-- [x] [H] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
-- [x] [E] Implement general searching in all views with Cmd-F (picker on lines)
-- [x] [H] Cmd-F line search: ensure selected line scrolls to center of screen
-- [x] [E] Allow page up/down in pickers
-- [x] [E] Allow clicking in picker and to select something
-- [x] [E] Press up in the picker doesn't change the focus to show the things at the bottom
 
 ### Notifications & Status
-- [x] Implement Claude usage algorithm
-- [x] Implement configurable working hours for par calculation
-- [x] [D] Turn usage into a single number/visualization that shows "par" — `par()` returns `working_pct - limit_pct` differential; `par_status()` classifies Under/Over/On.
 - [ ] [E] Usage: pace multiplier (`limit_pct / working_pct` as `0.7x`)
 - [ ] [E] Usage: projected remaining working hours at current burn rate
 - [ ] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
@@ -550,13 +367,11 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Implement git worktree creation/deletion via `git2` worktree API
 
 ### Polish & Integration
-- [x] [H] Reduce duplication between CodeView and TodoView (consider having TodoView wrap a CodeView)
 - [ ] [H] End-to-end test: full workflow from project creation to Claude review cycle
 - [ ] [H] Persistent state: survive app restart without losing session state or terminal sessions [perhaps use 'tmux' behind the scenes]
 - [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
 - [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
-- [x] [E] Garbage collect stale `.jc/replies/` files (e.g., on app startup, prune files older than N days)
 - [ ] [H] Allow projects to have a special `./status.sh` script that reports problems in the form `file:line - problem`
 
 ### Code Quality
@@ -566,6 +381,3 @@ It is deliberately *not* a full code editor on mobile.
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically
-
-### Unsorted
-- [x] [E] A ranking system for problems (Claude questions -> WAIT items on idle Claudes -> Unreviewed Git changes -> etc)
