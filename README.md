@@ -443,8 +443,8 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers)
 - [x] Parse TODO.md format (sessions, messages, WAIT markers)
 - [x] Build library for managing TODO.md representation
-- [ ] [H] On startup, if TODO.md has no valid sessions (all slugs are invalid or no `## Session` headings exist), discover the most recent JSONL session group and insert a `## Session <slug>: <label>` heading into TODO.md
-- [ ] [E] Skip sessions with invalid slugs during `ProjectState::create` instead of creating broken `SessionState` entries (currently creates terminals that can't resume)
+- [x] [H] On startup, if TODO.md has no valid sessions (all slugs are invalid or no `## Session` headings exist), discover the most recent JSONL session group and insert a `## Session <slug>: <label>` heading into TODO.md
+- [x] [E] Skip sessions with invalid slugs during `ProjectState::create` instead of creating broken `SessionState` entries (currently creates terminals that can't resume)
 - [ ] [D] Implement interactive correction of invalid session slugs in TODO.md (e.g., picker showing discovered slugs to replace an invalid one)
 - [ ] [H] Implement comment insertion from other views into the WAIT section
 - [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
