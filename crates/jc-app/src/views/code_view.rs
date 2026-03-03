@@ -1,3 +1,4 @@
+use crate::language::Language;
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -22,8 +23,12 @@ pub struct CodeView {
 
 impl CodeView {
   pub fn new(project_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-    let editor = cx
-      .new(|cx| InputState::new(window, cx).code_editor("text").soft_wrap(true).line_number(false));
+    let editor = cx.new(|cx| {
+      InputState::new(window, cx)
+        .code_editor(Language::default().name())
+        .soft_wrap(true)
+        .line_number(false)
+    });
 
     let subscription = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, _cx| {
       if matches!(event, InputEvent::Change) {
@@ -104,9 +109,9 @@ impl CodeView {
   fn load_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let Some(path) = self.current_file.as_ref() else { return };
     let content = std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {e}"));
-    let language = language_for_extension(path);
+    let language = Language::from_path(path);
     self.editor.update(cx, |state, cx| {
-      state.set_highlighter(language, cx);
+      state.set_highlighter(language.name(), cx);
       state.set_value(content, window, cx);
     });
     self.dirty = false;
@@ -129,8 +134,8 @@ impl CodeView {
     self.editor.read(cx).value().as_ref().to_string()
   }
 
-  pub fn current_language(&self) -> &'static str {
-    self.current_file.as_deref().map(language_for_extension).unwrap_or("text")
+  pub fn current_language(&self) -> Language {
+    self.current_file.as_deref().map(Language::from_path).unwrap_or_default()
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
@@ -192,28 +197,5 @@ impl Render for CodeView {
       .on_action(cx.listener(Self::reload_from_disk))
       .child(notification)
       .child(Input::new(&self.editor).h_full().appearance(false).bordered(false))
-  }
-}
-
-fn language_for_extension(path: &Path) -> &'static str {
-  match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
-    "rs" => "rust",
-    "js" => "javascript",
-    "ts" => "typescript",
-    "tsx" => "tsx",
-    "py" => "python",
-    "rb" => "ruby",
-    "go" => "go",
-    "c" | "h" => "c",
-    "cpp" | "cc" | "cxx" | "hpp" => "cpp",
-    "java" => "java",
-    "md" => "markdown",
-    "toml" => "toml",
-    "json" => "json",
-    "yaml" | "yml" => "yaml",
-    "html" => "html",
-    "css" => "css",
-    "sh" | "bash" | "zsh" => "bash",
-    _ => "text",
   }
 }

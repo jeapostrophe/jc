@@ -1,4 +1,5 @@
-use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
+use crate::language::Language;
+use tree_sitter::{Language as TsLanguage, Parser, Query, QueryCursor, StreamingIterator};
 
 pub struct OutlineItem {
   pub label: String,
@@ -9,8 +10,8 @@ pub struct OutlineItem {
   pub byte_range: std::ops::Range<usize>,
 }
 
-pub fn compute_outline(text: &str, language_name: &str) -> Vec<OutlineItem> {
-  let Some((ts_language, query_source)) = language_and_query(language_name) else {
+pub fn compute_outline(text: &str, language: Language) -> Vec<OutlineItem> {
+  let Some((ts_language, query_source)) = language_and_query(language) else {
     return Vec::new();
   };
 
@@ -101,25 +102,27 @@ pub fn compute_outline(text: &str, language_name: &str) -> Vec<OutlineItem> {
   items
 }
 
-fn language_and_query(name: &str) -> Option<(Language, &'static str)> {
-  match name {
-    "rust" => Some((tree_sitter_rust::LANGUAGE.into(), include_str!("outline_queries/rust.scm"))),
-    "markdown" => {
+fn language_and_query(language: Language) -> Option<(TsLanguage, &'static str)> {
+  match language {
+    Language::Rust => {
+      Some((tree_sitter_rust::LANGUAGE.into(), include_str!("outline_queries/rust.scm")))
+    }
+    Language::Markdown => {
       Some((tree_sitter_md::LANGUAGE.into(), include_str!("outline_queries/markdown.scm")))
     }
-    "python" => {
+    Language::Python => {
       Some((tree_sitter_python::LANGUAGE.into(), include_str!("outline_queries/python.scm")))
     }
-    "go" => Some((tree_sitter_go::LANGUAGE.into(), include_str!("outline_queries/go.scm"))),
-    "javascript" => Some((
+    Language::Go => Some((tree_sitter_go::LANGUAGE.into(), include_str!("outline_queries/go.scm"))),
+    Language::JavaScript => Some((
       tree_sitter_javascript::LANGUAGE.into(),
       include_str!("outline_queries/javascript.scm"),
     )),
-    "typescript" => Some((
+    Language::TypeScript => Some((
       tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
       include_str!("outline_queries/typescript.scm"),
     )),
-    "tsx" => Some((
+    Language::Tsx => Some((
       tree_sitter_typescript::LANGUAGE_TSX.into(),
       include_str!("outline_queries/javascript.scm"),
     )),

@@ -4,6 +4,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::language::Language;
 use crate::outline::{OutlineItem, compute_outline};
 use crate::views::code_view::CodeView;
 use crate::views::diff_view::DiffView;
@@ -381,7 +382,7 @@ pub struct TodoHeaderPickerDelegate {
 impl TodoHeaderPickerDelegate {
   pub fn new(todo_view: Entity<TodoView>, cx: &App) -> Self {
     let text = todo_view.read(cx).editor_text(cx);
-    let outline = compute_outline(&text, "markdown");
+    let outline = compute_outline(&text, Language::Markdown);
     let labels = outline_labels(&outline);
     Self { labels, outline, todo_view }
   }

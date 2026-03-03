@@ -363,7 +363,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [T] Verify whether Claude Code emits BEL (`\x07`) on task completion in terminal mode (replaces earlier `preferredNotifChannel` assumption)
 - [ ] [E] Change the dimensions of the terminal(s) and communicate to the terminal itself
 - [ ] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
-- [ ] [E] Run Claude Code inside the embedded terminal
+- [ ] [E] Run Claude Code inside the embedded terminal dedicated to Claude
 - [ ] [H] Implement Quake-style drop-down terminal toggle
 - [ ] [H] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
 - [ ] [H] Show old replies and plans as well. Provide a picker to scroll through to view. (Ctrl-Shift-O)
