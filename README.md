@@ -392,8 +392,8 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [H] Implement per-file "mark as reviewed" with collapses
 - [x] [E] Annotate which files have been "marked" in the git diff picker
 - [x] [H] Show one file at a time rather than raw multi-file output
-- [ ] [H] Implement region selection and comment keybinding
-- [ ] [H] Show git log as well to look at older diffs. Provide a picker to scroll through to view. (Ctrl-Shift-O)
+- [ ] [H] Implement region selection and comment keybinding [should be sensitive to what diff is shown]
+- [x] [H] Show git log as well to look at older diffs. Provide a picker to scroll through to view. (Cmd-Shift-O)
 - [x] [H] Implement language syntax highlighting inside of diffs
 
 ### Code Viewer
@@ -444,8 +444,8 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement Claude usage algorithm
 - [x] Implement configurable working hours for par calculation
 - [x] [D] Turn usage into a single number/visualization that shows "par" — `par()` returns `working_pct - limit_pct` differential; `par_status()` classifies Under/Over/On.
-- [ ] Usage: pace multiplier (`limit_pct / working_pct` as `0.7x`)
-- [ ] Usage: projected remaining working hours at current burn rate
+- [ ] [E] Usage: pace multiplier (`limit_pct / working_pct` as `0.7x`)
+- [ ] [E] Usage: projected remaining working hours at current burn rate
 - [ ] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] [E] Implement in-app status bar showing waiting tasks (driven by hook events)

@@ -20,6 +20,27 @@ pub enum DiffViewEvent {
 
 impl EventEmitter<DiffViewEvent> for DiffView {}
 
+#[derive(Clone)]
+pub enum DiffSource {
+  WorkingTree,
+  Commit { oid: git2::Oid, summary: String },
+}
+
+impl DiffSource {
+  pub fn label(&self) -> &str {
+    match self {
+      Self::WorkingTree => "Working tree",
+      Self::Commit { summary, .. } => summary,
+    }
+  }
+}
+
+pub struct GitLogEntry {
+  pub oid: git2::Oid,
+  pub short_hash: String,
+  pub summary: String,
+}
+
 pub struct FileDiff {
   pub name: String,
   pub content: String,
@@ -29,6 +50,7 @@ pub struct FileDiff {
 pub struct DiffView {
   editor: Entity<InputState>,
   project_path: PathBuf,
+  source: DiffSource,
   file_diffs: Vec<FileDiff>,
   current_file_index: usize,
   reviewed: HashMap<String, u64>,
@@ -41,6 +63,7 @@ impl DiffView {
     let mut view = Self {
       editor,
       project_path,
+      source: DiffSource::WorkingTree,
       file_diffs: Vec::new(),
       current_file_index: 0,
       reviewed: HashMap::default(),
@@ -49,8 +72,17 @@ impl DiffView {
     view
   }
 
+  pub fn set_source(&mut self, source: DiffSource, window: &mut Window, cx: &mut Context<Self>) {
+    self.source = source;
+    self.reviewed.clear();
+    self.refresh(window, cx);
+  }
+
   pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    let diff_text = generate_diff(&self.project_path);
+    let diff_text = match &self.source {
+      DiffSource::WorkingTree => generate_diff(&self.project_path),
+      DiffSource::Commit { oid, .. } => generate_commit_diff(&self.project_path, *oid),
+    };
     self.file_diffs = parse_file_diffs(&diff_text);
 
     // Prune reviewed entries: remove if file is gone or checksum changed.
@@ -105,6 +137,10 @@ impl DiffView {
 }
 
 impl DiffView {
+  pub fn source(&self) -> &DiffSource {
+    &self.source
+  }
+
   pub fn file_diffs(&self) -> &[FileDiff] {
     &self.file_diffs
   }
@@ -123,6 +159,10 @@ impl DiffView {
 
   pub fn file_count(&self) -> usize {
     self.file_diffs.len()
+  }
+
+  pub fn project_path(&self) -> &Path {
+    &self.project_path
   }
 }
 
@@ -217,4 +257,58 @@ fn compute_checksum(content: &str) -> u64 {
   let mut hasher = DefaultHasher::default();
   content.hash(&mut hasher);
   hasher.finish()
+}
+
+fn generate_commit_diff(path: &Path, oid: git2::Oid) -> String {
+  match generate_commit_diff_inner(path, oid) {
+    Ok(result) => result,
+    Err(e) => format!("Error generating commit diff: {e}"),
+  }
+}
+
+fn generate_commit_diff_inner(path: &Path, oid: git2::Oid) -> Result<String, git2::Error> {
+  let repo = git2::Repository::open(path)?;
+  let commit = repo.find_commit(oid)?;
+  let tree = commit.tree()?;
+
+  let parent_tree = if commit.parent_count() > 0 { Some(commit.parent(0)?.tree()?) } else { None };
+
+  let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+
+  let mut output = String::default();
+  diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+    match line.origin() {
+      '+' | '-' | ' ' => output.push(line.origin()),
+      _ => {}
+    }
+    let content = std::str::from_utf8(line.content()).unwrap_or("");
+    output.push_str(content);
+    true
+  })?;
+
+  Ok(output)
+}
+
+const MAX_LOG_ENTRIES: usize = 500;
+
+pub fn git_log(path: &Path) -> Vec<GitLogEntry> {
+  git_log_inner(path).unwrap_or_default()
+}
+
+fn git_log_inner(path: &Path) -> Result<Vec<GitLogEntry>, git2::Error> {
+  let repo = git2::Repository::open(path)?;
+  let mut revwalk = repo.revwalk()?;
+  revwalk.push_head()?;
+  revwalk.set_sorting(git2::Sort::TIME)?;
+
+  let mut entries = Vec::new();
+  for oid_result in revwalk.take(MAX_LOG_ENTRIES) {
+    let oid = oid_result?;
+    let commit = repo.find_commit(oid)?;
+    let summary = commit.summary().unwrap_or("").to_string();
+    let short_hash = format!("{:.7}", oid);
+    entries.push(GitLogEntry { oid, short_hash, summary });
+  }
+
+  Ok(entries)
 }

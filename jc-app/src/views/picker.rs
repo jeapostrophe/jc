@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::language::Language;
 use crate::outline::{OutlineItem, compute_outline};
 use crate::views::code_view::CodeView;
-use crate::views::diff_view::DiffView;
+use crate::views::diff_view::{DiffSource, DiffView, GitLogEntry, git_log};
 use crate::views::todo_view::TodoView;
 
 actions!(
@@ -400,6 +400,65 @@ impl PickerDelegate for DiffFilePickerDelegate {
         .child(label.clone())
     } else {
       row.child(div().text_xs().w(px(10.0))).child(label.clone())
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GitLogPickerDelegate
+// ---------------------------------------------------------------------------
+
+pub struct GitLogPickerDelegate {
+  labels: Vec<String>,
+  entries: Vec<GitLogEntry>,
+  diff_view: Entity<DiffView>,
+}
+
+impl GitLogPickerDelegate {
+  pub fn new(diff_view: Entity<DiffView>, cx: &App) -> Self {
+    let path = diff_view.read(cx).project_path().to_path_buf();
+    let entries = git_log(&path);
+
+    let mut labels = vec!["Working tree".to_string()];
+    labels.extend(entries.iter().map(|e| format!("{} {}", e.short_hash, e.summary)));
+
+    Self { labels, entries, diff_view }
+  }
+}
+
+impl PickerDelegate for GitLogPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
+    let source = if index == 0 {
+      DiffSource::WorkingTree
+    } else {
+      let entry = &self.entries[index - 1];
+      DiffSource::Commit { oid: entry.oid, summary: entry.summary.clone() }
+    };
+    self.diff_view.update(cx, |v, cx| v.set_source(source, window, cx));
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+
+    if index == 0 {
+      let marker_color =
+        if selected { theme.accent_foreground } else { gpui::hsla(30. / 360., 0.8, 0.5, 1.0) };
+      row
+        .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("*"))
+        .child("Working tree".to_string())
+    } else {
+      let entry = &self.entries[index - 1];
+      let hash_color =
+        if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
+      row
+        .child(div().text_xs().text_color(hash_color).child(entry.short_hash.clone()))
+        .child(entry.summary.clone())
     }
   }
 }

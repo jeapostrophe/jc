@@ -2,8 +2,8 @@ use crate::views::code_view::CodeView;
 use crate::views::diff_view::{DiffView, DiffViewEvent};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
-  CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, OpenContextPicker,
-  OpenFilePicker, PickerEvent, PickerState, TodoHeaderPickerDelegate,
+  CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
+  OpenContextPicker, OpenFilePicker, PickerEvent, PickerState, TodoHeaderPickerDelegate,
 };
 use crate::views::todo_view::TodoView;
 use gpui::prelude::FluentBuilder as _;
@@ -33,6 +33,7 @@ actions!(
     ShowTodoEditor,
     OpenInExternalEditor,
     EvenSplit,
+    OpenGitLogPicker,
   ]
 );
 
@@ -365,6 +366,19 @@ impl Workspace {
     self.show_picker(delegate, window, cx);
   }
 
+  fn open_git_log_picker(
+    &mut self,
+    _: &OpenGitLogPicker,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.active_picker.is_some() {
+      return;
+    }
+    let delegate = GitLogPickerDelegate::new(self.diff_view.clone(), cx);
+    self.show_picker_with_confirm(delegate, Some(PaneContentKind::GitDiff), window, cx);
+  }
+
   /// Show a picker, switching to `switch_pane` on confirm if provided.
   /// Also tracks recently opened files when confirming a file picker.
   fn show_picker_with_confirm<D: crate::views::picker::PickerDelegate>(
@@ -442,10 +456,11 @@ impl Workspace {
         let dv = self.diff_view.read(cx);
         let reviewed = dv.reviewed_count();
         let total = dv.file_count();
+        let source_label = dv.source().label();
         if let Some(name) = dv.current_file_name() {
-          format!("Diff: {name} ({reviewed}/{total})")
+          format!("Diff [{source_label}]: {name} ({reviewed}/{total})")
         } else {
-          format!("Diff ({reviewed}/{total})")
+          format!("Diff [{source_label}] ({reviewed}/{total})")
         }
       }
       Some(kind) => kind.label().to_string(),
@@ -545,6 +560,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::open_file_picker))
       .on_action(cx.listener(Self::open_context_picker))
       .on_action(cx.listener(Self::even_split))
+      .on_action(cx.listener(Self::open_git_log_picker))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable(("main-split", self.split_generation))
@@ -586,6 +602,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-5", ShowTodoEditor, Some("Workspace")),
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
     KeyBinding::new("cmd-|", EvenSplit, Some("Workspace")),
+    KeyBinding::new("cmd-shift-o", OpenGitLogPicker, Some("Workspace")),
   ]);
 
   cx.bind_keys([
