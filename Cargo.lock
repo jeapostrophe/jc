@@ -3218,6 +3218,7 @@ dependencies = [
  "jc-core",
  "jc-terminal",
  "notify",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-go",
  "tree-sitter-javascript",

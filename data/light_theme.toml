@@ -1,24 +1,54 @@
-# Light terminal color scheme (Tomorrow).
+# Tomorrow — unified light theme for terminal, UI, and syntax.
 # This file is embedded at compile time via include_str!.
-# The light counterpart of Tomorrow Night (default_theme.toml).
 
-[terminal]
+[palette]
 foreground = "#4D4D4C"
 background = "#FFFFFF"
-cursor = "#4D4D4C"
-black = "#000000"
-red = "#C82829"
-green = "#718C00"
-yellow = "#EAB700"
-blue = "#4271AE"
-magenta = "#8959A8"
-cyan = "#3E999F"
-white = "#FFFFFF"
-bright_black = "#8E908C"
-bright_red = "#F5871F"
-bright_green = "#718C00"
+cursor     = "#4D4D4C"
+black         = "#000000"
+red           = "#C82829"
+green         = "#718C00"
+yellow        = "#EAB700"
+blue          = "#4271AE"
+magenta       = "#8959A8"
+cyan          = "#3E999F"
+white         = "#FFFFFF"
+bright_black  = "#8E908C"
+bright_red    = "#F5871F"
+bright_green  = "#718C00"
 bright_yellow = "#EAB700"
-bright_blue = "#4271AE"
+bright_blue   = "#4271AE"
 bright_magenta = "#8959A8"
-bright_cyan = "#3E999F"
-bright_white = "#FFFFFF"
+bright_cyan   = "#3E999F"
+bright_white  = "#FFFFFF"
+
+[ui]
+border    = "#D6D6D6"
+muted     = "#EFEFEF"
+accent    = "#EFEFEF"
+selection = "#D6D6D6"
+
+[editor]
+background         = "#FFFFFF"
+foreground         = "#4D4D4C"
+active_line        = "#EFEFEF"
+line_number        = "#8E908C"
+active_line_number = "#4D4D4C"
+
+[syntax]
+keyword     = "#8959A8"
+string      = "#718C00"
+comment     = "#8E908C"
+function    = "#4271AE"
+number      = "#F5871F"
+type        = "#EAB700"
+constant    = "#F5871F"
+boolean     = "#F5871F"
+variable    = "#C82829"
+property    = "#C82829"
+operator    = "#3E999F"
+tag         = "#C82829"
+attribute   = "#EAB700"
+punctuation = "#4D4D4C"
+title       = "#C82829"
+constructor = "#EAB700"

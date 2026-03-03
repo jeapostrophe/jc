@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-const DARK_THEME_TOML: &str = include_str!("../../../data/default_theme.toml");
+const DARK_THEME_TOML: &str = include_str!("../../../data/dark_theme.toml");
 const LIGHT_THEME_TOML: &str = include_str!("../../../data/light_theme.toml");
 
 /// Which appearance variant is active.
@@ -19,7 +19,13 @@ impl Appearance {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeConfig {
-  pub terminal: TerminalTheme,
+  pub palette: PaletteColors,
+  #[serde(default)]
+  pub ui: UiColors,
+  #[serde(default)]
+  pub editor: EditorColors,
+  #[serde(default)]
+  pub syntax: SyntaxColors,
 }
 
 impl Default for ThemeConfig {
@@ -29,12 +35,12 @@ impl Default for ThemeConfig {
 }
 
 impl ThemeConfig {
-  /// The built-in dark terminal theme (Tomorrow Night).
+  /// The built-in dark theme (Tomorrow Night).
   pub fn dark() -> Self {
     toml::from_str(DARK_THEME_TOML).expect("embedded dark theme TOML must be valid")
   }
 
-  /// The built-in light terminal theme (Tomorrow).
+  /// The built-in light theme (Tomorrow).
   pub fn light() -> Self {
     toml::from_str(LIGHT_THEME_TOML).expect("embedded light theme TOML must be valid")
   }
@@ -49,7 +55,7 @@ impl ThemeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TerminalTheme {
+pub struct PaletteColors {
   pub foreground: String,
   pub background: String,
   pub cursor: String,
@@ -71,8 +77,46 @@ pub struct TerminalTheme {
   pub bright_white: String,
 }
 
-impl Default for TerminalTheme {
+impl Default for PaletteColors {
   fn default() -> Self {
-    ThemeConfig::default().terminal
+    ThemeConfig::default().palette
   }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiColors {
+  pub border: Option<String>,
+  pub muted: Option<String>,
+  pub accent: Option<String>,
+  pub selection: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EditorColors {
+  pub background: Option<String>,
+  pub foreground: Option<String>,
+  pub active_line: Option<String>,
+  pub line_number: Option<String>,
+  pub active_line_number: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyntaxColors {
+  pub keyword: Option<String>,
+  pub string: Option<String>,
+  pub comment: Option<String>,
+  pub function: Option<String>,
+  pub number: Option<String>,
+  #[serde(rename = "type")]
+  pub type_: Option<String>,
+  pub constant: Option<String>,
+  pub boolean: Option<String>,
+  pub variable: Option<String>,
+  pub property: Option<String>,
+  pub operator: Option<String>,
+  pub tag: Option<String>,
+  pub attribute: Option<String>,
+  pub punctuation: Option<String>,
+  pub title: Option<String>,
+  pub constructor: Option<String>,
 }

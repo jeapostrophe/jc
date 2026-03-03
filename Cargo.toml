@@ -11,6 +11,7 @@ gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
 git2 = { version = "0.20", default-features = false }
 gpui-component-assets = "0.5.1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

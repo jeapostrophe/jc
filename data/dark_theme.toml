@@ -1,0 +1,54 @@
+# Tomorrow Night — unified theme for terminal, UI, and syntax.
+# This file is embedded at compile time via include_str!.
+
+[palette]
+foreground = "#C5C8C6"
+background = "#1D1F21"
+cursor     = "#C5C8C6"
+black         = "#1D1F21"
+red           = "#CC6666"
+green         = "#B5BD68"
+yellow        = "#F0C674"
+blue          = "#81A2BE"
+magenta       = "#B294BB"
+cyan          = "#8ABEB7"
+white         = "#C5C8C6"
+bright_black  = "#969896"
+bright_red    = "#DE935F"
+bright_green  = "#B5BD68"
+bright_yellow = "#F0C674"
+bright_blue   = "#81A2BE"
+bright_magenta = "#B294BB"
+bright_cyan   = "#8ABEB7"
+bright_white  = "#FFFFFF"
+
+[ui]
+border    = "#373B41"
+muted     = "#282A2E"
+accent    = "#282A2E"
+selection = "#373B41"
+
+[editor]
+background         = "#1D1F21"
+foreground         = "#C5C8C6"
+active_line        = "#282A2E"
+line_number        = "#969896"
+active_line_number = "#C5C8C6"
+
+[syntax]
+keyword     = "#B294BB"
+string      = "#B5BD68"
+comment     = "#969896"
+function    = "#81A2BE"
+number      = "#DE935F"
+type        = "#F0C674"
+constant    = "#DE935F"
+boolean     = "#DE935F"
+variable    = "#CC6666"
+property    = "#CC6666"
+operator    = "#8ABEB7"
+tag         = "#CC6666"
+attribute   = "#F0C674"
+punctuation = "#C5C8C6"
+title       = "#CC6666"
+constructor = "#F0C674"

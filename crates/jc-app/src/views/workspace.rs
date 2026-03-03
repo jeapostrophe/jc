@@ -13,7 +13,7 @@ use gpui_component::TitleBar;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::theme::Theme;
 use jc_core::config::{AppConfig, AppState};
-use jc_core::theme::{Appearance, ThemeConfig};
+use jc_core::theme::Appearance;
 use jc_terminal::{Palette, TerminalConfig, TerminalView};
 use std::ops::DerefMut;
 use std::path::PathBuf;
@@ -87,8 +87,7 @@ impl Workspace {
 
     // Detect the current system appearance and pick the right terminal palette.
     let appearance = appearance_from_window(window.appearance());
-    let theme_config = ThemeConfig::for_appearance(appearance);
-    let palette = Palette::from(&theme_config.terminal);
+    let palette = Palette::for_appearance(appearance);
     let base_config =
       |palette: &Palette| TerminalConfig { palette: Some(palette.clone()), ..Default::default() };
 
@@ -174,18 +173,7 @@ impl Workspace {
   ) {
     // Update gpui_component theme (dark/light).
     Theme::sync_system_appearance(Some(window), cx.deref_mut());
-
-    // Update terminal palettes.
-    let theme_config = ThemeConfig::for_appearance(appearance);
-    let palette = Palette::from(&theme_config.terminal);
-
-    self.claude_terminal.update(cx, |view, _cx| {
-      view.set_palette(palette.clone());
-    });
-    self.general_terminal.update(cx, |view, _cx| {
-      view.set_palette(palette);
-    });
-
+    self.update_terminal_palettes(appearance, cx);
     cx.notify();
   }
 
@@ -201,19 +189,18 @@ impl Workspace {
       gpui_component::theme::ThemeMode::Light
     };
     Theme::change(mode, Some(window), cx.deref_mut());
+    self.update_terminal_palettes(new_appearance, cx);
+    cx.notify();
+  }
 
-    // Update terminal palettes.
-    let theme_config = ThemeConfig::for_appearance(new_appearance);
-    let palette = Palette::from(&theme_config.terminal);
-
+  fn update_terminal_palettes(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
+    let palette = Palette::for_appearance(appearance);
     self.claude_terminal.update(cx, |view, _cx| {
       view.set_palette(palette.clone());
     });
     self.general_terminal.update(cx, |view, _cx| {
       view.set_palette(palette);
     });
-
-    cx.notify();
   }
 
   fn project_path(&self) -> PathBuf {
