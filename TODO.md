@@ -5,41 +5,49 @@
 ### Message 0
 Review @README.md
 
-Add something to the checklist instructions about how if Claude is instructed to add something to the checklist it might require a new section
-
-Now focus on these tasks:
-- [ ] [H] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
-- [ ] [H] Parse TODO.md format (sessions, messages, WAIT markers)
-- [ ] [H] Build library for managing TODO.md representation (ropey-backed)
-- [ ] [E] Read session slug from TODO.md; load turns from all JSONL files sharing the slug
-
-This may require revisiting some of the design assumptions. It may require fleshing out some of the project/task-level state and app design.
+Work on the '### Session Architecture' issues. This is a substantial change that puts a lot of components into place for the future.
 
 ---
 
-Comment annotations in the ### WAIT section are not strict. They should be inserted like that from other contexts, but they are just free form text. I assume that the TODO system will provide a 'insert_comment(String)' functionality scoped to the current session to other components and they will deal with arranging the formatting of the comment themselves. Its job is to insert it safely into the right spot
+Step 1.
+The problem enum isn't quite right. I think everything is too specific at that level. In particular, a file being dirty really just means the code or todo view is dirty. I think the simplest thing is to represent it as:
+struct Problem {
+  component: ViewEnum, // Is this handled by Claue, Terminal, Diff, File, TODO, etc?
+  rank: i8, // A simple rating of importance
+  custom: String // A description that the ViewLook at
+}
+Maybe it would be better to be:
+struct Problem {
+  rank: i8,
+  kind: ViewProblem
+}
+where
+enum ViewProblem {
+  Todo(TodoProblem),
+  Claude(ClaudeProblem),
+  // etc
+}
 
-I think that the wavy underlines are really ugly in gpui. I would prefer to use the syntax highlighting system. Tree-sitter provides bolding for headings, but we could supplement that with colors
+But that might be overkill for now.
 
-I do think we should add a notion of a "problem" to the entire project session tracking data-structure where an example "problem" right now is just an invalid session slug.
+Step 2.
+The claude terminal needs to be bound to the slug's session too
 
-In your design, the Todo is "in charge" of the active session via the slug, but I think it should be opposite. The overall design should be:
+Eventually sessions will have their own code views and their own unique scroll/selection state for todo and diff. Are we defering that or is the design a mistake?
 
-App -> Projects
-Project -> TODO file + Sessions
-Session -> slug + all the panes and views
+Step 5.
 
-And the app has an active project with an active session. That will influence what the various views are showing. The crucial detail is that the TODO file state is shared between all of the sessions (because we expect them all to be modifying it)
+The indicator for problems should be:
+1. Shown in the session picker, like how file pickers show modifications
+2. An indicator in the existing title bar next to the "Project > Session" display
+3. An indicator in the upper right for how many sessions (other than the focused one) have a problem
 
-I don't know if there should be different instances of the various view objects all at the same time. I assume that there will be because we don't want the terminals to get disconnected.
-
-These details may be beyond the scope of this particular plan. If so, then they should be added to the README before continuing with this plan.
-
-No matter what, the plan should include updating the README with the completed checklist items.
+Optimize the plan for context window usage and parallelization. Branch and fork the context/tasks into parallel jobs as appropriate.
 
 ---
 
-The code and tests look correct, but when I load this project and look at its TODO, I don't see any of the custom highlighting, nor do I see any indication that it detects that 'xxx' is an invalid session slug.
+  1. [H] On startup, if TODO.md has no valid sessions, discover the most recent JSONL session group and insert a ## Session heading into TODO.md
+  2. [E] Skip sessions with invalid slugs during ProjectState::create instead of creating broken SessionState entries
 
 ### WAIT XXX
 

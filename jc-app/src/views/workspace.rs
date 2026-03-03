@@ -1,13 +1,12 @@
-use crate::views::code_view::CodeView;
-use crate::views::diff_view::{DiffView, DiffViewEvent};
+use crate::views::diff_view::DiffViewEvent;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
   OpenContextPicker, OpenFilePicker, PickerEvent, PickerState, ReplyHeadingPickerDelegate,
-  ReplyTurnPickerDelegate, TodoHeaderPickerDelegate,
+  ReplyTurnPickerDelegate, SessionPickerDelegate, ShowSessionPicker, TodoHeaderPickerDelegate,
 };
-use crate::views::reply_view::ReplyView;
-use crate::views::todo_view::{TodoView, TodoViewEvent};
+use crate::views::project_state::ProjectState;
+use crate::views::todo_view::TodoViewEvent;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -16,7 +15,7 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::theme::Theme;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::theme::Appearance;
-use jc_terminal::{Palette, TerminalConfig, TerminalView};
+use jc_terminal::Palette;
 use std::ops::DerefMut;
 use std::path::PathBuf;
 
@@ -58,13 +57,8 @@ pub struct Workspace {
   left_pane: Entity<Pane>,
   right_pane: Entity<Pane>,
   active_pane: ActivePane,
-  claude_terminal: Entity<TerminalView>,
-  general_terminal: Entity<TerminalView>,
-  diff_view: Entity<DiffView>,
-  code_view: Entity<CodeView>,
-  todo_view: Entity<TodoView>,
-  reply_view: Entity<ReplyView>,
-  state: AppState,
+  projects: Vec<ProjectState>,
+  active_project_index: usize,
   config: AppConfig,
   focus: FocusHandle,
   active_picker: Option<AnyView>,
@@ -73,8 +67,8 @@ pub struct Workspace {
   split_generation: usize,
   recent_files: Vec<PathBuf>,
   _appearance_subscription: Subscription,
-  _diff_view_subscription: Subscription,
-  _todo_view_subscription: Subscription,
+  _diff_view_subscription: Option<Subscription>,
+  _todo_view_subscription: Option<Subscription>,
 }
 
 impl Workspace {
@@ -84,49 +78,37 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> Self {
-    let project_path = state.project_path();
-
     // Detect the current system appearance and pick the right terminal palette.
     let appearance = appearance_from_window(window.appearance());
     let palette = Palette::for_appearance(appearance);
-    let base_config =
-      |palette: &Palette| TerminalConfig { palette: Some(palette.clone()), ..Default::default() };
 
-    let claude_config =
-      TerminalConfig { command: Some("claude".to_string()), ..base_config(&palette) };
-    let claude_terminal =
-      cx.new(|cx| TerminalView::new(claude_config, Some(&project_path), window, cx));
-    let general_terminal =
-      cx.new(|cx| TerminalView::new(base_config(&palette), Some(&project_path), window, cx));
-    let diff_view = cx.new(|cx| DiffView::new(project_path.clone(), window, cx));
-    let code_view = cx.new(|cx| CodeView::new(window, cx));
-    let todo_view = cx.new(|cx| TodoView::new(project_path.clone(), window, cx));
-    let reply_view = cx.new(|cx| ReplyView::new(project_path, window, cx));
-
-    let claude_focus = claude_terminal.read(cx).focus_handle(cx);
-    let general_focus = general_terminal.read(cx).focus_handle(cx);
-
-    let left_pane = cx.new(|cx| {
-      Pane::with_content(
-        PaneContent {
-          kind: PaneContentKind::ClaudeTerminal,
-          view: claude_terminal.clone().into(),
-          focus: claude_focus,
-        },
+    // Build a ProjectState per registered project.
+    let mut projects = Vec::new();
+    for project in &state.projects {
+      projects.push(ProjectState::create(
+        project.path.clone(),
+        project.name.clone(),
+        &palette,
+        window,
         cx,
-      )
-    });
+      ));
+    }
 
-    let right_pane = cx.new(|cx| {
-      Pane::with_content(
-        PaneContent {
-          kind: PaneContentKind::GeneralTerminal,
-          view: general_terminal.clone().into(),
-          focus: general_focus,
-        },
-        cx,
-      )
-    });
+    // If no projects registered, create a default one from cwd.
+    if projects.is_empty() {
+      let path = std::env::current_dir().unwrap_or_default();
+      let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+      projects.push(ProjectState::create(path, name, &palette, window, cx));
+    }
+
+    // Determine initial pane content from first project's first session.
+    let (left_content, right_content) = Self::initial_pane_contents(&projects[0], cx);
+
+    let left_pane = cx.new(|cx| Pane::with_content(left_content, cx));
+    let right_pane = cx.new(|cx| Pane::with_content(right_content, cx));
 
     left_pane.read(cx).focus_content(window);
 
@@ -136,36 +118,12 @@ impl Workspace {
         this.apply_appearance(appearance_from_window(window.appearance()), window, cx);
       });
 
-    let diff_view_subscription = cx.subscribe_in(
-      &diff_view,
-      window,
-      |this: &mut Self, _, event: &DiffViewEvent, window, cx| match event {
-        DiffViewEvent::Reviewed => {
-          this.open_diff_picker(window, cx);
-        }
-      },
-    );
-
-    let todo_view_subscription = cx.subscribe_in(
-      &todo_view,
-      window,
-      |this: &mut Self, _, _event: &TodoViewEvent, window, cx| {
-        let slug = this.todo_view.read(cx).document().first_session().map(|s| s.slug.clone());
-        this.reply_view.update(cx, |rv, cx| rv.set_session_slug(slug, window, cx));
-      },
-    );
-
-    Self {
+    let mut ws = Self {
       left_pane,
       right_pane,
       active_pane: ActivePane::Left,
-      claude_terminal,
-      general_terminal,
-      diff_view,
-      code_view,
-      todo_view,
-      reply_view,
-      state,
+      projects,
+      active_project_index: 0,
       config,
       focus: cx.focus_handle(),
       active_picker: None,
@@ -174,19 +132,95 @@ impl Workspace {
       split_generation: 0,
       recent_files: Vec::new(),
       _appearance_subscription: appearance_subscription,
-      _diff_view_subscription: diff_view_subscription,
-      _todo_view_subscription: todo_view_subscription,
-    }
+      _diff_view_subscription: None,
+      _todo_view_subscription: None,
+    };
+
+    ws.subscribe_active_project(window, cx);
+    ws
   }
 
-  /// Apply a new appearance: update the gpui_component theme and terminal palettes.
+  /// Build initial PaneContent for left and right panes from a project.
+  fn initial_pane_contents(project: &ProjectState, cx: &App) -> (PaneContent, PaneContent) {
+    let left = if let Some(session) = project.active_session() {
+      let focus = session.claude_terminal.read(cx).focus_handle(cx);
+      PaneContent {
+        kind: PaneContentKind::ClaudeTerminal,
+        view: session.claude_terminal.clone().into(),
+        focus,
+      }
+    } else {
+      let focus = project.todo_view.read(cx).focus_handle(cx);
+      PaneContent {
+        kind: PaneContentKind::TodoEditor,
+        view: project.todo_view.clone().into(),
+        focus,
+      }
+    };
+
+    let right = if let Some(session) = project.active_session() {
+      let focus = session.general_terminal.read(cx).focus_handle(cx);
+      PaneContent {
+        kind: PaneContentKind::GeneralTerminal,
+        view: session.general_terminal.clone().into(),
+        focus,
+      }
+    } else {
+      let focus = project.diff_view.read(cx).focus_handle(cx);
+      PaneContent { kind: PaneContentKind::GitDiff, view: project.diff_view.clone().into(), focus }
+    };
+
+    (left, right)
+  }
+
+  /// Subscribe to the active project's diff_view and todo_view events.
+  fn subscribe_active_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let project = &self.projects[self.active_project_index];
+
+    let diff_view = project.diff_view.clone();
+    self._diff_view_subscription = Some(cx.subscribe_in(
+      &diff_view,
+      window,
+      |this: &mut Self, _, event: &DiffViewEvent, window, cx| match event {
+        DiffViewEvent::Reviewed => {
+          this.open_diff_picker(window, cx);
+        }
+      },
+    ));
+
+    let todo_view = project.todo_view.clone();
+    self._todo_view_subscription = Some(cx.subscribe_in(
+      &todo_view,
+      window,
+      |_this: &mut Self, _, _event: &TodoViewEvent, _window, _cx| {
+        // With per-session reply views, we no longer need to sync slug here.
+        // The reply views are pre-bound to their session slugs.
+      },
+    ));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Accessors
+  // ---------------------------------------------------------------------------
+
+  fn active_project(&self) -> &ProjectState {
+    &self.projects[self.active_project_index]
+  }
+
+  fn project_path(&self) -> PathBuf {
+    self.active_project().path.clone()
+  }
+
+  // ---------------------------------------------------------------------------
+  // Appearance
+  // ---------------------------------------------------------------------------
+
   fn apply_appearance(
     &mut self,
     appearance: Appearance,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    // Update gpui_component theme (dark/light).
     Theme::sync_system_appearance(Some(window), cx.deref_mut());
     self.update_terminal_palettes(appearance, cx);
     cx.notify();
@@ -194,17 +228,21 @@ impl Workspace {
 
   fn update_terminal_palettes(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
     let palette = Palette::for_appearance(appearance);
-    self.claude_terminal.update(cx, |view, _cx| {
-      view.set_palette(palette.clone());
-    });
-    self.general_terminal.update(cx, |view, _cx| {
-      view.set_palette(palette);
-    });
+    for project in &self.projects {
+      for session in &project.sessions {
+        session.claude_terminal.update(cx, |view, _cx| {
+          view.set_palette(palette.clone());
+        });
+        session.general_terminal.update(cx, |view, _cx| {
+          view.set_palette(palette.clone());
+        });
+      }
+    }
   }
 
-  fn project_path(&self) -> PathBuf {
-    self.state.project_path()
-  }
+  // ---------------------------------------------------------------------------
+  // Window actions
+  // ---------------------------------------------------------------------------
 
   fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _cx: &mut Context<Self>) {
     window.remove_window();
@@ -217,6 +255,10 @@ impl Workspace {
   fn quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
     cx.quit();
   }
+
+  // ---------------------------------------------------------------------------
+  // Pane focus
+  // ---------------------------------------------------------------------------
 
   fn focus_left_pane(&mut self, _: &FocusLeftPane, window: &mut Window, cx: &mut Context<Self>) {
     self.active_pane = ActivePane::Left;
@@ -237,48 +279,54 @@ impl Workspace {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // View switching
+  // ---------------------------------------------------------------------------
+
   fn set_active_pane_view(
     &mut self,
     kind: PaneContentKind,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let (view, focus): (AnyView, FocusHandle) = match kind {
-      PaneContentKind::ClaudeTerminal => {
-        let focus = self.claude_terminal.read(cx).focus_handle(cx);
-        (self.claude_terminal.clone().into(), focus)
-      }
-      PaneContentKind::GeneralTerminal => {
-        let focus = self.general_terminal.read(cx).focus_handle(cx);
-        (self.general_terminal.clone().into(), focus)
-      }
+    let project = &self.projects[self.active_project_index];
+
+    let result: Option<(AnyView, FocusHandle)> = match kind {
+      PaneContentKind::ClaudeTerminal => project.active_session().map(|s| {
+        let focus = s.claude_terminal.read(cx).focus_handle(cx);
+        (s.claude_terminal.clone().into(), focus)
+      }),
+      PaneContentKind::GeneralTerminal => project.active_session().map(|s| {
+        let focus = s.general_terminal.read(cx).focus_handle(cx);
+        (s.general_terminal.clone().into(), focus)
+      }),
       PaneContentKind::GitDiff => {
-        self.diff_view.update(cx, |v, cx| v.refresh(window, cx));
-        let focus = self.diff_view.read(cx).focus_handle(cx);
-        (self.diff_view.clone().into(), focus)
+        project.diff_view.update(cx, |v, cx| v.refresh(window, cx));
+        let focus = project.diff_view.read(cx).focus_handle(cx);
+        Some((project.diff_view.clone().into(), focus))
       }
       PaneContentKind::CodeViewer => {
-        let focus = self.code_view.read(cx).focus_handle(cx);
-        (self.code_view.clone().into(), focus)
+        let focus = project.code_view.read(cx).focus_handle(cx);
+        Some((project.code_view.clone().into(), focus))
       }
       PaneContentKind::TodoEditor => {
-        let focus = self.todo_view.read(cx).focus_handle(cx);
-        (self.todo_view.clone().into(), focus)
+        let focus = project.todo_view.read(cx).focus_handle(cx);
+        Some((project.todo_view.clone().into(), focus))
       }
-      PaneContentKind::ReplyViewer => {
-        let slug = self.todo_view.read(cx).document().first_session().map(|s| s.slug.clone());
-        self.reply_view.update(cx, |v, cx| v.set_session_slug(slug, window, cx));
-        self.reply_view.update(cx, |v, cx| v.refresh(window, cx));
-        let focus = self.reply_view.read(cx).focus_handle(cx);
-        (self.reply_view.clone().into(), focus)
-      }
+      PaneContentKind::ReplyViewer => project.active_session().map(|s| {
+        s.reply_view.update(cx, |v, cx| v.refresh(window, cx));
+        let focus = s.reply_view.read(cx).focus_handle(cx);
+        (s.reply_view.clone().into(), focus)
+      }),
     };
 
-    let pane = self.active_pane_entity().clone();
-    pane.update(cx, |p, cx| {
-      p.set_content(PaneContent { kind, view, focus: focus.clone() }, cx);
-    });
-    focus.focus(window);
+    if let Some((view, focus)) = result {
+      let pane = self.active_pane_entity().clone();
+      pane.update(cx, |p, cx| {
+        p.set_content(PaneContent { kind, view, focus: focus.clone() }, cx);
+      });
+      focus.focus(window);
+    }
   }
 
   fn show_claude_terminal(
@@ -321,8 +369,6 @@ impl Workspace {
   }
 
   fn even_split(&mut self, _: &EvenSplit, _window: &mut Window, cx: &mut Context<Self>) {
-    // Bump the generation counter to force a fresh ResizableState with equal
-    // initial sizes the next time the workspace renders.
     self.split_generation += 1;
     cx.notify();
   }
@@ -335,11 +381,14 @@ impl Workspace {
   ) {
     let pane = self.active_pane_entity().clone();
     let kind = pane.read(cx).content_kind();
+    let project = self.active_project();
     let file_path = match kind {
       Some(PaneContentKind::CodeViewer) => {
-        self.code_view.read(cx).file_path().map(|p| p.to_path_buf())
+        project.code_view.read(cx).file_path().map(|p| p.to_path_buf())
       }
-      Some(PaneContentKind::TodoEditor) => Some(self.todo_view.read(cx).file_path().to_path_buf()),
+      Some(PaneContentKind::TodoEditor) => {
+        Some(project.todo_view.read(cx).file_path().to_path_buf())
+      }
       _ => None,
     };
     if let Some(path) = file_path {
@@ -349,14 +398,117 @@ impl Workspace {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Session switching
+  // ---------------------------------------------------------------------------
+
+  fn switch_to_session(
+    &mut self,
+    project_idx: usize,
+    session_idx: usize,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let project_changed = project_idx != self.active_project_index;
+    self.active_project_index = project_idx;
+    self.projects[project_idx].active_session_index = Some(session_idx);
+
+    if project_changed {
+      self.subscribe_active_project(window, cx);
+    }
+
+    // Rebind panes to the new session's views.
+    let project = &self.projects[self.active_project_index];
+    if let Some(session) = project.active_session() {
+      // Set left pane to claude terminal.
+      let focus = session.claude_terminal.read(cx).focus_handle(cx);
+      self.left_pane.update(cx, |p, cx| {
+        p.set_content(
+          PaneContent {
+            kind: PaneContentKind::ClaudeTerminal,
+            view: session.claude_terminal.clone().into(),
+            focus: focus.clone(),
+          },
+          cx,
+        );
+      });
+
+      // Set right pane to general terminal.
+      let focus = session.general_terminal.read(cx).focus_handle(cx);
+      self.right_pane.update(cx, |p, cx| {
+        p.set_content(
+          PaneContent {
+            kind: PaneContentKind::GeneralTerminal,
+            view: session.general_terminal.clone().into(),
+            focus: focus.clone(),
+          },
+          cx,
+        );
+      });
+
+      self.left_pane.read(cx).focus_content(window);
+      self.active_pane = ActivePane::Left;
+    }
+
+    cx.notify();
+  }
+
+  fn open_session_picker(
+    &mut self,
+    _: &ShowSessionPicker,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.active_picker.is_some() {
+      return;
+    }
+
+    let delegate = SessionPickerDelegate::new(&self.projects, self.active_project_index);
+    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
+    self.pre_picker_focus = window.focused(cx);
+
+    let subscription =
+      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
+        match event {
+          PickerEvent::Confirmed => {
+            let (project_idx, session_idx) = picker_entity.read(cx).delegate().confirmed_entry();
+            this.switch_to_session(project_idx, session_idx, window, cx);
+            if let Some(focus) = this.pre_picker_focus.take() {
+              focus.focus(window);
+            }
+            this.dismiss_picker();
+            cx.notify();
+          }
+          PickerEvent::Dismissed => {
+            if let Some(focus) = this.pre_picker_focus.take() {
+              focus.focus(window);
+            }
+            this.dismiss_picker();
+            cx.notify();
+          }
+        }
+      });
+
+    self.active_picker = Some(picker.clone().into());
+    self._picker_subscription = Some(subscription);
+
+    picker.read(cx).input_focus_handle(cx).focus(window);
+    cx.notify();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pickers
+  // ---------------------------------------------------------------------------
+
   fn open_file_picker(&mut self, _: &OpenFilePicker, window: &mut Window, cx: &mut Context<Self>) {
     if self.active_picker.is_some() {
       return;
     }
 
+    let project = self.active_project();
     let delegate = FilePickerDelegate::new(
-      self.project_path(),
-      self.code_view.clone(),
+      project.path.clone(),
+      project.code_view.clone(),
       self.recent_files.clone(),
     );
     self.show_picker_with_confirm(delegate, Some(PaneContentKind::CodeViewer), window, cx);
@@ -374,22 +526,25 @@ impl Workspace {
 
     let pane = self.active_pane_entity().clone();
     let kind = pane.read(cx).content_kind();
+    let project = self.active_project();
 
     match kind {
       Some(PaneContentKind::GitDiff) => {
         self.open_diff_picker(window, cx);
       }
       Some(PaneContentKind::TodoEditor) => {
-        let delegate = TodoHeaderPickerDelegate::new(self.todo_view.clone(), cx);
+        let delegate = TodoHeaderPickerDelegate::new(project.todo_view.clone(), cx);
         self.show_picker(delegate, window, cx);
       }
       Some(PaneContentKind::CodeViewer) => {
-        let delegate = CodeSymbolPickerDelegate::new(self.code_view.clone(), cx);
+        let delegate = CodeSymbolPickerDelegate::new(project.code_view.clone(), cx);
         self.show_picker(delegate, window, cx);
       }
       Some(PaneContentKind::ReplyViewer) => {
-        let delegate = ReplyHeadingPickerDelegate::new(self.reply_view.clone(), cx);
-        self.show_picker(delegate, window, cx);
+        if let Some(session) = project.active_session() {
+          let delegate = ReplyHeadingPickerDelegate::new(session.reply_view.clone(), cx);
+          self.show_picker(delegate, window, cx);
+        }
       }
       _ => {}
     }
@@ -399,7 +554,7 @@ impl Workspace {
     if self.active_picker.is_some() {
       return;
     }
-    let delegate = DiffFilePickerDelegate::new(self.diff_view.clone(), cx);
+    let delegate = DiffFilePickerDelegate::new(self.active_project().diff_view.clone(), cx);
     self.show_picker(delegate, window, cx);
   }
 
@@ -415,18 +570,19 @@ impl Workspace {
 
     let pane = self.active_pane_entity().clone();
     let kind = pane.read(cx).content_kind();
+    let project = self.active_project();
 
     if kind == Some(PaneContentKind::ReplyViewer) {
-      let delegate = ReplyTurnPickerDelegate::new(self.reply_view.clone(), cx);
-      self.show_picker(delegate, window, cx);
+      if let Some(session) = project.active_session() {
+        let delegate = ReplyTurnPickerDelegate::new(session.reply_view.clone(), cx);
+        self.show_picker(delegate, window, cx);
+      }
     } else {
-      let delegate = GitLogPickerDelegate::new(self.diff_view.clone(), cx);
+      let delegate = GitLogPickerDelegate::new(project.diff_view.clone(), cx);
       self.show_picker_with_confirm(delegate, Some(PaneContentKind::GitDiff), window, cx);
     }
   }
 
-  /// Show a picker, switching to `switch_pane` on confirm if provided.
-  /// Also tracks recently opened files when confirming a file picker.
   fn show_picker_with_confirm<D: crate::views::picker::PickerDelegate>(
     &mut self,
     delegate: D,
@@ -440,12 +596,10 @@ impl Workspace {
     let subscription =
       cx.subscribe_in(&picker, window, move |this: &mut Self, _, event, window, cx| match event {
         PickerEvent::Confirmed => {
-          // Track recently opened file from the code view.
-          if let Some(path) = this.code_view.read(cx).file_path() {
+          if let Some(path) = this.active_project().code_view.read(cx).file_path() {
             let path = path.to_path_buf();
             this.recent_files.retain(|p| p != &path);
             this.recent_files.insert(0, path);
-            // Keep at most 50 recent files.
             this.recent_files.truncate(50);
           }
           if let Some(kind) = switch_pane {
@@ -487,19 +641,23 @@ impl Workspace {
     self._picker_subscription = None;
   }
 
+  // ---------------------------------------------------------------------------
+  // Labels
+  // ---------------------------------------------------------------------------
+
   fn pane_header_label(&self, pane: &Entity<Pane>, cx: &App) -> String {
+    let project = self.active_project();
     match pane.read(cx).content_kind() {
       Some(PaneContentKind::CodeViewer) => {
-        if let Some(path) = self.code_view.read(cx).file_path() {
-          let project_root = self.state.projects.first().map(|p| &p.path);
-          let relative = project_root.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
+        if let Some(path) = project.code_view.read(cx).file_path() {
+          let relative = path.strip_prefix(&project.path).ok().unwrap_or(path);
           format!("Code: {}", relative.display())
         } else {
           "Code".to_string()
         }
       }
       Some(PaneContentKind::GitDiff) => {
-        let dv = self.diff_view.read(cx);
+        let dv = project.diff_view.read(cx);
         let reviewed = dv.reviewed_count();
         let total = dv.file_count();
         let source_label = dv.source().label();
@@ -510,8 +668,12 @@ impl Workspace {
         }
       }
       Some(PaneContentKind::ReplyViewer) => {
-        let label = self.reply_view.read(cx).current_turn_label();
-        format!("Reply: {label}")
+        if let Some(session) = project.active_session() {
+          let label = session.reply_view.read(cx).current_turn_label();
+          format!("Reply: {label}")
+        } else {
+          "Reply: No session".to_string()
+        }
       }
       Some(kind) => kind.label().to_string(),
       None => "Empty".to_string(),
@@ -520,26 +682,53 @@ impl Workspace {
 
   fn render_title_bar(&self, cx: &mut Context<Self>) -> TitleBar {
     let theme = cx.theme();
+    let project = self.active_project();
 
-    let project_name =
-      self.state.projects.first().map(|p| p.name.clone()).unwrap_or_else(|| "No project".into());
+    let mut title = project.name.clone();
+    if let Some(session) = project.active_session() {
+      title = format!("{} > {}", title, session.slug);
+    }
+
+    // Count problems across other sessions (not the active one).
+    let other_problems: usize = self
+      .projects
+      .iter()
+      .enumerate()
+      .flat_map(|(pi, p)| {
+        p.sessions.iter().enumerate().filter_map(move |(si, s)| {
+          let is_active = pi == self.active_project_index && Some(si) == p.active_session_index;
+          if is_active || s.problems.is_empty() { None } else { Some(s.problems.len()) }
+        })
+      })
+      .sum();
+
+    let current_has_problems = project.active_session().is_some_and(|s| !s.problems.is_empty());
+
+    let title_el = {
+      let el = div().text_sm().text_color(theme.foreground).child(title);
+      if current_has_problems {
+        el.child(div().ml_1().text_xs().text_color(gpui::hsla(0., 0.8, 0.5, 1.0)).child("!"))
+      } else {
+        el
+      }
+    };
+
+    let right_el = {
+      let mut el = div().flex().items_center().ml_auto().gap_2();
+      if other_problems > 0 {
+        el = el.child(
+          div()
+            .text_xs()
+            .text_color(gpui::hsla(30. / 360., 0.8, 0.5, 1.0))
+            .child(format!("{other_problems} problems")),
+        );
+      }
+      el.child(div().text_sm().text_color(theme.muted_foreground).child("Usage"))
+    };
 
     TitleBar::new()
-      .child(
-        div()
-          .flex()
-          .items_center()
-          .gap_1()
-          .mr_auto()
-          .child(div().text_sm().text_color(theme.foreground).child(project_name)),
-      )
-      .child(
-        div()
-          .flex()
-          .items_center()
-          .ml_auto()
-          .child(div().text_sm().text_color(theme.muted_foreground).child("Usage")),
-      )
+      .child(div().flex().items_center().gap_1().mr_auto().child(title_el))
+      .child(right_el)
   }
 }
 
@@ -612,6 +801,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::open_context_picker))
       .on_action(cx.listener(Self::even_split))
       .on_action(cx.listener(Self::open_git_log_picker))
+      .on_action(cx.listener(Self::open_session_picker))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable(("main-split", self.split_generation))
@@ -655,6 +845,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
     KeyBinding::new("cmd-|", EvenSplit, Some("Workspace")),
     KeyBinding::new("cmd-shift-o", OpenGitLogPicker, Some("Workspace")),
+    KeyBinding::new("cmd-p", ShowSessionPicker, Some("Workspace")),
   ]);
 
   cx.bind_keys([

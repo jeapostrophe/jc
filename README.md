@@ -32,12 +32,12 @@ data/
   light_theme.toml                  # unified light theme: terminal palette, UI chrome, syntax (Tomorrow)
   fonts/                            # bundled Lilex font (Regular, Bold, Italic, BoldItalic)
 jc-core/                            # data model + config persistence
-  src/lib.rs, config.rs, model.rs, session.rs, theme.rs
+  src/lib.rs, config.rs, model.rs, problem.rs, session.rs, theme.rs
 jc-terminal/                        # embedded terminal emulator
   src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
   examples/terminal_window.rs
 jc-app/                             # binary: CLI + GPUI app
-  src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view,reply_view}.rs
+  src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_state,session_state,project_view,diff_view,code_view,todo_view,reply_view}.rs
   src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
   examples/basic_window.rs
 ```
@@ -78,18 +78,20 @@ To find all JSONL files for a slug, scan the session directory and match on the 
 
 ### Session Architecture
 
-Target architecture: `App -> Projects -> Sessions`. Each Project owns a TODO file and Sessions. Each Session has a slug and owns its panes/views. The App has an active project with an active session; the active session drives what views show. The TODO file is shared across all sessions within a project.
+The app uses an `App -> Projects -> Sessions` hierarchy. Each `ProjectState` owns a TODO file, diff view, code view, and a list of `SessionState` entries. Each `SessionState` has a slug and owns a Claude terminal (resumed via `--resume <uuid>`), a general terminal, and a reply view pre-bound to the slug. The workspace has an active project with an active session; the active session drives which terminals and reply view are shown in the panes. Switching sessions swaps the pane contents without disconnecting terminals.
 
-Key design constraints:
-- Separate terminal instances per session (switching sessions must not disconnect terminals)
-- Session state derived from TODO.md headings, not persisted separately
-- "Problems" concept tracks validation issues (e.g., invalid session slugs) — extensible for future checks
+Key design points:
+- Separate terminal instances per session (switching sessions does not disconnect terminals)
+- Session state derived from TODO.md `## Session` headings, not persisted separately
+- `Problem { rank, description }` tracks validation issues (invalid slugs, dirty working directory) — extensible for future checks
+- Session picker (Cmd-P) shows all sessions across all projects with `>` for active and `!` for sessions with problems
+- Title bar shows `project > session` with problem indicators
 
 Checklist:
-- [ ] [D] Implement App -> Projects -> Sessions hierarchy (active project, active session tracking)
-- [ ] [H] Per-session terminal pairs with shared TODO file
-- [ ] [H] Session picker to switch active session within a project
-- [ ] [E] Track and display "problems" (invalid slugs, etc.) in status bar
+- [x] [D] Implement App -> Projects -> Sessions hierarchy (active project, active session tracking)
+- [x] [H] Per-session terminal pairs with shared TODO file
+- [x] [H] Session picker to switch active session within a project
+- [x] [E] Track and display "problems" (invalid slugs, dirty buffers, dirty working directories, etc.) in status bar
 
 ### TODO.md
 
@@ -429,8 +431,8 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [D] ~~Claude appears to create new session_ids "behind the scenes" when it enters and leaves planning mode~~ Resolved: Claude forks sessions on mode transitions. All forks share the same `slug`. Use slug as stable identifier.
 - [x] [D] ~~Add `session_slug` to Task model and persist in `state.toml`~~ Superseded: session state lives in TODO.md
 - [x] [D] ~~Consider having session state inside of TODO.md rather than having "Task 1"/etc~~ Resolved: sessions defined via `## Session <slug>: <label>` headings in TODO.md
-- [ ] [E] Implement session discovery by slug: scan JSONL files, extract slug, group by slug, adopt most recent slug on project init
-- [ ] [E] Invoke Claude Code with `--resume <session-id>` using the most recent file UUID from the session's slug group
+- [x] [E] Implement session discovery by slug: scan JSONL files, extract slug, group by slug, adopt most recent slug on project init
+- [x] [E] Invoke Claude Code with `--resume <session-id>` using the most recent file UUID from the session's slug group
 
 ### TODO.md System
 - [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
@@ -441,6 +443,9 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers)
 - [x] Parse TODO.md format (sessions, messages, WAIT markers)
 - [x] Build library for managing TODO.md representation
+- [ ] [H] On startup, if TODO.md has no valid sessions (all slugs are invalid or no `## Session` headings exist), discover the most recent JSONL session group and insert a `## Session <slug>: <label>` heading into TODO.md
+- [ ] [E] Skip sessions with invalid slugs during `ProjectState::create` instead of creating broken `SessionState` entries (currently creates terminals that can't resume)
+- [ ] [D] Implement interactive correction of invalid session slugs in TODO.md (e.g., picker showing discovered slugs to replace an invalid one)
 - [ ] [H] Implement comment insertion from other views into the WAIT section
 - [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
@@ -507,7 +512,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Track most recently visited files and put them at the top of file picker
 - [x] [E] Track modified files (from git) and mark them in the file picker
 - [x] [E] Annotate which files are recently visited in file picker with an R.
-- [ ] [H] Implement fuzzy project/session picker with filtering (waiting sessions, same project)
+- [x] [H] Implement fuzzy project/session picker with filtering (waiting sessions, same project)
 - [x] [H] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 - [ ] [E] Implement general searching in all views
@@ -523,7 +528,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [E] Implement in-app status bar showing waiting sessions (driven by hook events)
 - [ ] [E] Jump to next waiting session keybinding
 - [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
-- [ ] [D] Expand the concept of "problems" (Claude is asking for permission, a session is idle, there are messages in the wait section that haven't been sent, the project has non-filled-in-checklist items)
+- [ ] [D] Expand the concept of "problems" (Claude is asking for permission, a session is idle, there are messages in the wait section that haven't been sent, the project has non-filled-in-checklist items; maybe require new type)
 
 ### Mobile App
 - [ ] [D] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
@@ -549,3 +554,6 @@ It is deliberately *not* a full code editor on mobile.
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically
+
+### Unsorted
+- [x] [E] A ranking system for problems (Claude questions -> WAIT items on idle Claudes -> Unreviewed Git changes -> etc)

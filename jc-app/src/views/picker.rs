@@ -8,12 +8,21 @@ use crate::language::Language;
 use crate::outline::{OutlineItem, compute_outline};
 use crate::views::code_view::CodeView;
 use crate::views::diff_view::{DiffSource, DiffView, GitLogEntry, git_log};
+use crate::views::project_state::ProjectState;
 use crate::views::reply_view::ReplyView;
 use crate::views::todo_view::TodoView;
 
 actions!(
   picker,
-  [ConfirmPicker, CancelPicker, SelectNextItem, SelectPrevItem, OpenFilePicker, OpenContextPicker]
+  [
+    ConfirmPicker,
+    CancelPicker,
+    SelectNextItem,
+    SelectPrevItem,
+    OpenFilePicker,
+    OpenContextPicker,
+    ShowSessionPicker,
+  ]
 );
 
 pub fn init(cx: &mut App) {
@@ -142,6 +151,10 @@ impl<D: PickerDelegate> PickerState<D> {
     };
     state.refilter(cx);
     state
+  }
+
+  pub fn delegate(&self) -> &D {
+    &self.delegate
   }
 
   pub fn input_focus_handle(&self, cx: &App) -> FocusHandle {
@@ -732,5 +745,80 @@ impl PickerDelegate for ReplyHeadingPickerDelegate {
 
   fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
     hierarchy_preserving_filter(&self.outline, &self.labels, query_lower)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SessionPickerDelegate
+// ---------------------------------------------------------------------------
+
+pub struct SessionPickerDelegate {
+  labels: Vec<String>,
+  /// (project_index, session_index) for each label.
+  entries: Vec<(usize, usize)>,
+  active_entry: Option<usize>,
+  problems_per_entry: Vec<usize>,
+  /// Stores the last confirmed entry for the workspace to read.
+  confirmed: (usize, usize),
+}
+
+impl SessionPickerDelegate {
+  pub fn new(projects: &[ProjectState], active_project_index: usize) -> Self {
+    let mut labels = Vec::new();
+    let mut entries = Vec::new();
+    let mut problems_per_entry = Vec::new();
+    let mut active_entry = None;
+
+    for (pi, project) in projects.iter().enumerate() {
+      for (si, session) in project.sessions.iter().enumerate() {
+        let is_active = pi == active_project_index && Some(si) == project.active_session_index;
+        if is_active {
+          active_entry = Some(labels.len());
+        }
+        labels.push(format!("{} / {}: {}", project.name, session.slug, session.label));
+        entries.push((pi, si));
+        problems_per_entry.push(session.problems.len());
+      }
+    }
+
+    Self { labels, entries, active_entry, problems_per_entry, confirmed: (0, 0) }
+  }
+
+  pub fn confirmed_entry(&self) -> (usize, usize) {
+    self.confirmed
+  }
+}
+
+impl PickerDelegate for SessionPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
+    self.confirmed = self.entries[index];
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let label = &self.labels[index];
+    let is_active = self.active_entry == Some(index);
+    let has_problems = self.problems_per_entry[index] > 0;
+
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+
+    // Active session marker
+    let marker = if is_active {
+      let color =
+        if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
+      div().text_xs().text_color(color).font_weight(FontWeight::BOLD).child(">")
+    } else if has_problems {
+      let color = if selected { theme.accent_foreground } else { gpui::hsla(0., 0.8, 0.5, 1.0) };
+      div().text_xs().text_color(color).font_weight(FontWeight::BOLD).child("!")
+    } else {
+      div().text_xs().w(px(10.0))
+    };
+
+    row.child(marker).child(label.clone())
   }
 }
