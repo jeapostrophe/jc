@@ -341,20 +341,16 @@ impl PickerDelegate for FilePickerDelegate {
 
 pub struct DiffFilePickerDelegate {
   labels: Vec<String>,
-  lines: Vec<u32>,
+  reviewed: Vec<bool>,
   diff_view: Entity<DiffView>,
 }
 
 impl DiffFilePickerDelegate {
   pub fn new(diff_view: Entity<DiffView>, cx: &App) -> Self {
-    let entries = diff_view.read(cx).file_entries();
-    let mut labels = Vec::with_capacity(entries.len());
-    let mut lines = Vec::with_capacity(entries.len());
-    for (name, line) in entries {
-      labels.push(name.clone());
-      lines.push(*line);
-    }
-    Self { labels, lines, diff_view }
+    let dv = diff_view.read(cx);
+    let labels: Vec<String> = dv.file_diffs().iter().map(|fd| fd.name.clone()).collect();
+    let reviewed: Vec<bool> = dv.file_diffs().iter().map(|fd| dv.is_reviewed(&fd.name)).collect();
+    Self { labels, reviewed, diff_view }
   }
 }
 
@@ -364,8 +360,38 @@ impl PickerDelegate for DiffFilePickerDelegate {
   }
 
   fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
-    let line = self.lines[index];
-    self.diff_view.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+    self.diff_view.update(cx, |v, cx| v.set_file_index(index, window, cx));
+  }
+
+  fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
+    let mut result = Vec::new();
+    for (index, item) in self.labels.iter().enumerate() {
+      if let Some(score) = fuzzy_match(query_lower, item) {
+        // Push reviewed files to the bottom by subtracting a large bias.
+        let bias = if self.reviewed[index] { -10000 } else { 0 };
+        result.push(FilteredItem { index, score: score + bias });
+      }
+    }
+    result
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let label = &self.labels[index];
+    let is_reviewed = self.reviewed[index];
+
+    let row = div().px_2().py(px(3.0)).text_sm().flex().items_center().gap_1();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+
+    if is_reviewed {
+      let marker_color =
+        if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
+      row
+        .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("✓"))
+        .child(label.clone())
+    } else {
+      row.child(div().text_xs().w(px(10.0))).child(label.clone())
+    }
   }
 }
 

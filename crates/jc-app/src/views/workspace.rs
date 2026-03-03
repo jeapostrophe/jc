@@ -1,5 +1,5 @@
 use crate::views::code_view::CodeView;
-use crate::views::diff_view::DiffView;
+use crate::views::diff_view::{DiffView, DiffViewEvent};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, OpenContextPicker,
@@ -69,6 +69,7 @@ pub struct Workspace {
   split_generation: usize,
   recent_files: Vec<PathBuf>,
   _appearance_subscription: Subscription,
+  _diff_view_subscription: Subscription,
 }
 
 impl Workspace {
@@ -132,6 +133,16 @@ impl Workspace {
         this.apply_appearance(appearance_from_window(window.appearance()), window, cx);
       });
 
+    let diff_view_subscription = cx.subscribe_in(
+      &diff_view,
+      window,
+      |this: &mut Self, _, event: &DiffViewEvent, window, cx| match event {
+        DiffViewEvent::Reviewed => {
+          this.open_diff_picker(window, cx);
+        }
+      },
+    );
+
     Self {
       left_pane,
       right_pane,
@@ -150,6 +161,7 @@ impl Workspace {
       split_generation: 0,
       recent_files: Vec::new(),
       _appearance_subscription: appearance_subscription,
+      _diff_view_subscription: diff_view_subscription,
     }
   }
 
@@ -368,8 +380,7 @@ impl Workspace {
 
     match kind {
       Some(PaneContentKind::GitDiff) => {
-        let delegate = DiffFilePickerDelegate::new(self.diff_view.clone(), cx);
-        self.show_picker(delegate, window, cx);
+        self.open_diff_picker(window, cx);
       }
       Some(PaneContentKind::TodoEditor) => {
         let delegate = TodoHeaderPickerDelegate::new(self.todo_view.clone(), cx);
@@ -381,6 +392,14 @@ impl Workspace {
       }
       _ => {}
     }
+  }
+
+  fn open_diff_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.active_picker.is_some() {
+      return;
+    }
+    let delegate = DiffFilePickerDelegate::new(self.diff_view.clone(), cx);
+    self.show_picker(delegate, window, cx);
   }
 
   /// Show a picker, switching to `switch_pane` on confirm if provided.
@@ -454,6 +473,16 @@ impl Workspace {
           format!("Code: {}", relative.display())
         } else {
           "Code".to_string()
+        }
+      }
+      Some(PaneContentKind::GitDiff) => {
+        let dv = self.diff_view.read(cx);
+        let reviewed = dv.reviewed_count();
+        let total = dv.file_count();
+        if let Some(name) = dv.current_file_name() {
+          format!("Diff: {name} ({reviewed}/{total})")
+        } else {
+          format!("Diff ({reviewed}/{total})")
         }
       }
       Some(kind) => kind.label().to_string(),

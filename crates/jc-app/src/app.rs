@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use crate::views::code_view;
+use crate::views::diff_view;
 use crate::views::picker;
 use crate::views::todo_view;
 use crate::views::workspace::{self, Workspace};
@@ -17,6 +18,7 @@ pub fn run(state: AppState, config: AppConfig) {
     workspace::init(cx);
     picker::init(cx);
     code_view::init(cx);
+    diff_view::init(cx);
     todo_view::init(cx);
 
     // Register the bundled Lilex font family.
