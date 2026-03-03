@@ -5,7 +5,8 @@
       "Bash(rustc:*)",
       "Bash(curl:*)",
       "Bash(cargo metadata:*)",
-      "Bash(cargo doc:*)"
+      "Bash(cargo doc:*)",
+      "Bash(cargo tree:*)"
     ]
   }
 }

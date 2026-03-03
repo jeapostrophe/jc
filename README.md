@@ -394,7 +394,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [H] Show one file at a time rather than raw multi-file output
 - [ ] [H] Implement region selection and comment keybinding
 - [ ] [H] Show git log as well to look at older diffs. Provide a picker to scroll through to view. (Ctrl-Shift-O)
-- [ ] [H] Implement language syntax highlighting inside of diffs
+- [x] [H] Implement language syntax highlighting inside of diffs
 
 ### Code Viewer
 - [x] Implement syntax-highlighted file viewer (`tree-sitter` + `tree-sitter-highlight`)
@@ -437,7 +437,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Track modified files (from git) and mark them in the file picker
 - [x] [E] Annotate which files are recently visited in file picker with an R.
 - [ ] [H] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
-- [ ] [H] Use syntax highlighting inside of the picker appropriate to the original language
+- [x] [H] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 
 ### Notifications & Status
