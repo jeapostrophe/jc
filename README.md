@@ -347,7 +347,7 @@ It is deliberately *not* a full code editor on mobile.
 ### Notifications & Status
 - [ ] [E] Usage: pace multiplier (`limit_pct / working_pct` as `0.7x`)
 - [ ] [E] Usage: projected remaining working hours at current burn rate
-- [ ] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
+- [x] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] [E] Implement in-app status bar showing waiting sessions (driven by hook events)
 - [ ] [E] Jump to next problem keybinding on Cmd-;

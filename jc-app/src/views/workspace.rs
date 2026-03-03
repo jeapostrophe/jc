@@ -15,11 +15,14 @@ use gpui_component::ActiveTheme;
 use gpui_component::TitleBar;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::theme::Theme;
+use gpui_component::tooltip::Tooltip;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::theme::Appearance;
+use jc_core::usage::{FullUsageReport, ParStatus};
 use jc_terminal::Palette;
 use std::ops::DerefMut;
 use std::path::PathBuf;
+use std::time::Duration as StdDuration;
 
 actions!(
   workspace,
@@ -73,6 +76,8 @@ pub struct Workspace {
   _comment_subscription: Option<Subscription>,
   split_generation: usize,
   recent_files: Vec<PathBuf>,
+  usage_report: Option<FullUsageReport>,
+  _usage_poll_task: Option<Task<()>>,
   _appearance_subscription: Subscription,
   _diff_view_subscription: Option<Subscription>,
 }
@@ -128,6 +133,40 @@ impl Workspace {
         this.apply_appearance(appearance_from_window(window.appearance()), window, cx);
       });
 
+    let working_hours = config.working_hours.clone();
+    let usage_poll_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+      loop {
+        let wh = working_hours.clone();
+        let result = std::thread::spawn(move || -> Option<FullUsageReport> {
+          let token = jc_core::claude_api::load_oauth_token().ok()?;
+          let api = jc_core::claude_api::fetch_usage(&token).ok()?;
+          Some(FullUsageReport::from_api(&api, &wh))
+        })
+        .join()
+        .ok()
+        .flatten();
+
+        let Ok(should_continue) = cx.update(|cx: &mut App| {
+          if let Some(entity) = this.upgrade() {
+            entity.update(cx, |view, cx| {
+              view.usage_report = result;
+              cx.notify();
+            });
+            true
+          } else {
+            false
+          }
+        }) else {
+          break;
+        };
+        if !should_continue {
+          break;
+        }
+
+        Timer::after(StdDuration::from_secs(60)).await;
+      }
+    });
+
     let mut ws = Self {
       left_pane,
       right_pane,
@@ -144,6 +183,8 @@ impl Workspace {
       _comment_subscription: None,
       split_generation: 0,
       recent_files: Vec::new(),
+      usage_report: None,
+      _usage_poll_task: Some(usage_poll_task),
       _appearance_subscription: appearance_subscription,
       _diff_view_subscription: None,
     };
@@ -815,6 +856,65 @@ impl Workspace {
     }
   }
 
+  fn render_usage_label(&self, theme: &gpui_component::theme::ThemeColor) -> AnyElement {
+    match &self.usage_report {
+      None => div().text_sm().text_color(theme.muted_foreground).child("...").into_any_element(),
+      Some(full) => {
+        let color = match full.par_status() {
+          ParStatus::Under => theme.success,
+          ParStatus::On => theme.warning,
+          ParStatus::Over => theme.danger,
+        };
+        let label = full.title_label();
+        let full = full.clone();
+        div()
+          .id("usage-label")
+          .text_sm()
+          .text_color(color)
+          .child(label)
+          .tooltip(move |window, cx| {
+            let f = full.clone();
+            Tooltip::element(move |_window, cx| {
+              let f = &f;
+              let theme = cx.theme();
+              let dim = theme.muted_foreground;
+              let fg = theme.foreground;
+              div()
+                .font_family("Lilex")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_xs()
+                .child(
+                  div().flex().gap_2().child(
+                    div().text_color(fg).child(format!(
+                      "5h: {:.0}%  (resets {})",
+                      f.five_hour_pct, f.five_hour_reset
+                    )),
+                  ),
+                )
+                .child(div().flex().gap_2().child(div().text_color(fg).child(format!(
+                  "7d: {:.0}%  (resets {})",
+                  f.report.limit_pct, f.seven_day_reset
+                ))))
+                .child(
+                  div().text_color(dim).child(format!("Work time: {:.0}%", f.report.working_pct)),
+                )
+                .child(div().text_color(fg).child(f.title_label()))
+                .when_some(f.extra.as_ref(), |el, extra| {
+                  el.child(div().text_color(dim).child(format!(
+                    "Extra: ${:.0} / ${:.0} ({:.1}%)",
+                    extra.used_credits, extra.monthly_limit, extra.utilization,
+                  )))
+                })
+            })
+            .build(window, cx)
+          })
+          .into_any_element()
+      }
+    }
+  }
+
   fn render_title_bar(&self, cx: &mut Context<Self>) -> TitleBar {
     let theme = cx.theme();
     let project = self.active_project();
@@ -858,10 +958,11 @@ impl Workspace {
             .child(format!("{other_problems} problems")),
         );
       }
-      el.child(div().text_sm().text_color(theme.muted_foreground).child("Usage"))
+      el.child(self.render_usage_label(theme)).mr_2()
     };
 
     TitleBar::new()
+      .font_family("Lilex")
       .child(div().flex().items_center().gap_1().mr_auto().child(title_el))
       .child(right_el)
   }

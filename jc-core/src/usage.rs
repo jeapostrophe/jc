@@ -1,4 +1,5 @@
-use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Weekday};
+use crate::claude_api::ApiUsageResponse;
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Weekday};
 use serde::{Deserialize, Serialize};
 
 const BAR_WIDTH: usize = 40;
@@ -187,6 +188,7 @@ fn date_and_hour(date: NaiveDate, hour: u8) -> NaiveDateTime {
   }
 }
 
+#[derive(Debug, Clone)]
 pub struct UsageReport {
   pub limit_pct: f64,
   pub week_pct: f64,
@@ -298,4 +300,172 @@ pub fn parse_time(s: &str) -> Option<(u8, u8)> {
     return None;
   }
   Some((hour, minute))
+}
+
+/// Extra usage billing info (formatted for display).
+#[derive(Debug, Clone)]
+pub struct ExtraUsageInfo {
+  pub monthly_limit: f64,
+  pub used_credits: f64,
+  pub utilization: f64,
+}
+
+/// Full usage report combining 5-hour window, 7-day par calculation, and extra usage.
+#[derive(Debug, Clone)]
+pub struct FullUsageReport {
+  /// 7-day par report (the core calculation).
+  pub report: UsageReport,
+  /// 5-hour window utilization percentage.
+  pub five_hour_pct: f64,
+  /// Human-readable 5-hour reset time (e.g. "in 2h 15m").
+  pub five_hour_reset: String,
+  /// Human-readable 7-day reset time (e.g. "Thu 21:59").
+  pub seven_day_reset: String,
+  /// Extra usage info, if enabled.
+  pub extra: Option<ExtraUsageInfo>,
+}
+
+impl FullUsageReport {
+  /// Build from API response + working hours config.
+  pub fn from_api(api: &ApiUsageResponse, working_hours: &WorkingHours) -> Self {
+    // Parse the 7-day reset time to extract day/hour/minute for the par calculation.
+    let (reset_day, reset_hour, reset_minute) = parse_reset_time(&api.seven_day.resets_at);
+
+    let report =
+      working_hours.calculate(api.seven_day.utilization, reset_day, reset_hour, reset_minute);
+
+    let five_hour_reset = format_reset_relative(&api.five_hour.resets_at);
+    let seven_day_reset = format_reset_weekday(&api.seven_day.resets_at);
+
+    let extra = api.extra_usage.as_ref().and_then(|e| {
+      if e.is_enabled {
+        Some(ExtraUsageInfo {
+          monthly_limit: e.monthly_limit.unwrap_or(0.0),
+          used_credits: e.used_credits.unwrap_or(0.0),
+          utilization: e.utilization.unwrap_or(0.0),
+        })
+      } else {
+        None
+      }
+    });
+
+    Self {
+      report,
+      five_hour_pct: api.five_hour.utilization,
+      five_hour_reset,
+      seven_day_reset,
+      extra,
+    }
+  }
+
+  /// Short label for the title bar, e.g. "Par +12".
+  pub fn title_label(&self) -> String {
+    let par = self.report.par();
+    let sign = if par > 0.0 { "+" } else { "" };
+    format!("Par {sign}{:.0}", par)
+  }
+
+  pub fn par_status(&self) -> ParStatus {
+    self.report.par_status()
+  }
+
+  /// Print colored CLI output.
+  pub fn print_cli(&self) {
+    let red = "\x1b[31m";
+    let green = "\x1b[32m";
+    let yellow = "\x1b[33m";
+    let dim = "\x1b[2m";
+    let reset = "\x1b[0m";
+    let bold = "\x1b[1m";
+
+    let par = self.report.par();
+    let (par_color, par_label) = match self.report.par_status() {
+      ParStatus::Under => (green, "Under par"),
+      ParStatus::Over => (red, "Over par"),
+      ParStatus::On => (yellow, "On par"),
+    };
+
+    // Headline
+    let sign = if par > 0.0 { "+" } else { "" };
+    println!("  {bold}{par_color}{par_label}: {sign}{:.0}{reset}", par);
+
+    // 5-hour window
+    let five_color = if self.five_hour_pct > 80.0 {
+      red
+    } else if self.five_hour_pct > 50.0 {
+      yellow
+    } else {
+      green
+    };
+    println!();
+    println!(
+      "  5h window: {five_color}{:>3.0}%{reset} {} {dim}resets {}{reset}",
+      self.five_hour_pct,
+      bar(self.five_hour_pct, five_color, dim, reset),
+      self.five_hour_reset,
+    );
+
+    // 7-day bars
+    let working_color = comparison_color(self.report.working_pct, self.report.limit_pct);
+    println!(
+      "  7d budget: {:>3.0}% {} {dim}resets {}{reset}",
+      self.report.limit_pct,
+      bar(self.report.limit_pct, dim, dim, reset),
+      self.seven_day_reset,
+    );
+    println!(
+      "  Work time: {working_color}{:>3.0}%{reset} {}",
+      self.report.working_pct,
+      bar(self.report.working_pct, working_color, dim, reset),
+    );
+
+    // Extra usage
+    if let Some(extra) = &self.extra {
+      println!();
+      println!(
+        "  {dim}Extra usage: ${:.0} / ${:.0} ({:.1}%){reset}",
+        extra.used_credits, extra.monthly_limit, extra.utilization,
+      );
+    }
+  }
+}
+
+/// Parse ISO 8601 reset time to (Weekday, hour, minute) in local time.
+fn parse_reset_time(iso: &str) -> (Weekday, u8, u8) {
+  use chrono::DateTime;
+  if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
+    let local = dt.with_timezone(&Local);
+    (local.weekday(), local.hour() as u8, local.minute() as u8)
+  } else {
+    // Fallback: try without timezone suffix (shouldn't happen with the API)
+    (Weekday::Thu, 21, 59)
+  }
+}
+
+/// Format reset time as relative duration, e.g. "in 2h 15m".
+fn format_reset_relative(iso: &str) -> String {
+  use chrono::DateTime;
+  if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
+    let now = Local::now();
+    let diff = dt.signed_duration_since(now);
+    if diff.num_seconds() <= 0 {
+      return "now".to_string();
+    }
+    let hours = diff.num_hours();
+    let minutes = diff.num_minutes() % 60;
+    if hours > 0 { format!("in {hours}h {minutes:02}m") } else { format!("in {minutes}m") }
+  } else {
+    "unknown".to_string()
+  }
+}
+
+/// Format reset time as weekday + time, e.g. "Thu 21:59".
+fn format_reset_weekday(iso: &str) -> String {
+  use chrono::DateTime;
+  if let Ok(dt) = DateTime::parse_from_rfc3339(iso) {
+    let local = dt.with_timezone(&Local);
+    local.format("%a %H:%M").to_string()
+  } else {
+    "unknown".to_string()
+  }
 }
