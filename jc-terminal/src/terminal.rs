@@ -14,6 +14,7 @@ pub enum TerminalEvent {
   Exit,
   ChildExit(i32),
   PtyWrite(String),
+  CursorBlinkingChange,
 }
 
 /// Forwards alacritty events to a flume channel.
@@ -36,6 +37,7 @@ impl EventListener for EventProxy {
       Event::Exit => TerminalEvent::Exit,
       Event::ChildExit(code) => TerminalEvent::ChildExit(code),
       Event::PtyWrite(s) => TerminalEvent::PtyWrite(s),
+      Event::CursorBlinkingChange => TerminalEvent::CursorBlinkingChange,
       _ => return,
     };
     let _ = self.tx.send(terminal_event);

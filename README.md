@@ -433,6 +433,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [D] ~~Consider having session state inside of TODO.md rather than having "Task 1"/etc~~ Resolved: sessions defined via `## Session <slug>: <label>` headings in TODO.md
 - [x] [E] Implement session discovery by slug: scan JSONL files, extract slug, group by slug, adopt most recent slug on project init
 - [x] [E] Invoke Claude Code with `--resume <session-id>` using the most recent file UUID from the session's slug group
+- [ ] [H] Cursor not blinking properly in the Claude terminal — Claude Code does its own cursor management; need to properly signal focus state and respect its cursor escape sequences
 
 ### TODO.md System
 - [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
@@ -450,6 +451,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
+- [ ] [E] Switching to TODO view should automatically scroll to the WAIT section of the active session
 
 ### Claude Reply Viewer
 - [x] Read session slug from TODO.md; load turns from all JSONL files sharing the slug
@@ -458,7 +460,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Implement turn picker (Cmd-Shift-O, newest first, shows request text as preview)
 - [x] [E] Implement Cmd-T heading picker within rendered turns
 - [x] [E] File watching for JSONL changes (reload turns on update)
-- [ ] [E] Watch all JSONL files in the slug group (not just one file) for changes
+- [x] [E] Watch all JSONL files in the slug group (not just one file) for changes
 - [ ] [H] Full conversation rendering: tool use summaries, thinking blocks as additional headings
 
 ### Git Diff View
@@ -500,7 +502,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Auto-switch themes with system dark mode
 - [x] [T] Remove Cmd-Shift-T manual theme toggle
 - [x] [E] Ensure that the theme is used for all parts of the UI. (Right now, the terminal colors don't match the code view colors)
-- [ ] [E] Labels on Diff/Reply/FileViews should be limited to one line, right now they can wrap
+- [x] [E] Labels on Diff/Reply/FileViews should be limited to one line, right now they can wrap
 - [ ] [H] Implement Quake-style bottom terminal overlay
 - [ ] [H] Implement multi-window with shared session state
 
@@ -515,7 +517,8 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [H] Implement fuzzy project/session picker with filtering (waiting sessions, same project)
 - [x] [H] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
-- [ ] [E] Implement general searching in all views
+- [x] [E] Implement general searching in all views with Cmd-F (picker on lines)
+- [ ] [H] Cmd-F line search: fix keybinding capture (editor's built-in find UI intercepts Cmd-F) and ensure selected line scrolls to center of screen
 
 ### Notifications & Status
 - [x] Implement Claude usage algorithm
@@ -526,7 +529,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] [E] Implement in-app status bar showing waiting sessions (driven by hook events)
-- [ ] [E] Jump to next waiting session keybinding
+- [ ] [E] Jump to next problem keybinding on Cmd-;
 - [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
 - [ ] [D] Expand the concept of "problems" (Claude is asking for permission, a session is idle, there are messages in the wait section that haven't been sent, the project has non-filled-in-checklist items; maybe require new type)
 
@@ -549,7 +552,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
 - [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
-- [ ] [E] Garbage collect stale `.jc/replies/` files (e.g., on app startup, prune files older than N days)
+- [x] [E] Garbage collect stale `.jc/replies/` files (e.g., on app startup, prune files older than N days)
 - [ ] [H] Allow projects to have a special `./status.sh` script that reports problems in the form `file:line - problem`
 
 ### Automation

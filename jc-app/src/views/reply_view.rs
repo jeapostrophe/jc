@@ -10,6 +10,22 @@ use std::path::{Path, PathBuf};
 
 pub fn init(_cx: &mut App) {}
 
+pub fn gc_stale_replies(project_path: &Path) {
+  let replies_dir = project_path.join(".jc/replies");
+  let Ok(entries) = std::fs::read_dir(&replies_dir) else { return };
+  let cutoff = std::time::SystemTime::now()
+    .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600))
+    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+  for entry in entries.flatten() {
+    if let Ok(meta) = entry.metadata()
+      && let Ok(mtime) = meta.modified()
+      && mtime < cutoff
+    {
+      let _ = std::fs::remove_file(entry.path());
+    }
+  }
+}
+
 pub struct ReplyView {
   editor: Entity<InputState>,
   project_path: PathBuf,

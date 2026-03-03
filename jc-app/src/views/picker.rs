@@ -1,7 +1,9 @@
 use gpui::*;
 use gpui_component::ActiveTheme;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::highlighter::SyntaxHighlighter;
+use gpui_component::input::{Input, InputEvent, InputState, Rope};
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crate::language::Language;
@@ -22,6 +24,7 @@ actions!(
     OpenFilePicker,
     OpenContextPicker,
     ShowSessionPicker,
+    SearchLines,
   ]
 );
 
@@ -36,6 +39,12 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("ctrl-p", SelectPrevItem, Some("Picker")),
     KeyBinding::new("cmd-o", OpenFilePicker, Some("Workspace")),
     KeyBinding::new("cmd-t", OpenContextPicker, Some("Workspace")),
+    KeyBinding::new("cmd-f", SearchLines, Some("Workspace")),
+    // Also bind in "Input" context so our SearchLines takes precedence over
+    // gpui-component's built-in Search action (which opens the editor's find
+    // panel). Since this binding is registered after gpui_component::init(),
+    // it has a higher index and wins at the same context depth.
+    KeyBinding::new("cmd-f", SearchLines, Some("Input")),
   ]);
 }
 
@@ -820,5 +829,156 @@ impl PickerDelegate for SessionPickerDelegate {
     };
 
     row.child(marker).child(label.clone())
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LineSearchPickerDelegate
+// ---------------------------------------------------------------------------
+
+type ScrollCallback = Box<dyn Fn(u32, &mut Window, &mut App)>;
+
+struct LineEntry {
+  /// 1-based line number.
+  line_number: u32,
+  /// The line content (without trailing newline).
+  content: String,
+  /// Syntax highlight styles for this line, with byte ranges relative to `content`.
+  styles: Vec<(Range<usize>, HighlightStyle)>,
+}
+
+pub struct LineSearchPickerDelegate<F: Fn(u32, &mut Window, &mut App) + 'static> {
+  labels: Vec<String>,
+  entries: Vec<LineEntry>,
+  scroll_to_line: F,
+}
+
+impl<F: Fn(u32, &mut Window, &mut App) + 'static> LineSearchPickerDelegate<F> {
+  fn build(text: &str, language: &str, scroll_to_line: F, cx: &App) -> Self {
+    let theme = cx.theme();
+    let rope = Rope::from(text);
+    let mut highlighter = SyntaxHighlighter::new(language);
+    highlighter.update(None, &rope);
+
+    let mut entries = Vec::new();
+    let mut labels = Vec::new();
+    let mut byte_offset: usize = 0;
+
+    for (i, line) in text.split('\n').enumerate() {
+      let line_number = (i as u32) + 1;
+      let line_byte_start = byte_offset;
+      let line_byte_end = byte_offset + line.len();
+
+      // Skip empty/whitespace-only lines.
+      if !line.trim().is_empty() {
+        let raw_styles =
+          highlighter.styles(&(line_byte_start..line_byte_end), &theme.highlight_theme);
+        // Adjust ranges to be relative to line start.
+        let styles: Vec<(Range<usize>, HighlightStyle)> = raw_styles
+          .into_iter()
+          .filter_map(|(r, s)| {
+            let start = r.start.saturating_sub(line_byte_start);
+            let end = r.end.saturating_sub(line_byte_start).min(line.len());
+            if start < end { Some((start..end, s)) } else { None }
+          })
+          .collect();
+
+        labels.push(format!("{line_number}: {line}"));
+        entries.push(LineEntry { line_number, content: line.to_string(), styles });
+      }
+
+      // +1 for the '\n' separator (or end of string).
+      byte_offset = line_byte_end + 1;
+    }
+
+    Self { labels, entries, scroll_to_line }
+  }
+}
+
+impl LineSearchPickerDelegate<ScrollCallback> {
+  pub fn for_code_view(code_view: &Entity<CodeView>, cx: &App) -> Self {
+    let text = code_view.read(cx).editor_text(cx);
+    let language = code_view.read(cx).current_language().name();
+    let entity = code_view.clone();
+    let callback: ScrollCallback = Box::new(move |line, window, cx| {
+      entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+    });
+    Self::build(&text, language, callback, cx)
+  }
+
+  pub fn for_todo_view(todo_view: &Entity<TodoView>, cx: &App) -> Self {
+    let text = todo_view.read(cx).editor_text(cx);
+    let entity = todo_view.clone();
+    let callback: ScrollCallback = Box::new(move |line, window, cx| {
+      entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+    });
+    Self::build(&text, "markdown", callback, cx)
+  }
+
+  pub fn for_diff_view(diff_view: &Entity<DiffView>, cx: &App) -> Self {
+    let text = diff_view.read(cx).editor_text(cx);
+    let language = diff_view.read(cx).current_file_language().name();
+    let entity = diff_view.clone();
+    let callback: ScrollCallback = Box::new(move |line, window, cx| {
+      entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+    });
+    Self::build(&text, language, callback, cx)
+  }
+
+  pub fn for_reply_view(reply_view: &Entity<ReplyView>, cx: &App) -> Self {
+    let text = reply_view.read(cx).editor_text(cx);
+    let entity = reply_view.clone();
+    let callback: ScrollCallback = Box::new(move |line, window, cx| {
+      entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+    });
+    Self::build(&text, "markdown", callback, cx)
+  }
+}
+
+impl<F: Fn(u32, &mut Window, &mut App) + 'static> PickerDelegate for LineSearchPickerDelegate<F> {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
+    let line = self.entries[index].line_number;
+    // line_number is 1-based; scroll_to_line expects 0-based line index.
+    let line_0 = line.saturating_sub(1);
+    (self.scroll_to_line)(line_0, window, cx);
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let entry = &self.entries[index];
+
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+
+    // Line number in muted/comment color.
+    let line_num_color = if selected {
+      theme.accent_foreground
+    } else {
+      theme.highlight_theme.style("comment").and_then(|s| s.color).unwrap_or(theme.muted_foreground)
+    };
+    let line_num =
+      div().text_xs().text_color(line_num_color).mr_1().child(format!("{}:", entry.line_number));
+
+    // Build syntax-highlighted line content using StyledText.
+    let line_text: SharedString = entry.content.clone().into();
+    let styled = if selected {
+      // When selected, use accent foreground — no syntax colors.
+      StyledText::new(line_text)
+    } else {
+      let adjusted_styles: Vec<(Range<usize>, HighlightStyle)> = entry.styles.clone();
+      let default_style = TextStyle {
+        font_family: "Lilex".into(),
+        font_size: theme.font_size.into(),
+        color: theme.foreground,
+        ..Default::default()
+      };
+      StyledText::new(line_text).with_default_highlights(&default_style, adjusted_styles)
+    };
+
+    row.child(line_num).child(styled)
   }
 }

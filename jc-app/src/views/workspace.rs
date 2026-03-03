@@ -2,10 +2,12 @@ use crate::views::diff_view::DiffViewEvent;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
-  OpenContextPicker, OpenFilePicker, PickerEvent, PickerState, ReplyHeadingPickerDelegate,
-  ReplyTurnPickerDelegate, SessionPickerDelegate, ShowSessionPicker, TodoHeaderPickerDelegate,
+  LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
+  ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines, SessionPickerDelegate,
+  ShowSessionPicker, TodoHeaderPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
+use crate::views::reply_view::gc_stale_replies;
 use crate::views::todo_view::TodoViewEvent;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -92,6 +94,8 @@ impl Workspace {
         window,
         cx,
       ));
+      let path = project.path.clone();
+      std::thread::spawn(move || gc_stale_replies(&path));
     }
 
     // If no projects registered, create a default one from cwd.
@@ -101,6 +105,8 @@ impl Workspace {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".into());
+      let gc_path = path.clone();
+      std::thread::spawn(move || gc_stale_replies(&gc_path));
       projects.push(ProjectState::create(path, name, &palette, window, cx));
     }
 
@@ -583,6 +589,38 @@ impl Workspace {
     }
   }
 
+  fn search_lines(&mut self, _: &SearchLines, window: &mut Window, cx: &mut Context<Self>) {
+    if self.active_picker.is_some() {
+      return;
+    }
+
+    let pane = self.active_pane_entity().clone();
+    let kind = pane.read(cx).content_kind();
+    let project = self.active_project();
+
+    match kind {
+      Some(PaneContentKind::CodeViewer) => {
+        let delegate = LineSearchPickerDelegate::for_code_view(&project.code_view, cx);
+        self.show_picker(delegate, window, cx);
+      }
+      Some(PaneContentKind::TodoEditor) => {
+        let delegate = LineSearchPickerDelegate::for_todo_view(&project.todo_view, cx);
+        self.show_picker(delegate, window, cx);
+      }
+      Some(PaneContentKind::GitDiff) => {
+        let delegate = LineSearchPickerDelegate::for_diff_view(&project.diff_view, cx);
+        self.show_picker(delegate, window, cx);
+      }
+      Some(PaneContentKind::ReplyViewer) => {
+        if let Some(session) = project.active_session() {
+          let delegate = LineSearchPickerDelegate::for_reply_view(&session.reply_view, cx);
+          self.show_picker(delegate, window, cx);
+        }
+      }
+      _ => {}
+    }
+  }
+
   fn show_picker_with_confirm<D: crate::views::picker::PickerDelegate>(
     &mut self,
     delegate: D,
@@ -758,6 +796,7 @@ impl Render for Workspace {
         .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
         .border_b_1()
         .border_color(theme.border)
+        .truncate()
         .child(label)
     };
 
@@ -802,6 +841,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::even_split))
       .on_action(cx.listener(Self::open_git_log_picker))
       .on_action(cx.listener(Self::open_session_picker))
+      .on_action(cx.listener(Self::search_lines))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable(("main-split", self.split_generation))

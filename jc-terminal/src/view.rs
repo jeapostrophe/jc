@@ -2,7 +2,8 @@ use crate::colors::Palette;
 use crate::input::keystroke_to_bytes;
 use crate::pty::PtyHandle;
 use crate::render::{CellLayout, TerminalRenderState, measure_cell, paint_terminal};
-use crate::terminal::TerminalState;
+use crate::terminal::{TerminalEvent, TerminalState};
+use alacritty_terminal::term::TermMode;
 use gpui::{
   App, AsyncApp, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
   KeyBinding, KeyDownEvent, ParentElement, Pixels, Render, SharedString, Styled, Timer, WeakEntity,
@@ -11,7 +12,7 @@ use gpui::{
 use parking_lot::Mutex;
 use std::io::Read;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const FONT_SIZE_STEP: Pixels = px(2.0);
@@ -68,6 +69,7 @@ pub struct TerminalView {
   focus: FocusHandle,
   last_size: Arc<Mutex<(u16, u16)>>,
   cursor_visible: bool,
+  cursor_reset_at: Instant,
   cached_layout: Option<CellLayout>,
   was_focused: bool,
 }
@@ -133,8 +135,12 @@ impl TerminalView {
         }
         // Handle terminal events (PtyWrite for DSR responses, etc.)
         while let Ok(event) = event_rx.try_recv() {
-          if let crate::terminal::TerminalEvent::PtyWrite(s) = event {
-            let _ = pty_for_write.write_all(s.as_bytes());
+          match event {
+            TerminalEvent::PtyWrite(s) => {
+              let _ = pty_for_write.write_all(s.as_bytes());
+            }
+            TerminalEvent::CursorBlinkingChange => {}
+            _ => {}
           }
         }
         let _ = cx.update(|cx: &mut App| {
@@ -146,7 +152,7 @@ impl TerminalView {
     })
     .detach();
 
-    // Cursor blink timer — only toggles and notifies when focused.
+    // Cursor blink timer — only toggles when focused and terminal says blinking is enabled.
     cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
       loop {
         Timer::after(CURSOR_BLINK_INTERVAL).await;
@@ -154,6 +160,9 @@ impl TerminalView {
           if let Some(entity) = this.upgrade() {
             entity.update(cx, |view, cx| {
               if view.was_focused {
+                if view.cursor_reset_at.elapsed() < CURSOR_BLINK_INTERVAL {
+                  return;
+                }
                 view.cursor_visible = !view.cursor_visible;
                 cx.notify();
               }
@@ -184,6 +193,7 @@ impl TerminalView {
       focus: cx.focus_handle(),
       last_size: Arc::new(Mutex::new((cols, rows))),
       cursor_visible: true,
+      cursor_reset_at: Instant::now(),
       cached_layout: None,
       was_focused: false,
     }
@@ -196,6 +206,7 @@ impl TerminalView {
 
   fn reset_cursor_blink(&mut self) {
     self.cursor_visible = true;
+    self.cursor_reset_at = Instant::now();
   }
 
   fn increase_font_size(
@@ -243,6 +254,20 @@ impl Render for TerminalView {
     let palette_fg = self.palette.foreground;
     let palette_bg = self.palette.background;
     let focused = self.focus.is_focused(window);
+    if focused != self.was_focused {
+      {
+        let handle = self.state.term_handle();
+        let mut term = handle.lock();
+        term.is_focused = focused;
+        if term.mode().contains(TermMode::FOCUS_IN_OUT) {
+          let seq = if focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" as &[u8] };
+          let _ = self.pty.write_all(seq);
+        }
+      }
+      if focused {
+        self.reset_cursor_blink();
+      }
+    }
     self.was_focused = focused;
     let cursor_visible = self.cursor_visible;
 
