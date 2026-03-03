@@ -31,16 +31,15 @@ data/
   dark_theme.toml                   # unified dark theme: terminal palette, UI chrome, syntax (Tomorrow Night)
   light_theme.toml                  # unified light theme: terminal palette, UI chrome, syntax (Tomorrow)
   fonts/                            # bundled Lilex font (Regular, Bold, Italic, BoldItalic)
-crates/
-  jc-core/                          # data model + config persistence
-    src/lib.rs, config.rs, model.rs, theme.rs
-  jc-terminal/                      # embedded terminal emulator
-    src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
-    examples/terminal_window.rs
-  jc-app/                           # binary: CLI + GPUI app
-    src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view}.rs
-    src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
-    examples/basic_window.rs
+jc-core/                            # data model + config persistence
+  src/lib.rs, config.rs, model.rs, theme.rs
+jc-terminal/                        # embedded terminal emulator
+  src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
+  examples/terminal_window.rs
+jc-app/                             # binary: CLI + GPUI app
+  src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view}.rs
+  src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
+  examples/basic_window.rs
 ```
 
 ## Design Principles
@@ -353,8 +352,8 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement `jc` CLI for adding projects from the command line
 - [x] [T] Remove code_editor_demo
 - [x] [E] Stringly-typed language names vs enum (`Language` enum in `language.rs`)
-- [ ] [E] Move the crates out of './crates' and into the top-level
-- [ ] [E] Starting with no project should initialize to a project in the cwd
+- [x] [E] Move the crates out of './crates' and into the top-level
+- [x] [E] Starting with no project should initialize to a project in the cwd
 
 ### Terminal Emulator
 - [x] Integrate `alacritty_terminal` with GPUI rendering (`jc-terminal` crate)
@@ -368,8 +367,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Change the font size of the terminal(s) via font size keybindings (Cmd-+/-/0)
 - [ ] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
 - [x] [E] Run Claude Code inside the embedded terminal dedicated to Claude
-- [ ] [E] Fix the working directory of the terminals
-- [ ] [H] Implement Quake-style drop-down terminal toggle
+- [x] [E] Fix the working directory of the terminals
 - [ ] [H] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
 - [ ] [H] Show old replies and plans as well. Provide a picker to scroll through to view. (Ctrl-Shift-O)
 
@@ -417,7 +415,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement view switching for diff, TODO, code views (Cmd-3/4/5)
 - [x] Use a monospace font (Lilex) in code editor views (diff, code, TODO)
 - [x] Disable line numbers in code editor views
-- [ ] [E] Change the size of the split with a keybinding to make even split (Cmd-Shift-=) [keybinding doesn't work]
+- [x] [E] Change the size of the split with a keybinding to make even split (Cmd-|)
 - [x] [E] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
 - [x] [T] Move default theme file to 'data' directory rather than embedding defaults in source
 - [ ] [E] Implement view switching for reply view
@@ -425,7 +423,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [D] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting
 - [x] [E] Add a light theme (Tomorrow palette in `light_theme.toml`)
 - [x] [E] Auto-switch themes with system dark mode
-- [ ] [T] Remove Cmd-Shift-T manual theme toggle
+- [x] [T] Remove Cmd-Shift-T manual theme toggle
 - [x] [E] Ensure that the theme is used for all parts of the UI. (Right now, the terminal colors don't match the code view colors)
 - [ ] [H] Implement Quake-style bottom terminal overlay
 - [ ] [H] Implement multi-window with shared session state
@@ -437,7 +435,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Improve open_file_picker to use show_picker
 - [x] [E] Track most recently visited files and put them at the top of file picker
 - [x] [E] Track modified files (from git) and mark them in the file picker
-- [ ] [E] Annotate which files are recently visited in file picker with an R.
+- [x] [E] Annotate which files are recently visited in file picker with an R.
 - [ ] [H] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
 - [ ] [H] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)

@@ -318,16 +318,26 @@ impl PickerDelegate for FilePickerDelegate {
     let theme = cx.theme();
     let label = &self.files[index];
     let is_modified = self.modified_files.contains(label);
+    let is_recent = self.recent_indices.contains(&index);
 
     let row = div().px_2().py(px(3.0)).text_sm().flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    if is_modified {
-      // Show "M" marker for git-modified files.
-      let marker_color =
+    let marker = if is_modified {
+      let color =
         if selected { theme.accent_foreground } else { gpui::hsla(30. / 360., 0.8, 0.5, 1.0) };
+      Some(("M", color))
+    } else if is_recent {
+      let color =
+        if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
+      Some(("R", color))
+    } else {
+      None
+    };
+
+    if let Some((text, color)) = marker {
       row
-        .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("M"))
+        .child(div().text_xs().text_color(color).font_weight(FontWeight::BOLD).child(text))
         .child(label.clone())
     } else {
       row.child(div().text_xs().w(px(10.0))).child(label.clone())

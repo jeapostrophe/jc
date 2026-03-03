@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["jc-core", "jc-terminal", "jc-app"]
 resolver = "2"
 
 [workspace.package]

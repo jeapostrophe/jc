@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-const DARK_THEME_TOML: &str = include_str!("../../../data/dark_theme.toml");
-const LIGHT_THEME_TOML: &str = include_str!("../../../data/light_theme.toml");
+const DARK_THEME_TOML: &str = include_str!("../../data/dark_theme.toml");
+const LIGHT_THEME_TOML: &str = include_str!("../../data/light_theme.toml");
 
 /// Which appearance variant is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

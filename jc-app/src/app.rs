@@ -155,10 +155,10 @@ pub fn run(state: AppState, config: AppConfig) {
     // Register the bundled Lilex font family.
     cx.text_system()
       .add_fonts(vec![
-        Cow::Borrowed(include_bytes!("../../../data/fonts/Lilex-Regular.ttf")),
-        Cow::Borrowed(include_bytes!("../../../data/fonts/Lilex-Bold.ttf")),
-        Cow::Borrowed(include_bytes!("../../../data/fonts/Lilex-Italic.ttf")),
-        Cow::Borrowed(include_bytes!("../../../data/fonts/Lilex-BoldItalic.ttf")),
+        Cow::Borrowed(include_bytes!("../../data/fonts/Lilex-Regular.ttf")),
+        Cow::Borrowed(include_bytes!("../../data/fonts/Lilex-Bold.ttf")),
+        Cow::Borrowed(include_bytes!("../../data/fonts/Lilex-Italic.ttf")),
+        Cow::Borrowed(include_bytes!("../../data/fonts/Lilex-BoldItalic.ttf")),
       ])
       .expect("failed to register Lilex fonts");
 

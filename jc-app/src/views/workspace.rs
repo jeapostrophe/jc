@@ -33,7 +33,6 @@ actions!(
     ShowTodoEditor,
     OpenInExternalEditor,
     EvenSplit,
-    ToggleTheme,
   ]
 );
 
@@ -93,8 +92,10 @@ impl Workspace {
 
     let claude_config =
       TerminalConfig { command: Some("claude".to_string()), ..base_config(&palette) };
-    let claude_terminal = cx.new(|cx| TerminalView::new(claude_config, None, window, cx));
-    let general_terminal = cx.new(|cx| TerminalView::new(base_config(&palette), None, window, cx));
+    let claude_terminal =
+      cx.new(|cx| TerminalView::new(claude_config, Some(&project_path), window, cx));
+    let general_terminal =
+      cx.new(|cx| TerminalView::new(base_config(&palette), Some(&project_path), window, cx));
     let diff_view = cx.new(|cx| DiffView::new(project_path.clone(), window, cx));
     let code_view = cx.new(|cx| CodeView::new(project_path.clone(), window, cx));
     let todo_view = cx.new(|cx| TodoView::new(project_path, window, cx));
@@ -174,22 +175,6 @@ impl Workspace {
     // Update gpui_component theme (dark/light).
     Theme::sync_system_appearance(Some(window), cx.deref_mut());
     self.update_terminal_palettes(appearance, cx);
-    cx.notify();
-  }
-
-  fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
-    // Read current gpui_component theme mode and flip it.
-    let current_dark = cx.theme().is_dark();
-    let new_appearance = if current_dark { Appearance::Light } else { Appearance::Dark };
-
-    // Use Theme::change to set the gpui_component theme explicitly.
-    let mode: gpui_component::theme::ThemeMode = if new_appearance.is_dark() {
-      gpui_component::theme::ThemeMode::Dark
-    } else {
-      gpui_component::theme::ThemeMode::Light
-    };
-    Theme::change(mode, Some(window), cx.deref_mut());
-    self.update_terminal_palettes(new_appearance, cx);
     cx.notify();
   }
 
@@ -569,7 +554,6 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::open_file_picker))
       .on_action(cx.listener(Self::open_context_picker))
       .on_action(cx.listener(Self::even_split))
-      .on_action(cx.listener(Self::toggle_theme))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable(("main-split", self.split_generation))
@@ -610,8 +594,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-4", ShowCodeViewer, Some("Workspace")),
     KeyBinding::new("cmd-5", ShowTodoEditor, Some("Workspace")),
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
-    KeyBinding::new("cmd-shift-=", EvenSplit, Some("Workspace")),
-    KeyBinding::new("cmd-shift-t", ToggleTheme, Some("Workspace")),
+    KeyBinding::new("cmd-|", EvenSplit, Some("Workspace")),
   ]);
 
   cx.bind_keys([

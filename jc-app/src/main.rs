@@ -23,6 +23,10 @@ fn main() -> anyhow::Result<()> {
   if let Some(path) = &cli.path {
     state.register_project(path);
     config::save_state(&state)?;
+  } else if state.projects.is_empty() {
+    let cwd = std::env::current_dir()?;
+    state.register_project(&cwd);
+    config::save_state(&state)?;
   }
 
   app::run(state, config);
