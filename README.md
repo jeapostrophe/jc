@@ -76,6 +76,21 @@ The slug links a session to a group of Claude Code JSONL files in `~/.claude/pro
 
 To find all JSONL files for a slug, scan the session directory and match on the `slug` field. The most recently modified file in the group is the "active" one.
 
+### Session Architecture
+
+Target architecture: `App -> Projects -> Sessions`. Each Project owns a TODO file and Sessions. Each Session has a slug and owns its panes/views. The App has an active project with an active session; the active session drives what views show. The TODO file is shared across all sessions within a project.
+
+Key design constraints:
+- Separate terminal instances per session (switching sessions must not disconnect terminals)
+- Session state derived from TODO.md headings, not persisted separately
+- "Problems" concept tracks validation issues (e.g., invalid session slugs) — extensible for future checks
+
+Checklist:
+- [ ] [D] Implement App -> Projects -> Sessions hierarchy (active project, active session tracking)
+- [ ] [H] Per-session terminal pairs with shared TODO file
+- [ ] [H] Session picker to switch active session within a project
+- [ ] [E] Track and display "problems" (invalid slugs, etc.) in status bar
+
 ### TODO.md
 
 Each project has a single TODO.md file. The app is the sole writer; if the file changes on disk, the app detects it and shows a visual indicator (with optional git-style merge).
@@ -385,7 +400,7 @@ It is deliberately *not* a full code editor on mobile.
 > - **[D]** Design — Subtle design issues that need to be resolved with a human first
 > - **[?]** Unclassified — Needs triage. When you encounter a `[?]` task, read the task description, examine the relevant code, and replace `[?]` with the correct label (`[T]`/`[E]`/`[H]`/`[D]`). Do this before starting any other work.
 >
-> *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox.*
+> *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox. If the item doesn't fit under an existing section, create a new `###` section for it.*
 
 ### Core Infrastructure
 - [x] Set up Rust workspace (`jc-app`, `jc-core`)
@@ -423,16 +438,16 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
 - [x] [E] Fix focus to center the target in the middle of the screen
 - [x] [E] Word wrapping lines to fix the length of lines
-- [ ] [H] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
-- [ ] [H] Parse TODO.md format (sessions, messages, WAIT markers)
-- [ ] [H] Build library for managing TODO.md representation (ropey-backed)
+- [x] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers)
+- [x] Parse TODO.md format (sessions, messages, WAIT markers)
+- [x] Build library for managing TODO.md representation
 - [ ] [H] Implement comment insertion from other views into the WAIT section
 - [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
 
 ### Claude Reply Viewer
-- [ ] [E] Read session slug from TODO.md; load turns from all JSONL files sharing the slug
+- [x] Read session slug from TODO.md; load turns from all JSONL files sharing the slug
 - [x] [H] Implement JSONL session parser in `jc-core` (parse messages, group into turns)
 - [x] [H] Implement ReplyView (render a turn as Markdown in read-only editor, Cmd-6)
 - [x] [E] Implement turn picker (Cmd-Shift-O, newest first, shows request text as preview)

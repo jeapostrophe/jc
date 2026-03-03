@@ -15,6 +15,7 @@ pub fn init(cx: &mut App) {
 pub struct CodeView {
   editor: Entity<InputState>,
   current_file: Option<PathBuf>,
+  language_override: Option<SharedString>,
   dirty: bool,
   externally_modified: bool,
   saving: Arc<AtomicBool>,
@@ -40,6 +41,7 @@ impl CodeView {
     Self {
       editor,
       current_file: None,
+      language_override: None,
       dirty: false,
       externally_modified: false,
       saving: Arc::new(AtomicBool::new(false)),
@@ -113,9 +115,10 @@ impl CodeView {
   fn load_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let Some(path) = self.current_file.as_ref() else { return };
     let content = std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {e}"));
-    let language = Language::from_path(path);
+    let lang: SharedString =
+      self.language_override.clone().unwrap_or_else(|| Language::from_path(path).name().into());
     self.editor.update(cx, |state, cx| {
-      state.set_highlighter(language.name(), cx);
+      state.set_highlighter(lang, cx);
       state.set_value(content, window, cx);
     });
     self.dirty = false;
@@ -136,6 +139,20 @@ impl CodeView {
 impl CodeView {
   pub fn is_dirty(&self) -> bool {
     self.dirty
+  }
+
+  pub fn editor(&self) -> &Entity<InputState> {
+    &self.editor
+  }
+
+  /// Set a persistent language override. When set, file reloads use this
+  /// language instead of detecting from the file extension.
+  pub fn set_language_override(&mut self, lang: impl Into<SharedString>, cx: &mut Context<Self>) {
+    let lang: SharedString = lang.into();
+    self.language_override = Some(lang.clone());
+    self.editor.update(cx, |state, cx| {
+      state.set_highlighter(lang, cx);
+    });
   }
 
   pub fn editor_text(&self, cx: &App) -> String {

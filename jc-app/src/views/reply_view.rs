@@ -216,6 +216,18 @@ impl ReplyView {
   pub fn project_path(&self) -> &Path {
     &self.project_path
   }
+
+  pub fn set_session_slug(
+    &mut self,
+    slug: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.session_slug != slug {
+      self.session_slug = slug;
+      self.refresh(window, cx);
+    }
+  }
 }
 
 impl Focusable for ReplyView {

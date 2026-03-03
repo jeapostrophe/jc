@@ -7,7 +7,7 @@ use crate::views::picker::{
   ReplyTurnPickerDelegate, TodoHeaderPickerDelegate,
 };
 use crate::views::reply_view::ReplyView;
-use crate::views::todo_view::TodoView;
+use crate::views::todo_view::{TodoView, TodoViewEvent};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -74,6 +74,7 @@ pub struct Workspace {
   recent_files: Vec<PathBuf>,
   _appearance_subscription: Subscription,
   _diff_view_subscription: Subscription,
+  _todo_view_subscription: Subscription,
 }
 
 impl Workspace {
@@ -145,6 +146,15 @@ impl Workspace {
       },
     );
 
+    let todo_view_subscription = cx.subscribe_in(
+      &todo_view,
+      window,
+      |this: &mut Self, _, _event: &TodoViewEvent, window, cx| {
+        let slug = this.todo_view.read(cx).document().first_session().map(|s| s.slug.clone());
+        this.reply_view.update(cx, |rv, cx| rv.set_session_slug(slug, window, cx));
+      },
+    );
+
     Self {
       left_pane,
       right_pane,
@@ -165,6 +175,7 @@ impl Workspace {
       recent_files: Vec::new(),
       _appearance_subscription: appearance_subscription,
       _diff_view_subscription: diff_view_subscription,
+      _todo_view_subscription: todo_view_subscription,
     }
   }
 
@@ -255,6 +266,8 @@ impl Workspace {
         (self.todo_view.clone().into(), focus)
       }
       PaneContentKind::ReplyViewer => {
+        let slug = self.todo_view.read(cx).document().first_session().map(|s| s.slug.clone());
+        self.reply_view.update(cx, |v, cx| v.set_session_slug(slug, window, cx));
         self.reply_view.update(cx, |v, cx| v.refresh(window, cx));
         let focus = self.reply_view.read(cx).focus_handle(cx);
         (self.reply_view.clone().into(), focus)

@@ -1,19 +1,47 @@
 # TODO
 
 # Claude
-## Task 0
+## Session xxx: 0
 ### Message 0
 Review @README.md
 
-We're focusing on the Claude 'session_id' feature.
+Add something to the checklist instructions about how if Claude is instructed to add something to the checklist it might require a new section
 
-I am using Claude right now and I see that it is not "stable" with which session id it uses. I gave it a task and when it switched to execution mode from planning mode it started a new session. I assume that any use of '/clear' also creates a new session.
+Now focus on these tasks:
+- [ ] [H] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
+- [ ] [H] Parse TODO.md format (sessions, messages, WAIT markers)
+- [ ] [H] Build library for managing TODO.md representation (ropey-backed)
+- [ ] [E] Read session slug from TODO.md; load turns from all JSONL files sharing the slug
 
-How can we resolve this? Do the jsonl files give an indication of their "parent" or "child"?
+This may require revisiting some of the design assumptions. It may require fleshing out some of the project/task-level state and app design.
+
+---
+
+Comment annotations in the ### WAIT section are not strict. They should be inserted like that from other contexts, but they are just free form text. I assume that the TODO system will provide a 'insert_comment(String)' functionality scoped to the current session to other components and they will deal with arranging the formatting of the comment themselves. Its job is to insert it safely into the right spot
+
+I think that the wavy underlines are really ugly in gpui. I would prefer to use the syntax highlighting system. Tree-sitter provides bolding for headings, but we could supplement that with colors
+
+I do think we should add a notion of a "problem" to the entire project session tracking data-structure where an example "problem" right now is just an invalid session slug.
+
+In your design, the Todo is "in charge" of the active session via the slug, but I think it should be opposite. The overall design should be:
+
+App -> Projects
+Project -> TODO file + Sessions
+Session -> slug + all the panes and views
+
+And the app has an active project with an active session. That will influence what the various views are showing. The crucial detail is that the TODO file state is shared between all of the sessions (because we expect them all to be modifying it)
+
+I don't know if there should be different instances of the various view objects all at the same time. I assume that there will be because we don't want the terminals to get disconnected.
+
+These details may be beyond the scope of this particular plan. If so, then they should be added to the README before continuing with this plan.
+
+No matter what, the plan should include updating the README with the completed checklist items.
+
+---
+
+The code and tests look correct, but when I load this project and look at its TODO, I don't see any of the custom highlighting, nor do I see any indication that it detects that 'xxx' is an invalid session slug.
 
 ### WAIT XXX
-
-XXX The file watcher -> reload causes the reply viewer to change focus and go to different replys
 
 ---
  

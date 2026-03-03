@@ -9,6 +9,7 @@ use crate::views::reply_view;
 use crate::views::workspace::{self, Workspace};
 use gpui::*;
 use gpui_component::TitleBar;
+use gpui_component::highlighter::{LanguageConfig, LanguageRegistry};
 use gpui_component::theme::{Theme, ThemeMode};
 use jc_core::config::{AppConfig, AppState};
 use jc_core::theme::ThemeConfig;
@@ -139,12 +140,44 @@ fn apply_unified_themes(cx: &mut App) {
   Theme::sync_system_appearance(None, cx);
 }
 
+/// Register a custom "todo-markdown" tree-sitter language that extends the
+/// base markdown highlights with custom heading patterns for TODO sessions.
+///
+/// Uses heading level as a proxy for content type (h2 = Session, h3 = Message/WAIT).
+/// `#match?` predicates are not evaluated by gpui-component's highlighter, so we
+/// rely purely on structural patterns instead.
+fn register_todo_language() {
+  let registry = LanguageRegistry::singleton();
+  let Some(md) = registry.language("markdown") else {
+    eprintln!("todo-markdown: base 'markdown' language not found in registry");
+    return;
+  };
+  // h2 headings → @type (yellow) — Session headings
+  // h3 headings → @function (blue) — Message and WAIT headings
+  // h1 headings remain @title (red) from the base markdown query.
+  let custom_queries = "\
+(atx_heading (atx_h2_marker) (inline) @type)
+(atx_heading (atx_h3_marker) (inline) @function)
+";
+  let combined_highlights = format!("{}{}", custom_queries, md.highlights);
+  let config = LanguageConfig::new(
+    "todo-markdown",
+    md.language.clone(),
+    md.injection_languages.clone(),
+    &combined_highlights,
+    &md.injections,
+    &md.locals,
+  );
+  registry.register("todo-markdown", &config);
+}
+
 pub fn run(state: AppState, config: AppConfig) {
   let app = Application::new().with_assets(gpui_component_assets::Assets);
 
   app.run(move |cx| {
     gpui_component::init(cx);
     apply_unified_themes(cx);
+    register_todo_language();
     jc_terminal::init(cx);
     workspace::init(cx);
     picker::init(cx);
