@@ -1,3 +1,4 @@
+use crate::views::comment_panel::CommentContext;
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputState};
@@ -205,8 +206,24 @@ impl ReplyView {
     self.turns[self.current_turn_index].label()
   }
 
+  pub fn editor(&self) -> &Entity<InputState> {
+    &self.editor
+  }
+
   pub fn editor_text(&self, cx: &App) -> String {
     super::editor_text(&self.editor, cx)
+  }
+
+  pub fn comment_context(&self, cx: &App) -> Option<CommentContext> {
+    if self.turns.is_empty() {
+      return None;
+    }
+    let filename = format!(".jc/replies/turn_{:04}.md", self.current_turn_index);
+    let (start, end) = super::selection_line_range(&self.editor, cx);
+    let line_part = if start == end { format!("{start}") } else { format!("{start}-{end}") };
+    let prefilled = format!("* {filename}:{line_part} \u{2014} ");
+    let cursor_offset = prefilled.len();
+    Some(CommentContext { prefilled, cursor_offset })
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {

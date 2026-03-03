@@ -1,4 +1,5 @@
 pub mod code_view;
+pub mod comment_panel;
 pub mod diff_view;
 pub mod pane;
 pub mod picker;
@@ -16,6 +17,12 @@ use gpui_component::input::InputState;
 /// Reads the full text content from an editor widget.
 pub fn editor_text(editor: &Entity<InputState>, cx: &App) -> String {
   editor.read(cx).value().as_ref().to_string()
+}
+
+/// Returns the 1-based (start_line, end_line) of the current selection in an editor.
+pub fn selection_line_range(editor: &Entity<InputState>, cx: &App) -> (u32, u32) {
+  let (start, end) = editor.read(cx).selection_positions();
+  (start.line + 1, end.line + 1)
 }
 
 /// Scrolls an editor widget so the given 0-based `line` is approximately centered.

@@ -8,3 +8,4 @@
 * Write and maintain examples.
 * Check for CLAUDE.md files in subdirectories relevant to the code you're modifying.
 * If you see any `[?]` labels in the README.md task checklist, triage them first: read the task, examine the relevant code, and replace `[?]` with the correct difficulty label (`[T]`/`[E]`/`[H]`/`[D]`) before starting other work.
+* When updating gpui-component, run `scripts/update-gpui-component.sh` to re-vendor from cargo cache and apply patches.

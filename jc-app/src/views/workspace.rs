@@ -1,3 +1,4 @@
+use crate::views::comment_panel::{CommentPanel, CommentPanelEvent};
 use crate::views::diff_view::DiffViewEvent;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
@@ -38,6 +39,8 @@ actions!(
     EvenSplit,
     OpenGitLogPicker,
     ShowReplyViewer,
+    OpenCommentPanel,
+    SaveFile,
   ]
 );
 
@@ -66,6 +69,9 @@ pub struct Workspace {
   active_picker: Option<AnyView>,
   pre_picker_focus: Option<FocusHandle>,
   _picker_subscription: Option<Subscription>,
+  active_comment_panel: Option<AnyView>,
+  pre_comment_focus: Option<FocusHandle>,
+  _comment_subscription: Option<Subscription>,
   split_generation: usize,
   recent_files: Vec<PathBuf>,
   _appearance_subscription: Subscription,
@@ -135,6 +141,9 @@ impl Workspace {
       active_picker: None,
       pre_picker_focus: None,
       _picker_subscription: None,
+      active_comment_panel: None,
+      pre_comment_focus: None,
+      _comment_subscription: None,
       split_generation: 0,
       recent_files: Vec::new(),
       _appearance_subscription: appearance_subscription,
@@ -680,6 +689,101 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
+  // Comment panel
+  // ---------------------------------------------------------------------------
+
+  fn open_comment_panel(
+    &mut self,
+    _: &OpenCommentPanel,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.active_comment_panel.is_some() || self.active_picker.is_some() {
+      return;
+    }
+
+    let pane = self.active_pane_entity().clone();
+    let kind = pane.read(cx).content_kind();
+    let project = self.active_project();
+
+    let context = match kind {
+      Some(PaneContentKind::CodeViewer) => {
+        project.code_view.read(cx).comment_context(&project.path, cx)
+      }
+      Some(PaneContentKind::GitDiff) => project.diff_view.read(cx).comment_context(cx),
+      Some(PaneContentKind::ReplyViewer) => {
+        project.active_session().and_then(|s| s.reply_view.read(cx).comment_context(cx))
+      }
+      _ => None,
+    };
+
+    let Some(context) = context else { return };
+
+    // Save focus before creating the panel — CommentPanel::new calls
+    // set_cursor_position which steals focus to the panel's input.
+    self.pre_comment_focus = window.focused(cx);
+    let panel = cx.new(|cx| CommentPanel::new(context, window, cx));
+
+    let subscription =
+      cx.subscribe_in(&panel, window, |this: &mut Self, _, event, window, cx| match event {
+        CommentPanelEvent::Confirmed(text) => {
+          // Insert comment into active session's WAIT section.
+          let project = &this.projects[this.active_project_index];
+          if let Some(session) = project.active_session() {
+            let comment = format!("{text}\n");
+            project.todo_view.update(cx, |tv, cx| {
+              tv.insert_comment(&session.slug, &comment, window, cx);
+              tv.save(cx);
+            });
+          }
+          if let Some(focus) = this.pre_comment_focus.take() {
+            focus.focus(window);
+          }
+          this.dismiss_comment_panel();
+          cx.notify();
+        }
+        CommentPanelEvent::Dismissed => {
+          if let Some(focus) = this.pre_comment_focus.take() {
+            focus.focus(window);
+          }
+          this.dismiss_comment_panel();
+          cx.notify();
+        }
+      });
+
+    self.active_comment_panel = Some(panel.clone().into());
+    self._comment_subscription = Some(subscription);
+
+    panel.read(cx).input_focus_handle(cx).focus(window);
+    cx.notify();
+  }
+
+  fn dismiss_comment_panel(&mut self) {
+    self.active_comment_panel = None;
+    self._comment_subscription = None;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Save file
+  // ---------------------------------------------------------------------------
+
+  fn save_file(&mut self, _: &SaveFile, _window: &mut Window, cx: &mut Context<Self>) {
+    let pane = self.active_pane_entity().clone();
+    let kind = pane.read(cx).content_kind();
+    let project = &self.projects[self.active_project_index];
+
+    match kind {
+      Some(PaneContentKind::CodeViewer) => {
+        project.code_view.update(cx, |v, cx| v.save(cx));
+      }
+      Some(PaneContentKind::TodoEditor) => {
+        project.todo_view.update(cx, |v, cx| v.save(cx));
+      }
+      _ => {}
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Labels
   // ---------------------------------------------------------------------------
 
@@ -842,6 +946,8 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::open_git_log_picker))
       .on_action(cx.listener(Self::open_session_picker))
       .on_action(cx.listener(Self::search_lines))
+      .on_action(cx.listener(Self::open_comment_panel))
+      .on_action(cx.listener(Self::save_file))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable(("main-split", self.split_generation))
@@ -866,6 +972,24 @@ impl Render for Workspace {
           .with_priority(1),
         )
       })
+      .when_some(self.active_comment_panel.as_ref(), |el, panel| {
+        el.child(
+          deferred(
+            div()
+              .absolute()
+              .size_full()
+              .top_0()
+              .left_0()
+              .flex()
+              .justify_center()
+              .pt(px(80.0))
+              .bg(hsla(0., 0., 0., 0.3))
+              .on_mouse_down(MouseButton::Left, |_, _, _cx| {})
+              .child(panel.clone()),
+          )
+          .with_priority(1),
+        )
+      })
   }
 }
 
@@ -886,10 +1010,14 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-|", EvenSplit, Some("Workspace")),
     KeyBinding::new("cmd-shift-o", OpenGitLogPicker, Some("Workspace")),
     KeyBinding::new("cmd-p", ShowSessionPicker, Some("Workspace")),
+    KeyBinding::new("cmd-k", OpenCommentPanel, Some("Workspace")),
+    KeyBinding::new("cmd-s", SaveFile, Some("Workspace")),
   ]);
 
   cx.bind_keys([
     KeyBinding::new("cmd-[", FocusLeftPane, Some("Input")),
     KeyBinding::new("cmd-]", FocusRightPane, Some("Input")),
+    KeyBinding::new("cmd-k", OpenCommentPanel, Some("Input")),
+    KeyBinding::new("cmd-s", SaveFile, Some("Input")),
   ]);
 }

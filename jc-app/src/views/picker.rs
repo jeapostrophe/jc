@@ -238,6 +238,7 @@ impl<D: PickerDelegate> Render for PickerState<D> {
       .on_action(cx.listener(Self::cancel))
       .on_action(cx.listener(Self::select_next))
       .on_action(cx.listener(Self::select_prev))
+      .font_family("Lilex")
       .w(px(500.0))
       .max_h(px(400.0))
       .bg(theme.background)

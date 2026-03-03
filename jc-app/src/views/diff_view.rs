@@ -3,6 +3,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use crate::language::Language;
+use crate::views::comment_panel::CommentContext;
 use git2::DiffFormat;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -165,8 +166,25 @@ impl DiffView {
     &self.project_path
   }
 
+  pub fn editor(&self) -> &Entity<InputState> {
+    &self.editor
+  }
+
   pub fn editor_text(&self, cx: &App) -> String {
     super::editor_text(&self.editor, cx)
+  }
+
+  pub fn comment_context(&self, cx: &App) -> Option<CommentContext> {
+    let file_name = self.current_file_name()?;
+    let (start, end) = super::selection_line_range(&self.editor, cx);
+    let line_part = if start == end { format!("{start}") } else { format!("{start}-{end}") };
+    let source_prefix = match &self.source {
+      DiffSource::WorkingTree => String::default(),
+      DiffSource::Commit { oid, .. } => format!("{:.7}:", oid),
+    };
+    let prefilled = format!("* git-diff:{source_prefix}{file_name}:{line_part} \u{2014} ",);
+    let cursor_offset = prefilled.len();
+    Some(CommentContext { prefilled, cursor_offset })
   }
 
   pub fn current_file_language(&self) -> Language {

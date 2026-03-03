@@ -1,0 +1,16 @@
+--- a/src/input/state.rs
++++ b/src/input/state.rs
+@@ -804,6 +804,13 @@
+         self.text.offset_to_position(offset)
+     }
+
++    /// Return the (0-based) start and end [`Position`] of the current selection.
++    pub fn selection_positions(&self) -> (Position, Position) {
++        let start = self.text.offset_to_position(self.selected_range.start);
++        let end = self.text.offset_to_position(self.selected_range.end);
++        (start, end)
++    }
++
+     /// Set (0-based) [`Position`] of the cursor.
+     ///
+     /// This will move the cursor to the specified line and column, and update the selection range.
