@@ -20,10 +20,33 @@ impl PtyHandle {
     rows: u16,
     working_dir: Option<&Path>,
   ) -> Result<(Self, Box<dyn Read + Send>)> {
+    let cmd = CommandBuilder::new_default_prog();
+    Self::spawn_pty(cmd, cols, rows, working_dir)
+  }
+
+  /// Spawn a specific command in a new PTY.
+  ///
+  /// The `program` string is parsed as the executable name (e.g. `"claude"`).
+  /// Returns the handle (for writing/resizing) and a reader (moved to a background thread).
+  pub fn spawn_command(
+    program: &str,
+    cols: u16,
+    rows: u16,
+    working_dir: Option<&Path>,
+  ) -> Result<(Self, Box<dyn Read + Send>)> {
+    let cmd = CommandBuilder::new(program);
+    Self::spawn_pty(cmd, cols, rows, working_dir)
+  }
+
+  fn spawn_pty(
+    mut cmd: CommandBuilder,
+    cols: u16,
+    rows: u16,
+    working_dir: Option<&Path>,
+  ) -> Result<(Self, Box<dyn Read + Send>)> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
 
-    let mut cmd = CommandBuilder::new_default_prog();
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     if let Some(dir) = working_dir {

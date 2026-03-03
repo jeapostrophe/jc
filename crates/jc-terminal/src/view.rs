@@ -23,6 +23,10 @@ pub struct TerminalConfig {
   pub initial_cols: u16,
   pub initial_rows: u16,
   pub palette: Option<Palette>,
+  /// Optional command to run instead of the default shell.
+  /// When set, the terminal spawns this command (e.g. `"claude"`)
+  /// rather than the user's login shell.
+  pub command: Option<String>,
 }
 
 impl Default for TerminalConfig {
@@ -34,6 +38,7 @@ impl Default for TerminalConfig {
       initial_cols: 80,
       initial_rows: 24,
       palette: None,
+      command: None,
     }
   }
 }
@@ -64,8 +69,11 @@ impl TerminalView {
 
     let state = TerminalState::new(cols as usize, rows as usize, event_tx);
 
-    let (pty, reader) =
-      PtyHandle::spawn_shell(cols, rows, working_dir).expect("failed to spawn shell");
+    let (pty, reader) = if let Some(ref cmd) = config.command {
+      PtyHandle::spawn_command(cmd, cols, rows, working_dir).expect("failed to spawn command")
+    } else {
+      PtyHandle::spawn_shell(cols, rows, working_dir).expect("failed to spawn shell")
+    };
     let pty = Arc::new(pty);
 
     // Background thread: blocking PTY reads -> channel
