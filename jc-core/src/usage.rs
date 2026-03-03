@@ -194,50 +194,68 @@ pub struct UsageReport {
 }
 
 impl UsageReport {
+  /// Par differential: positive = under par (budget to spare), negative = over par (burning too fast).
+  ///
+  /// The value is `working_pct - limit_pct`: how many percentage points of headroom (or deficit)
+  /// you have relative to the pace of working time elapsed.
+  pub fn par(&self) -> f64 {
+    self.working_pct - self.limit_pct
+  }
+
+  /// Whether par is under (good), over (bad), or on par.
+  pub fn par_status(&self) -> ParStatus {
+    let par = self.par();
+    if par > THRESHOLD {
+      ParStatus::Under
+    } else if par < -THRESHOLD {
+      ParStatus::Over
+    } else {
+      ParStatus::On
+    }
+  }
+
   pub fn print(&self) {
     let red = "\x1b[31m";
     let green = "\x1b[32m";
+    let yellow = "\x1b[33m";
     let dim = "\x1b[2m";
     let reset = "\x1b[0m";
 
-    let week_color = comparison_color(self.week_pct, self.limit_pct);
+    let par = self.par();
+    let (par_color, par_label) = match self.par_status() {
+      ParStatus::Under => (green, "Under par"),
+      ParStatus::Over => (red, "Over par"),
+      ParStatus::On => (yellow, "On par"),
+    };
+
+    // Headline: single par number
+    let sign = if par > 0.0 { "+" } else { "" };
+    println!("  {par_color}{par_label}: {sign}{:.0}{reset}", par);
+
+    // Detail bars
     let working_color = comparison_color(self.working_pct, self.limit_pct);
 
-    println!("   Limit Usage: {:>3.0}% {}", self.limit_pct, bar(self.limit_pct, dim, dim, reset),);
+    println!();
+    println!("   Budget used: {:>3.0}% {}", self.limit_pct, bar(self.limit_pct, dim, dim, reset));
     println!(
-      "    Week Usage: {}{:>3.0}%{} {}",
-      week_color,
-      self.week_pct,
-      reset,
-      bar(self.week_pct, week_color, dim, reset),
-    );
-    println!(
-      " Working Usage: {}{:>3.0}%{} {}",
+      "  Working time: {}{:>3.0}%{} {}",
       working_color,
       self.working_pct,
       reset,
       bar(self.working_pct, working_color, dim, reset),
     );
-
-    // Summary line
-    let diff = self.working_pct - self.limit_pct;
-    if diff > THRESHOLD {
-      println!(
-        "\n  {green}Under par{reset} — {:.0}% of working time elapsed, only {:.0}% of budget used",
-        self.working_pct, self.limit_pct,
-      );
-    } else if diff < -THRESHOLD {
-      println!(
-        "\n  {red}Over par{reset} — {:.0}% of budget used, but only {:.0}% of working time elapsed",
-        self.limit_pct, self.working_pct,
-      );
-    } else {
-      println!(
-        "\n  On par — {:.0}% budget vs {:.0}% working time",
-        self.limit_pct, self.working_pct,
-      );
-    }
   }
+}
+
+/// Par status classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParStatus {
+  /// Budget to spare — working time is ahead of usage.
+  Under,
+  /// Burning too fast — usage is ahead of working time.
+  Over,
+  /// Roughly balanced.
+  On,
 }
 
 /// Pick ANSI color: green if reference > limit (under par), red if under (over par).

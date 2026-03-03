@@ -443,7 +443,9 @@ It is deliberately *not* a full code editor on mobile.
 ### Notifications & Status
 - [x] Implement Claude usage algorithm
 - [x] Implement configurable working hours for par calculation
-- [ ] [D] Turn usage into a single number/visualization that shows "par"
+- [x] [D] Turn usage into a single number/visualization that shows "par" — `par()` returns `working_pct - limit_pct` differential; `par_status()` classifies Under/Over/On.
+- [ ] Usage: pace multiplier (`limit_pct / working_pct` as `0.7x`)
+- [ ] Usage: projected remaining working hours at current burn rate
 - [ ] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] [E] Implement in-app status bar showing waiting tasks (driven by hook events)
