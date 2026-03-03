@@ -1,3 +1,4 @@
+use crate::language::Language;
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -25,7 +26,10 @@ pub struct TodoView {
 impl TodoView {
   pub fn new(project_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
     let editor = cx.new(|cx| {
-      InputState::new(window, cx).code_editor("markdown").soft_wrap(true).line_number(false)
+      InputState::new(window, cx)
+        .code_editor(Language::Markdown.name())
+        .soft_wrap(true)
+        .line_number(false)
     });
 
     let subscription = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, _cx| {

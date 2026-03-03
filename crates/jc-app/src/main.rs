@@ -1,4 +1,5 @@
 mod app;
+mod language;
 mod outline;
 mod views;
 
