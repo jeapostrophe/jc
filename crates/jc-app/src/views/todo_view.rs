@@ -1,6 +1,7 @@
 use gpui::*;
 use gpui_component::ActiveTheme;
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::RopeExt;
+use gpui_component::input::{Input, InputEvent, InputState, Position};
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +18,10 @@ pub struct TodoView {
   file_path: PathBuf,
   dirty: bool,
   externally_modified: bool,
+  /// Set when the file changes on disk and the buffer is clean; cleared after
+  /// the auto-reload is performed during the next render pass (which provides
+  /// the required `Window` reference).
+  pending_auto_reload: bool,
   saving: Arc<AtomicBool>,
   _subscription: Subscription,
   _watcher: Option<notify::RecommendedWatcher>,
@@ -72,7 +77,14 @@ impl TodoView {
           let _ = cx.update(|cx| {
             if let Some(entity) = this.upgrade() {
               entity.update(cx, |view, cx| {
-                view.externally_modified = true;
+                if view.dirty {
+                  // User has unsaved edits -- show the reload banner.
+                  view.externally_modified = true;
+                } else {
+                  // Buffer is clean -- schedule an auto-reload on the next
+                  // render pass (we need a Window reference for set_value).
+                  view.pending_auto_reload = true;
+                }
                 cx.notify();
               });
             }
@@ -91,6 +103,7 @@ impl TodoView {
       file_path,
       dirty: false,
       externally_modified: false,
+      pending_auto_reload: false,
       saving,
       _subscription: subscription,
       _watcher: watcher,
@@ -110,6 +123,7 @@ impl TodoView {
     });
     self.dirty = false;
     self.externally_modified = false;
+    self.pending_auto_reload = false;
   }
 
   pub fn save(&mut self, cx: &mut Context<Self>) {
@@ -147,13 +161,38 @@ impl TodoView {
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
     self.editor.update(cx, |editor, cx| {
-      editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
+      // Estimate the number of visible lines in the editor viewport.
+      // We use the window height and line height as an approximation,
+      // scaled down because the editor doesn't fill the entire window.
+      let line_height = window.line_height();
+      let window_height = window.bounds().size.height;
+      let estimated_visible = ((window_height / line_height) * 0.6) as u32;
+      let half_page = estimated_visible / 2;
+
+      let total_lines = editor.text().lines_len() as u32;
+
+      // Two-step cursor move to center the target line:
+      // 1) Jump to a line ~half a viewport below the target so the
+      //    viewport scrolls past it.
+      // 2) Jump back to the target; since it is now above the viewport
+      //    the scroll logic places it at the top -- roughly centered.
+      let lookahead = (line + half_page).min(total_lines.saturating_sub(1));
+      if lookahead != line {
+        editor.set_cursor_position(Position::new(lookahead, 0), window, cx);
+      }
+      editor.set_cursor_position(Position::new(line, 0), window, cx);
     });
   }
 }
 
 impl Render for TodoView {
-  fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+  fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    // Perform deferred auto-reload (requires the Window reference that only
+    // render provides).
+    if self.pending_auto_reload {
+      self.load(window, cx);
+    }
+
     let theme = cx.theme();
 
     let notification = if self.externally_modified {
