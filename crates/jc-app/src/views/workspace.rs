@@ -11,9 +11,11 @@ use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::TitleBar;
 use gpui_component::resizable::{h_resizable, resizable_panel};
+use gpui_component::theme::Theme;
 use jc_core::config::{AppConfig, AppState};
-use jc_core::theme::ThemeConfig;
+use jc_core::theme::{Appearance, ThemeConfig};
 use jc_terminal::{Palette, TerminalConfig, TerminalView};
+use std::ops::DerefMut;
 use std::path::PathBuf;
 
 actions!(
@@ -30,6 +32,7 @@ actions!(
     ShowCodeViewer,
     ShowTodoEditor,
     OpenInExternalEditor,
+    ToggleTheme,
   ]
 );
 
@@ -37,6 +40,14 @@ actions!(
 pub enum ActivePane {
   Left,
   Right,
+}
+
+/// Map a GPUI WindowAppearance to our Appearance enum.
+fn appearance_from_window(appearance: WindowAppearance) -> Appearance {
+  match appearance {
+    WindowAppearance::Dark | WindowAppearance::VibrantDark => Appearance::Dark,
+    WindowAppearance::Light | WindowAppearance::VibrantLight => Appearance::Light,
+  }
 }
 
 pub struct Workspace {
@@ -54,13 +65,13 @@ pub struct Workspace {
   active_picker: Option<AnyView>,
   pre_picker_focus: Option<FocusHandle>,
   _picker_subscription: Option<Subscription>,
+  _appearance_subscription: Subscription,
 }
 
 impl Workspace {
   pub fn new(
     state: AppState,
     config: AppConfig,
-    theme: ThemeConfig,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> Self {
@@ -70,7 +81,10 @@ impl Workspace {
       .map(|p| p.path.clone())
       .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-    let palette = Palette::from(&theme.terminal);
+    // Detect the current system appearance and pick the right terminal palette.
+    let appearance = appearance_from_window(window.appearance());
+    let theme_config = ThemeConfig::for_appearance(appearance);
+    let palette = Palette::from(&theme_config.terminal);
     let terminal_config =
       |palette: &Palette| TerminalConfig { palette: Some(palette.clone()), ..Default::default() };
 
@@ -109,6 +123,12 @@ impl Workspace {
 
     left_pane.read(cx).focus_content(window);
 
+    // Observe system appearance changes and update themes accordingly.
+    let appearance_subscription =
+      cx.observe_window_appearance(window, |this: &mut Self, window, cx| {
+        this.apply_appearance(appearance_from_window(window.appearance()), window, cx);
+      });
+
     Self {
       left_pane,
       right_pane,
@@ -124,7 +144,59 @@ impl Workspace {
       active_picker: None,
       pre_picker_focus: None,
       _picker_subscription: None,
+      _appearance_subscription: appearance_subscription,
     }
+  }
+
+  /// Apply a new appearance: update the gpui_component theme and terminal palettes.
+  fn apply_appearance(
+    &mut self,
+    appearance: Appearance,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    // Update gpui_component theme (dark/light).
+    Theme::sync_system_appearance(Some(window), cx.deref_mut());
+
+    // Update terminal palettes.
+    let theme_config = ThemeConfig::for_appearance(appearance);
+    let palette = Palette::from(&theme_config.terminal);
+
+    self.claude_terminal.update(cx, |view, _cx| {
+      view.set_palette(palette.clone());
+    });
+    self.general_terminal.update(cx, |view, _cx| {
+      view.set_palette(palette);
+    });
+
+    cx.notify();
+  }
+
+  fn toggle_theme(&mut self, _: &ToggleTheme, window: &mut Window, cx: &mut Context<Self>) {
+    // Read current gpui_component theme mode and flip it.
+    let current_dark = cx.theme().is_dark();
+    let new_appearance = if current_dark { Appearance::Light } else { Appearance::Dark };
+
+    // Use Theme::change to set the gpui_component theme explicitly.
+    let mode: gpui_component::theme::ThemeMode = if new_appearance.is_dark() {
+      gpui_component::theme::ThemeMode::Dark
+    } else {
+      gpui_component::theme::ThemeMode::Light
+    };
+    Theme::change(mode, Some(window), cx.deref_mut());
+
+    // Update terminal palettes.
+    let theme_config = ThemeConfig::for_appearance(new_appearance);
+    let palette = Palette::from(&theme_config.terminal);
+
+    self.claude_terminal.update(cx, |view, _cx| {
+      view.set_palette(palette.clone());
+    });
+    self.general_terminal.update(cx, |view, _cx| {
+      view.set_palette(palette);
+    });
+
+    cx.notify();
   }
 
   fn project_path(&self) -> PathBuf {
@@ -457,6 +529,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::open_in_external_editor))
       .on_action(cx.listener(Self::open_file_picker))
       .on_action(cx.listener(Self::open_context_picker))
+      .on_action(cx.listener(Self::toggle_theme))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable("main-split")
@@ -497,6 +570,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-4", ShowCodeViewer, Some("Workspace")),
     KeyBinding::new("cmd-5", ShowTodoEditor, Some("Workspace")),
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
+    KeyBinding::new("cmd-shift-t", ToggleTheme, Some("Workspace")),
   ]);
 
   cx.bind_keys([

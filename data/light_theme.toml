@@ -1,0 +1,24 @@
+# Light terminal color scheme (Tomorrow).
+# This file is embedded at compile time via include_str!.
+# The light counterpart of Tomorrow Night (default_theme.toml).
+
+[terminal]
+foreground = "#4D4D4C"
+background = "#FFFFFF"
+cursor = "#4D4D4C"
+black = "#000000"
+red = "#C82829"
+green = "#718C00"
+yellow = "#EAB700"
+blue = "#4271AE"
+magenta = "#8959A8"
+cyan = "#3E999F"
+white = "#FFFFFF"
+bright_black = "#8E908C"
+bright_red = "#F5871F"
+bright_green = "#718C00"
+bright_yellow = "#EAB700"
+bright_blue = "#4271AE"
+bright_magenta = "#8959A8"
+bright_cyan = "#3E999F"
+bright_white = "#FFFFFF"
