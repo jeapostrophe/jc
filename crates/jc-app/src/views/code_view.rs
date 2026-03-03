@@ -151,7 +151,7 @@ impl Render for CodeView {
       .key_context("CodeView")
       .track_focus(&self.editor.read(cx).focus_handle(cx))
       .size_full()
-      .font_family("Menlo")
+      .font_family("Lilex")
       .on_action(cx.listener(Self::reload_from_disk))
       .child(notification)
       .child(Input::new(&self.editor).h_full().appearance(false).bordered(false))

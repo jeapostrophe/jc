@@ -85,7 +85,7 @@ impl Render for DiffView {
   fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
     div()
       .size_full()
-      .font_family("Menlo")
+      .font_family("Lilex")
       .child(Input::new(&self.editor).h_full().appearance(false).bordered(false).disabled(true))
   }
 }

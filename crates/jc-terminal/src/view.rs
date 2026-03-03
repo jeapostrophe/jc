@@ -28,7 +28,7 @@ pub struct TerminalConfig {
 impl Default for TerminalConfig {
   fn default() -> Self {
     Self {
-      font_family: "Menlo".into(),
+      font_family: "Lilex".into(),
       font_size: px(14.0),
       line_height: 1.3,
       initial_cols: 80,

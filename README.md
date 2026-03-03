@@ -410,10 +410,10 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement pane view switching for terminals (Cmd-1 Claude, Cmd-2 General, Cmd-[/] focus)
 - [x] Cmd-[/] overrides InputState indent/outdent when editor is focused (bound in Input context)
 - [x] Implement view switching for diff, TODO, code views (Cmd-3/4/5)
-- [x] Use a monospace font (Menlo) in code editor views (diff, code, TODO)
+- [x] Use a monospace font (Lilex) in code editor views (diff, code, TODO)
 - [x] Disable line numbers in code editor views
 - [ ] [E] Change the size of the split by dragging with a keybinding to make even split
-- [ ] [E] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
+- [x] [E] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
 - [x] [T] Move default theme file to 'data' directory rather than embedding defaults in source
 - [ ] [E] Implement view switching for reply view
 - [ ] [E] Implement independent scroll positions per pane
