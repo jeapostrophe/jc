@@ -912,7 +912,7 @@ impl LineSearchPickerDelegate<ScrollCallback> {
     let callback: ScrollCallback = Box::new(move |line, window, cx| {
       entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
     });
-    Self::build(&text, "markdown", callback, cx)
+    Self::build(&text, Language::Markdown.name(), callback, cx)
   }
 
   pub fn for_diff_view(diff_view: &Entity<DiffView>, cx: &App) -> Self {
@@ -931,7 +931,7 @@ impl LineSearchPickerDelegate<ScrollCallback> {
     let callback: ScrollCallback = Box::new(move |line, window, cx| {
       entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
     });
-    Self::build(&text, "markdown", callback, cx)
+    Self::build(&text, Language::Markdown.name(), callback, cx)
   }
 }
 
@@ -969,14 +969,13 @@ impl<F: Fn(u32, &mut Window, &mut App) + 'static> PickerDelegate for LineSearchP
       // When selected, use accent foreground — no syntax colors.
       StyledText::new(line_text)
     } else {
-      let adjusted_styles: Vec<(Range<usize>, HighlightStyle)> = entry.styles.clone();
       let default_style = TextStyle {
         font_family: "Lilex".into(),
         font_size: theme.font_size.into(),
         color: theme.foreground,
         ..Default::default()
       };
-      StyledText::new(line_text).with_default_highlights(&default_style, adjusted_styles)
+      StyledText::new(line_text).with_default_highlights(&default_style, entry.styles.clone())
     };
 
     row.child(line_num).child(styled)

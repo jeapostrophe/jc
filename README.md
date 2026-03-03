@@ -482,6 +482,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
 - [x] [E] Fix focus to center the target in the middle of the screen
 - [x] [E] Word wrapping lines to fix the length of lines
+- [ ] [E] Focus into the text area on view selection so keybindings work
 - [ ] [D] Implement light editing (basic text modification, not full editor; mostly for inserting comments into documents)
 
 ### Window & Pane Management
@@ -519,6 +520,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 - [x] [E] Implement general searching in all views with Cmd-F (picker on lines)
 - [ ] [H] Cmd-F line search: fix keybinding capture (editor's built-in find UI intercepts Cmd-F) and ensure selected line scrolls to center of screen
+- [ ] [E] Allow page up/down in pickers
 
 ### Notifications & Status
 - [x] Implement Claude usage algorithm
@@ -554,6 +556,11 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
 - [x] [E] Garbage collect stale `.jc/replies/` files (e.g., on app startup, prune files older than N days)
 - [ ] [H] Allow projects to have a special `./status.sh` script that reports problems in the form `file:line - problem`
+
+### Code Quality
+- [ ] [H] Move focus-change PTY writes (`\x1b[I`/`\x1b[O`) out of `TerminalView::render()` into a proper focus observer to avoid side effects during rendering
+- [ ] [E] Lazy-highlight `LineSearchPickerDelegate::build()` — currently does O(N) syntax highlighting of every line on each Cmd-F; will lag on very large files
+- [ ] [E] Collapse the four `LineSearchPickerDelegate::for_*_view` factories into one generic method via a shared trait (editor_text + scroll_to_line + language_name)
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically

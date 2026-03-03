@@ -7,9 +7,13 @@
 ### Message 0
 Review @README.md
 
-Work on these issues:
-  1. [H] On startup, if TODO.md has no valid sessions, discover the most recent JSONL session group and insert a ## Session heading into TODO.md
-  2. [E] Skip sessions with invalid slugs during ProjectState::create instead of creating broken SessionState entries
+Make a plan that can solve as many of these problems as possible in parallel agents
+- [ ] [E] Cursor not blinking properly in the Claude terminal
+- [ ] [E] Watch all JSONL files in the slug group (not just one file) for changes
+- [ ] [E] Labels on Diff/Reply/FileViews should be limited to one line, right now they can wrap
+- [ ] [E] Implement general searching in all views with Cmd-F (picker on lines)
+- [ ] [E] Garbage collect stale `.jc/replies/` files (e.g., on app startup, prune files older than N days)
+
 
 ### WAIT XXX
 

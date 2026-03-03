@@ -166,7 +166,7 @@ impl DiffView {
   }
 
   pub fn editor_text(&self, cx: &App) -> String {
-    self.editor.read(cx).value().as_ref().to_string()
+    super::editor_text(&self.editor, cx)
   }
 
   pub fn current_file_language(&self) -> Language {
@@ -178,23 +178,7 @@ impl DiffView {
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
-    let line_height = window.line_height();
-    let viewport_height = window.viewport_size().height;
-    let half_viewport_lines =
-      if line_height > px(0.) { (viewport_height / line_height / 2.0).floor() as u32 } else { 15 };
-
-    let pre_line = line.saturating_sub(half_viewport_lines);
-    self.editor.update(cx, |editor, cx| {
-      editor.set_cursor_position(gpui_component::input::Position::new(pre_line, 0), window, cx);
-    });
-
-    let editor = self.editor.clone();
-    cx.spawn_in(window, async move |_this: WeakEntity<DiffView>, cx: &mut AsyncWindowContext| {
-      let _ = editor.update_in(cx, |editor, window, cx| {
-        editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
-      });
-    })
-    .detach();
+    super::scroll_editor_to_line(&self.editor, line, window, cx);
   }
 }
 

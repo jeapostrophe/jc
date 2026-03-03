@@ -11,6 +11,38 @@ pub mod workspace;
 
 use gpui::*;
 use gpui_component::ActiveTheme;
+use gpui_component::input::InputState;
+
+/// Reads the full text content from an editor widget.
+pub fn editor_text(editor: &Entity<InputState>, cx: &App) -> String {
+  editor.read(cx).value().as_ref().to_string()
+}
+
+/// Scrolls an editor widget so the given 0-based `line` is approximately centered.
+pub fn scroll_editor_to_line<V: 'static>(
+  editor: &Entity<InputState>,
+  line: u32,
+  window: &mut Window,
+  cx: &mut Context<V>,
+) {
+  let line_height = window.line_height();
+  let viewport_height = window.viewport_size().height;
+  let half_viewport_lines =
+    if line_height > px(0.) { (viewport_height / line_height / 2.0).floor() as u32 } else { 15 };
+
+  let pre_line = line.saturating_sub(half_viewport_lines);
+  editor.update(cx, |editor, cx| {
+    editor.set_cursor_position(gpui_component::input::Position::new(pre_line, 0), window, cx);
+  });
+
+  let editor = editor.clone();
+  cx.spawn_in(window, async move |_this: WeakEntity<V>, cx: &mut AsyncWindowContext| {
+    let _ = editor.update_in(cx, |editor, window, cx| {
+      editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
+    });
+  })
+  .detach();
+}
 
 /// Renders a warning banner when a file has been externally modified.
 pub fn external_change_banner(externally_modified: bool, cx: &App) -> AnyElement {

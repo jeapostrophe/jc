@@ -156,7 +156,7 @@ impl CodeView {
   }
 
   pub fn editor_text(&self, cx: &App) -> String {
-    self.editor.read(cx).value().as_ref().to_string()
+    super::editor_text(&self.editor, cx)
   }
 
   pub fn save(&mut self, cx: &mut Context<Self>) {
@@ -182,29 +182,7 @@ impl CodeView {
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
-    // Estimate half the viewport in lines for centering.
-    let line_height = window.line_height();
-    let viewport_height = window.viewport_size().height;
-    let half_viewport_lines =
-      if line_height > px(0.) { (viewport_height / line_height / 2.0).floor() as u32 } else { 15 };
-
-    // Position cursor above the target so the viewport scrolls to show that line
-    // at the top. After the next layout, the target line will be roughly centered.
-    let pre_line = line.saturating_sub(half_viewport_lines);
-    self.editor.update(cx, |editor, cx| {
-      editor.set_cursor_position(gpui_component::input::Position::new(pre_line, 0), window, cx);
-    });
-
-    // On the next frame, move the cursor to the actual target line. Since it is
-    // already visible in the viewport, the editor will not adjust the scroll
-    // offset, leaving the target approximately centered.
-    let editor = self.editor.clone();
-    cx.spawn_in(window, async move |_this: WeakEntity<CodeView>, cx: &mut AsyncWindowContext| {
-      let _ = editor.update_in(cx, |editor, window, cx| {
-        editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
-      });
-    })
-    .detach();
+    super::scroll_editor_to_line(&self.editor, line, window, cx);
   }
 }
 
