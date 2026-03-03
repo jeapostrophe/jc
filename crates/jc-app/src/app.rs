@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::views::code_view;
 use crate::views::picker;
 use crate::views::todo_view;
@@ -17,6 +19,16 @@ pub fn run(state: AppState, config: AppConfig, theme: ThemeConfig) {
     picker::init(cx);
     code_view::init(cx);
     todo_view::init(cx);
+
+    // Register the bundled Lilex font family.
+    cx.text_system()
+      .add_fonts(vec![
+        Cow::Borrowed(include_bytes!("../../../data/fonts/Lilex-Regular.ttf")),
+        Cow::Borrowed(include_bytes!("../../../data/fonts/Lilex-Bold.ttf")),
+        Cow::Borrowed(include_bytes!("../../../data/fonts/Lilex-Italic.ttf")),
+        Cow::Borrowed(include_bytes!("../../../data/fonts/Lilex-BoldItalic.ttf")),
+      ])
+      .expect("failed to register Lilex fonts");
 
     cx.on_window_closed(|cx| {
       if cx.windows().is_empty() {
