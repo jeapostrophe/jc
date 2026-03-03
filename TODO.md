@@ -29,6 +29,8 @@ Make a plan that will do as many [E] tasks as possible in parallel sub-agents sc
 
   - Terminal size change was confused
 
+- Terminal and editor themes don't match
+
 ### WAIT XXX
 
 

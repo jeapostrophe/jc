@@ -28,7 +28,9 @@ Config and state live in `~/.config/jc/` (`config.toml`, `state.toml`, and `them
 ```
 Cargo.toml                          # workspace root
 data/
-  default_theme.toml                # default terminal color scheme (Tomorrow Night)
+  default_theme.toml                # dark terminal color scheme (Tomorrow Night)
+  light_theme.toml                  # light terminal color scheme (Tomorrow)
+  fonts/                            # bundled Lilex font (Regular, Bold, Italic, BoldItalic)
 crates/
   jc-core/                          # data model + config persistence
     src/lib.rs, config.rs, model.rs, theme.rs
@@ -36,7 +38,7 @@ crates/
     src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
     examples/terminal_window.rs
   jc-app/                           # binary: CLI + GPUI app
-    src/main.rs, app.rs, outline.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view}.rs
+    src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_view,diff_view,code_view,todo_view}.rs
     src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
     examples/basic_window.rs
 ```
@@ -349,7 +351,7 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement project and task data model
 - [x] Implement `jc` CLI for adding projects from the command line
 - [x] [T] Remove code_editor_demo
-- [ ] [E] Stringly-typed language names vs enum
+- [x] [E] Stringly-typed language names vs enum (`Language` enum in `language.rs`)
 - [ ] [E] Move the crates out of './crates' and into the top-level
 
 ### Terminal Emulator
@@ -361,9 +363,9 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Extract terminal color palette to a theme file (`~/.config/jc/theme.toml`)
 - [x] Run general-purpose shell in a second terminal per task
 - [ ] [T] Verify whether Claude Code emits BEL (`\x07`) on task completion in terminal mode (replaces earlier `preferredNotifChannel` assumption)
-- [ ] [E] Change the dimensions of the terminal(s) and communicate to the terminal itself
+- [x] [E] Change the font size of the terminal(s) via font size keybindings (Cmd-+/-/0)
 - [ ] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
-- [ ] [E] Run Claude Code inside the embedded terminal dedicated to Claude
+- [x] [E] Run Claude Code inside the embedded terminal dedicated to Claude
 - [ ] [H] Implement Quake-style drop-down terminal toggle
 - [ ] [H] Implement session JSONL reader for reply capture (extract assistant messages to `./reply/<id>.md`)
 - [ ] [H] Show old replies and plans as well. Provide a picker to scroll through to view. (Ctrl-Shift-O)
@@ -371,9 +373,9 @@ It is deliberately *not* a full code editor on mobile.
 ### TODO.md System
 - [x] Integrate `gpui-component` editor widget with `tree-sitter-md` for markdown highlighting
 - [x] Detect external file modifications (file watcher) and show visual indicator
-- [ ] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
-- [ ] [E] Fix focus to center the target in the middle of the screen
-- [ ] [E] Word wrapping lines to fix the length of lines
+- [x] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
+- [x] [E] Fix focus to center the target in the middle of the screen
+- [x] [E] Word wrapping lines to fix the length of lines
 - [ ] [H] Add custom highlight pass for TODO.md constructs (WAIT markers, Message headers, comment annotations)
 - [ ] [H] Parse TODO.md format (agents, messages, WAIT markers)
 - [ ] [H] Build library for managing TODO.md representation (ropey-backed)
@@ -384,9 +386,8 @@ It is deliberately *not* a full code editor on mobile.
 
 ### Git Diff View
 - [x] Render git diff via `git2` with `tree-sitter` syntax-aware highlighting
-- [x] Add word-level inline highlighting via `similar`
-- [ ] [E] Fix word-level diff (strange annotations appearing instead of highlight
-- [ ] [E] Word wrapping lines to fix the length of lines
+- [ ] [H] Add word-level inline highlighting via `similar` with background highlights NOT diagnostics
+- [x] [E] Word wrapping lines to fix the length of lines
 - [ ] [H] Implement per-file "mark as reviewed" with collapses
 - [ ] [E] Annotate which files have been "marked" in the git diff picker
 - [ ] [H] Show one file at a time rather than raw multi-file output
@@ -398,9 +399,9 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement fuzzy file picker (search repo files)
 - [x] Implement symbol picker with hierarchy context (custom `outline.scm` queries)
 - [x] Implement "open in external editor" keybinding (Cmd-Shift-E)
-- [ ] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
-- [ ] [E] Fix focus to center the target in the middle of the screen
-- [ ] [E] Word wrapping lines to fix the length of lines
+- [x] [E] Automatically reload when the buffer is not dirty, rather than displaying a message
+- [x] [E] Fix focus to center the target in the middle of the screen
+- [x] [E] Word wrapping lines to fix the length of lines
 - [ ] [D] Implement light editing (basic text modification, not full editor)
 
 ### Window & Pane Management
@@ -412,14 +413,15 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement view switching for diff, TODO, code views (Cmd-3/4/5)
 - [x] Use a monospace font (Lilex) in code editor views (diff, code, TODO)
 - [x] Disable line numbers in code editor views
-- [ ] [E] Change the size of the split by dragging with a keybinding to make even split
+- [ ] [E] Change the size of the split with a keybinding to make even split (Cmd-Shift-=) [keybinding doesn't work]
 - [x] [E] Change the font to Lilex (https://lilex.myrt.co/); may require downloading and bundling in a 'data' directory
 - [x] [T] Move default theme file to 'data' directory rather than embedding defaults in source
 - [ ] [E] Implement view switching for reply view
 - [ ] [E] Implement independent scroll positions per pane
 - [ ] [D] Unified theme system tying together UI chrome, terminal palette, and code editor highlighting
-- [ ] [E] Add a light theme
-- [ ] [E] Auto-switch themes with system dark mode
+- [x] [E] Add a light theme (Tomorrow palette in `light_theme.toml`)
+- [x] [E] Auto-switch themes with system dark mode
+- [ ] [T] Remove Cmd-Shift-T manual theme toggle
 - [ ] [H] Implement Quake-style bottom terminal overlay
 - [ ] [H] Implement multi-window with shared session state
 
@@ -427,9 +429,10 @@ It is deliberately *not* a full code editor on mobile.
 - [x] Implement generic fuzzy picker library shared by multiple pickers
 - [x] Implement file picker
 - [x] Implement symbol picker
-- [ ] [E] Improve open_file_picker to use show_picker
-- [ ] [E] Track most recently visited files and put them at the top of file picker
-- [ ] [E] Track modified files (from git) and mark them in the file picker
+- [x] [E] Improve open_file_picker to use show_picker
+- [x] [E] Track most recently visited files and put them at the top of file picker
+- [x] [E] Track modified files (from git) and mark them in the file picker
+- [ ] [E] Annotate which files are recently visited in file picker with an R.
 - [ ] [H] Implement fuzzy project/task picker with filtering (waiting tasks, same project)
 - [ ] [H] Use syntax highlighting inside of the picker appropriate to the original language
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
