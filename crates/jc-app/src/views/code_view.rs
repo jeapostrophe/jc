@@ -1,6 +1,6 @@
 use gpui::*;
 use gpui_component::ActiveTheme;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 
@@ -14,16 +14,32 @@ pub struct CodeView {
   editor: Entity<InputState>,
   current_file: Option<PathBuf>,
   project_path: PathBuf,
+  dirty: bool,
   externally_modified: bool,
+  _subscription: Subscription,
   _watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl CodeView {
   pub fn new(project_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-    let editor = cx.new(|cx| {
-      InputState::new(window, cx).code_editor("text").soft_wrap(false).line_number(false)
+    let editor = cx
+      .new(|cx| InputState::new(window, cx).code_editor("text").soft_wrap(true).line_number(false));
+
+    let subscription = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, _cx| {
+      if matches!(event, InputEvent::Change) {
+        this.dirty = true;
+      }
     });
-    Self { editor, current_file: None, project_path, externally_modified: false, _watcher: None }
+
+    Self {
+      editor,
+      current_file: None,
+      project_path,
+      dirty: false,
+      externally_modified: false,
+      _subscription: subscription,
+      _watcher: None,
+    }
   }
 
   pub fn file_path(&self) -> Option<&Path> {
@@ -31,12 +47,12 @@ impl CodeView {
   }
 
   pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-    self.setup_watcher(&path, cx);
+    self.setup_watcher(&path, window, cx);
     self.current_file = Some(path);
     self.load_current(window, cx);
   }
 
-  fn setup_watcher(&mut self, path: &Path, cx: &mut Context<Self>) {
+  fn setup_watcher(&mut self, path: &Path, window: &Window, cx: &mut Context<Self>) {
     let watched_file = match path.file_name() {
       Some(f) => f.to_os_string(),
       None => return,
@@ -67,15 +83,15 @@ impl CodeView {
       let _ = w.watch(&parent, RecursiveMode::NonRecursive);
     }
 
-    cx.spawn(async move |this: WeakEntity<CodeView>, cx: &mut AsyncApp| {
+    cx.spawn_in(window, async move |this: WeakEntity<CodeView>, cx: &mut AsyncWindowContext| {
       while notify_rx.recv_async().await.is_ok() {
         while notify_rx.try_recv().is_ok() {}
-        let _ = cx.update(|cx| {
-          if let Some(entity) = this.upgrade() {
-            entity.update(cx, |view, cx| {
-              view.externally_modified = true;
-              cx.notify();
-            });
+        let _ = this.update_in(cx, |view, window, cx| {
+          if view.dirty {
+            view.externally_modified = true;
+            cx.notify();
+          } else {
+            view.load_current(window, cx);
           }
         });
       }
@@ -93,6 +109,7 @@ impl CodeView {
       state.set_highlighter(language, cx);
       state.set_value(content, window, cx);
     });
+    self.dirty = false;
     self.externally_modified = false;
     cx.notify();
   }
@@ -117,9 +134,29 @@ impl CodeView {
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+    // Estimate half the viewport in lines for centering.
+    let line_height = window.line_height();
+    let viewport_height = window.viewport_size().height;
+    let half_viewport_lines =
+      if line_height > px(0.) { (viewport_height / line_height / 2.0).floor() as u32 } else { 15 };
+
+    // Position cursor above the target so the viewport scrolls to show that line
+    // at the top. After the next layout, the target line will be roughly centered.
+    let pre_line = line.saturating_sub(half_viewport_lines);
     self.editor.update(cx, |editor, cx| {
-      editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
+      editor.set_cursor_position(gpui_component::input::Position::new(pre_line, 0), window, cx);
     });
+
+    // On the next frame, move the cursor to the actual target line. Since it is
+    // already visible in the viewport, the editor will not adjust the scroll
+    // offset, leaving the target approximately centered.
+    let editor = self.editor.clone();
+    cx.spawn_in(window, async move |_this: WeakEntity<CodeView>, cx: &mut AsyncWindowContext| {
+      let _ = editor.update_in(cx, |editor, window, cx| {
+        editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
+      });
+    })
+    .detach();
   }
 }
 
