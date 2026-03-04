@@ -86,7 +86,11 @@ pub fn paint_terminal(
       let col = Column(col_idx);
       let cell = &grid[Point::new(line, col)];
 
-      let bg = palette.resolve_bg(&cell.bg);
+      let bg = if cell.flags.contains(Flags::INVERSE) {
+        palette.resolve_fg(&cell.fg)
+      } else {
+        palette.resolve_bg(&cell.bg)
+      };
       if bg != palette.background {
         let x = origin.x + layout.width * col_idx as f32;
         let y = origin.y + layout.height * line_idx as f32;
@@ -106,7 +110,11 @@ pub fn paint_terminal(
         continue;
       }
 
-      let fg = palette.resolve_fg(&cell.fg);
+      let fg = if cell.flags.contains(Flags::INVERSE) {
+        palette.resolve_bg(&cell.bg)
+      } else {
+        palette.resolve_fg(&cell.fg)
+      };
       let weight =
         if cell.flags.contains(Flags::BOLD) { FontWeight::BOLD } else { FontWeight::NORMAL };
       let style =

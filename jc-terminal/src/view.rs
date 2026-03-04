@@ -6,8 +6,8 @@ use crate::terminal::{TerminalEvent, TerminalState};
 use alacritty_terminal::term::TermMode;
 use gpui::{
   App, AsyncApp, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
-  KeyBinding, KeyDownEvent, ParentElement, Pixels, Render, SharedString, Styled, Timer, WeakEntity,
-  Window, actions, canvas, div, px,
+  KeyBinding, KeyDownEvent, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
+  Timer, WeakEntity, Window, actions, canvas, div, px,
 };
 use parking_lot::Mutex;
 use std::io::Read;
@@ -68,10 +68,11 @@ pub struct TerminalView {
   default_font_size: Pixels,
   focus: FocusHandle,
   last_size: Arc<Mutex<(u16, u16)>>,
+  focused: bool,
   cursor_visible: bool,
   cursor_reset_at: Instant,
   cached_layout: Option<CellLayout>,
-  was_focused: bool,
+  _subscriptions: Vec<Subscription>,
 }
 
 impl TerminalView {
@@ -159,7 +160,7 @@ impl TerminalView {
         let Ok(should_continue) = cx.update(|cx: &mut App| {
           if let Some(entity) = this.upgrade() {
             entity.update(cx, |view, cx| {
-              if view.was_focused {
+              if view.focused {
                 if view.cursor_reset_at.elapsed() < CURSOR_BLINK_INTERVAL {
                   return;
                 }
@@ -183,6 +184,12 @@ impl TerminalView {
 
     let palette = config.palette.take().unwrap_or_default();
     let default_font_size = config.font_size;
+    let focus = cx.focus_handle();
+
+    let _subscriptions = vec![
+      cx.on_focus(&focus, _window, Self::on_focus),
+      cx.on_blur(&focus, _window, Self::on_blur),
+    ];
 
     Self {
       state,
@@ -190,12 +197,13 @@ impl TerminalView {
       palette,
       config,
       default_font_size,
-      focus: cx.focus_handle(),
+      focus,
       last_size: Arc::new(Mutex::new((cols, rows))),
+      focused: false,
       cursor_visible: true,
       cursor_reset_at: Instant::now(),
       cached_layout: None,
-      was_focused: false,
+      _subscriptions,
     }
   }
 
@@ -217,6 +225,33 @@ impl TerminalView {
   /// Get a clone of the PTY handle for use in background threads.
   pub fn pty_handle(&self) -> Arc<PtyHandle> {
     self.pty.clone()
+  }
+
+  fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    self.focused = true;
+    {
+      let handle = self.state.term_handle();
+      let mut term = handle.lock();
+      term.is_focused = true;
+      if term.mode().contains(TermMode::FOCUS_IN_OUT) {
+        let _ = self.pty.write_all(b"\x1b[I");
+      }
+    }
+    self.reset_cursor_blink();
+    cx.notify();
+  }
+
+  fn on_blur(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    self.focused = false;
+    {
+      let handle = self.state.term_handle();
+      let mut term = handle.lock();
+      term.is_focused = false;
+      if term.mode().contains(TermMode::FOCUS_IN_OUT) {
+        let _ = self.pty.write_all(b"\x1b[O");
+      }
+    }
+    cx.notify();
   }
 
   fn reset_cursor_blink(&mut self) {
@@ -268,22 +303,7 @@ impl Render for TerminalView {
     let line_height = self.config.line_height;
     let palette_fg = self.palette.foreground;
     let palette_bg = self.palette.background;
-    let focused = self.focus.is_focused(window);
-    if focused != self.was_focused {
-      {
-        let handle = self.state.term_handle();
-        let mut term = handle.lock();
-        term.is_focused = focused;
-        if term.mode().contains(TermMode::FOCUS_IN_OUT) {
-          let seq = if focused { b"\x1b[I" as &[u8] } else { b"\x1b[O" as &[u8] };
-          let _ = self.pty.write_all(seq);
-        }
-      }
-      if focused {
-        self.reset_cursor_blink();
-      }
-    }
-    self.was_focused = focused;
+    let focused = self.focused;
     let cursor_visible = self.cursor_visible;
 
     // Cache cell layout — only re-measure when font config changes.
