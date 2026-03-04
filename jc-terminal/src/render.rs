@@ -2,11 +2,13 @@ use crate::colors::Palette;
 use crate::terminal::EventProxy;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-  App, Bounds, FontStyle, FontWeight, Pixels, SharedString, Window, fill, font, point, px, size,
+  App, Bounds, FontStyle, FontWeight, Hsla, Pixels, SharedString, Window, fill, font, point, px,
+  size,
 };
 
 /// Measured cell dimensions for the current font.
@@ -54,6 +56,7 @@ pub struct TerminalRenderState<'a> {
   pub line_height: f32,
   pub focused: bool,
   pub cursor_visible: bool,
+  pub selection: Option<SelectionRange>,
 }
 
 /// Paint the terminal grid onto a GPUI canvas.
@@ -79,6 +82,8 @@ pub fn paint_terminal(
   let origin = bounds.origin;
   let line_height_px = font_size * line_height;
 
+  let selection_color = Hsla { h: 210.0 / 360.0, s: 0.6, l: 0.5, a: 0.35 };
+
   // Pass 1: Paint cell backgrounds
   for line_idx in 0..num_lines {
     let line = Line(line_idx as i32);
@@ -95,6 +100,24 @@ pub fn paint_terminal(
         let x = origin.x + layout.width * col_idx as f32;
         let y = origin.y + layout.height * line_idx as f32;
         window.paint_quad(fill(Bounds::new(point(x, y), size(layout.width, layout.height)), bg));
+      }
+    }
+  }
+
+  // Pass 1.5: Paint selection highlight
+  if let Some(ref sel) = state.selection {
+    for line_idx in 0..num_lines {
+      let line = Line(line_idx as i32);
+      for col_idx in 0..num_cols {
+        let pt = Point::new(line, Column(col_idx));
+        if sel.contains(pt) {
+          let x = origin.x + layout.width * col_idx as f32;
+          let y = origin.y + layout.height * line_idx as f32;
+          window.paint_quad(fill(
+            Bounds::new(point(x, y), size(layout.width, layout.height)),
+            selection_color,
+          ));
+        }
       }
     }
   }

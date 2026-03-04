@@ -3,11 +3,11 @@ use gpui::Keystroke;
 
 /// Convert a GPUI keystroke into terminal byte sequences.
 pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
-  let key = keystroke.key_char.as_deref().unwrap_or("");
-
-  // Handle Ctrl+key combos
+  // Handle Ctrl+key combos.  Use `keystroke.key` (the base key name, always
+  // populated) rather than `key_char` which GPUI sets to None when Ctrl is
+  // held on macOS.
   if keystroke.modifiers.control
-    && let Some(ch) = key.chars().next()
+    && let Some(ch) = keystroke.key.chars().next()
   {
     let byte = match ch {
       'a'..='z' => Some(ch as u8 - b'a' + 1),
@@ -23,6 +23,8 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
       return Some(vec![b]);
     }
   }
+
+  let key = keystroke.key_char.as_deref().unwrap_or("");
 
   // Handle special named keys
   let app_cursor = mode.contains(TermMode::APP_CURSOR);

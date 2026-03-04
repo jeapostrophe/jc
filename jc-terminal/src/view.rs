@@ -3,11 +3,14 @@ use crate::input::keystroke_to_bytes;
 use crate::pty::PtyHandle;
 use crate::render::{CellLayout, TerminalRenderState, measure_cell, paint_terminal};
 use crate::terminal::{TerminalEvent, TerminalState};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::TermMode;
 use gpui::{
-  App, AsyncApp, Bounds, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
-  KeyBinding, KeyDownEvent, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
-  Timer, WeakEntity, Window, actions, canvas, div, px,
+  App, AsyncApp, Bounds, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
+  IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+  ParentElement, Pixels, Render, SharedString, Styled, Subscription, Timer, WeakEntity, Window,
+  actions, canvas, div, px,
 };
 use parking_lot::Mutex;
 use std::io::Read;
@@ -19,7 +22,7 @@ const FONT_SIZE_STEP: Pixels = px(2.0);
 const FONT_SIZE_MIN: Pixels = px(8.0);
 const FONT_SIZE_MAX: Pixels = px(72.0);
 
-actions!(terminal, [IncreaseFontSize, DecreaseFontSize, ResetFontSize]);
+actions!(terminal, [IncreaseFontSize, DecreaseFontSize, ResetFontSize, Copy, Paste]);
 
 /// Register terminal keybindings. Call once during app initialization.
 pub fn init(cx: &mut App) {
@@ -28,6 +31,8 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-+", IncreaseFontSize, Some("Terminal")),
     KeyBinding::new("cmd--", DecreaseFontSize, Some("Terminal")),
     KeyBinding::new("cmd-0", ResetFontSize, Some("Terminal")),
+    KeyBinding::new("cmd-c", Copy, Some("Terminal")),
+    KeyBinding::new("cmd-v", Paste, Some("Terminal")),
   ]);
 }
 
@@ -59,6 +64,27 @@ impl Default for TerminalConfig {
   }
 }
 
+/// Convert a mouse pixel position to an alacritty grid point and cell side.
+fn pixel_to_grid(
+  pos: gpui::Point<Pixels>,
+  origin: gpui::Point<Pixels>,
+  layout: CellLayout,
+  cols: u16,
+  rows: u16,
+) -> (Point, Side) {
+  let rel_x = (pos.x - origin.x).max(px(0.0));
+  let rel_y = (pos.y - origin.y).max(px(0.0));
+
+  let col = (rel_x / layout.width).floor().min(cols.saturating_sub(1) as f32) as usize;
+  let row = (rel_y / layout.height).floor().min(rows.saturating_sub(1) as f32) as usize;
+
+  // Which side of the cell midpoint the cursor is on.
+  let cell_x = rel_x % layout.width;
+  let side = if cell_x > layout.width / 2.0 { Side::Right } else { Side::Left };
+
+  (Point::new(Line(row as i32), Column(col)), side)
+}
+
 /// GPUI view that embeds a terminal emulator.
 pub struct TerminalView {
   state: TerminalState,
@@ -72,6 +98,8 @@ pub struct TerminalView {
   cursor_visible: bool,
   cursor_reset_at: Instant,
   cached_layout: Option<CellLayout>,
+  /// Canvas origin stored during paint so mouse handlers can convert pixels to grid coords.
+  canvas_origin: Arc<Mutex<gpui::Point<Pixels>>>,
   _subscriptions: Vec<Subscription>,
 }
 
@@ -203,6 +231,7 @@ impl TerminalView {
       cursor_visible: true,
       cursor_reset_at: Instant::now(),
       cached_layout: None,
+      canvas_origin: Arc::new(Mutex::new(gpui::Point::default())),
       _subscriptions,
     }
   }
@@ -225,6 +254,17 @@ impl TerminalView {
   /// Get a clone of the PTY handle for use in background threads.
   pub fn pty_handle(&self) -> Arc<PtyHandle> {
     self.pty.clone()
+  }
+
+  /// Get the selected text from the terminal, if any.
+  pub fn selected_text(&self) -> Option<String> {
+    self.state.with_term(|term| term.selection_to_string())
+  }
+
+  fn grid_point_and_side(&self, pos: gpui::Point<Pixels>, layout: CellLayout) -> (Point, Side) {
+    let origin = *self.canvas_origin.lock();
+    let (cols, rows) = *self.last_size.lock();
+    pixel_to_grid(pos, origin, layout, cols, rows)
   }
 
   fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {
@@ -288,6 +328,80 @@ impl TerminalView {
     self.cached_layout = None;
     cx.notify();
   }
+
+  fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+    if let Some(text) = self.selected_text() {
+      cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+  }
+
+  fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+    if let Some(item) = cx.read_from_clipboard()
+      && let Some(text) = item.text()
+    {
+      let bracketed = self.bracketed_paste_mode();
+      let pty = self.pty.clone();
+      std::thread::spawn(move || {
+        if bracketed {
+          let _ = pty.write_all(b"\x1b[200~");
+          // Strip ESC chars from pasted text in bracketed mode (security).
+          let sanitized = text.replace('\x1b', "");
+          let _ = pty.write_all(sanitized.as_bytes());
+          let _ = pty.write_all(b"\x1b[201~");
+        } else {
+          // Normalize newlines: terminals expect \r.
+          let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+          let _ = pty.write_all(normalized.as_bytes());
+        }
+      });
+    }
+  }
+
+  fn mouse_down(&mut self, position: gpui::Point<Pixels>, click_count: usize, layout: CellLayout) {
+    let (point, side) = self.grid_point_and_side(position, layout);
+    let selection_type = match click_count {
+      1 => SelectionType::Simple,
+      2 => SelectionType::Semantic,
+      3 => SelectionType::Lines,
+      _ => SelectionType::Lines,
+    };
+    let selection = Selection::new(selection_type, point, side);
+    let handle = self.state.term_handle();
+    let mut term = handle.lock();
+    term.selection = Some(selection);
+  }
+
+  fn mouse_drag(&mut self, position: gpui::Point<Pixels>, layout: CellLayout) {
+    let (point, side) = self.grid_point_and_side(position, layout);
+    let handle = self.state.term_handle();
+    let mut term = handle.lock();
+    if let Some(ref mut selection) = term.selection {
+      selection.update(point, side);
+    }
+  }
+
+  fn mouse_up(&mut self, position: gpui::Point<Pixels>, click_count: usize, layout: CellLayout) {
+    let (point, side) = self.grid_point_and_side(position, layout);
+    let handle = self.state.term_handle();
+    let mut term = handle.lock();
+    if let Some(ref mut selection) = term.selection {
+      selection.update(point, side);
+    }
+    // Single-click with no drag (start == end): clear selection.
+    if click_count == 1
+      && let Some(ref sel) = term.selection
+      && sel.ty == SelectionType::Simple
+    {
+      // Check if selection resolves to empty.
+      drop(term);
+      let text = self.state.with_term(|t| t.selection_to_string());
+      if text.is_none() || text.as_deref() == Some("") {
+        let handle = self.state.term_handle();
+        let mut term = handle.lock();
+        term.selection = None;
+      }
+    }
+  }
 }
 
 impl Focusable for TerminalView {
@@ -306,6 +420,10 @@ impl Render for TerminalView {
     let focused = self.focused;
     let cursor_visible = self.cursor_visible;
 
+    // Snapshot the current selection range for rendering.
+    let selection_range: Option<SelectionRange> =
+      self.state.with_term(|term| term.renderable_content().selection);
+
     // Cache cell layout — only re-measure when font config changes.
     let layout = *self
       .cached_layout
@@ -321,12 +439,40 @@ impl Render for TerminalView {
       .on_action(cx.listener(Self::increase_font_size))
       .on_action(cx.listener(Self::decrease_font_size))
       .on_action(cx.listener(Self::reset_font_size))
+      .on_action(cx.listener(Self::copy))
+      .on_action(cx.listener(Self::paste))
+      .on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+          this.mouse_down(event.position, event.click_count, layout);
+          cx.notify();
+        }),
+      )
+      .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+        if event.dragging() {
+          this.mouse_drag(event.position, layout);
+          cx.notify();
+        }
+      }))
+      .on_mouse_up(
+        MouseButton::Left,
+        cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
+          this.mouse_up(event.position, event.click_count, layout);
+          cx.notify();
+        }),
+      )
       .on_key_down(cx.listener({
         let pty = self.pty.clone();
         move |this, event: &KeyDownEvent, _window, _cx| {
           this.reset_cursor_blink();
           let mode = this.state.with_term(|t| *t.mode());
           if let Some(bytes) = keystroke_to_bytes(&event.keystroke, mode) {
+            // Clear selection on any key press that generates terminal input.
+            {
+              let handle = this.state.term_handle();
+              let mut term = handle.lock();
+              term.selection = None;
+            }
             let _ = pty.write_all(&bytes);
           }
         }
@@ -334,7 +480,9 @@ impl Render for TerminalView {
       .child(canvas(
         {
           let font_family = font_family.clone();
+          let canvas_origin = self.canvas_origin.clone();
           move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+            *canvas_origin.lock() = bounds.origin;
             (bounds, layout, font_family)
           }
         },
@@ -371,6 +519,7 @@ impl Render for TerminalView {
               line_height,
               focused,
               cursor_visible,
+              selection: selection_range,
             };
             paint_terminal(&term, prep_bounds, layout, &render_state, window, cx);
           }
