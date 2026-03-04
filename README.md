@@ -187,13 +187,98 @@ Navigation:
 
 The view monitors the JSONL file for changes and reloads when updated (e.g., while Claude is working). JSONL files are append-only so even large sessions (multi-MB) reload quickly.
 
-## Status & Usage Tracking
+## Problems & Status
 
-### Session Status Indicators
+The app tracks **problems** — actionable conditions that need the user's attention. Problems drive the notification system, status indicators, and navigation.
 
-A persistent indicator shows which sessions have Claude responses waiting for review. The app detects "waiting" via Claude Code's hooks system (HTTP hooks fire on `Stop` and `Notification` events) with BEL character detection as a lightweight backup signal (if Claude Code emits it).
+### Problem Sources
 
-A fuzzy picker (keybinding) lets the user jump between projects and sessions. A modifier key filters to only waiting sessions or same-project sessions.
+Each view defines its own problem types. Problems are scoped to the level that owns them:
+
+**Session-level problems** (owned by `SessionState`):
+
+| Source | Problem | Trigger | Resolution |
+|---|---|---|---|
+| Claude terminal | `ClaudeProblem::Stop` | Hook event: Claude finishes | User interacts with the session |
+| Claude terminal | `ClaudeProblem::Permission` | Hook event: permission prompt | User interacts with the session |
+| Claude terminal | `ClaudeProblem::Idle` | Hook event: idle prompt | User interacts with the session |
+| Claude terminal | `ClaudeProblem::ApiError` | Hook event: API error | User interacts with the session |
+| General terminal | `TerminalProblem::Bell` | BEL character detected | User focuses the terminal |
+| TODO view | `TodoProblem::UnsentWait` | Content exists below `### WAIT` | Content is sent or removed |
+| TODO view | `TodoProblem::InvalidSlug` | `## Session` slug has no JSONL | Slug is corrected or JSONL appears |
+
+**Project-level problems** (owned by `ProjectState`):
+
+| Source | Problem | Trigger | Resolution |
+|---|---|---|---|
+| Diff view | `DiffProblem::UnreviewedFile(PathBuf)` | Dirty working tree files | File marked as reviewed |
+| Script | `ScriptProblem { rank, file, line, message }` | `./status.sh` output | Script stops reporting it |
+
+### Problem Type Design
+
+Each view defines its own enum. Aggregation uses wrapper enums at the session and project level:
+
+```rust
+// Per-view enums
+enum ClaudeProblem { Stop, Permission, Idle, ApiError }
+enum TerminalProblem { Bell }
+enum DiffProblem { UnreviewedFile(PathBuf) }
+enum TodoProblem { UnsentWait, InvalidSlug { slug: String, line: usize } }
+
+// Script problems use the format: {rank:}?file{:line}? - message
+struct ScriptProblem { rank: Option<i8>, file: PathBuf, line: Option<usize>, message: String }
+
+// Session-level wrapper
+enum SessionProblem { Claude(ClaudeProblem), Terminal(TerminalProblem), Todo(TodoProblem) }
+
+// Project-level wrapper
+enum ProjectProblem { Diff(DiffProblem), Script(ScriptProblem) }
+```
+
+Each inner type derives its own rank and description. Built-in problems have implicit ranks (permission > API error > stop > idle > BEL > unreviewed diff > unsent wait > invalid slug). Script problems use an explicit optional rank from the script output; unranked script problems sort below built-in ones.
+
+### Refresh Model
+
+Problems are recomputed on a unified refresh cycle rather than managed individually:
+
+- **Push sources** (hooks, BEL): Write into a `pending_events` set on the session. Events persist in this set until their resolution condition is met.
+- **Poll sources** (diff, TODO, status.sh): Computed fresh each cycle by querying the relevant view.
+- A single `refresh_problems()` method on session/project merges both: it converts pending events into problems, queries poll sources, and replaces the full problem list.
+- Refresh runs on a timer (2–3 seconds) and on demand when the user switches views or interacts.
+
+**Resolution** has two flavors:
+- **Implicit**: The condition no longer holds on next poll (diff is clean, WAIT is empty, script stops reporting). These resolve automatically via the refresh-replaces-all model.
+- **Acknowledgment**: The user does something that clears a pending event flag (focuses terminal after BEL, interacts with session after Claude stop). The session tracks unacknowledged events; user actions drain them.
+
+### Display
+
+Problems surface in multiple locations:
+
+- **Title bar** (left of session label): A dirty marker on the session label (`"! Project > Session"`) if the active session has any problems.
+- **Title bar** (right of session label): A count on the session label (`"! Project > Session: 5"`) with hover tooltip listing all problems.
+- **Session picker** (Cmd-P): Dirty marker and count on sessions that have problems.
+- **Project picker**: Dirty marker and count on projects that have problems.
+- **Global indicator** (upper right, left of usage): Count of projects with problems, with hover listing project/session pairs and their counts: (`"3 | Par +5"`)
+
+**Navigation**: In the first version, problems are display-only. In a future version, each problem kind maps to a navigation target: Claude problems jump to the Claude terminal, TODO problems jump to the TODO view, diff problems jump to the diff view at the file, script problems jump to the code view at `file:line`.
+
+### Script Problems (`status.sh`)
+
+Projects can optionally include a `./status.sh` script. The app runs it periodically and parses stdout lines in the format:
+
+```
+file:line - message
+file - message
+3:file:line - message
+```
+
+Where:
+- `file` is required (relative to project root)
+- `line` is optional (for jump-to-source)
+- The leading number before the first `:file` is an optional rank (lower = more important)
+- Everything after ` - ` is the message
+
+The script runs with the project root as cwd. Non-zero exit is not an error — it just means no problems. The app ignores stderr.
 
 ### Claude Usage Dashboard
 
@@ -233,7 +318,7 @@ It is deliberately *not* a full code editor on mobile.
 | Symbol navigation | tree-sitter custom `outline.scm` queries (sourced from Zed, updated via `scripts/update-outline-queries.sh`) |
 | Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff` for word-level highlighting |
 | Git worktrees | `git2` worktree API (create/list/prune) |
-| Claude idle detection | Claude Code hooks system (HTTP endpoint) + BEL detection (if emitted) + silence heuristic fallback |
+| Problem tracking | Per-view problem enums + unified refresh cycle; push via Claude Code hooks (HTTP) + BEL; poll via diff/TODO/status.sh |
 | Claude reply viewer | Parse session JSONL from `~/.claude/projects/`, group into turns, render as Markdown in read-only editor |
 | Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
 | Persistent state | `~/.config/jc/` --- project registry, window layout; session state in TODO.md |
@@ -304,12 +389,23 @@ It is deliberately *not* a full code editor on mobile.
 ### Navigation & Pickers
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 
-### Notifications & Status
+### Problems & Status
 - [x] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
-- [ ] [E] Implement in-app status bar showing waiting sessions (driven by hook events)
-- [ ] [E] Jump to next problem keybinding on Cmd-;
+- [ ] [H] Define per-view problem enums (`ClaudeProblem`, `TerminalProblem`, `DiffProblem`, `TodoProblem`) and wrapper enums (`SessionProblem`, `ProjectProblem`) in `jc-core`
+- [ ] [H] Wire hook events into `SessionState.pending_events` (set flags on Stop/Permission/Idle/ApiError, clear on user interaction)
+- [ ] [E] Surface `TerminalEvent::Bell` from `TerminalView` to workspace (currently silently discarded)
+- [ ] [E] Implement `TodoProblem::UnsentWait` detection (check for content below `### WAIT`)
+- [ ] [E] Implement `DiffProblem::UnreviewedFile` detection (dirty files not marked reviewed)
+- [ ] [H] Implement `refresh_problems()` on `SessionState` and `ProjectState` (merge push events + poll sources, replace problem list)
+- [ ] [E] Wire refresh timer (2–3 seconds) and on-demand refresh on view switch
+- [ ] [E] Populate title bar problem indicators (dirty marker + count) from refreshed problem lists
+- [ ] [E] Show problem markers in session picker and project picker
+- [ ] [E] Add global problem count indicator in upper right (left of usage dashboard)
+- [ ] [H] Implement hover tooltips listing problems on title bar and global indicator
+- [ ] [H] Implement `status.sh` runner: periodic execution, parse `{rank:}?file{:line}? - message` format, produce `ScriptProblem`s
+- [ ] [H] Problem navigation: jump to the view/file that can address each problem kind
+- [ ] [E] Jump to next problem keybinding (Cmd-;)
 - [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
-- [ ] [D] Expand the concept of "problems" (Claude is asking for permission, a session is idle, there are messages in the wait section that haven't been sent, the project has non-filled-in-checklist items; maybe require new type)
 
 ### Mobile App
 - [ ] [D] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
@@ -329,11 +425,8 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
 - [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
-- [ ] [H] Allow projects to have a special `./status.sh` script that reports problems in the form `file:line - problem`
 
 ### Code Quality
-- [x] [E] Lazy-highlight `LineSearchPickerDelegate::build()` — currently does O(N) syntax highlighting of every line on each Cmd-F; will lag on very large files
-- [x] [E] Collapse the four `LineSearchPickerDelegate::for_*_view` factories into one generic method via a shared trait (editor_text + scroll_to_line + language_name)
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically
