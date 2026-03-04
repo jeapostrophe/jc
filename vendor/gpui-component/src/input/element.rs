@@ -752,6 +752,73 @@ impl TextElement {
     // Combine marker styles
     styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
 
+    // Apply extra highlights on top of syntax + diagnostics.
+    // We cannot use combine_highlights here because it uses a HashSet
+    // internally, making the override order non-deterministic. Instead,
+    // split existing styles at extra highlight boundaries and force the
+    // extra style fields onto overlapping ranges.
+    if !state.extra_highlights.is_empty() {
+      let extras: Vec<_> = state
+        .extra_highlights
+        .iter()
+        .filter(|(r, _)| r.start < visible_byte_range.end && r.end > visible_byte_range.start)
+        .collect();
+      if !extras.is_empty() {
+        let mut result: Vec<(Range<usize>, HighlightStyle)> =
+          Vec::with_capacity(styles.len() + extras.len());
+        for (range, style) in styles {
+          // Check if any extra overlaps this range.
+          let mut remainder = Some(range.clone());
+          for (er, es) in &extras {
+            let Some(ref r) = remainder else { break };
+            if er.start >= r.end || er.end <= r.start {
+              continue; // no overlap
+            }
+            // Portion before the extra range — keep original style.
+            if r.start < er.start {
+              result.push((r.start..er.start, style));
+            }
+            // Overlapping portion — merge extra on top.
+            let overlap_start = r.start.max(er.start);
+            let overlap_end = r.end.min(er.end);
+            result.push((overlap_start..overlap_end, style.highlight(*es)));
+            // Remaining portion after the extra range.
+            if r.end > er.end {
+              remainder = Some(er.end..r.end);
+            } else {
+              remainder = None;
+            }
+          }
+          if let Some(r) = remainder {
+            if !r.is_empty() {
+              result.push((r, style));
+            }
+          }
+        }
+        // Fill gaps: extra ranges that had no base style.
+        for (er, es) in &extras {
+          let covered: Vec<_> = result
+            .iter()
+            .filter(|(r, _)| r.start < er.end && r.end > er.start)
+            .map(|(r, _)| r.clone())
+            .collect();
+          let mut pos = er.start.max(visible_byte_range.start);
+          let end = er.end.min(visible_byte_range.end);
+          for c in &covered {
+            if pos < c.start {
+              result.push((pos..c.start, *es));
+            }
+            pos = pos.max(c.end);
+          }
+          if pos < end {
+            result.push((pos..end, *es));
+          }
+        }
+        result.sort_by_key(|(r, _)| r.start);
+        styles = result;
+      }
+    }
+
     Some(styles)
   }
 }

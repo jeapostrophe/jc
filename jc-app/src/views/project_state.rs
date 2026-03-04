@@ -71,6 +71,11 @@ impl ProjectState {
 
     let active_session_index = if sessions.is_empty() { None } else { Some(0) };
 
+    // Highlight the initial active session in the TODO view.
+    if let Some(slug) = active_session_index.and_then(|i| sessions.get(i)).map(|s| s.slug.clone()) {
+      todo_view.update(cx, |tv, cx| tv.set_active_slug(Some(&slug), cx));
+    }
+
     Self { path, name, sessions, active_session_index, todo_view, diff_view, code_view }
   }
 

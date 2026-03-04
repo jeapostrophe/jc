@@ -5,10 +5,11 @@
 use anyhow::Result;
 use gpui::{
   Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
-  EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
-  KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
-  Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-  Task, UTF16Selection, Window, actions, div, point, prelude::FluentBuilder as _, px,
+  EventEmitter, FocusHandle, Focusable, HighlightStyle, InteractiveElement as _, IntoElement,
+  KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+  ParentElement as _, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString,
+  Styled as _, Subscription, Task, UTF16Selection, Window, actions, div, point,
+  prelude::FluentBuilder as _, px,
 };
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
@@ -332,6 +333,10 @@ pub struct InputState {
 
   pub(super) _context_menu_task: Task<Result<()>>,
   pub(super) inline_completion: InlineCompletion,
+
+  /// Extra highlight styles applied on top of syntax and diagnostic highlights.
+  /// Useful for custom range decorations (e.g. background highlights).
+  pub(super) extra_highlights: Vec<(Range<usize>, HighlightStyle)>,
 }
 
 impl EventEmitter<InputEvent> for InputState {}
@@ -411,6 +416,7 @@ impl InputState {
       _context_menu_task: Task::ready(Ok(())),
       _pending_update: false,
       inline_completion: InlineCompletion::default(),
+      extra_highlights: Vec::new(),
     }
   }
 
@@ -504,6 +510,16 @@ impl InputState {
   }
 
   /// Set highlighter language for for [`InputMode::CodeEditor`] mode.
+  /// Set extra highlight styles applied on top of syntax and diagnostic highlights.
+  pub fn set_extra_highlights(
+    &mut self,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    cx: &mut Context<Self>,
+  ) {
+    self.extra_highlights = highlights;
+    cx.notify();
+  }
+
   pub fn set_highlighter(&mut self, new_language: impl Into<SharedString>, cx: &mut Context<Self>) {
     match &mut self.mode {
       InputMode::CodeEditor { language, highlighter, .. } => {
@@ -835,20 +851,17 @@ impl InputState {
     self.select_to(self.next_boundary(self.cursor()), cx);
   }
 
-  pub(super) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-    if self.mode.is_single_line() {
-      return;
-    }
-    let offset = self.start_of_line().saturating_sub(1);
-    self.select_to(self.previous_boundary(offset), cx);
+  pub(super) fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+    self.select_vertical(-1, window, cx);
   }
 
-  pub(super) fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-    if self.mode.is_single_line() {
-      return;
-    }
-    let offset = (self.end_of_line() + 1).min(self.text.len());
-    self.select_to(self.next_boundary(offset), cx);
+  pub(super) fn select_down(
+    &mut self,
+    _: &SelectDown,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.select_vertical(1, window, cx);
   }
 
   pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {

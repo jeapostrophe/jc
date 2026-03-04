@@ -299,12 +299,7 @@ pub fn send_from_wait(
   let message_text = selected_text.to_string();
 
   // Compute next message index.
-  let message_index = session
-    .messages
-    .iter()
-    .map(|m| m.index + 1)
-    .max()
-    .unwrap_or(0);
+  let message_index = session.messages.iter().map(|m| m.index + 1).max().unwrap_or(0);
 
   // Build remaining body (parts of the body before and after the effective range).
   let before_sel = &text[body_range.start..effective.start];
@@ -319,8 +314,7 @@ pub fn send_from_wait(
   let before_wait = &text[..wait.heading_byte_range.start];
   let after_body = &text[body_range.end..];
 
-  let mut new_text =
-    String::with_capacity(text.len() + message_text.len() + 32);
+  let mut new_text = String::with_capacity(text.len() + message_text.len() + 32);
   new_text.push_str(before_wait);
   new_text.push_str(&format!("### Message {}\n", message_index));
   new_text.push_str(&message_text);

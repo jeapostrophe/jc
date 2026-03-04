@@ -472,6 +472,13 @@ impl Workspace {
     self.active_project_index = project_idx;
     self.projects[project_idx].active_session_index = Some(session_idx);
 
+    // Update the TODO view's active session highlight.
+    {
+      let slug = self.projects[project_idx].sessions.get(session_idx).map(|s| s.slug.clone());
+      let todo_view = self.projects[project_idx].todo_view.clone();
+      todo_view.update(cx, |tv, cx| tv.set_active_slug(slug.as_deref(), cx));
+    }
+
     if project_changed {
       self.subscribe_active_project(window, cx);
     }
@@ -992,12 +999,7 @@ impl Workspace {
   // Send to terminal
   // ---------------------------------------------------------------------------
 
-  fn send_to_terminal(
-    &mut self,
-    _: &SendToTerminal,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
+  fn send_to_terminal(&mut self, _: &SendToTerminal, window: &mut Window, cx: &mut Context<Self>) {
     let project = &self.projects[self.active_project_index];
     let Some(slug) = project.active_slug().map(str::to_string) else {
       return;

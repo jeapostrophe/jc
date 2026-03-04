@@ -1,8 +1,10 @@
 use crate::views::code_view::CodeView;
 use gpui::*;
+use gpui_component::ActiveTheme;
 use gpui_component::highlighter::{Diagnostic, DiagnosticSeverity};
 use gpui_component::input::{InputEvent, Position, Rope};
-use jc_core::todo::{self, TodoDocument, TodoProblem};
+use jc_core::todo::{self, TodoDocument, TodoProblem, TodoSession};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// TodoView wraps a [`CodeView`] opened on the project's `TODO.md` file,
@@ -13,6 +15,7 @@ pub struct TodoView {
   project_path: PathBuf,
   document: TodoDocument,
   problems: Vec<TodoProblem>,
+  active_slug: Option<String>,
   _editor_subscription: Subscription,
 }
 
@@ -34,6 +37,7 @@ impl TodoView {
         if matches!(event, InputEvent::Change) {
           let text = this.code_view.read(cx).editor_text(cx);
           this.document = todo::parse(&text);
+          this.apply_session_highlights(cx);
           // Skip re-validation on every keystroke (it scans the filesystem).
           cx.notify();
         }
@@ -44,8 +48,15 @@ impl TodoView {
     let document = todo::parse(&text);
     let problems = todo::validate(&document, &project_path);
 
-    let mut view =
-      Self { code_view, file_path, project_path, document, problems, _editor_subscription };
+    let mut view = Self {
+      code_view,
+      file_path,
+      project_path,
+      document,
+      problems,
+      active_slug: None,
+      _editor_subscription,
+    };
     view.apply_diagnostics(cx);
     view
   }
@@ -72,6 +83,17 @@ impl TodoView {
 
   pub fn problems(&self) -> &[TodoProblem] {
     &self.problems
+  }
+
+  /// Set the active session slug. The active session's headings get
+  /// highlighted with the `@type` / `@function` theme colors while
+  /// other sessions use default markdown heading colors.
+  pub fn set_active_slug(&mut self, slug: Option<&str>, cx: &mut Context<Self>) {
+    let changed = self.active_slug.as_deref() != slug;
+    self.active_slug = slug.map(|s| s.to_string());
+    if changed {
+      self.apply_session_highlights(cx);
+    }
   }
 
   /// Insert a `## Session <slug>: <label>` heading into the TODO.md,
@@ -124,12 +146,7 @@ impl TodoView {
     cx: &mut Context<Self>,
   ) -> Option<(String, usize)> {
     let text = self.editor_text(cx);
-    let selection = self
-      .code_view
-      .read(cx)
-      .editor()
-      .read(cx)
-      .selection_byte_range();
+    let selection = self.code_view.read(cx).editor().read(cx).selection_byte_range();
     let session = self.document.session_by_slug(slug)?;
     let result = todo::send_from_wait(&text, session, selection)?;
     self.code_view.update(cx, |cv, cx| {
@@ -149,6 +166,7 @@ impl TodoView {
     self.document = todo::parse(&text);
     self.problems = todo::validate(&self.document, &self.project_path);
     self.apply_diagnostics(cx);
+    self.apply_session_highlights(cx);
   }
 
   /// Push current problems as editor diagnostics (wavy underlines on invalid slugs).
@@ -181,6 +199,72 @@ impl TodoView {
       });
     });
   }
+
+  /// Apply foreground highlights to the active session's headings.
+  /// h2 (`## Session`) → `@type` color, h3 (`### Message` / `### WAIT`) → `@function` color.
+  fn apply_session_highlights(&self, cx: &mut Context<Self>) {
+    let slug = match &self.active_slug {
+      Some(s) => s.as_str(),
+      None => {
+        // Clear highlights.
+        self.code_view.update(cx, |cv, cx| {
+          cv.editor().update(cx, |state, cx| {
+            state.set_extra_highlights(Vec::new(), cx);
+          });
+        });
+        return;
+      }
+    };
+
+    let session = match self.document.session_by_slug(slug) {
+      Some(s) => s,
+      None => {
+        self.code_view.update(cx, |cv, cx| {
+          cv.editor().update(cx, |state, cx| {
+            state.set_extra_highlights(Vec::new(), cx);
+          });
+        });
+        return;
+      }
+    };
+
+    let theme = &cx.theme().highlight_theme;
+    let h2_style = theme.style("type").unwrap_or_default();
+    let h3_style = theme.style("function").unwrap_or_default();
+
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+
+    // Highlight the session heading (## Session slug: label).
+    highlights.push((session.heading_byte_range.clone(), h2_style));
+
+    // Highlight all ### Message and ### WAIT headings within this session.
+    for msg in &session.messages {
+      highlights.push((msg.heading_byte_range.clone(), h3_style));
+    }
+    if let Some(wait) = &session.wait {
+      highlights.push((wait.heading_byte_range.clone(), h3_style));
+    }
+
+    self.code_view.update(cx, |cv, cx| {
+      cv.editor().update(cx, |state, cx| {
+        state.set_extra_highlights(highlights, cx);
+      });
+    });
+  }
+}
+
+/// Compute the full byte range of a session (heading through content,
+/// up to the next session's heading or end of document).
+#[allow(dead_code)]
+fn session_full_range(session: &TodoSession, doc: &TodoDocument, text_len: usize) -> Range<usize> {
+  let start = session.heading_byte_range.start;
+  let end = doc
+    .sessions
+    .iter()
+    .find(|s| s.heading_byte_range.start > start)
+    .map(|next| next.heading_byte_range.start)
+    .unwrap_or(text_len);
+  start..end
 }
 
 impl Render for TodoView {

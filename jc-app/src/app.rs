@@ -153,19 +153,13 @@ fn register_todo_language() {
     eprintln!("todo-markdown: base 'markdown' language not found in registry");
     return;
   };
-  // h2 headings → @type (yellow) — Session headings
-  // h3 headings → @function (blue) — Message and WAIT headings
-  // h1 headings remain @title (red) from the base markdown query.
-  let custom_queries = "\
-(atx_heading (atx_h2_marker) (inline) @type)
-(atx_heading (atx_h3_marker) (inline) @function)
-";
-  let combined_highlights = format!("{}{}", custom_queries, md.highlights);
+  // Use base markdown highlighting only — active session headings are
+  // highlighted dynamically via extra_highlights in TodoView.
   let config = LanguageConfig::new(
     "todo-markdown",
     md.language.clone(),
     md.injection_languages.clone(),
-    &combined_highlights,
+    &md.highlights,
     &md.injections,
     &md.locals,
   );

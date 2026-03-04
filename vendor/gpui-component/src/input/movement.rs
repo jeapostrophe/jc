@@ -109,6 +109,57 @@ impl InputState {
     cx.notify();
   }
 
+  /// Extend the selection vertically by one line while preserving the column.
+  ///
+  /// Mirrors `move_vertical` but calls `select_to` instead of `move_to`.
+  pub(super) fn select_vertical(
+    &mut self,
+    move_lines: isize,
+    _: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.mode.is_single_line() {
+      return;
+    }
+    let Some(last_layout) = &self.last_layout else {
+      return;
+    };
+
+    let offset = self.cursor();
+    let was_preferred_column = self.preferred_column;
+
+    let mut display_point = self.text_wrapper.offset_to_display_point(offset);
+    display_point.row = display_point.row.saturating_add_signed(move_lines);
+    display_point.column = 0;
+    let mut new_offset = self.text_wrapper.display_point_to_offset(display_point);
+
+    if let Some((preferred_x, column)) = was_preferred_column {
+      let mut next_display_point = self.text_wrapper.offset_to_display_point(new_offset);
+      next_display_point.column = 0;
+      let next_point = self.text_wrapper.display_point_to_point(next_display_point);
+      let line_start_offset = self.text.line_start_offset(next_point.row);
+
+      if let Some(line) = last_layout.line(next_point.row) {
+        if let Some(x) = line.closest_index_for_position(
+          Point { x: preferred_x, y: next_display_point.local_row * last_layout.line_height },
+          last_layout.line_height,
+        ) {
+          new_offset = line_start_offset + x;
+        }
+      } else {
+        let max_line_len = self.text.slice_line(next_point.row).len();
+        new_offset = line_start_offset + column.min(max_line_len);
+      }
+    }
+
+    self.pause_blink_cursor(cx);
+    let direction = if move_lines < 0 { MoveDirection::Up } else { MoveDirection::Down };
+    self.select_to(new_offset, cx);
+    self.scroll_to(new_offset, Some(direction), cx);
+    self.preferred_column = was_preferred_column;
+    cx.notify();
+  }
+
   pub(super) fn left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
     self.pause_blink_cursor(cx);
     if self.selected_range.is_empty() {
