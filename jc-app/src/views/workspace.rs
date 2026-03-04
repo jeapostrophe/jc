@@ -4,8 +4,9 @@ use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
   LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
-  ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines, SessionPickerDelegate,
-  ShowSessionPicker, ShowSlugPicker, SlugAction, SlugPickerDelegate, TodoHeaderPickerDelegate,
+  ProblemPickerDelegate, ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines,
+  SessionPickerDelegate, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker, SlugAction,
+  SlugPickerDelegate, TodoHeaderPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
@@ -19,6 +20,7 @@ use gpui_component::theme::Theme;
 use gpui_component::tooltip::Tooltip;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
+use jc_core::problem::ProblemTarget;
 use jc_core::theme::Appearance;
 use jc_core::usage::{FullUsageReport, ParStatus};
 use jc_terminal::{Palette, TerminalView, TerminalViewEvent};
@@ -46,6 +48,7 @@ actions!(
     OpenCommentPanel,
     SaveFile,
     SendToTerminal,
+    NextProblem,
   ]
 );
 
@@ -89,6 +92,7 @@ pub struct Workspace {
   _hook_poll_task: Option<Task<()>>,
   _bell_subscriptions: Vec<Subscription>,
   _problems_poll_task: Option<Task<()>>,
+  last_jumped_target: Option<ProblemTarget>,
 }
 
 impl Workspace {
@@ -290,6 +294,7 @@ impl Workspace {
       _hook_poll_task: hook_poll_task,
       _bell_subscriptions: bell_subscriptions,
       _problems_poll_task: Some(problems_poll_task),
+      last_jumped_target: None,
     };
 
     ws.subscribe_active_project(window, cx);
@@ -574,6 +579,174 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     self.set_active_pane_view(PaneContentKind::ReplyViewer, window, cx);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Problem navigation
+  // ---------------------------------------------------------------------------
+
+  fn next_problem(&mut self, _: &NextProblem, window: &mut Window, cx: &mut Context<Self>) {
+    let project = &self.projects[self.active_project_index];
+
+    // Collect all problem targets sorted by rank.
+    let mut ranked: Vec<(i8, ProblemTarget)> = Vec::new();
+    if let Some(session) = project.active_session() {
+      for p in &session.problems {
+        ranked.push((p.rank(), p.target()));
+      }
+    }
+    for p in &project.problems {
+      ranked.push((p.rank(), p.target()));
+    }
+
+    if ranked.is_empty() {
+      return;
+    }
+
+    ranked.sort_by_key(|(rank, _)| *rank);
+
+    // Find position of last jumped target; advance to next (or start at 0).
+    let next = match &self.last_jumped_target {
+      Some(prev) => {
+        let pos = ranked.iter().position(|(_, t)| t == prev);
+        match pos {
+          Some(i) => (i + 1) % ranked.len(),
+          None => 0,
+        }
+      }
+      None => 0,
+    };
+
+    let target = ranked.into_iter().nth(next).unwrap().1;
+    self.jump_to_problem_target(target, window, cx);
+  }
+
+  fn jump_to_problem_target(
+    &mut self,
+    target: ProblemTarget,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.last_jumped_target = Some(target.clone());
+
+    let kind = match &target {
+      ProblemTarget::ClaudeTerminal => PaneContentKind::ClaudeTerminal,
+      ProblemTarget::GeneralTerminal => PaneContentKind::GeneralTerminal,
+      ProblemTarget::TodoEditor => PaneContentKind::TodoEditor,
+      ProblemTarget::DiffView { .. } => PaneContentKind::GitDiff,
+      ProblemTarget::CodeView { .. } => PaneContentKind::CodeViewer,
+    };
+
+    let project = &self.projects[self.active_project_index];
+    let result: Option<(AnyView, FocusHandle)> = match kind {
+      PaneContentKind::ClaudeTerminal => project.active_session().map(|s| {
+        let focus = s.claude_terminal.read(cx).focus_handle(cx);
+        (s.claude_terminal.clone().into(), focus)
+      }),
+      PaneContentKind::GeneralTerminal => project.active_session().map(|s| {
+        let focus = s.general_terminal.read(cx).focus_handle(cx);
+        (s.general_terminal.clone().into(), focus)
+      }),
+      PaneContentKind::GitDiff => {
+        project.diff_view.update(cx, |v, cx| v.refresh(window, cx));
+        let focus = project.diff_view.read(cx).focus_handle(cx);
+        Some((project.diff_view.clone().into(), focus))
+      }
+      PaneContentKind::CodeViewer => {
+        let focus = project.code_view.read(cx).focus_handle(cx);
+        Some((project.code_view.clone().into(), focus))
+      }
+      PaneContentKind::TodoEditor => {
+        let focus = project.todo_view.read(cx).focus_handle(cx);
+        Some((project.todo_view.clone().into(), focus))
+      }
+      PaneContentKind::ReplyViewer => None,
+    };
+
+    if let Some((view, focus)) = result {
+      let pane = self.active_pane_entity().clone();
+      pane.update(cx, |p, cx| {
+        p.set_content(PaneContent { kind, view, focus: focus.clone() }, cx);
+      });
+      focus.focus(window);
+
+      // Post-navigation: open file in code view, or navigate to diff file.
+      match target {
+        ProblemTarget::CodeView { file, line } => {
+          let project_path = self.projects[self.active_project_index].path.clone();
+          let full_path = project_path.join(&file);
+          let code_view = self.projects[self.active_project_index].code_view.clone();
+          code_view.update(cx, |v, cx| {
+            v.open_file(full_path, window, cx);
+            if let Some(line) = line {
+              v.scroll_to_line(line as u32, window, cx);
+            }
+          });
+        }
+        ProblemTarget::DiffView { file } => {
+          let diff_view = self.projects[self.active_project_index].diff_view.clone();
+          let file_str = file.to_string_lossy();
+          let idx = {
+            let dv = diff_view.read(cx);
+            dv.file_diffs().iter().position(|fd| fd.name == *file_str)
+          };
+          if let Some(idx) = idx {
+            diff_view.update(cx, |v, cx| v.set_file_index(idx, window, cx));
+          }
+        }
+        _ => {}
+      }
+
+      cx.notify();
+    }
+  }
+
+  fn open_problem_picker(
+    &mut self,
+    _: &ShowProblemPicker,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.active_picker.is_some() {
+      return;
+    }
+
+    let project = &self.projects[self.active_project_index];
+    let session_problems: &[_] =
+      project.active_session().map(|s| s.problems.as_slice()).unwrap_or(&[]);
+    let delegate = ProblemPickerDelegate::new(session_problems, &project.problems);
+
+    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
+    self.pre_picker_focus = window.focused(cx);
+
+    let subscription =
+      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
+        match event {
+          PickerEvent::Confirmed => {
+            let target = picker_entity.read(cx).delegate().confirmed_target().cloned();
+            // jump_to_problem_target sets focus itself; drop stale pre_picker_focus.
+            this.pre_picker_focus.take();
+            if let Some(target) = target {
+              this.jump_to_problem_target(target, window, cx);
+            }
+            this.dismiss_picker();
+            cx.notify();
+          }
+          PickerEvent::Dismissed => {
+            if let Some(focus) = this.pre_picker_focus.take() {
+              focus.focus(window);
+            }
+            this.dismiss_picker();
+            cx.notify();
+          }
+        }
+      });
+
+    self.active_picker = Some(picker.clone().into());
+    self._picker_subscription = Some(subscription);
+
+    picker.read(cx).input_focus_handle(cx).focus(window);
+    cx.notify();
   }
 
   fn even_split(&mut self, _: &EvenSplit, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1316,6 +1489,14 @@ impl Workspace {
     let current_total =
       project.active_session().map(|s| s.problems.len()).unwrap_or(0) + project_problem_count;
 
+    // Collect active-session + project problems for the title tooltip.
+    let active_session_problems: Vec<String> = project
+      .active_session()
+      .map(|s| s.problems.iter().map(|p| p.description()).collect())
+      .unwrap_or_default();
+    let active_project_problems: Vec<String> =
+      project.problems.iter().map(|p| p.description()).collect();
+
     // Count OTHER sessions that have problems (session + project combined > 0).
     let other_sessions_with_problems: usize = self
       .projects
@@ -1333,17 +1514,63 @@ impl Workspace {
       })
       .sum();
 
+    // Collect problems for all OTHER sessions, grouped by project > session.
+    let other_problems: Vec<(String, Vec<String>)> = self
+      .projects
+      .iter()
+      .enumerate()
+      .flat_map(|(pi, p)| {
+        let project_descs: Vec<String> = p.problems.iter().map(|pr| pr.description()).collect();
+        p.sessions.iter().enumerate().filter_map(move |(si, s)| {
+          let is_active = pi == self.active_project_index && Some(si) == p.active_session_index;
+          if is_active {
+            return None;
+          }
+          let mut descs: Vec<String> = s.problems.iter().map(|sp| sp.description()).collect();
+          descs.extend(project_descs.clone());
+          if descs.is_empty() {
+            return None;
+          }
+          let header = format!("{} > {}", p.name, s.slug);
+          Some((header, descs))
+        })
+      })
+      .collect();
+
     let title_el = {
-      let el = div().flex().items_center().text_sm().text_color(theme.foreground);
+      let el =
+        div().id("title-problems").flex().items_center().text_sm().text_color(theme.foreground);
       if current_total > 0 {
         el.child(div().mr_1().text_xs().text_color(gpui::hsla(0., 0.8, 0.5, 1.0)).child("!"))
           .child(title)
           .child(
             div()
+              .id("title-problem-count")
               .ml_1()
               .text_xs()
               .text_color(gpui::hsla(0., 0.8, 0.5, 1.0))
-              .child(format!("{current_total}")),
+              .child(format!("{current_total}"))
+              .tooltip(move |window, cx| {
+                let session_problems = active_session_problems.clone();
+                let project_problems = active_project_problems.clone();
+                Tooltip::element(move |_window, cx| {
+                  let theme = cx.theme();
+                  let fg = theme.foreground;
+                  let dim = theme.muted_foreground;
+                  let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
+                  for desc in &session_problems {
+                    col = col.child(div().text_color(fg).child(desc.clone()));
+                  }
+                  if !session_problems.is_empty() && !project_problems.is_empty() {
+                    col = col.child(div().text_color(dim).child("—"));
+                  }
+                  for desc in &project_problems {
+                    col = col.child(div().text_color(fg).child(desc.clone()));
+                  }
+                  col
+                })
+                .build(window, cx)
+              }),
           )
       } else {
         el.child(title)
@@ -1353,11 +1580,33 @@ impl Workspace {
     let right_el = {
       let mut el = div().flex().items_center().ml_auto().gap_2();
       if other_sessions_with_problems > 0 {
+        let other = other_problems.clone();
         el = el.child(
           div()
+            .id("global-problems")
             .text_xs()
             .text_color(gpui::hsla(30. / 360., 0.8, 0.5, 1.0))
-            .child(format!("{other_sessions_with_problems}")),
+            .child(format!("{other_sessions_with_problems}"))
+            .tooltip(move |window, cx| {
+              let other = other.clone();
+              Tooltip::element(move |_window, cx| {
+                let theme = cx.theme();
+                let fg = theme.foreground;
+                let dim = theme.muted_foreground;
+                let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
+                for (i, (header, descs)) in other.iter().enumerate() {
+                  if i > 0 {
+                    col = col.child(div().text_color(dim).child("—"));
+                  }
+                  col = col.child(div().text_color(dim).child(header.clone()));
+                  for desc in descs {
+                    col = col.child(div().text_color(fg).pl_2().child(desc.clone()));
+                  }
+                }
+                col
+              })
+              .build(window, cx)
+            }),
         );
       }
       el.child(self.render_usage_label(theme)).mr_2()
@@ -1481,6 +1730,8 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::open_comment_panel))
       .on_action(cx.listener(Self::save_file))
       .on_action(cx.listener(Self::send_to_terminal))
+      .on_action(cx.listener(Self::next_problem))
+      .on_action(cx.listener(Self::open_problem_picker))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable(("main-split", self.split_generation))
@@ -1530,6 +1781,8 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Workspace")),
     KeyBinding::new("cmd-s", SaveFile, Some("Workspace")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Workspace")),
+    KeyBinding::new("cmd-;", NextProblem, Some("Workspace")),
+    KeyBinding::new("cmd-:", ShowProblemPicker, Some("Workspace")),
   ]);
 
   cx.bind_keys([

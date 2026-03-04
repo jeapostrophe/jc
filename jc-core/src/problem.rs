@@ -1,6 +1,20 @@
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
+// Navigation target
+// ---------------------------------------------------------------------------
+
+/// Where to navigate when the user jumps to a problem.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProblemTarget {
+  ClaudeTerminal,
+  GeneralTerminal,
+  TodoEditor,
+  DiffView { file: PathBuf },
+  CodeView { file: PathBuf, line: Option<usize> },
+}
+
+// ---------------------------------------------------------------------------
 // Per-view leaf enums
 // ---------------------------------------------------------------------------
 
@@ -59,6 +73,14 @@ pub enum ProjectProblem {
 // ---------------------------------------------------------------------------
 
 impl SessionProblem {
+  pub fn target(&self) -> ProblemTarget {
+    match self {
+      Self::Claude(_) => ProblemTarget::ClaudeTerminal,
+      Self::Terminal(TerminalProblem::Bell) => ProblemTarget::GeneralTerminal,
+      Self::Todo(_) => ProblemTarget::TodoEditor,
+    }
+  }
+
   pub fn rank(&self) -> i8 {
     match self {
       Self::Claude(ClaudeProblem::Permission) => 1,
@@ -85,6 +107,13 @@ impl SessionProblem {
 }
 
 impl ProjectProblem {
+  pub fn target(&self) -> ProblemTarget {
+    match self {
+      Self::Diff(DiffProblem::UnreviewedFile(f)) => ProblemTarget::DiffView { file: f.clone() },
+      Self::Script(sp) => ProblemTarget::CodeView { file: sp.file.clone(), line: sp.line },
+    }
+  }
+
   pub fn rank(&self) -> i8 {
     match self {
       Self::Diff(DiffProblem::UnreviewedFile(_)) => 10,

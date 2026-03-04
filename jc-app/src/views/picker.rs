@@ -13,6 +13,7 @@ use crate::views::diff_view::{DiffSource, DiffView, GitLogEntry, git_log};
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::ReplyView;
 use crate::views::todo_view::TodoView;
+use jc_core::problem::{ProblemTarget, ProjectProblem, SessionProblem};
 
 actions!(
   picker,
@@ -28,6 +29,7 @@ actions!(
     ShowSessionPicker,
     SearchLines,
     ShowSlugPicker,
+    ShowProblemPicker,
   ]
 );
 
@@ -1194,5 +1196,70 @@ impl<F: Fn(u32, &mut Window, &mut App) + 'static> PickerDelegate for LineSearchP
     };
 
     row.child(line_num).child(styled)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ProblemPickerDelegate
+// ---------------------------------------------------------------------------
+
+struct ProblemPickerEntry {
+  description: String,
+  target: ProblemTarget,
+}
+
+pub struct ProblemPickerDelegate {
+  labels: Vec<String>,
+  entries: Vec<ProblemPickerEntry>,
+  confirmed_target: Option<ProblemTarget>,
+}
+
+impl ProblemPickerDelegate {
+  pub fn new(session_problems: &[SessionProblem], project_problems: &[ProjectProblem]) -> Self {
+    let mut ranked: Vec<(i8, ProblemPickerEntry)> = Vec::new();
+
+    for p in session_problems {
+      ranked
+        .push((p.rank(), ProblemPickerEntry { description: p.description(), target: p.target() }));
+    }
+    for p in project_problems {
+      ranked
+        .push((p.rank(), ProblemPickerEntry { description: p.description(), target: p.target() }));
+    }
+
+    ranked.sort_by_key(|(rank, _)| *rank);
+    let entries: Vec<ProblemPickerEntry> = ranked.into_iter().map(|(_, e)| e).collect();
+
+    let labels: Vec<String> = entries.iter().map(|e| e.description.clone()).collect();
+
+    Self { labels, entries, confirmed_target: None }
+  }
+
+  pub fn confirmed_target(&self) -> Option<&ProblemTarget> {
+    self.confirmed_target.as_ref()
+  }
+}
+
+impl PickerDelegate for ProblemPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
+    self.confirmed_target = Some(self.entries[index].target.clone());
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let entry = &self.entries[index];
+
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+
+    let marker_color =
+      if selected { theme.accent_foreground } else { gpui::hsla(0., 0.8, 0.5, 1.0) };
+    let marker = picker_marker_base().text_color(marker_color).child("!");
+
+    row.child(marker).child(entry.description.clone())
   }
 }
