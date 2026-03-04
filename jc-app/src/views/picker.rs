@@ -27,6 +27,7 @@ actions!(
     OpenContextPicker,
     ShowSessionPicker,
     SearchLines,
+    ShowSlugPicker,
   ]
 );
 
@@ -860,6 +861,118 @@ impl PickerDelegate for SessionPickerDelegate {
     };
 
     row.child(marker).child(label.clone())
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SlugPickerDelegate
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct SlugEntry {
+  pub slug: String,
+  /// Index in ProjectState.sessions, None if not yet adopted.
+  pub session_index: Option<usize>,
+  /// Label from TODO.md, empty if not adopted.
+  pub label: String,
+  pub relative_time: String,
+}
+
+pub struct SlugPickerDelegate {
+  labels: Vec<String>,
+  entries: Vec<SlugEntry>,
+  confirmed_index: Option<usize>,
+}
+
+impl SlugPickerDelegate {
+  pub fn new(project: &ProjectState) -> Self {
+    use jc_core::session::{discover_session_groups, format_relative_time};
+
+    let groups = discover_session_groups(&project.path);
+    let mut labels = Vec::new();
+    let mut entries = Vec::new();
+
+    for group in &groups {
+      // Check if this slug is already adopted in project.sessions.
+      let session_match = project
+        .sessions
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.slug == group.slug);
+
+      let (session_index, label) = match session_match {
+        Some((idx, s)) => (Some(idx), s.label.clone()),
+        None => (None, String::new()),
+      };
+
+      let relative_time = format_relative_time(group.latest_mtime);
+
+      let display = if label.is_empty() {
+        format!("{} ({})", group.slug, relative_time)
+      } else {
+        format!("{}: {} ({})", group.slug, label, relative_time)
+      };
+
+      labels.push(display);
+      entries.push(SlugEntry {
+        slug: group.slug.clone(),
+        session_index,
+        label,
+        relative_time,
+      });
+    }
+
+    Self { labels, entries, confirmed_index: None }
+  }
+
+  pub fn confirmed_entry(&self) -> Option<&SlugEntry> {
+    self.confirmed_index.and_then(|i| self.entries.get(i))
+  }
+}
+
+impl PickerDelegate for SlugPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
+    self.confirmed_index = Some(index);
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let entry = &self.entries[index];
+    let adopted = entry.session_index.is_some();
+
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+
+    // Left marker: ✓ (green) if adopted, + (blue) if not.
+    let (marker_text, marker_color) = if adopted {
+      let color =
+        if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
+      ("✓", color)
+    } else {
+      let color =
+        if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
+      ("+", color)
+    };
+
+    let marker =
+      div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).w(px(14.0)).child(marker_text);
+
+    // Middle: slug (+ ": label" if adopted).
+    let middle = if !entry.label.is_empty() {
+      format!("{}: {}", entry.slug, entry.label)
+    } else {
+      entry.slug.clone()
+    };
+
+    // Right: relative time, right-aligned.
+    let time_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
+    let time_el = div().ml_auto().text_xs().text_color(time_color).child(entry.relative_time.clone());
+
+    row.child(marker).child(middle).child(time_el)
   }
 }
 

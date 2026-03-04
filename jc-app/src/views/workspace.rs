@@ -5,10 +5,11 @@ use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
   LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
   ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines, SessionPickerDelegate,
-  ShowSessionPicker, TodoHeaderPickerDelegate,
+  ShowSessionPicker, ShowSlugPicker, SlugPickerDelegate, TodoHeaderPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
+use crate::views::session_state::SessionState;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -529,8 +530,61 @@ impl Workspace {
         match event {
           PickerEvent::Confirmed => {
             let (project_idx, session_idx) = picker_entity.read(cx).delegate().confirmed_entry();
+            // switch_to_session sets focus to the left pane; drop stale pre_picker_focus.
+            this.pre_picker_focus.take();
             this.switch_to_session(project_idx, session_idx, window, cx);
+            this.dismiss_picker();
+            cx.notify();
+          }
+          PickerEvent::Dismissed => {
             if let Some(focus) = this.pre_picker_focus.take() {
+              focus.focus(window);
+            }
+            this.dismiss_picker();
+            cx.notify();
+          }
+        }
+      });
+
+    self.active_picker = Some(picker.clone().into());
+    self._picker_subscription = Some(subscription);
+
+    picker.read(cx).input_focus_handle(cx).focus(window);
+    cx.notify();
+  }
+
+  fn open_slug_picker(
+    &mut self,
+    _: &ShowSlugPicker,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.active_picker.is_some() {
+      return;
+    }
+
+    let project = &self.projects[self.active_project_index];
+    let delegate = SlugPickerDelegate::new(project);
+    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
+    self.pre_picker_focus = window.focused(cx);
+
+    let project_idx = self.active_project_index;
+    let subscription =
+      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
+        match event {
+          PickerEvent::Confirmed => {
+            let entry = picker_entity.read(cx).delegate().confirmed_entry().cloned();
+            if let Some(entry) = entry {
+              if let Some(session_idx) = entry.session_index {
+                // switch_to_session sets focus to the left pane; drop stale pre_picker_focus.
+                this.pre_picker_focus.take();
+                this.switch_to_session(project_idx, session_idx, window, cx);
+              } else {
+                // adopt_slug calls switch_to_session internally; same reasoning.
+                this.pre_picker_focus.take();
+                this.adopt_slug(project_idx, &entry.slug, window, cx);
+              }
+            } else if let Some(focus) = this.pre_picker_focus.take() {
               focus.focus(window);
             }
             this.dismiss_picker();
@@ -551,6 +605,40 @@ impl Workspace {
 
     picker.read(cx).input_focus_handle(cx).focus(window);
     cx.notify();
+  }
+
+  fn adopt_slug(
+    &mut self,
+    project_idx: usize,
+    slug: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let todo_view = self.projects[project_idx].todo_view.clone();
+    let project_path = self.projects[project_idx].path.clone();
+
+    // Insert heading in TODO.md.
+    todo_view.update(cx, |tv, cx| {
+      tv.insert_session_heading(slug, window, cx);
+      tv.save(cx);
+    });
+
+    // Build palette and create session state.
+    let appearance = appearance_from_window(window.appearance());
+    let palette = Palette::for_appearance(appearance);
+    let session = SessionState::create(
+      slug.to_string(),
+      "New session".to_string(),
+      &project_path,
+      &palette,
+      window,
+      cx,
+    );
+
+    let project = &mut self.projects[project_idx];
+    project.sessions.push(session);
+    let new_idx = project.sessions.len() - 1;
+    self.switch_to_session(project_idx, new_idx, window, cx);
   }
 
   // ---------------------------------------------------------------------------
@@ -1044,6 +1132,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::even_split))
       .on_action(cx.listener(Self::open_git_log_picker))
       .on_action(cx.listener(Self::open_session_picker))
+      .on_action(cx.listener(Self::open_slug_picker))
       .on_action(cx.listener(Self::search_lines))
       .on_action(cx.listener(Self::open_comment_panel))
       .on_action(cx.listener(Self::save_file))
@@ -1092,6 +1181,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-|", EvenSplit, Some("Workspace")),
     KeyBinding::new("cmd-shift-o", OpenGitLogPicker, Some("Workspace")),
     KeyBinding::new("cmd-p", ShowSessionPicker, Some("Workspace")),
+    KeyBinding::new("cmd-shift-p", ShowSlugPicker, Some("Workspace")),
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Workspace")),
     KeyBinding::new("cmd-s", SaveFile, Some("Workspace")),
   ]);

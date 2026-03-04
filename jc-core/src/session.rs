@@ -230,6 +230,16 @@ pub fn discover_latest_session_group(project_path: &Path) -> Option<SessionGroup
   })
 }
 
+pub fn format_relative_time(time: SystemTime) -> String {
+  let secs = time.elapsed().unwrap_or_default().as_secs();
+  match secs {
+    0..60 => "just now".to_string(),
+    60..3600 => format!("{}m ago", secs / 60),
+    3600..86400 => format!("{}h ago", secs / 3600),
+    _ => format!("{}d ago", secs / 86400),
+  }
+}
+
 /// Parse all JSONL files in a slug group into a unified list of turns.
 pub fn parse_session_group(group: &SessionGroup) -> Vec<Turn> {
   let mut acc = SessionAccumulator::default();
