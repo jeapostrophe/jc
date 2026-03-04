@@ -82,6 +82,8 @@ pub struct Workspace {
   _usage_poll_task: Option<Task<()>>,
   _appearance_subscription: Subscription,
   _diff_view_subscription: Option<Subscription>,
+  _left_focus_in: Subscription,
+  _right_focus_in: Subscription,
 }
 
 impl Workspace {
@@ -169,6 +171,22 @@ impl Workspace {
       }
     });
 
+    let left_focus = left_pane.read(cx).focus_handle(cx);
+    let right_focus = right_pane.read(cx).focus_handle(cx);
+
+    let left_focus_in = cx.on_focus_in(&left_focus, window, |this, _window, cx| {
+      if this.active_pane != ActivePane::Left {
+        this.active_pane = ActivePane::Left;
+        cx.notify();
+      }
+    });
+    let right_focus_in = cx.on_focus_in(&right_focus, window, |this, _window, cx| {
+      if this.active_pane != ActivePane::Right {
+        this.active_pane = ActivePane::Right;
+        cx.notify();
+      }
+    });
+
     let mut ws = Self {
       left_pane,
       right_pane,
@@ -189,6 +207,8 @@ impl Workspace {
       _usage_poll_task: Some(usage_poll_task),
       _appearance_subscription: appearance_subscription,
       _diff_view_subscription: None,
+      _left_focus_in: left_focus_in,
+      _right_focus_in: right_focus_in,
     };
 
     ws.subscribe_active_project(window, cx);
