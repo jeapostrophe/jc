@@ -46,7 +46,7 @@ impl TodoView {
     // Initial parse and validate.
     let text = code_view.read(cx).editor_text(cx);
     let document = todo::parse(&text);
-    let problems = todo::validate(&document, &project_path);
+    let problems = todo::validate(&document, &project_path, &text);
 
     let mut view = Self {
       code_view,
@@ -178,7 +178,7 @@ impl TodoView {
   pub fn revalidate(&mut self, cx: &mut Context<Self>) {
     let text = self.code_view.read(cx).editor_text(cx);
     self.document = todo::parse(&text);
-    self.problems = todo::validate(&self.document, &self.project_path);
+    self.problems = todo::validate(&self.document, &self.project_path, &text);
     self.apply_diagnostics(cx);
     self.apply_session_highlights(cx);
   }
@@ -192,6 +192,7 @@ impl TodoView {
           diag_set.reset(&rope);
           for problem in &self.problems {
             match problem {
+              TodoProblem::UnsentWait { .. } => {}
               TodoProblem::InvalidSessionSlug { slug, line, .. } => {
                 // Position is 0-based; our line numbers are 1-based.
                 // Slug starts at column 11 ("## Session ".len()).

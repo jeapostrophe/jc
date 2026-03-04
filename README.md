@@ -83,10 +83,10 @@ The app uses an `App -> Projects -> Sessions` hierarchy. Each `ProjectState` own
 Key design points:
 - Separate terminal instances per session (switching sessions does not disconnect terminals)
 - Session state derived from TODO.md `## Session` headings, not persisted separately
-- `Problem { rank, description }` tracks validation issues (invalid slugs, dirty working directory) — extensible for future checks
-- **Session picker (Cmd-P):** Shows all adopted sessions across all projects. Format: `project / label    (slug) recency`. The `(slug)` is only shown when the label is ambiguous (appears on more than one session). Markers: `>` for active, `!` for problems.
-- **Slug picker (Cmd-Shift-P):** Shows all discovered sessions for the current project plus a "NEW" entry. Format: `project / label    (slug) recency`. Adopted sessions show their TODO label; orphaned sessions show "Attach". Selecting "NEW" launches a fresh Claude instance and auto-detects the slug.
-- Title bar shows `project > session` with problem indicators
+- Per-view typed problem enums (`SessionProblem`, `ProjectProblem`) track actionable conditions; see [Problems & Status](#problems--status)
+- **Session picker (Cmd-P):** Shows all adopted sessions across all projects. Format: `project / label    (slug) recency`. The `(slug)` is only shown when the label is ambiguous (appears on more than one session). Markers: red problem count for sessions with problems, green `>` for active session, blank otherwise. Problem counts include both session-level and project-level problems.
+- **Slug picker (Cmd-Shift-P):** Shows all discovered sessions for the current project plus a "NEW" entry. Format: `project / label    (slug) recency`. Adopted sessions show their TODO label; orphaned sessions show "Attach". Markers: red problem count or green `✓` for adopted sessions, blue `+` for attach, yellow `*` for new. Selecting "NEW" launches a fresh Claude instance and auto-detects the slug.
+- Title bar shows `project > session` with `!` dirty marker and problem count when the active session has problems
 
 ### TODO.md
 
@@ -219,23 +219,25 @@ Each view defines its own problem types. Problems are scoped to the level that o
 Each view defines its own enum. Aggregation uses wrapper enums at the session and project level:
 
 ```rust
-// Per-view enums
+// Per-view leaf enums (jc-core/src/problem.rs)
 enum ClaudeProblem { Stop, Permission, Idle, ApiError }
 enum TerminalProblem { Bell }
 enum DiffProblem { UnreviewedFile(PathBuf) }
-enum TodoProblem { UnsentWait, InvalidSlug { slug: String, line: usize } }
+enum AppTodoProblem { UnsentWait { slug }, InvalidSlug { slug, line } }
 
-// Script problems use the format: {rank:}?file{:line}? - message
+// Script problems (scaffolded, not yet wired) use the format: {rank:}?file{:line}? - message
 struct ScriptProblem { rank: Option<i8>, file: PathBuf, line: Option<usize>, message: String }
 
 // Session-level wrapper
-enum SessionProblem { Claude(ClaudeProblem), Terminal(TerminalProblem), Todo(TodoProblem) }
+enum SessionProblem { Claude(ClaudeProblem), Terminal(TerminalProblem), Todo(AppTodoProblem) }
 
 // Project-level wrapper
 enum ProjectProblem { Diff(DiffProblem), Script(ScriptProblem) }
 ```
 
-Each inner type derives its own rank and description. Built-in problems have implicit ranks (permission > API error > stop > idle > BEL > unreviewed diff > unsent wait > invalid slug). Script problems use an explicit optional rank from the script output; unranked script problems sort below built-in ones.
+Note: `AppTodoProblem` is distinct from the parser-level `TodoProblem` in `jc-core/src/todo.rs`. The parser detects raw conditions (invalid slug, unsent wait); `SessionState::refresh_problems()` converts them into `AppTodoProblem` variants filtered to the session's slug.
+
+Each problem type has a `rank()` and `description()` method. Built-in ranks: permission (1) > API error (2) > stop (3) > idle (4) > BEL (5) > unsent wait (6) > invalid slug (7) > unreviewed file (10). Script problems use an explicit optional rank; unranked ones default to 20.
 
 ### Refresh Model
 
@@ -243,24 +245,28 @@ Problems are recomputed on a unified refresh cycle rather than managed individua
 
 - **Push sources** (hooks, BEL): Write into a `pending_events` set on the session. Events persist in this set until their resolution condition is met.
 - **Poll sources** (diff, TODO, status.sh): Computed fresh each cycle by querying the relevant view.
-- A single `refresh_problems()` method on session/project merges both: it converts pending events into problems, queries poll sources, and replaces the full problem list.
-- Refresh runs on a timer (2–3 seconds) and on demand when the user switches views or interacts.
+- A single `refresh_problems()` method on session/project merges both: it converts pending events into problems, queries poll sources, and replaces the full problem list. It returns whether the problem count changed.
+- Refresh runs on a 2-second timer and on demand when the user switches sessions, reviews a diff file, or interacts. The timer only triggers a re-render (`cx.notify()`) when problems actually change.
 
 **Resolution** has two flavors:
 - **Implicit**: The condition no longer holds on next poll (diff is clean, WAIT is empty, script stops reporting). These resolve automatically via the refresh-replaces-all model.
-- **Acknowledgment**: The user does something that clears a pending event flag (focuses terminal after BEL, interacts with session after Claude stop). The session tracks unacknowledged events; user actions drain them.
+- **Acknowledgment**: The user does something that clears pending event flags. `SessionState` stores a `pending_events: HashSet<PendingEvent>` set. Push sources (hooks, BEL) insert events; `session.acknowledge()` clears all events when the user switches to a session. Additionally, switching to the Claude terminal clears the `TerminalBell` event specifically.
 
 ### Display
 
 Problems surface in multiple locations:
 
-- **Title bar** (left of session label): A dirty marker on the session label (`"! Project > Session"`) if the active session has any problems.
-- **Title bar** (right of session label): A count on the session label (`"! Project > Session: 5"`) with hover tooltip listing all problems.
-- **Session picker** (Cmd-P): Dirty marker and count on sessions that have problems.
-- **Project picker**: Dirty marker and count on projects that have problems.
-- **Global indicator** (upper right, left of usage): Count of projects with problems, with hover listing project/session pairs and their counts: (`"3 | Par +5"`)
+- **Title bar**: `"! Project > Session N"` — a `!` dirty marker on the left and a problem count on the right when the active session + project has problems. The count is session problems + project problems.
+- **Session picker** (Cmd-P): Red problem count replaces the green `>` marker for sessions with problems. Count is session + project combined.
+- **Slug picker** (Cmd-Shift-P): Red problem count replaces the green `✓` for adopted sessions with problems.
+- **Global indicator** (upper right, left of usage): Count of *other* sessions (not the active one) that have problems.
 
-**Navigation**: In the first version, problems are display-only. In a future version, each problem kind maps to a navigation target: Claude problems jump to the Claude terminal, TODO problems jump to the TODO view, diff problems jump to the diff view at the file, script problems jump to the code view at `file:line`.
+All marker columns use a fixed-width right-aligned layout (`picker_marker_base()`) so single-character markers and multi-digit counts align cleanly.
+
+**Not yet implemented:**
+- Hover tooltips listing individual problems on title bar and global indicator
+- Problem navigation (jump to the view/file that can address each problem kind)
+- Jump to next problem keybinding (Cmd-;)
 
 ### Script Problems (`status.sh`)
 
@@ -318,7 +324,7 @@ It is deliberately *not* a full code editor on mobile.
 | Symbol navigation | tree-sitter custom `outline.scm` queries (sourced from Zed, updated via `scripts/update-outline-queries.sh`) |
 | Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff` for word-level highlighting |
 | Git worktrees | `git2` worktree API (create/list/prune) |
-| Problem tracking | Per-view problem enums + unified refresh cycle; push via Claude Code hooks (HTTP) + BEL; poll via diff/TODO/status.sh |
+| Problem tracking | Per-view typed enums (`ClaudeProblem`, `TerminalProblem`, `DiffProblem`, `AppTodoProblem`) + wrapper enums (`SessionProblem`, `ProjectProblem`); push via hooks + BEL into `pending_events`; poll via diff/TODO every 2s; `refresh_problems()` merges both and skips re-render when unchanged |
 | Claude reply viewer | Parse session JSONL from `~/.claude/projects/`, group into turns, render as Markdown in read-only editor |
 | Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
 | Persistent state | `~/.config/jc/` --- project registry, window layout; session state in TODO.md |
@@ -391,16 +397,16 @@ It is deliberately *not* a full code editor on mobile.
 
 ### Problems & Status
 - [x] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
-- [ ] [H] Define per-view problem enums (`ClaudeProblem`, `TerminalProblem`, `DiffProblem`, `TodoProblem`) and wrapper enums (`SessionProblem`, `ProjectProblem`) in `jc-core`
-- [ ] [H] Wire hook events into `SessionState.pending_events` (set flags on Stop/Permission/Idle/ApiError, clear on user interaction)
-- [ ] [E] Surface `TerminalEvent::Bell` from `TerminalView` to workspace (currently silently discarded)
-- [ ] [E] Implement `TodoProblem::UnsentWait` detection (check for content below `### WAIT`)
-- [ ] [E] Implement `DiffProblem::UnreviewedFile` detection (dirty files not marked reviewed)
-- [ ] [H] Implement `refresh_problems()` on `SessionState` and `ProjectState` (merge push events + poll sources, replace problem list)
-- [ ] [E] Wire refresh timer (2–3 seconds) and on-demand refresh on view switch
-- [ ] [E] Populate title bar problem indicators (dirty marker + count) from refreshed problem lists
-- [ ] [E] Show problem markers in session picker and project picker
-- [ ] [E] Add global problem count indicator in upper right (left of usage dashboard)
+- [x] [H] Define per-view problem enums (`ClaudeProblem`, `TerminalProblem`, `DiffProblem`, `TodoProblem`) and wrapper enums (`SessionProblem`, `ProjectProblem`) in `jc-core`
+- [x] [H] Wire hook events into `SessionState.pending_events` (set flags on Stop/Permission/Idle/ApiError, clear on user interaction)
+- [x] [E] Surface `TerminalEvent::Bell` from `TerminalView` to workspace via `TerminalViewEvent::Bell` event emitter
+- [x] [E] Implement `TodoProblem::UnsentWait` detection (check for content below `### WAIT`)
+- [x] [E] Implement `DiffProblem::UnreviewedFile` detection (dirty files not marked reviewed)
+- [x] [H] Implement `refresh_problems()` on `SessionState` and `ProjectState` (merge push events + poll sources, replace problem list, return change flag)
+- [x] [E] Wire refresh timer (2 seconds) and on-demand refresh on session switch, diff review, and user interaction
+- [x] [E] Populate title bar problem indicators (`!` dirty marker + count) from refreshed problem lists
+- [x] [E] Show problem markers in session picker (red count) and slug picker (red count / green check)
+- [x] [E] Add global problem count indicator in upper right (count of other sessions with problems)
 - [ ] [H] Implement hover tooltips listing problems on title bar and global indicator
 - [ ] [H] Implement `status.sh` runner: periodic execution, parse `{rank:}?file{:line}? - message` format, produce `ScriptProblem`s
 - [ ] [H] Problem navigation: jump to the view/file that can address each problem kind

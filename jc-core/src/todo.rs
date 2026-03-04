@@ -39,6 +39,7 @@ pub struct TodoWait {
 #[derive(Debug, Clone)]
 pub enum TodoProblem {
   InvalidSessionSlug { slug: String, line: u32, slug_byte_range: Range<usize> },
+  UnsentWait { slug: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +331,7 @@ pub fn send_from_wait(
 // Validation
 // ---------------------------------------------------------------------------
 
-pub fn validate(doc: &TodoDocument, project_path: &Path) -> Vec<TodoProblem> {
+pub fn validate(doc: &TodoDocument, project_path: &Path, text: &str) -> Vec<TodoProblem> {
   let mut problems = Vec::default();
 
   for session in &doc.sessions {
@@ -340,6 +341,15 @@ pub fn validate(doc: &TodoDocument, project_path: &Path) -> Vec<TodoProblem> {
         line: session.line,
         slug_byte_range: session.slug_byte_range.clone(),
       });
+    }
+  }
+
+  for session in &doc.sessions {
+    if let Some(wait) = &session.wait {
+      let body = &text[wait.body_byte_range.clone()];
+      if !body.trim().is_empty() {
+        problems.push(TodoProblem::UnsentWait { slug: session.slug.clone() });
+      }
     }
   }
 

@@ -7,10 +7,10 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::TermMode;
 use gpui::{
-  App, AsyncApp, Bounds, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
-  IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-  ParentElement, Pixels, Render, SharedString, Styled, Subscription, Timer, WeakEntity, Window,
-  actions, canvas, div, px,
+  App, AsyncApp, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
+  InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+  MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
+  Timer, WeakEntity, Window, actions, canvas, div, px,
 };
 use parking_lot::Mutex;
 use std::io::Read;
@@ -84,6 +84,14 @@ fn pixel_to_grid(
 
   (Point::new(Line(row as i32), Column(col)), side)
 }
+
+/// Events emitted by [`TerminalView`] for the host application.
+#[derive(Debug, Clone)]
+pub enum TerminalViewEvent {
+  Bell,
+}
+
+impl EventEmitter<TerminalViewEvent> for TerminalView {}
 
 /// GPUI view that embeds a terminal emulator.
 pub struct TerminalView {
@@ -167,6 +175,13 @@ impl TerminalView {
           match event {
             TerminalEvent::PtyWrite(s) => {
               let _ = pty_for_write.write_all(s.as_bytes());
+            }
+            TerminalEvent::Bell => {
+              let _ = cx.update(|cx: &mut App| {
+                if let Some(entity) = this.upgrade() {
+                  entity.update(cx, |_view, cx| cx.emit(TerminalViewEvent::Bell));
+                }
+              });
             }
             TerminalEvent::CursorBlinkingChange => {}
             _ => {}

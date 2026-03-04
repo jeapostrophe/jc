@@ -9,7 +9,7 @@ use crate::views::picker::{
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
-use crate::views::session_state::SessionState;
+use crate::views::session_state::{PendingEvent, SessionState};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -18,10 +18,10 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::theme::Theme;
 use gpui_component::tooltip::Tooltip;
 use jc_core::config::{AppConfig, AppState};
-use jc_core::hooks::{HookEvent, HookServer};
+use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
 use jc_core::theme::Appearance;
 use jc_core::usage::{FullUsageReport, ParStatus};
-use jc_terminal::Palette;
+use jc_terminal::{Palette, TerminalView, TerminalViewEvent};
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
@@ -87,6 +87,8 @@ pub struct Workspace {
   _right_focus_in: Subscription,
   _hook_server: Option<HookServer>,
   _hook_poll_task: Option<Task<()>>,
+  _bell_subscriptions: Vec<Subscription>,
+  _problems_poll_task: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -231,6 +233,37 @@ impl Workspace {
       }
     };
 
+    // Subscribe to bell events from all sessions' claude terminals.
+    let bell_subscriptions = Self::subscribe_bells(&projects, cx);
+
+    // Problem refresh poll task — runs immediately, then every 2 seconds.
+    let problems_poll_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+      loop {
+        let Ok(should_continue) = cx.update(|cx: &mut App| {
+          if let Some(entity) = this.upgrade() {
+            entity.update(cx, |view, cx| {
+              let mut changed = false;
+              for project in &mut view.projects {
+                changed |= project.refresh_problems(cx);
+              }
+              if changed {
+                cx.notify();
+              }
+            });
+            true
+          } else {
+            false
+          }
+        }) else {
+          break;
+        };
+        if !should_continue {
+          break;
+        }
+        Timer::after(StdDuration::from_secs(2)).await;
+      }
+    });
+
     let mut ws = Self {
       left_pane,
       right_pane,
@@ -255,6 +288,8 @@ impl Workspace {
       _right_focus_in: right_focus_in,
       _hook_server: hook_server,
       _hook_poll_task: hook_poll_task,
+      _bell_subscriptions: bell_subscriptions,
+      _problems_poll_task: Some(problems_poll_task),
     };
 
     ws.subscribe_active_project(window, cx);
@@ -294,16 +329,55 @@ impl Workspace {
     (left, right)
   }
 
+  /// Subscribe to bell events from all sessions' claude terminals.
+  fn subscribe_bells(projects: &[ProjectState], cx: &mut Context<Self>) -> Vec<Subscription> {
+    let mut subs = Vec::new();
+    for (pi, project) in projects.iter().enumerate() {
+      for (si, session) in project.sessions.iter().enumerate() {
+        subs.push(Self::make_bell_subscription(&session.claude_terminal, pi, si, cx));
+      }
+    }
+    subs
+  }
+
+  /// Subscribe to bell events for a single newly-created session.
+  fn subscribe_session_bell(&mut self, pi: usize, si: usize, cx: &mut Context<Self>) {
+    let terminal = &self.projects[pi].sessions[si].claude_terminal;
+    let sub = Self::make_bell_subscription(terminal, pi, si, cx);
+    self._bell_subscriptions.push(sub);
+  }
+
+  fn make_bell_subscription(
+    terminal: &Entity<TerminalView>,
+    pi: usize,
+    si: usize,
+    cx: &mut Context<Self>,
+  ) -> Subscription {
+    cx.subscribe(
+      terminal,
+      move |this: &mut Self, _, event: &TerminalViewEvent, cx: &mut Context<Self>| match event {
+        TerminalViewEvent::Bell => {
+          if let Some(session) = this.projects.get_mut(pi).and_then(|p| p.sessions.get_mut(si)) {
+            session.pending_events.insert(PendingEvent::TerminalBell);
+          }
+          cx.notify();
+        }
+      },
+    )
+  }
+
   /// Subscribe to the active project's diff_view and todo_view events.
   fn subscribe_active_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let project = &self.projects[self.active_project_index];
 
+    let active_pi = self.active_project_index;
     let diff_view = project.diff_view.clone();
     self._diff_view_subscription = Some(cx.subscribe_in(
       &diff_view,
       window,
-      |this: &mut Self, _, event: &DiffViewEvent, window, cx| match event {
+      move |this: &mut Self, _, event: &DiffViewEvent, window, cx| match event {
         DiffViewEvent::Reviewed => {
+          this.projects[active_pi].refresh_problems(cx);
           this.open_diff_picker(window, cx);
         }
       },
@@ -400,8 +474,17 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let project = &self.projects[self.active_project_index];
+    // Clear bell when user switches to the claude terminal.
+    if kind == PaneContentKind::ClaudeTerminal {
+      let si = self.projects[self.active_project_index].active_session_index;
+      if let Some(si) = si
+        && let Some(session) = self.projects[self.active_project_index].sessions.get_mut(si)
+      {
+        session.pending_events.remove(&PendingEvent::TerminalBell);
+      }
+    }
 
+    let project = &self.projects[self.active_project_index];
     let result: Option<(AnyView, FocusHandle)> = match kind {
       PaneContentKind::ClaudeTerminal => project.active_session().map(|s| {
         let focus = s.claude_terminal.read(cx).focus_handle(cx);
@@ -538,6 +621,11 @@ impl Workspace {
     self.active_project_index = project_idx;
     self.projects[project_idx].active_session_index = Some(session_idx);
 
+    // Acknowledge pending events for this session (user is switching to it).
+    if let Some(session) = self.projects[project_idx].sessions.get_mut(session_idx) {
+      session.acknowledge();
+    }
+
     // Update the TODO view's active session highlight.
     {
       let slug = self.projects[project_idx].sessions.get(session_idx).map(|s| s.slug.clone());
@@ -548,6 +636,9 @@ impl Workspace {
     if project_changed {
       self.subscribe_active_project(window, cx);
     }
+
+    // Refresh problems after acknowledge.
+    self.projects[project_idx].refresh_problems(cx);
 
     // Rebind panes to the new session's views.
     let project = &self.projects[self.active_project_index];
@@ -715,6 +806,7 @@ impl Workspace {
     let project = &mut self.projects[project_idx];
     project.sessions.push(session);
     let new_idx = project.sessions.len() - 1;
+    self.subscribe_session_bell(project_idx, new_idx, cx);
     self.switch_to_session(project_idx, new_idx, window, cx);
   }
 
@@ -750,6 +842,7 @@ impl Workspace {
     let project = &mut self.projects[project_idx];
     project.sessions.push(session);
     let new_idx = project.sessions.len() - 1;
+    self.subscribe_session_bell(project_idx, new_idx, cx);
     self.switch_to_session(project_idx, new_idx, window, cx);
 
     // Poll for the new JSONL file in the background. Once a new slug appears,
@@ -1219,38 +1312,52 @@ impl Workspace {
       title = format!("{} > {}", title, session.slug);
     }
 
-    // Count problems across other sessions (not the active one).
-    let other_problems: usize = self
+    let project_problem_count = project.problems.len();
+    let current_total =
+      project.active_session().map(|s| s.problems.len()).unwrap_or(0) + project_problem_count;
+
+    // Count OTHER sessions that have problems (session + project combined > 0).
+    let other_sessions_with_problems: usize = self
       .projects
       .iter()
       .enumerate()
       .flat_map(|(pi, p)| {
         p.sessions.iter().enumerate().filter_map(move |(si, s)| {
           let is_active = pi == self.active_project_index && Some(si) == p.active_session_index;
-          if is_active || s.problems.is_empty() { None } else { Some(s.problems.len()) }
+          if is_active {
+            return None;
+          }
+          let total = s.problems.len() + p.problems.len();
+          if total > 0 { Some(1usize) } else { None }
         })
       })
       .sum();
 
-    let current_has_problems = project.active_session().is_some_and(|s| !s.problems.is_empty());
-
     let title_el = {
-      let el = div().text_sm().text_color(theme.foreground).child(title);
-      if current_has_problems {
-        el.child(div().ml_1().text_xs().text_color(gpui::hsla(0., 0.8, 0.5, 1.0)).child("!"))
+      let el = div().flex().items_center().text_sm().text_color(theme.foreground);
+      if current_total > 0 {
+        el.child(div().mr_1().text_xs().text_color(gpui::hsla(0., 0.8, 0.5, 1.0)).child("!"))
+          .child(title)
+          .child(
+            div()
+              .ml_1()
+              .text_xs()
+              .text_color(gpui::hsla(0., 0.8, 0.5, 1.0))
+              .child(format!("{current_total}")),
+          )
       } else {
-        el
+        el.child(title)
       }
     };
 
     let right_el = {
       let mut el = div().flex().items_center().ml_auto().gap_2();
-      if other_problems > 0 {
+      if other_sessions_with_problems > 0 {
         el = el.child(
           div()
             .text_xs()
             .text_color(gpui::hsla(30. / 360., 0.8, 0.5, 1.0))
-            .child(format!("{other_problems} problems")),
+            .child(format!("{other_sessions_with_problems}")),
         );
       }
       el.child(self.render_usage_label(theme)).mr_2()
@@ -1264,6 +1371,25 @@ impl Workspace {
 
   fn handle_hook_event(&mut self, event: HookEvent, cx: &mut Context<Self>) {
     eprintln!("hook: {:?} session={} slug={:?}", event.kind, event.session_id, event.slug);
+
+    let pending = match event.kind {
+      HookEventKind::Stop => PendingEvent::ClaudeStop,
+      HookEventKind::PermissionPrompt => PendingEvent::ClaudePermission,
+      HookEventKind::IdlePrompt => PendingEvent::ClaudeIdle,
+    };
+
+    // Match the slug to a session across all projects.
+    if let Some(slug) = &event.slug {
+      for project in &mut self.projects {
+        for session in &mut project.sessions {
+          if &session.slug == slug {
+            session.pending_events.insert(pending.clone());
+            break;
+          }
+        }
+      }
+    }
+
     cx.notify();
   }
 }

@@ -3,12 +3,12 @@ use crate::views::diff_view::DiffView;
 use crate::views::session_state::SessionState;
 use crate::views::todo_view::TodoView;
 use gpui::*;
-use jc_core::problem::Problem;
+use jc_core::problem::{DiffProblem, ProjectProblem};
 use jc_core::session::discover_latest_session_group;
 use jc_core::todo;
 use jc_terminal::Palette;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct ProjectState {
   pub path: PathBuf,
@@ -18,6 +18,7 @@ pub struct ProjectState {
   pub todo_view: Entity<TodoView>,
   pub diff_view: Entity<DiffView>,
   pub code_view: Entity<CodeView>,
+  pub problems: Vec<ProjectProblem>,
 }
 
 impl ProjectState {
@@ -49,8 +50,9 @@ impl ProjectState {
       .read(cx)
       .problems()
       .iter()
-      .map(|p| match p {
-        todo::TodoProblem::InvalidSessionSlug { slug, .. } => slug.clone(),
+      .filter_map(|p| match p {
+        todo::TodoProblem::InvalidSessionSlug { slug, .. } => Some(slug.clone()),
+        todo::TodoProblem::UnsentWait { .. } => None,
       })
       .collect();
 
@@ -76,7 +78,16 @@ impl ProjectState {
       todo_view.update(cx, |tv, cx| tv.set_active_slug(Some(&slug), cx));
     }
 
-    Self { path, name, sessions, active_session_index, todo_view, diff_view, code_view }
+    Self {
+      path,
+      name,
+      sessions,
+      active_session_index,
+      todo_view,
+      diff_view,
+      code_view,
+      problems: Vec::new(),
+    }
   }
 
   pub fn active_session(&self) -> Option<&SessionState> {
@@ -87,40 +98,33 @@ impl ProjectState {
     self.active_session().map(|s| s.slug.as_str())
   }
 
-  pub fn collect_problems(&self, cx: &App) -> Vec<Problem> {
-    let mut problems = Vec::new();
+  /// Refresh problems for all sessions and the project itself.
+  /// Returns `true` if any problem list changed.
+  pub fn refresh_problems(&mut self, cx: &App) -> bool {
+    let todo_view = self.todo_view.read(cx);
+    let todo_problems = todo_view.problems();
 
-    // TodoProblems -> Problems (invalid slugs)
-    for tp in self.todo_view.read(cx).problems() {
-      match tp {
-        todo::TodoProblem::InvalidSessionSlug { slug, .. } => {
-          problems.push(Problem { rank: 5, description: format!("Invalid slug: {slug}") });
-        }
-      }
+    let mut changed = false;
+    for session in &mut self.sessions {
+      changed |= session.refresh_problems(todo_problems);
     }
 
-    // Per-session problems
-    for session in &self.sessions {
-      problems.extend(session.problems.iter().cloned());
+    // Project-level problems: unreviewed diff files.
+    let mut problems = Vec::<ProjectProblem>::new();
+    for path in self.diff_view.read(cx).unreviewed_files() {
+      problems.push(ProjectProblem::Diff(DiffProblem::UnreviewedFile(path)));
     }
-
-    // Git dirty working directory
-    if is_git_dirty(&self.path) {
-      problems.push(Problem { rank: 1, description: "Dirty working directory".into() });
+    problems.sort_by_key(|p| p.rank());
+    if self.problems.len() != problems.len() {
+      changed = true;
     }
-
-    problems
+    self.problems = problems;
+    changed
   }
-}
 
-fn is_git_dirty(path: &Path) -> bool {
-  let Ok(repo) = git2::Repository::open(path) else {
-    return false;
-  };
-  let mut opts = git2::StatusOptions::default();
-  opts.include_untracked(true);
-  repo
-    .statuses(Some(&mut opts))
-    .ok()
-    .is_some_and(|statuses| statuses.iter().any(|e| !e.status().is_empty()))
+  /// Total problem count across all sessions and the project.
+  pub fn total_problem_count(&self) -> usize {
+    let session_count: usize = self.sessions.iter().map(|s| s.problems.len()).sum();
+    session_count + self.problems.len()
+  }
 }

@@ -154,6 +154,15 @@ impl DiffView {
     self.file_diffs.get(self.current_file_index).map(|fd| fd.name.as_str())
   }
 
+  pub fn unreviewed_files(&self) -> Vec<PathBuf> {
+    self
+      .file_diffs
+      .iter()
+      .filter(|fd| !self.is_reviewed(&fd.name))
+      .map(|fd| PathBuf::from(&fd.name))
+      .collect()
+  }
+
   pub fn reviewed_count(&self) -> usize {
     self.file_diffs.iter().filter(|fd| self.is_reviewed(&fd.name)).count()
   }

@@ -55,6 +55,11 @@ pub fn init(cx: &mut App) {
 
 const MAX_VISIBLE_RESULTS: usize = 200;
 
+/// Fixed-width, right-aligned marker column used in session/slug picker rows.
+fn picker_marker_base() -> Div {
+  div().text_xs().font_weight(FontWeight::BOLD).w(px(22.0)).flex_shrink_0().flex().justify_end()
+}
+
 pub fn fuzzy_match(query_lower: &[char], candidate: &str) -> Option<i64> {
   if query_lower.is_empty() {
     return Some(0);
@@ -802,6 +807,7 @@ struct SessionPickerEntry {
   relative_time: String,
   /// Whether this label appears on more than one session (needing slug disambiguation).
   ambiguous_label: bool,
+  /// Total problem count (session + project).
   problems: usize,
 }
 
@@ -844,7 +850,7 @@ impl SessionPickerDelegate {
           slug: session.slug.clone(),
           relative_time,
           ambiguous_label: false, // computed below
-          problems: session.problems.len(),
+          problems: session.problems.len() + project.problems.len(),
         });
       }
     }
@@ -889,16 +895,15 @@ impl PickerDelegate for SessionPickerDelegate {
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    // Active session marker.
-    let marker = if is_active {
+    let marker = if has_problems {
+      let color = if selected { theme.accent_foreground } else { gpui::hsla(0., 0.8, 0.5, 1.0) };
+      picker_marker_base().text_color(color).child(format!("{}", entry.problems))
+    } else if is_active {
       let color =
         if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
-      div().text_xs().text_color(color).font_weight(FontWeight::BOLD).child(">")
-    } else if has_problems {
-      let color = if selected { theme.accent_foreground } else { gpui::hsla(0., 0.8, 0.5, 1.0) };
-      div().text_xs().text_color(color).font_weight(FontWeight::BOLD).child("!")
+      picker_marker_base().text_color(color).child(">")
     } else {
-      div().text_xs().w(px(10.0))
+      picker_marker_base()
     };
 
     // Main text: "project / label".
@@ -939,6 +944,8 @@ pub struct SlugEntry {
   pub display_label: String,
   pub slug: String,
   pub relative_time: String,
+  /// Total problem count (session + project) for adopted sessions.
+  pub problems: usize,
 }
 
 pub struct SlugPickerDelegate {
@@ -960,17 +967,21 @@ impl SlugPickerDelegate {
       display_label: "NEW".to_string(),
       slug: String::new(),
       relative_time: String::new(),
+      problems: 0,
     }];
 
     for group in &groups {
       // Check if this slug is already adopted in project.sessions.
       let session_match = project.sessions.iter().enumerate().find(|(_, s)| s.slug == group.slug);
 
-      let (action, display_label) = match session_match {
-        Some((idx, s)) => (SlugAction::Switch(idx), s.label.clone()),
+      let project_problem_count = project.problems.len();
+      let (action, display_label, problems) = match session_match {
+        Some((idx, s)) => {
+          (SlugAction::Switch(idx), s.label.clone(), s.problems.len() + project_problem_count)
+        }
         None => {
           let summary = group.summary().unwrap_or_else(|| "Attach".to_string());
-          (SlugAction::Attach(group.slug.clone(), summary.clone()), summary)
+          (SlugAction::Attach(group.slug.clone(), summary.clone()), summary, 0)
         }
       };
 
@@ -984,6 +995,7 @@ impl SlugPickerDelegate {
         display_label,
         slug: group.slug.clone(),
         relative_time,
+        problems,
       });
     }
 
@@ -1011,31 +1023,29 @@ impl PickerDelegate for SlugPickerDelegate {
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    // Left marker.
-    let (marker_text, marker_color) = match &entry.action {
+    // Left marker: red count (problems) / green check (no problems) for Switch,
+    // "+" for Attach, "*" for New.
+    let marker = match &entry.action {
+      SlugAction::Switch(_) if entry.problems > 0 => {
+        let color = if selected { theme.accent_foreground } else { gpui::hsla(0., 0.8, 0.5, 1.0) };
+        picker_marker_base().text_color(color).child(format!("{}", entry.problems))
+      }
       SlugAction::Switch(_) => {
         let color =
           if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
-        ("✓", color)
+        picker_marker_base().text_color(color).child("✓")
       }
       SlugAction::Attach(..) => {
         let color =
           if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
-        ("+", color)
+        picker_marker_base().text_color(color).child("+")
       }
       SlugAction::New => {
         let color =
           if selected { theme.accent_foreground } else { gpui::hsla(50. / 360., 0.8, 0.5, 1.0) };
-        ("*", color)
+        picker_marker_base().text_color(color).child("*")
       }
     };
-
-    let marker = div()
-      .text_xs()
-      .text_color(marker_color)
-      .font_weight(FontWeight::BOLD)
-      .w(px(14.0))
-      .child(marker_text);
 
     // Main text: "project / label" — truncate with ellipsis to avoid overflow.
     let main_text = format!("{} / {}", entry.project_name, entry.display_label);

@@ -1,9 +1,20 @@
 use crate::views::reply_view::ReplyView;
 use gpui::*;
-use jc_core::problem::Problem;
+use jc_core::problem::{AppTodoProblem, ClaudeProblem, SessionProblem, TerminalProblem};
 use jc_core::session::discover_session_group;
+use jc_core::todo::TodoProblem;
 use jc_terminal::{Palette, TerminalConfig, TerminalView};
+use std::collections::HashSet;
 use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PendingEvent {
+  ClaudeStop,
+  ClaudePermission,
+  ClaudeIdle,
+  ClaudeApiError,
+  TerminalBell,
+}
 
 pub struct SessionState {
   pub slug: String,
@@ -11,7 +22,8 @@ pub struct SessionState {
   pub claude_terminal: Entity<TerminalView>,
   pub general_terminal: Entity<TerminalView>,
   pub reply_view: Entity<ReplyView>,
-  pub problems: Vec<Problem>,
+  pub pending_events: HashSet<PendingEvent>,
+  pub problems: Vec<SessionProblem>,
 }
 
 impl SessionState {
@@ -50,6 +62,57 @@ impl SessionState {
       rv
     });
 
-    Self { slug, label, claude_terminal, general_terminal, reply_view, problems: Vec::new() }
+    Self {
+      slug,
+      label,
+      claude_terminal,
+      general_terminal,
+      reply_view,
+      pending_events: HashSet::default(),
+      problems: Vec::new(),
+    }
+  }
+
+  /// Rebuild `self.problems` from pending events and todo problems.
+  /// Returns `true` if the problem count changed.
+  pub fn refresh_problems(&mut self, todo_problems: &[TodoProblem]) -> bool {
+    let old_len = self.problems.len();
+    let mut problems = Vec::<SessionProblem>::new();
+
+    for event in &self.pending_events {
+      let sp = match event {
+        PendingEvent::ClaudeStop => SessionProblem::Claude(ClaudeProblem::Stop),
+        PendingEvent::ClaudePermission => SessionProblem::Claude(ClaudeProblem::Permission),
+        PendingEvent::ClaudeIdle => SessionProblem::Claude(ClaudeProblem::Idle),
+        PendingEvent::ClaudeApiError => SessionProblem::Claude(ClaudeProblem::ApiError),
+        PendingEvent::TerminalBell => SessionProblem::Terminal(TerminalProblem::Bell),
+      };
+      problems.push(sp);
+    }
+
+    for tp in todo_problems {
+      match tp {
+        TodoProblem::InvalidSessionSlug { slug, line, .. } if slug == &self.slug => {
+          problems.push(SessionProblem::Todo(AppTodoProblem::InvalidSlug {
+            slug: slug.clone(),
+            line: *line,
+          }));
+        }
+        TodoProblem::UnsentWait { slug } if slug == &self.slug => {
+          problems.push(SessionProblem::Todo(AppTodoProblem::UnsentWait { slug: slug.clone() }));
+        }
+        _ => {}
+      }
+    }
+
+    problems.sort_by_key(|p| p.rank());
+    let changed = old_len != problems.len();
+    self.problems = problems;
+    changed
+  }
+
+  /// Clear all pending events (called when the user interacts with the session).
+  pub fn acknowledge(&mut self) {
+    self.pending_events.clear();
   }
 }
