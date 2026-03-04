@@ -925,8 +925,8 @@ impl PickerDelegate for SessionPickerDelegate {
 pub enum SlugAction {
   /// Switch to an already-adopted session.
   Switch(usize),
-  /// Adopt an orphaned slug (not yet in TODO.md).
-  Attach(String),
+  /// Adopt an orphaned slug (not yet in TODO.md).  Carries `(slug, label)`.
+  Attach(String, String),
   /// Create a brand new Claude session.
   New,
 }
@@ -968,7 +968,10 @@ impl SlugPickerDelegate {
 
       let (action, display_label) = match session_match {
         Some((idx, s)) => (SlugAction::Switch(idx), s.label.clone()),
-        None => (SlugAction::Attach(group.slug.clone()), "Attach".to_string()),
+        None => {
+          let summary = group.summary().unwrap_or_else(|| "Attach".to_string());
+          (SlugAction::Attach(group.slug.clone(), summary.clone()), summary)
+        }
       };
 
       let relative_time = format_relative_time(group.latest_mtime);
@@ -1015,7 +1018,7 @@ impl PickerDelegate for SlugPickerDelegate {
           if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
         ("✓", color)
       }
-      SlugAction::Attach(_) => {
+      SlugAction::Attach(..) => {
         let color =
           if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
         ("+", color)
@@ -1034,8 +1037,9 @@ impl PickerDelegate for SlugPickerDelegate {
       .w(px(14.0))
       .child(marker_text);
 
-    // Main text: "project / label".
+    // Main text: "project / label" — truncate with ellipsis to avoid overflow.
     let main_text = format!("{} / {}", entry.project_name, entry.display_label);
+    let main_el = div().overflow_hidden().text_ellipsis().min_w_0().child(main_text);
 
     // Muted right section: "(slug) recency" (omit for NEW).
     let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
@@ -1046,9 +1050,15 @@ impl PickerDelegate for SlugPickerDelegate {
     } else {
       format!("({}) {}", entry.slug, entry.relative_time)
     };
-    let right_el = div().ml_auto().text_xs().text_color(muted_color).child(right);
+    let right_el = div()
+      .ml_auto()
+      .flex_shrink_0()
+      .text_xs()
+      .text_color(muted_color)
+      .whitespace_nowrap()
+      .child(right);
 
-    row.child(marker).child(main_text).child(right_el)
+    row.child(marker).child(main_el).child(right_el)
   }
 }
 

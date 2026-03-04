@@ -121,6 +121,78 @@ impl SessionGroup {
   pub fn latest_session_id(&self) -> Option<String> {
     self.files[0].file_stem().map(|s| s.to_string_lossy().into_owned())
   }
+
+  /// A short human-readable summary extracted from the first informative user
+  /// message in the session group.
+  pub fn summary(&self) -> Option<String> {
+    // Try the oldest file first (the original session start), then fall back
+    // to newer files which may be forks with generic openers.
+    for path in self.files.iter().rev() {
+      if let Some(s) = extract_first_user_summary(path) {
+        return Some(s);
+      }
+    }
+    None
+  }
+}
+
+/// Extract a short summary from a JSONL file by finding the first informative
+/// user message.  Reads at most 200 lines — the interesting content (plan
+/// headings, task descriptions) appears early.
+pub fn extract_first_user_summary(path: &Path) -> Option<String> {
+  use std::io::{BufRead, BufReader};
+  let file = std::fs::File::open(path).ok()?;
+  let reader = BufReader::new(file);
+
+  for line in reader.lines().take(200) {
+    let line = line.ok()?;
+    // Fast-path: skip lines that aren't user messages.
+    if !line.contains("\"user\"") {
+      continue;
+    }
+    let entry: RawEntry = match serde_json::from_str(&line) {
+      Ok(e) => e,
+      Err(_) => continue,
+    };
+    if entry.entry_type != "user" || entry.is_meta {
+      continue;
+    }
+    let Some(msg) = entry.message else { continue };
+    if msg.role != "user" {
+      continue;
+    }
+    let text = extract_user_text(&msg.content);
+    for l in text.lines() {
+      let l = l.trim();
+      if l.is_empty()
+        || l.starts_with('<')
+        || l == "Review @README.md"
+        || l == "[Request interrupted by user for tool use]"
+        || l.contains("Implement the following plan")
+      {
+        continue;
+      }
+      // Strip leading markdown heading markers.
+      let l = l.trim_start_matches('#').trim_start();
+      if l.is_empty() {
+        continue;
+      }
+      // Truncate to 80 chars (UTF-8 safe).
+      if l.len() > 80 {
+        let truncate_at = l
+          .char_indices()
+          .take_while(|(i, _)| *i <= 80)
+          .last()
+          .map(|(i, c)| i + c.len_utf8())
+          .unwrap_or(l.len());
+        let mut s = l[..truncate_at].to_string();
+        s.push_str("...");
+        return Some(s);
+      }
+      return Some(l.to_string());
+    }
+  }
+  None
 }
 
 /// Extract the slug from a JSONL file by reading until we find one.

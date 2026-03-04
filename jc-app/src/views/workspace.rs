@@ -575,9 +575,9 @@ impl Workspace {
                 this.pre_picker_focus.take();
                 this.switch_to_session(project_idx, session_idx, window, cx);
               }
-              Some(SlugAction::Attach(slug)) => {
+              Some(SlugAction::Attach(slug, label)) => {
                 this.pre_picker_focus.take();
-                this.adopt_slug(project_idx, &slug, window, cx);
+                this.adopt_slug(project_idx, &slug, &label, window, cx);
               }
               Some(SlugAction::New) => {
                 this.pre_picker_focus.take();
@@ -613,6 +613,7 @@ impl Workspace {
     &mut self,
     project_idx: usize,
     slug: &str,
+    label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -621,15 +622,21 @@ impl Workspace {
 
     // Insert heading in TODO.md.
     todo_view.update(cx, |tv, cx| {
-      tv.insert_session_heading(slug, slug, window, cx);
+      tv.insert_session_heading(slug, label, window, cx);
       tv.save(cx);
     });
 
     // Build palette and create session state.
     let appearance = appearance_from_window(window.appearance());
     let palette = Palette::for_appearance(appearance);
-    let session =
-      SessionState::create(slug.to_string(), slug.to_string(), &project_path, &palette, window, cx);
+    let session = SessionState::create(
+      slug.to_string(),
+      label.to_string(),
+      &project_path,
+      &palette,
+      window,
+      cx,
+    );
 
     let project = &mut self.projects[project_idx];
     project.sessions.push(session);
