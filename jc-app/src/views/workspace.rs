@@ -18,6 +18,7 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::theme::Theme;
 use gpui_component::tooltip::Tooltip;
 use jc_core::config::{AppConfig, AppState};
+use jc_core::hooks::{HookEvent, HookServer};
 use jc_core::theme::Appearance;
 use jc_core::usage::{FullUsageReport, ParStatus};
 use jc_terminal::Palette;
@@ -84,6 +85,8 @@ pub struct Workspace {
   _diff_view_subscription: Option<Subscription>,
   _left_focus_in: Subscription,
   _right_focus_in: Subscription,
+  _hook_server: Option<HookServer>,
+  _hook_poll_task: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -187,6 +190,47 @@ impl Workspace {
       }
     });
 
+    // Start hook server for Claude Code integration.
+    let project_paths: Vec<PathBuf> = projects.iter().map(|p| p.path.clone()).collect();
+    let (hook_server, hook_poll_task) = match HookServer::start(project_paths.clone()) {
+      Ok(server) => {
+        let port = server.port;
+        // Install hooks into each project's settings (fire and forget).
+        for path in &project_paths {
+          let path = path.clone();
+          std::thread::spawn(move || {
+            if let Err(e) = jc_core::hooks_settings::install_hooks(&path, port) {
+              eprintln!("failed to install hooks for {}: {e}", path.display());
+            }
+          });
+        }
+        // Spawn async task to consume hook events.
+        let rx = server.rx.clone();
+        let task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+          while let Ok(event) = rx.recv_async().await {
+            let Ok(should_continue) = cx.update(|cx: &mut App| {
+              if let Some(entity) = this.upgrade() {
+                entity.update(cx, |view, cx| view.handle_hook_event(event, cx));
+                true
+              } else {
+                false
+              }
+            }) else {
+              break;
+            };
+            if !should_continue {
+              break;
+            }
+          }
+        });
+        (Some(server), Some(task))
+      }
+      Err(e) => {
+        eprintln!("failed to start hook server: {e}");
+        (None, None)
+      }
+    };
+
     let mut ws = Self {
       left_pane,
       right_pane,
@@ -209,6 +253,8 @@ impl Workspace {
       _diff_view_subscription: None,
       _left_focus_in: left_focus_in,
       _right_focus_in: right_focus_in,
+      _hook_server: hook_server,
+      _hook_poll_task: hook_poll_task,
     };
 
     ws.subscribe_active_project(window, cx);
@@ -1214,6 +1260,22 @@ impl Workspace {
       .font_family("Lilex")
       .child(div().flex().items_center().gap_1().mr_auto().child(title_el))
       .child(right_el)
+  }
+
+  fn handle_hook_event(&mut self, event: HookEvent, cx: &mut Context<Self>) {
+    eprintln!("hook: {:?} session={} slug={:?}", event.kind, event.session_id, event.slug);
+    cx.notify();
+  }
+}
+
+impl Drop for Workspace {
+  fn drop(&mut self) {
+    for project in &self.projects {
+      let _ = jc_core::hooks_settings::uninstall_hooks(&project.path);
+    }
+    if let Some(server) = &self._hook_server {
+      server.shutdown();
+    }
   }
 }
 

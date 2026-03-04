@@ -195,6 +195,12 @@ pub fn extract_first_user_summary(path: &Path) -> Option<String> {
   None
 }
 
+/// Look up the slug for a session UUID by finding the corresponding JSONL file.
+pub fn session_id_to_slug(project_path: &Path, session_id: &str) -> Option<String> {
+  let target = session_dir(project_path).join(format!("{session_id}.jsonl"));
+  if target.exists() { extract_slug(&target) } else { None }
+}
+
 /// Extract the slug from a JSONL file by reading until we find one.
 /// Only reads the first few KB — slugs appear in early entries.
 fn extract_slug(path: &Path) -> Option<String> {

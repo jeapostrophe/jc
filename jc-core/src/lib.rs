@@ -1,5 +1,7 @@
 pub mod claude_api;
 pub mod config;
+pub mod hooks;
+pub mod hooks_settings;
 pub mod model;
 pub mod problem;
 pub mod session;

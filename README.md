@@ -321,12 +321,10 @@ It is deliberately *not* a full code editor on mobile.
 > *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox. If the item doesn't fit under an existing section, create a new `###` section for it.*
 
 ### Terminal Emulator
-- [ ] [T] Verify whether Claude Code emits BEL (`\x07`) on task completion in terminal mode
-- [ ] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
-- [ ] [H] Cursor not blinking properly in the Claude terminal — Claude Code does its own cursor management; need to properly signal focus state and respect its cursor escape sequences
+- [x] [T] Verify whether Claude Code emits BEL (`\x07`) on task completion in terminal mode — verdict: skip, using hooks instead
+- [x] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
 
 ### TODO.md System
-- [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
 
@@ -345,7 +343,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 
 ### Notifications & Status
-- [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
+- [x] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] [E] Implement in-app status bar showing waiting sessions (driven by hook events)
 - [ ] [E] Jump to next problem keybinding on Cmd-;
 - [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
@@ -372,7 +370,6 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Allow projects to have a special `./status.sh` script that reports problems in the form `file:line - problem`
 
 ### Code Quality
-- [ ] [H] Move focus-change PTY writes (`\x1b[I`/`\x1b[O`) out of `TerminalView::render()` into a proper focus observer to avoid side effects during rendering
 - [ ] [E] Lazy-highlight `LineSearchPickerDelegate::build()` — currently does O(N) syntax highlighting of every line on each Cmd-F; will lag on very large files
 - [ ] [E] Collapse the four `LineSearchPickerDelegate::for_*_view` factories into one generic method via a shared trait (editor_text + scroll_to_line + language_name)
 
