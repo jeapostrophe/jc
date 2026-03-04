@@ -20,6 +20,7 @@ pub struct CodeView {
   dirty: bool,
   externally_modified: bool,
   saving: Arc<AtomicBool>,
+  base_content: String,
   _subscription: Subscription,
   _watcher: Option<notify::RecommendedWatcher>,
 }
@@ -46,6 +47,7 @@ impl CodeView {
       dirty: false,
       externally_modified: false,
       saving: Arc::new(AtomicBool::new(false)),
+      base_content: String::default(),
       _subscription: subscription,
       _watcher: None,
     }
@@ -100,8 +102,10 @@ impl CodeView {
         while notify_rx.try_recv().is_ok() {}
         let _ = this.update_in(cx, |view, window, cx| {
           if view.dirty {
-            view.externally_modified = true;
-            cx.notify();
+            if !view.try_merge(window, cx) {
+              view.externally_modified = true;
+              cx.notify();
+            }
           } else {
             view.load_current(window, cx);
           }
@@ -116,6 +120,7 @@ impl CodeView {
   fn load_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let Some(path) = self.current_file.as_ref() else { return };
     let content = std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {e}"));
+    self.base_content = content.clone();
     let lang: SharedString =
       self.language_override.clone().unwrap_or_else(|| Language::from_path(path).name().into());
     self.editor.update(cx, |state, cx| {
@@ -135,11 +140,39 @@ impl CodeView {
   ) {
     self.load_current(window, cx);
   }
+
+  /// Attempt a three-way merge of disk changes with buffer edits.
+  /// Returns `true` if the merge succeeded (or no real change), `false` on conflict.
+  fn try_merge(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    let Some(path) = self.current_file.as_ref() else {
+      return false;
+    };
+    let Ok(theirs) = std::fs::read_to_string(path) else {
+      return false;
+    };
+    if theirs == self.base_content {
+      return true;
+    }
+    let ours = self.editor.read(cx).value().to_string();
+    match diffy::merge(&self.base_content, &ours, &theirs) {
+      Ok(merged) => {
+        let (cursor_pos, _) = self.editor.read(cx).selection_positions();
+        self.editor.update(cx, |state, cx| {
+          state.set_value(merged, window, cx);
+          state.set_cursor_position(cursor_pos, window, cx);
+        });
+        self.base_content = theirs;
+        cx.notify();
+        true
+      }
+      Err(_) => false,
+    }
+  }
 }
 
 impl CodeView {
-  pub fn is_dirty(&self) -> bool {
-    self.dirty
+  pub fn is_dirty(&self, cx: &App) -> bool {
+    self.editor.read(cx).value().as_ref() != self.base_content
   }
 
   pub fn editor(&self) -> &Entity<InputState> {
@@ -167,6 +200,7 @@ impl CodeView {
     if let Err(e) = std::fs::write(path, content.as_ref()) {
       eprintln!("Failed to save {}: {e}", path.display());
     }
+    self.base_content = content.to_string();
     self.dirty = false;
 
     // Clear saving flag after a brief delay to suppress self-triggered watcher event.

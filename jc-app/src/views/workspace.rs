@@ -1381,12 +1381,18 @@ impl Workspace {
     let project = self.active_project();
     match pane.read(cx).content_kind() {
       Some(PaneContentKind::CodeViewer) => {
-        if let Some(path) = project.code_view.read(cx).file_path() {
+        let cv = project.code_view.read(cx);
+        let dirty = if cv.is_dirty(cx) { " [+]" } else { "" };
+        if let Some(path) = cv.file_path() {
           let relative = path.strip_prefix(&project.path).ok().unwrap_or(path);
-          format!("Code: {}", relative.display())
+          format!("Code: {}{dirty}", relative.display())
         } else {
-          "Code".to_string()
+          format!("Code{dirty}")
         }
+      }
+      Some(PaneContentKind::TodoEditor) => {
+        let dirty = if project.todo_view.read(cx).is_dirty(cx) { " [+]" } else { "" };
+        format!("TODO{dirty}")
       }
       Some(PaneContentKind::GitDiff) => {
         let dv = project.diff_view.read(cx);

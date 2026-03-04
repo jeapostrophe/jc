@@ -65,6 +65,10 @@ impl TodoView {
     &self.file_path
   }
 
+  pub fn is_dirty(&self, cx: &App) -> bool {
+    self.code_view.read(cx).is_dirty(cx)
+  }
+
   pub fn editor_text(&self, cx: &App) -> String {
     self.code_view.read(cx).editor_text(cx)
   }
