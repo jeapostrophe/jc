@@ -901,6 +901,11 @@ impl Workspace {
                   div().text_color(dim).child(format!("Work time: {:.0}%", f.report.working_pct)),
                 )
                 .child(div().text_color(fg).child(f.title_label()))
+                .child(div().text_color(dim).child(format!(
+                  "Pace: {}  Remaining: {}",
+                  f.pace_label(),
+                  f.remaining_hours_label()
+                )))
                 .when_some(f.extra.as_ref(), |el, extra| {
                   el.child(div().text_color(dim).child(format!(
                     "Extra: ${:.0} / ${:.0} ({:.1}%)",

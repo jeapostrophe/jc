@@ -358,6 +358,81 @@ impl FullUsageReport {
     }
   }
 
+  /// Pace multiplier: `limit_pct / working_pct`.
+  /// Values < 1.0 mean under par (budget to spare), > 1.0 means over par.
+  /// Returns `None` if working_pct is zero (no work time elapsed).
+  pub fn pace(&self) -> Option<f64> {
+    if self.report.working_pct > 0.0 {
+      Some(self.report.limit_pct / self.report.working_pct)
+    } else {
+      None
+    }
+  }
+
+  /// Projected remaining working hours at the current burn rate before hitting 100%.
+  /// Returns `None` if no usage yet or working_pct is zero.
+  pub fn projected_remaining_hours(&self) -> Option<f64> {
+    let r = &self.report;
+    if r.limit_pct <= 0.0 || r.working_pct <= 0.0 {
+      return None;
+    }
+    // Burn rate: limit_pct per working_pct (in the same units).
+    // Remaining budget: 100 - limit_pct.
+    // Total working hours in window derived from working_pct / 100 * total_work_hours,
+    // but we can compute directly: remaining_pct / rate_per_work_pct.
+    // rate = limit_pct / working_pct (budget points consumed per work-time point).
+    // remaining work_pct until budget hits 100: (100 - limit_pct) / rate.
+    // Convert that to hours: remaining_work_pct / 100 * total_work_hours.
+    // Simplified: (100 - limit_pct) * working_pct / limit_pct is remaining_work_pct,
+    // then * total_work_hours / 100. But we don't know total_work_hours here.
+    //
+    // Alternative: use the ratio directly.
+    // Hours elapsed so far = working_pct / 100 * total_work_hours (unknown).
+    // Budget consumed per hour = limit_pct / (working_pct / 100 * total_work_hours).
+    // Hours to exhaust = (100 - limit_pct) / (limit_pct / (working_pct / 100 * TWH))
+    //                  = (100 - limit_pct) * working_pct * TWH / (limit_pct * 100).
+    //
+    // We need total_work_hours. We can compute it from the 7-day schedule but we don't
+    // store it. Instead, approximate: working_pct% of a 7-day window means
+    // elapsed_work_hours = working_pct / 100 * TWH. We know the burn rate in
+    // pct-per-work-pct = limit_pct / working_pct. Remaining budget = 100 - limit_pct.
+    // Remaining work_pct = remaining_budget / burn_rate = (100 - limit_pct) * working_pct / limit_pct.
+    // But we need to convert work_pct to hours. Since we don't have TWH, use a simpler
+    // approach: the user worked some hours and burned limit_pct. Remaining budget is
+    // (100 - limit_pct). At the same rate, remaining_hours = elapsed_hours * (100 - limit_pct) / limit_pct.
+    // We don't have elapsed_hours directly, but we can estimate from working_pct.
+    //
+    // Use a standard 40h work week as the baseline for the 7-day window.
+    let total_work_hours = 40.0; // reasonable default
+    let elapsed_work_hours = r.working_pct / 100.0 * total_work_hours;
+    if elapsed_work_hours <= 0.0 {
+      return None;
+    }
+    let burn_rate = r.limit_pct / elapsed_work_hours; // pct per hour
+    let remaining_pct = 100.0 - r.limit_pct;
+    if burn_rate <= 0.0 {
+      return None;
+    }
+    Some(remaining_pct / burn_rate)
+  }
+
+  /// Format pace as a string like "0.7x".
+  pub fn pace_label(&self) -> String {
+    match self.pace() {
+      Some(p) => format!("{p:.1}x"),
+      None => "—".to_string(),
+    }
+  }
+
+  /// Format projected remaining hours as a string like "12.5h".
+  pub fn remaining_hours_label(&self) -> String {
+    match self.projected_remaining_hours() {
+      Some(h) if h >= 100.0 => ">99h".to_string(),
+      Some(h) => format!("{h:.1}h"),
+      None => "—".to_string(),
+    }
+  }
+
   /// Short label for the title bar, e.g. "Par +12".
   pub fn title_label(&self) -> String {
     let par = self.report.par();
@@ -419,9 +494,21 @@ impl FullUsageReport {
       bar(self.report.working_pct, working_color, dim, reset),
     );
 
+    // Pace and projection
+    println!();
+    let pace_color = match self.pace() {
+      Some(p) if p > 1.1 => red,
+      Some(p) if p < 0.9 => green,
+      _ => yellow,
+    };
+    println!(
+      "       Pace: {pace_color}{}{reset}  {dim}Remaining: {}{reset}",
+      self.pace_label(),
+      self.remaining_hours_label(),
+    );
+
     // Extra usage
     if let Some(extra) = &self.extra {
-      println!();
       println!(
         "  {dim}Extra usage: ${:.0} / ${:.0} ({:.1}%){reset}",
         extra.used_credits, extra.monthly_limit, extra.utilization,

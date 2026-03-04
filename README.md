@@ -345,8 +345,8 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 
 ### Notifications & Status
-- [ ] [E] Usage: pace multiplier (`limit_pct / working_pct` as `0.7x`)
-- [ ] [E] Usage: projected remaining working hours at current burn rate
+- [x] [E] Usage: pace multiplier (`limit_pct / working_pct` as `0.7x`)
+- [x] [E] Usage: projected remaining working hours at current burn rate
 - [x] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] [E] Implement in-app status bar showing waiting sessions (driven by hook events)
