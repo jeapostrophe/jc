@@ -227,7 +227,21 @@ impl ReplyView {
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
     super::scroll_editor_to_line(&self.editor, line, window, cx);
   }
+}
 
+impl super::LineSearchable for ReplyView {
+  fn editor_text(&self, cx: &App) -> String {
+    self.editor_text(cx)
+  }
+  fn language_name(&self) -> crate::language::Language {
+    crate::language::Language::Markdown
+  }
+  fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+    self.scroll_to_line(line, window, cx)
+  }
+}
+
+impl ReplyView {
   pub fn project_path(&self) -> &Path {
     &self.project_path
   }

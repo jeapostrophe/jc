@@ -199,6 +199,18 @@ impl DiffView {
   }
 }
 
+impl super::LineSearchable for DiffView {
+  fn editor_text(&self, cx: &App) -> String {
+    self.editor_text(cx)
+  }
+  fn language_name(&self) -> Language {
+    self.current_file_language()
+  }
+  fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+    self.scroll_to_line(line, window, cx)
+  }
+}
+
 impl Focusable for DiffView {
   fn focus_handle(&self, cx: &App) -> FocusHandle {
     self.editor.read(cx).focus_handle(cx)

@@ -895,20 +895,20 @@ impl Workspace {
 
     match kind {
       Some(PaneContentKind::CodeViewer) => {
-        let delegate = LineSearchPickerDelegate::for_code_view(&project.code_view, cx);
+        let delegate = LineSearchPickerDelegate::for_view(&project.code_view, cx);
         self.show_picker(delegate, window, cx);
       }
       Some(PaneContentKind::TodoEditor) => {
-        let delegate = LineSearchPickerDelegate::for_todo_view(&project.todo_view, cx);
+        let delegate = LineSearchPickerDelegate::for_view(&project.todo_view, cx);
         self.show_picker(delegate, window, cx);
       }
       Some(PaneContentKind::GitDiff) => {
-        let delegate = LineSearchPickerDelegate::for_diff_view(&project.diff_view, cx);
+        let delegate = LineSearchPickerDelegate::for_view(&project.diff_view, cx);
         self.show_picker(delegate, window, cx);
       }
       Some(PaneContentKind::ReplyViewer) => {
         if let Some(session) = project.active_session() {
-          let delegate = LineSearchPickerDelegate::for_reply_view(&session.reply_view, cx);
+          let delegate = LineSearchPickerDelegate::for_view(&session.reply_view, cx);
           self.show_picker(delegate, window, cx);
         }
       }

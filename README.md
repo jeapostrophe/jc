@@ -131,40 +131,6 @@ From any view (diff, terminal, code, reply), the user can press a comment keybin
 
 **Simplest possible:** `osascript -e 'display notification ...'` for zero-dependency MVP.
 
-### Claude Code Idle Detection
-
-**Verdict: Use Claude Code's hooks system.** This is purpose-built for exactly our use case.
-
-**Primary mechanism:** Configure HTTP hooks in `~/.claude/settings.json` that POST to a local port our app listens on:
-- `Stop` hook fires when Claude finishes responding (definitive completion signal)
-- `Notification` hook with `idle_prompt` matcher fires when waiting for input
-- `Notification` hook with `permission_prompt` matcher fires when tool approval needed
-- `PermissionRequest` hook fires with full tool details for permission dialogs
-
-**Secondary signal (status unknown):** The `preferredNotifChannel = terminal_bell` setting mentioned in earlier research does not exist in the current Claude Code settings schema (as of March 2026). Claude Code may already emit BEL (`\x07`) on task completion in terminal mode --- needs testing. The `jc-terminal` crate already detects `TerminalEvent::Bell` via alacritty, so if BEL is emitted, no extra configuration is needed.
-
-**Combine with:** Brief silence heuristic as a tertiary fallback (2+ seconds of PTY silence AND a Stop hook = confident idle state).
-
-**Known issues:** `idle_prompt` fires after EVERY response, not just genuine wait states (bug tracked in Claude Code issues). The `Stop` hook is more reliable.
-
-### Claude Usage Dashboard
-
-**Verdict: Poll the undocumented OAuth usage API.** `GET https://api.anthropic.com/api/oauth/usage` returns exactly what we need:
-
-```json
-{
-  "five_hour": { "utilization": 37.0, "resets_at": "2026-02-08T04:59:59Z" },
-  "seven_day": { "utilization": 26.0, "resets_at": "2026-02-12T14:59:59Z" },
-  "extra_usage": { "is_enabled": true, "monthly_limit": 5000, "used_credits": 1234, "utilization": 24.68 }
-}
-```
-
-**Token access:** Read from macOS Keychain via `security find-generic-password -s "Claude Code-credentials" -w`, parse JSON, extract `claudeAiOauth.accessToken`. Poll every 30-60 seconds.
-
-**Par calculation:** Compare `seven_day.utilization` against `(elapsed_working_seconds / total_working_seconds_in_window) * 100`, adjusted for configured working hours.
-
-**Risk:** Undocumented endpoint, could change. A `claude-usage` Rust crate already exists on crates.io. Community tools (bash scripts, Python dashboards) demonstrate the pattern is stable.
-
 ## Views & Panels
 
 The window has a **left pane** and a **right pane**. Any view can appear in either pane with independent scroll positions. A **Quake-style terminal** can be toggled at the bottom of the window via a keybinding for quick commands.
@@ -320,10 +286,6 @@ It is deliberately *not* a full code editor on mobile.
 >
 > *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox. If the item doesn't fit under an existing section, create a new `###` section for it.*
 
-### Terminal Emulator
-- [x] [T] Verify whether Claude Code emits BEL (`\x07`) on task completion in terminal mode — verdict: skip, using hooks instead
-- [x] [H] Configure Claude Code hooks (HTTP endpoint) for idle/permission detection
-
 ### TODO.md System
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
@@ -371,7 +333,7 @@ It is deliberately *not* a full code editor on mobile.
 
 ### Code Quality
 - [ ] [E] Lazy-highlight `LineSearchPickerDelegate::build()` — currently does O(N) syntax highlighting of every line on each Cmd-F; will lag on very large files
-- [ ] [E] Collapse the four `LineSearchPickerDelegate::for_*_view` factories into one generic method via a shared trait (editor_text + scroll_to_line + language_name)
+- [x] [E] Collapse the four `LineSearchPickerDelegate::for_*_view` factories into one generic method via a shared trait (editor_text + scroll_to_line + language_name)
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically

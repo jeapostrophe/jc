@@ -1126,42 +1126,14 @@ impl<F: Fn(u32, &mut Window, &mut App) + 'static> LineSearchPickerDelegate<F> {
 }
 
 impl LineSearchPickerDelegate<ScrollCallback> {
-  pub fn for_code_view(code_view: &Entity<CodeView>, cx: &App) -> Self {
-    let text = code_view.read(cx).editor_text(cx);
-    let language = code_view.read(cx).current_language().name();
-    let entity = code_view.clone();
+  pub fn for_view<V: super::LineSearchable>(view: &Entity<V>, cx: &App) -> Self {
+    let text = view.read(cx).editor_text(cx);
+    let language = view.read(cx).language_name().name();
+    let entity = view.clone();
     let callback: ScrollCallback = Box::new(move |line, window, cx| {
       entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
     });
     Self::build(&text, language, callback, cx)
-  }
-
-  pub fn for_todo_view(todo_view: &Entity<TodoView>, cx: &App) -> Self {
-    let text = todo_view.read(cx).editor_text(cx);
-    let entity = todo_view.clone();
-    let callback: ScrollCallback = Box::new(move |line, window, cx| {
-      entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
-    });
-    Self::build(&text, Language::Markdown.name(), callback, cx)
-  }
-
-  pub fn for_diff_view(diff_view: &Entity<DiffView>, cx: &App) -> Self {
-    let text = diff_view.read(cx).editor_text(cx);
-    let language = diff_view.read(cx).current_file_language().name();
-    let entity = diff_view.clone();
-    let callback: ScrollCallback = Box::new(move |line, window, cx| {
-      entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
-    });
-    Self::build(&text, language, callback, cx)
-  }
-
-  pub fn for_reply_view(reply_view: &Entity<ReplyView>, cx: &App) -> Self {
-    let text = reply_view.read(cx).editor_text(cx);
-    let entity = reply_view.clone();
-    let callback: ScrollCallback = Box::new(move |line, window, cx| {
-      entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
-    });
-    Self::build(&text, Language::Markdown.name(), callback, cx)
   }
 }
 

@@ -14,6 +14,15 @@ use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::InputState;
 
+use crate::language::Language;
+
+/// Trait for views that support line search via `LineSearchPickerDelegate`.
+pub trait LineSearchable: Sized + 'static {
+  fn editor_text(&self, cx: &App) -> String;
+  fn language_name(&self) -> Language;
+  fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>);
+}
+
 /// Reads the full text content from an editor widget.
 pub fn editor_text(editor: &Entity<InputState>, cx: &App) -> String {
   editor.read(cx).value().as_ref().to_string()

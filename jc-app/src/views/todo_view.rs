@@ -76,7 +76,21 @@ impl TodoView {
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
     self.code_view.update(cx, |cv, cx| cv.scroll_to_line(line, window, cx));
   }
+}
 
+impl super::LineSearchable for TodoView {
+  fn editor_text(&self, cx: &App) -> String {
+    self.editor_text(cx)
+  }
+  fn language_name(&self) -> crate::language::Language {
+    crate::language::Language::Markdown
+  }
+  fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
+    self.scroll_to_line(line, window, cx)
+  }
+}
+
+impl TodoView {
   pub fn document(&self) -> &TodoDocument {
     &self.document
   }
