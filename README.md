@@ -407,10 +407,10 @@ It is deliberately *not* a full code editor on mobile.
 - [x] [E] Populate title bar problem indicators (`!` dirty marker + count) from refreshed problem lists
 - [x] [E] Show problem markers in session picker (red count) and slug picker (red count / green check)
 - [x] [E] Add global problem count indicator in upper right (count of other sessions with problems)
-- [ ] [H] Implement hover tooltips listing problems on title bar and global indicator
-- [ ] [H] Implement `status.sh` runner: periodic execution, parse `{rank:}?file{:line}? - message` format, produce `ScriptProblem`s
-- [ ] [H] Problem navigation: jump to the view/file that can address each problem kind
-- [ ] [E] Jump to next problem keybinding (Cmd-;)
+- [x] [H] Implement hover tooltips listing problems on title bar and global indicator
+- [x] [H] Implement `status.sh` runner: periodic execution, parse `{rank:}?file{:line}? - message` format, produce `ScriptProblem`s
+- [x] [H] Problem navigation: jump to the view/file that can address each problem kind
+- [x] [E] Jump to next problem keybinding (Cmd-;)
 - [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
 
 ### Mobile App
