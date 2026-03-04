@@ -57,6 +57,13 @@ pub fn init(cx: &mut App) {
 
 const MAX_VISIBLE_RESULTS: usize = 200;
 
+// Semantic marker colors used in picker rows and the title bar.
+pub const MARKER_RED: Hsla = Hsla { h: 0., s: 0.8, l: 0.5, a: 1.0 };
+pub const MARKER_GREEN: Hsla = Hsla { h: 120. / 360., s: 0.6, l: 0.4, a: 1.0 };
+pub const MARKER_BLUE: Hsla = Hsla { h: 210. / 360., s: 0.6, l: 0.5, a: 1.0 };
+pub const MARKER_ORANGE: Hsla = Hsla { h: 30. / 360., s: 0.8, l: 0.5, a: 1.0 };
+pub const MARKER_YELLOW: Hsla = Hsla { h: 50. / 360., s: 0.8, l: 0.5, a: 1.0 };
+
 /// Fixed-width, right-aligned marker column used in session/slug picker rows.
 fn picker_marker_base() -> Div {
   div().text_xs().font_weight(FontWeight::BOLD).w(px(22.0)).flex_shrink_0().flex().justify_end()
@@ -385,12 +392,10 @@ impl PickerDelegate for FilePickerDelegate {
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
     let marker = if is_modified {
-      let color =
-        if selected { theme.accent_foreground } else { gpui::hsla(30. / 360., 0.8, 0.5, 1.0) };
+      let color = if selected { theme.accent_foreground } else { MARKER_ORANGE };
       Some(("M", color))
     } else if is_recent {
-      let color =
-        if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
+      let color = if selected { theme.accent_foreground } else { MARKER_BLUE };
       Some(("R", color))
     } else {
       None
@@ -455,8 +460,7 @@ impl PickerDelegate for DiffFilePickerDelegate {
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
     if is_reviewed {
-      let marker_color =
-        if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
+      let marker_color = if selected { theme.accent_foreground } else { MARKER_GREEN };
       row
         .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("✓"))
         .child(label.clone())
@@ -509,15 +513,13 @@ impl PickerDelegate for GitLogPickerDelegate {
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
     if index == 0 {
-      let marker_color =
-        if selected { theme.accent_foreground } else { gpui::hsla(30. / 360., 0.8, 0.5, 1.0) };
+      let marker_color = if selected { theme.accent_foreground } else { MARKER_ORANGE };
       row
         .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("*"))
         .child("Working tree".to_string())
     } else {
       let entry = &self.entries[index - 1];
-      let hash_color =
-        if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
+      let hash_color = if selected { theme.accent_foreground } else { MARKER_BLUE };
       row
         .child(div().text_xs().text_color(hash_color).child(entry.short_hash.clone()))
         .child(entry.summary.clone())
@@ -898,11 +900,10 @@ impl PickerDelegate for SessionPickerDelegate {
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
     let marker = if has_problems {
-      let color = if selected { theme.accent_foreground } else { gpui::hsla(0., 0.8, 0.5, 1.0) };
+      let color = if selected { theme.accent_foreground } else { MARKER_RED };
       picker_marker_base().text_color(color).child(format!("{}", entry.problems))
     } else if is_active {
-      let color =
-        if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
+      let color = if selected { theme.accent_foreground } else { MARKER_GREEN };
       picker_marker_base().text_color(color).child(">")
     } else {
       picker_marker_base()
@@ -972,11 +973,10 @@ impl SlugPickerDelegate {
       problems: 0,
     }];
 
+    let project_problem_count = project.problems.len();
     for group in &groups {
       // Check if this slug is already adopted in project.sessions.
       let session_match = project.sessions.iter().enumerate().find(|(_, s)| s.slug == group.slug);
-
-      let project_problem_count = project.problems.len();
       let (action, display_label, problems) = match session_match {
         Some((idx, s)) => {
           (SlugAction::Switch(idx), s.label.clone(), s.problems.len() + project_problem_count)
@@ -1029,22 +1029,19 @@ impl PickerDelegate for SlugPickerDelegate {
     // "+" for Attach, "*" for New.
     let marker = match &entry.action {
       SlugAction::Switch(_) if entry.problems > 0 => {
-        let color = if selected { theme.accent_foreground } else { gpui::hsla(0., 0.8, 0.5, 1.0) };
+        let color = if selected { theme.accent_foreground } else { MARKER_RED };
         picker_marker_base().text_color(color).child(format!("{}", entry.problems))
       }
       SlugAction::Switch(_) => {
-        let color =
-          if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
+        let color = if selected { theme.accent_foreground } else { MARKER_GREEN };
         picker_marker_base().text_color(color).child("✓")
       }
       SlugAction::Attach(..) => {
-        let color =
-          if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
+        let color = if selected { theme.accent_foreground } else { MARKER_BLUE };
         picker_marker_base().text_color(color).child("+")
       }
       SlugAction::New => {
-        let color =
-          if selected { theme.accent_foreground } else { gpui::hsla(50. / 360., 0.8, 0.5, 1.0) };
+        let color = if selected { theme.accent_foreground } else { MARKER_YELLOW };
         picker_marker_base().text_color(color).child("*")
       }
     };
@@ -1256,8 +1253,7 @@ impl PickerDelegate for ProblemPickerDelegate {
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    let marker_color =
-      if selected { theme.accent_foreground } else { gpui::hsla(0., 0.8, 0.5, 1.0) };
+    let marker_color = if selected { theme.accent_foreground } else { MARKER_RED };
     let marker = picker_marker_base().text_color(marker_color).child("!");
 
     row.child(marker).child(entry.description.clone())

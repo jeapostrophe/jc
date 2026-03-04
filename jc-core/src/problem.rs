@@ -23,7 +23,6 @@ pub enum ClaudeProblem {
   Stop,
   Permission,
   Idle,
-  ApiError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,7 +35,7 @@ pub enum DiffProblem {
   UnreviewedFile(PathBuf),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScriptProblem {
   pub rank: Option<i8>,
   pub file: PathBuf,
@@ -55,14 +54,14 @@ pub enum AppTodoProblem {
 // Wrapper enums
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SessionProblem {
   Claude(ClaudeProblem),
   Terminal(TerminalProblem),
   Todo(AppTodoProblem),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProjectProblem {
   Diff(DiffProblem),
   Script(ScriptProblem),
@@ -84,7 +83,6 @@ impl SessionProblem {
   pub fn rank(&self) -> i8 {
     match self {
       Self::Claude(ClaudeProblem::Permission) => 1,
-      Self::Claude(ClaudeProblem::ApiError) => 2,
       Self::Claude(ClaudeProblem::Stop) => 3,
       Self::Claude(ClaudeProblem::Idle) => 4,
       Self::Terminal(TerminalProblem::Bell) => 5,
@@ -96,7 +94,6 @@ impl SessionProblem {
   pub fn description(&self) -> String {
     match self {
       Self::Claude(ClaudeProblem::Permission) => "Permission prompt".into(),
-      Self::Claude(ClaudeProblem::ApiError) => "API error".into(),
       Self::Claude(ClaudeProblem::Stop) => "Stopped".into(),
       Self::Claude(ClaudeProblem::Idle) => "Idle prompt".into(),
       Self::Terminal(TerminalProblem::Bell) => "Bell".into(),

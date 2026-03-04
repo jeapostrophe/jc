@@ -3,10 +3,10 @@ use crate::views::diff_view::DiffViewEvent;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
-  LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
-  ProblemPickerDelegate, ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines,
-  SessionPickerDelegate, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker, SlugAction,
-  SlugPickerDelegate, TodoHeaderPickerDelegate,
+  LineSearchPickerDelegate, MARKER_ORANGE, MARKER_RED, OpenContextPicker, OpenFilePicker,
+  PickerEvent, PickerState, ProblemPickerDelegate, ReplyHeadingPickerDelegate,
+  ReplyTurnPickerDelegate, SearchLines, SessionPickerDelegate, ShowProblemPicker,
+  ShowSessionPicker, ShowSlugPicker, SlugAction, SlugPickerDelegate, TodoHeaderPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
@@ -1497,23 +1497,6 @@ impl Workspace {
     let active_project_problems: Vec<String> =
       project.problems.iter().map(|p| p.description()).collect();
 
-    // Count OTHER sessions that have problems (session + project combined > 0).
-    let other_sessions_with_problems: usize = self
-      .projects
-      .iter()
-      .enumerate()
-      .flat_map(|(pi, p)| {
-        p.sessions.iter().enumerate().filter_map(move |(si, s)| {
-          let is_active = pi == self.active_project_index && Some(si) == p.active_session_index;
-          if is_active {
-            return None;
-          }
-          let total = s.problems.len() + p.problems.len();
-          if total > 0 { Some(1usize) } else { None }
-        })
-      })
-      .sum();
-
     // Collect problems for all OTHER sessions, grouped by project > session.
     let other_problems: Vec<(String, Vec<String>)> = self
       .projects
@@ -1536,42 +1519,41 @@ impl Workspace {
         })
       })
       .collect();
+    let other_sessions_with_problems = other_problems.len();
 
     let title_el = {
       let el =
         div().id("title-problems").flex().items_center().text_sm().text_color(theme.foreground);
       if current_total > 0 {
-        el.child(div().mr_1().text_xs().text_color(gpui::hsla(0., 0.8, 0.5, 1.0)).child("!"))
-          .child(title)
-          .child(
-            div()
-              .id("title-problem-count")
-              .ml_1()
-              .text_xs()
-              .text_color(gpui::hsla(0., 0.8, 0.5, 1.0))
-              .child(format!("{current_total}"))
-              .tooltip(move |window, cx| {
-                let session_problems = active_session_problems.clone();
-                let project_problems = active_project_problems.clone();
-                Tooltip::element(move |_window, cx| {
-                  let theme = cx.theme();
-                  let fg = theme.foreground;
-                  let dim = theme.muted_foreground;
-                  let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
-                  for desc in &session_problems {
-                    col = col.child(div().text_color(fg).child(desc.clone()));
-                  }
-                  if !session_problems.is_empty() && !project_problems.is_empty() {
-                    col = col.child(div().text_color(dim).child("—"));
-                  }
-                  for desc in &project_problems {
-                    col = col.child(div().text_color(fg).child(desc.clone()));
-                  }
-                  col
-                })
-                .build(window, cx)
-              }),
-          )
+        el.child(div().mr_1().text_xs().text_color(MARKER_RED).child("!")).child(title).child(
+          div()
+            .id("title-problem-count")
+            .ml_1()
+            .text_xs()
+            .text_color(MARKER_RED)
+            .child(format!("{current_total}"))
+            .tooltip(move |window, cx| {
+              let session_problems = active_session_problems.clone();
+              let project_problems = active_project_problems.clone();
+              Tooltip::element(move |_window, cx| {
+                let theme = cx.theme();
+                let fg = theme.foreground;
+                let dim = theme.muted_foreground;
+                let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
+                for desc in &session_problems {
+                  col = col.child(div().text_color(fg).child(desc.clone()));
+                }
+                if !session_problems.is_empty() && !project_problems.is_empty() {
+                  col = col.child(div().text_color(dim).child("—"));
+                }
+                for desc in &project_problems {
+                  col = col.child(div().text_color(fg).child(desc.clone()));
+                }
+                col
+              })
+              .build(window, cx)
+            }),
+        )
       } else {
         el.child(title)
       }
@@ -1585,7 +1567,7 @@ impl Workspace {
           div()
             .id("global-problems")
             .text_xs()
-            .text_color(gpui::hsla(30. / 360., 0.8, 0.5, 1.0))
+            .text_color(MARKER_ORANGE)
             .child(format!("{other_sessions_with_problems}"))
             .tooltip(move |window, cx| {
               let other = other.clone();

@@ -12,7 +12,6 @@ pub enum PendingEvent {
   ClaudeStop,
   ClaudePermission,
   ClaudeIdle,
-  ClaudeApiError,
   TerminalBell,
 }
 
@@ -74,9 +73,8 @@ impl SessionState {
   }
 
   /// Rebuild `self.problems` from pending events and todo problems.
-  /// Returns `true` if the problem count changed.
+  /// Returns `true` if the problem list changed.
   pub fn refresh_problems(&mut self, todo_problems: &[TodoProblem]) -> bool {
-    let old_len = self.problems.len();
     let mut problems = Vec::<SessionProblem>::new();
 
     for event in &self.pending_events {
@@ -84,7 +82,6 @@ impl SessionState {
         PendingEvent::ClaudeStop => SessionProblem::Claude(ClaudeProblem::Stop),
         PendingEvent::ClaudePermission => SessionProblem::Claude(ClaudeProblem::Permission),
         PendingEvent::ClaudeIdle => SessionProblem::Claude(ClaudeProblem::Idle),
-        PendingEvent::ClaudeApiError => SessionProblem::Claude(ClaudeProblem::ApiError),
         PendingEvent::TerminalBell => SessionProblem::Terminal(TerminalProblem::Bell),
       };
       problems.push(sp);
@@ -106,7 +103,7 @@ impl SessionState {
     }
 
     problems.sort_by_key(|p| p.rank());
-    let changed = old_len != problems.len();
+    let changed = self.problems != problems;
     self.problems = problems;
     changed
   }

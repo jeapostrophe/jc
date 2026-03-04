@@ -132,7 +132,7 @@ impl ProjectState {
       problems.push(ProjectProblem::Script(sp.clone()));
     }
     problems.sort_by_key(|p| p.rank());
-    if self.problems.len() != problems.len() {
+    if self.problems != problems {
       changed = true;
     }
     self.problems = problems;

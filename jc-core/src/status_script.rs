@@ -49,11 +49,6 @@ pub fn parse_line(line: &str) -> Option<ScriptProblem> {
 /// Returns an empty vec if the script doesn't exist, isn't executable, or exits
 /// with a non-zero status code.  Stderr is ignored.
 pub fn run_status_script(project_path: &Path) -> Vec<ScriptProblem> {
-  let script = project_path.join("status.sh");
-  if !script.exists() {
-    return Vec::new();
-  }
-
   let output = match Command::new("./status.sh")
     .current_dir(project_path)
     .stderr(std::process::Stdio::null())
