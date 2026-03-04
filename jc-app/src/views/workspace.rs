@@ -3,10 +3,10 @@ use crate::views::diff_view::DiffViewEvent;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
-  LineSearchPickerDelegate, MARKER_ORANGE, MARKER_RED, OpenContextPicker, OpenFilePicker,
-  PickerEvent, PickerState, ProblemPickerDelegate, ReplyHeadingPickerDelegate,
-  ReplyTurnPickerDelegate, SearchLines, SessionPickerDelegate, ShowProblemPicker,
-  ShowSessionPicker, ShowSlugPicker, SlugAction, SlugPickerDelegate, TodoHeaderPickerDelegate,
+  LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
+  ProblemPickerDelegate, ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines,
+  SessionPickerDelegate, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker, SlugAction,
+  SlugPickerDelegate, TodoHeaderPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
@@ -1525,12 +1525,12 @@ impl Workspace {
       let el =
         div().id("title-problems").flex().items_center().text_sm().text_color(theme.foreground);
       if current_total > 0 {
-        el.child(div().mr_1().text_xs().text_color(MARKER_RED).child("!")).child(title).child(
+        el.child(div().mr_1().text_xs().text_color(theme.red).child("!")).child(title).child(
           div()
             .id("title-problem-count")
             .ml_1()
             .text_xs()
-            .text_color(MARKER_RED)
+            .text_color(theme.red)
             .child(format!("{current_total}"))
             .tooltip(move |window, cx| {
               let session_problems = active_session_problems.clone();
@@ -1567,7 +1567,7 @@ impl Workspace {
           div()
             .id("global-problems")
             .text_xs()
-            .text_color(MARKER_ORANGE)
+            .text_color(theme.yellow)
             .child(format!("{other_sessions_with_problems}"))
             .tooltip(move |window, cx| {
               let other = other.clone();
