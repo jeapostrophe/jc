@@ -24,3 +24,5 @@ tree-sitter-go.workspace = true
 tree-sitter-javascript.workspace = true
 tree-sitter-typescript.workspace = true
 diffy.workspace = true
+objc2.workspace = true
+objc2-app-kit.workspace = true

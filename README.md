@@ -125,11 +125,9 @@ From any view (diff, terminal, code, reply), the user can press a comment keybin
 
 ### macOS Notifications
 
-**Verdict: Use `objc2-user-notifications` (modern API).** Since the app will be a bundled `.app` anyway (required by GPUI/Metal), the code-signing requirement is not a burden. This gives us action buttons ("Switch to Session"), notification grouping via `threadIdentifier`, async delegate callbacks, and future-proofing (Apple's current API, not deprecated).
+**Current implementation:** Dock bounce via `NSApplication::requestUserAttention` (`objc2-app-kit`, already linked through GPUI). No app bundling or code signing required. Fires on hook events (Claude stop, permission prompt, idle) when the window is not active. Critical events (permission prompts) bounce repeatedly until the user focuses the app.
 
-**Fallback:** `mac-notification-sys` v0.6.9 works today without code signing but uses deprecated `NSUserNotificationCenter`. Fine for prototyping.
-
-**Simplest possible:** `osascript -e 'display notification ...'` for zero-dependency MVP.
+**Notification banners** (`osascript`, `UNUserNotificationCenter`) require a bundled `.app` with a bundle ID — they silently fail for unbundled binaries. Banners will work once the app is bundled for distribution.
 
 ## Views & Panels
 
@@ -331,7 +329,7 @@ It is deliberately *not* a full code editor on mobile.
 | Mobile server | `axum` + `axum-server` (tls-rustls) + `rcgen` (self-signed certs) |
 | Mobile QR pairing | `fast_qr` (ECL Q, render as GPUI quads) |
 | Mobile app | Separate project (Swift/native iOS likely) |
-| Desktop notifications | `objc2-user-notifications` (modern UNUserNotificationCenter, requires app bundling) |
+| Desktop notifications | Dock bounce via `objc2-app-kit` (`NSApplication::requestUserAttention`); no bundling required. Banners need `.app` bundle. |
 
 ## Workflow Walkthrough
 
@@ -378,7 +376,6 @@ It is deliberately *not* a full code editor on mobile.
 > *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox. If the item doesn't fit under an existing section, create a new `###` section for it.*
 
 ### TODO.md System
-- [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
 
 ### Claude Reply Viewer
@@ -396,22 +393,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 
 ### Problems & Status
-- [x] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
-- [x] [H] Define per-view problem enums (`ClaudeProblem`, `TerminalProblem`, `DiffProblem`, `TodoProblem`) and wrapper enums (`SessionProblem`, `ProjectProblem`) in `jc-core`
-- [x] [H] Wire hook events into `SessionState.pending_events` (set flags on Stop/Permission/Idle/ApiError, clear on user interaction)
-- [x] [E] Surface `TerminalEvent::Bell` from `TerminalView` to workspace via `TerminalViewEvent::Bell` event emitter
-- [x] [E] Implement `TodoProblem::UnsentWait` detection (check for content below `### WAIT`)
-- [x] [E] Implement `DiffProblem::UnreviewedFile` detection (dirty files not marked reviewed)
-- [x] [H] Implement `refresh_problems()` on `SessionState` and `ProjectState` (merge push events + poll sources, replace problem list, return change flag)
-- [x] [E] Wire refresh timer (2 seconds) and on-demand refresh on session switch, diff review, and user interaction
-- [x] [E] Populate title bar problem indicators (`!` dirty marker + count) from refreshed problem lists
-- [x] [E] Show problem markers in session picker (red count) and slug picker (red count / green check)
-- [x] [E] Add global problem count indicator in upper right (count of other sessions with problems)
-- [x] [H] Implement hover tooltips listing problems on title bar and global indicator
-- [x] [H] Implement `status.sh` runner: periodic execution, parse `{rank:}?file{:line}? - message` format, produce `ScriptProblem`s
-- [x] [H] Problem navigation: jump to the view/file that can address each problem kind
-- [x] [E] Jump to next problem keybinding (Cmd-;)
-- [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
+- [ ] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
 
 ### Mobile App
 - [ ] [D] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
@@ -430,7 +412,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Persistent state: survive app restart without losing session state or terminal sessions [perhaps use 'tmux' behind the scenes]
 - [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
-- [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for notifications + distribution
+- [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for distribution (and prerequisite for `objc2-user-notifications` upgrade)
 
 ### Code Quality
 

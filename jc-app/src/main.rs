@@ -1,5 +1,6 @@
 mod app;
 mod language;
+mod notify;
 mod outline;
 mod views;
 

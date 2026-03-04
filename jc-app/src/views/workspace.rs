@@ -93,6 +93,8 @@ pub struct Workspace {
   _bell_subscriptions: Vec<Subscription>,
   _problems_poll_task: Option<Task<()>>,
   last_jumped_target: Option<ProblemTarget>,
+  window_active: bool,
+  _window_activation_subscription: Subscription,
 }
 
 impl Workspace {
@@ -144,6 +146,12 @@ impl Workspace {
     let appearance_subscription =
       cx.observe_window_appearance(window, |this: &mut Self, window, cx| {
         this.apply_appearance(appearance_from_window(window.appearance()), window, cx);
+      });
+
+    // Track window activation for notification suppression.
+    let window_activation_subscription =
+      cx.observe_window_activation(window, |this: &mut Self, window, _cx| {
+        this.window_active = window.is_window_active();
       });
 
     let working_hours = config.working_hours.clone();
@@ -295,6 +303,8 @@ impl Workspace {
       _bell_subscriptions: bell_subscriptions,
       _problems_poll_task: Some(problems_poll_task),
       last_jumped_target: None,
+      window_active: true,
+      _window_activation_subscription: window_activation_subscription,
     };
 
     ws.subscribe_active_project(window, cx);
@@ -1616,14 +1626,34 @@ impl Workspace {
     };
 
     // Match the slug to a session across all projects.
+    let mut matched_project: Option<String> = None;
+    let mut matched_label: Option<String> = None;
     if let Some(slug) = &event.slug {
       for project in &mut self.projects {
         for session in &mut project.sessions {
           if &session.slug == slug {
-            session.pending_events.insert(pending.clone());
+            let is_new = session.pending_events.insert(pending.clone());
+            if is_new {
+              matched_project = Some(project.name.clone());
+              matched_label = Some(session.label.clone());
+            }
             break;
           }
         }
+      }
+    }
+
+    // Notify when the window is not active (user is in another app).
+    if let (Some(project_name), Some(session_label)) = (matched_project, matched_label) {
+      if !self.window_active {
+        let critical = matches!(event.kind, HookEventKind::PermissionPrompt);
+        let title = format!("{project_name} > {session_label}");
+        let message = match event.kind {
+          HookEventKind::Stop => "Claude finished",
+          HookEventKind::PermissionPrompt => "Permission needed",
+          HookEventKind::IdlePrompt => "Claude is idle",
+        };
+        crate::notify::notify(&title, message, critical);
       }
     }
 
