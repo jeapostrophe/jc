@@ -3,12 +3,14 @@ use crate::views::diff_view::DiffView;
 use crate::views::session_state::SessionState;
 use crate::views::todo_view::TodoView;
 use gpui::*;
-use jc_core::problem::{DiffProblem, ProjectProblem};
+use jc_core::problem::{DiffProblem, ProjectProblem, ScriptProblem};
 use jc_core::session::discover_latest_session_group;
+use jc_core::status_script;
 use jc_core::todo;
 use jc_terminal::Palette;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
 
 pub struct ProjectState {
   pub path: PathBuf,
@@ -19,6 +21,8 @@ pub struct ProjectState {
   pub diff_view: Entity<DiffView>,
   pub code_view: Entity<CodeView>,
   pub problems: Vec<ProjectProblem>,
+  pub script_problems: Vec<ScriptProblem>,
+  pub last_script_run: Option<Instant>,
 }
 
 impl ProjectState {
@@ -87,6 +91,8 @@ impl ProjectState {
       diff_view,
       code_view,
       problems: Vec::new(),
+      script_problems: Vec::new(),
+      last_script_run: None,
     }
   }
 
@@ -109,10 +115,21 @@ impl ProjectState {
       changed |= session.refresh_problems(todo_problems);
     }
 
-    // Project-level problems: unreviewed diff files.
+    // Run status.sh at most once every 10 seconds.
+    let script_interval = std::time::Duration::from_secs(10);
+    let should_run_script = self.last_script_run.map_or(true, |t| t.elapsed() >= script_interval);
+    if should_run_script {
+      self.script_problems = status_script::run_status_script(&self.path);
+      self.last_script_run = Some(Instant::now());
+    }
+
+    // Project-level problems: unreviewed diff files + script problems.
     let mut problems = Vec::<ProjectProblem>::new();
     for path in self.diff_view.read(cx).unreviewed_files() {
       problems.push(ProjectProblem::Diff(DiffProblem::UnreviewedFile(path)));
+    }
+    for sp in &self.script_problems {
+      problems.push(ProjectProblem::Script(sp.clone()));
     }
     problems.sort_by_key(|p| p.rank());
     if self.problems.len() != problems.len() {

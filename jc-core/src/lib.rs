@@ -5,6 +5,7 @@ pub mod hooks_settings;
 pub mod model;
 pub mod problem;
 pub mod session;
+pub mod status_script;
 pub mod theme;
 pub mod todo;
 pub mod usage;
