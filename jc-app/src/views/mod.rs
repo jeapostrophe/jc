@@ -62,9 +62,7 @@ pub fn external_change_banner(externally_modified: bool, cx: &App) -> AnyElement
       .bg(theme.warning)
       .text_sm()
       .text_color(theme.warning_foreground)
-      .child(
-        "Merge conflict \u{2014} press Cmd-R to reload from disk (unsaved edits will be lost)",
-      )
+      .child("Merge conflict \u{2014} press Cmd-R to reload from disk (unsaved edits will be lost)")
       .into_any_element()
   } else {
     div().into_any_element()

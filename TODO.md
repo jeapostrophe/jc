@@ -8,22 +8,12 @@ Test
 
 Review @README.md
 
-I want to work on the '### Problems & Status' section
+Look at this issue
+- [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
 
-Build a plan for these problems.
-Optimize the plan for context window usage and parallelization. Branch and fork the context/tasks into parallel jobs as appropriate.
-Limit scope relative to an expectation of how the context window will grow.
+I don't like needing to do the bundling/etc, maybe I am too nervous about that concern. I don't want to be running Xcode and dealing with all sorts of Apple account setup. Am I too nervous?
 
----
-
-* The ! in the title bar doesn't need a hover; it is okay if only the numbers have one
-* Make a "problem picker" (propose a keybinding) that lets you select the problems in the current session and jump to them
-* Make the Cmd-; jump to the problem in whatever the active pane is, rather than the left
-* The Cmd-; needs to jump to the next problem if you are pressing it over and over again --- how to do this well?
-
----
-
-Find all direct color values in the code (e.g. Hsla) and ensure that they are using the colors from the theme set
+If it is a valid concern, is there some system level command line tool that I can run to pop up a notification? Can I just make the app icon jump?
 
 ---
 
@@ -31,6 +21,11 @@ Review @README.md
 
 Optimize the plan for context window usage and parallelization. Branch and fork the context/tasks into parallel jobs as appropriate.
 Limit scope relative to an expectation of how the context window will grow.
+
+XXX focus on one panel only
+XXX the Cmd-N buttons are hard to remember
+
+banana
 
 ---
 
