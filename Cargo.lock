@@ -3832,6 +3832,7 @@ dependencies = [
  "gpui-component-assets",
  "jc-core",
  "jc-terminal",
+ "libc",
  "notify",
  "serde_json",
  "tree-sitter",

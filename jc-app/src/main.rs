@@ -28,13 +28,21 @@ enum Command {
     /// Time the window resets in 24h local time (e.g. 2159).
     reset_hhmm: Option<String>,
   },
+  /// Remove stale jc hooks from all configured projects.
+  CleanHooks,
 }
 
 fn main() -> anyhow::Result<()> {
   let cli = Cli::parse();
 
-  if let Some(Command::Usage { limit_pct, reset_day, reset_hhmm }) = cli.command {
-    return cmd_usage(limit_pct, reset_day, reset_hhmm);
+  match cli.command {
+    Some(Command::Usage { limit_pct, reset_day, reset_hhmm }) => {
+      return cmd_usage(limit_pct, reset_day, reset_hhmm);
+    }
+    Some(Command::CleanHooks) => {
+      return cmd_clean_hooks();
+    }
+    None => {}
   }
 
   let config = config::load_config()?;
@@ -48,6 +56,10 @@ fn main() -> anyhow::Result<()> {
     state.register_project(&cwd);
     config::save_state(&state)?;
   }
+
+  // Install a SIGINT handler that cleans hooks before exiting.
+  // The GPUI event loop swallows Ctrl-C, so Drop doesn't always run.
+  install_signal_handler(&state);
 
   app::run(state, config);
   Ok(())
@@ -87,4 +99,57 @@ fn cmd_usage(
   }
 
   Ok(())
+}
+
+fn cmd_clean_hooks() -> anyhow::Result<()> {
+  let state = config::load_state()?;
+
+  let mut paths: Vec<PathBuf> = state.projects.iter().map(|p| p.path.clone()).collect();
+
+  // Also include cwd if it's not already in the list.
+  if let Ok(cwd) = std::env::current_dir() {
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    if !paths.iter().any(|p| *p == cwd) {
+      paths.push(cwd);
+    }
+  }
+
+  for path in &paths {
+    match jc_core::hooks_settings::uninstall_hooks(path) {
+      Ok(()) => eprintln!("cleaned hooks for {}", path.display()),
+      Err(e) => eprintln!("failed to clean hooks for {}: {e}", path.display()),
+    }
+  }
+  Ok(())
+}
+
+/// Store project paths globally so the signal handler can access them.
+static SIGNAL_CLEANUP_PATHS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn install_signal_handler(state: &config::AppState) {
+  let paths: Vec<PathBuf> = state.projects.iter().map(|p| p.path.clone()).collect();
+  *SIGNAL_CLEANUP_PATHS.lock().unwrap() = paths;
+
+  unsafe {
+    libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+    libc::signal(libc::SIGTERM, sigint_handler as libc::sighandler_t);
+  }
+}
+
+extern "C" fn sigint_handler(sig: libc::c_int) {
+  // Signal handlers must be async-signal-safe. We do minimal work:
+  // uninstall_hooks only does file I/O (open, read, write), which is
+  // technically not async-signal-safe but is reliable in practice for
+  // single-threaded cleanup before exit.
+  if let Ok(paths) = SIGNAL_CLEANUP_PATHS.lock() {
+    for path in paths.iter() {
+      let _ = jc_core::hooks_settings::uninstall_hooks(path);
+    }
+  }
+
+  // Re-raise with default handler for normal exit behavior.
+  unsafe {
+    libc::signal(sig, libc::SIG_DFL);
+    libc::raise(sig);
+  }
 }
