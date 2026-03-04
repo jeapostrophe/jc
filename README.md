@@ -325,7 +325,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Cursor not blinking properly in the Claude terminal — Claude Code does its own cursor management; need to properly signal focus state and respect its cursor escape sequences
 
 ### TODO.md System
-- [ ] [D] Implement interactive correction of invalid session slugs in TODO.md (e.g., picker showing discovered slugs to replace an invalid one)
+- [x] [D] Implement interactive correction of invalid session slugs in TODO.md (e.g., picker showing discovered slugs to replace an invalid one)
 - [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]

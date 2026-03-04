@@ -1,19 +1,15 @@
 # TODO
 
 # Claude
+## Session happy-leaping-locket: New session
+### WAIT
+## Session effervescent-dreaming-sonnet: New session
+### WAIT
 ## Session parallel-singing-russell: New session
 ### WAIT
 ## Session xxx: 0
 ### Message 0
 Review @README.md
-
-Make a plan that can solve as many of these problems as possible in parallel agents
-- [ ] [E] Cursor not blinking properly in the Claude terminal
-- [ ] [E] Watch all JSONL files in the slug group (not just one file) for changes
-- [ ] [E] Labels on Diff/Reply/FileViews should be limited to one line, right now they can wrap
-- [ ] [E] Implement general searching in all views with Cmd-F (picker on lines)
-- [ ] [E] Garbage collect stale `.jc/replies/` files (e.g., on app startup, prune files older than N days)
-
 
 ### WAIT XXX
 
