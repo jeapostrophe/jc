@@ -1071,21 +1071,22 @@ type ScrollCallback = Box<dyn Fn(u32, &mut Window, &mut App)>;
 struct LineEntry {
   /// 1-based line number.
   line_number: u32,
+  /// Byte offset of the line start in the original text.
+  byte_start: usize,
   /// The line content (without trailing newline).
   content: String,
-  /// Syntax highlight styles for this line, with byte ranges relative to `content`.
-  styles: Vec<(Range<usize>, HighlightStyle)>,
 }
 
 pub struct LineSearchPickerDelegate<F: Fn(u32, &mut Window, &mut App) + 'static> {
   labels: Vec<String>,
   entries: Vec<LineEntry>,
+  /// Syntax highlighter with the parsed tree — styles are queried on demand in render_item.
+  highlighter: SyntaxHighlighter,
   scroll_to_line: F,
 }
 
 impl<F: Fn(u32, &mut Window, &mut App) + 'static> LineSearchPickerDelegate<F> {
-  fn build(text: &str, language: &str, scroll_to_line: F, cx: &App) -> Self {
-    let theme = cx.theme();
+  fn build(text: &str, language: &str, scroll_to_line: F, _cx: &App) -> Self {
     let rope = Rope::from(text);
     let mut highlighter = SyntaxHighlighter::new(language);
     highlighter.update(None, &rope);
@@ -1097,31 +1098,22 @@ impl<F: Fn(u32, &mut Window, &mut App) + 'static> LineSearchPickerDelegate<F> {
     for (i, line) in text.split('\n').enumerate() {
       let line_number = (i as u32) + 1;
       let line_byte_start = byte_offset;
-      let line_byte_end = byte_offset + line.len();
 
       // Skip empty/whitespace-only lines.
       if !line.trim().is_empty() {
-        let raw_styles =
-          highlighter.styles(&(line_byte_start..line_byte_end), &theme.highlight_theme);
-        // Adjust ranges to be relative to line start.
-        let styles: Vec<(Range<usize>, HighlightStyle)> = raw_styles
-          .into_iter()
-          .filter_map(|(r, s)| {
-            let start = r.start.saturating_sub(line_byte_start);
-            let end = r.end.saturating_sub(line_byte_start).min(line.len());
-            if start < end { Some((start..end, s)) } else { None }
-          })
-          .collect();
-
         labels.push(format!("{line_number}: {line}"));
-        entries.push(LineEntry { line_number, content: line.to_string(), styles });
+        entries.push(LineEntry {
+          line_number,
+          byte_start: line_byte_start,
+          content: line.to_string(),
+        });
       }
 
       // +1 for the '\n' separator (or end of string).
-      byte_offset = line_byte_end + 1;
+      byte_offset = byte_offset + line.len() + 1;
     }
 
-    Self { labels, entries, scroll_to_line }
+    Self { labels, entries, highlighter, scroll_to_line }
   }
 }
 
@@ -1165,19 +1157,30 @@ impl<F: Fn(u32, &mut Window, &mut App) + 'static> PickerDelegate for LineSearchP
     let line_num =
       div().text_xs().text_color(line_num_color).mr_1().child(format!("{}:", entry.line_number));
 
-    // Build syntax-highlighted line content using StyledText.
+    // Build syntax-highlighted line content using StyledText (computed lazily per visible item).
     let line_text: SharedString = entry.content.clone().into();
     let styled = if selected {
       // When selected, use accent foreground — no syntax colors.
       StyledText::new(line_text)
     } else {
+      let byte_end = entry.byte_start + entry.content.len();
+      let raw_styles =
+        self.highlighter.styles(&(entry.byte_start..byte_end), &theme.highlight_theme);
+      let styles: Vec<(Range<usize>, HighlightStyle)> = raw_styles
+        .into_iter()
+        .filter_map(|(r, s)| {
+          let start = r.start.saturating_sub(entry.byte_start);
+          let end = r.end.saturating_sub(entry.byte_start).min(entry.content.len());
+          if start < end { Some((start..end, s)) } else { None }
+        })
+        .collect();
       let default_style = TextStyle {
         font_family: "Lilex".into(),
         font_size: theme.font_size.into(),
         color: theme.foreground,
         ..Default::default()
       };
-      StyledText::new(line_text).with_default_highlights(&default_style, entry.styles.clone())
+      StyledText::new(line_text).with_default_highlights(&default_style, styles)
     };
 
     row.child(line_num).child(styled)

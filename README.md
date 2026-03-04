@@ -332,7 +332,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Allow projects to have a special `./status.sh` script that reports problems in the form `file:line - problem`
 
 ### Code Quality
-- [ ] [E] Lazy-highlight `LineSearchPickerDelegate::build()` — currently does O(N) syntax highlighting of every line on each Cmd-F; will lag on very large files
+- [x] [E] Lazy-highlight `LineSearchPickerDelegate::build()` — currently does O(N) syntax highlighting of every line on each Cmd-F; will lag on very large files
 - [x] [E] Collapse the four `LineSearchPickerDelegate::for_*_view` factories into one generic method via a shared trait (editor_text + scroll_to_line + language_name)
 
 ### Automation
