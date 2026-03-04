@@ -212,11 +212,11 @@ pub fn has_valid_sessions(doc: &TodoDocument, project_path: &Path) -> bool {
     .any(|s| crate::session::discover_session_group(project_path, &s.slug).is_some())
 }
 
-/// Build new text with a `## Session <slug>: New session` heading inserted.
+/// Build new text with a `## Session <slug>: <label>` heading inserted.
 /// If a `# Claude` section exists, the heading goes right after it. Otherwise
 /// a `# Claude` section is appended at the end of the text.
-pub fn insert_session_heading(text: &str, doc: &TodoDocument, slug: &str) -> String {
-  let heading = format!("## Session {slug}: New session\n### WAIT\n");
+pub fn insert_session_heading(text: &str, doc: &TodoDocument, slug: &str, label: &str) -> String {
+  let heading = format!("## Session {slug}: {label}\n### WAIT\n");
 
   if let Some(claude_line) = doc.claude_section_line {
     // Find byte offset right after the `# Claude` line.
@@ -512,8 +512,8 @@ some notes
 # Claude
 ";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "my-slug");
-    assert!(result.contains("# Claude\n## Session my-slug: New session\n### WAIT\n"));
+    let result = insert_session_heading(text, &doc, "my-slug", "my-slug");
+    assert!(result.contains("# Claude\n## Session my-slug: my-slug\n### WAIT\n"));
     // Verify it re-parses correctly.
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 1);
@@ -528,8 +528,8 @@ some notes
 some notes
 ";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "test-slug");
-    assert!(result.contains("# Claude\n## Session test-slug: New session\n### WAIT\n"));
+    let result = insert_session_heading(text, &doc, "test-slug", "test-slug");
+    assert!(result.contains("# Claude\n## Session test-slug: test-slug\n### WAIT\n"));
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 1);
     assert_eq!(new_doc.sessions[0].slug, "test-slug");
@@ -539,8 +539,8 @@ some notes
   fn insert_session_heading_empty_document() {
     let text = "";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "fresh");
-    assert_eq!(result, "# Claude\n## Session fresh: New session\n### WAIT\n");
+    let result = insert_session_heading(text, &doc, "fresh", "fresh");
+    assert_eq!(result, "# Claude\n## Session fresh: fresh\n### WAIT\n");
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 1);
     assert_eq!(new_doc.sessions[0].slug, "fresh");
@@ -555,7 +555,7 @@ some notes
 notes
 ";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "new-slug");
+    let result = insert_session_heading(text, &doc, "new-slug", "new-slug");
     // New heading should be inserted right after `# Claude`, before the old session.
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 2);

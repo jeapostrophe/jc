@@ -793,36 +793,76 @@ impl PickerDelegate for ReplyHeadingPickerDelegate {
 // SessionPickerDelegate
 // ---------------------------------------------------------------------------
 
+struct SessionPickerEntry {
+  project_index: usize,
+  session_index: usize,
+  project_name: String,
+  label: String,
+  slug: String,
+  relative_time: String,
+  /// Whether this label appears on more than one session (needing slug disambiguation).
+  ambiguous_label: bool,
+  problems: usize,
+}
+
 pub struct SessionPickerDelegate {
+  /// Labels used for fuzzy filtering (format: "project / label slug").
   labels: Vec<String>,
-  /// (project_index, session_index) for each label.
-  entries: Vec<(usize, usize)>,
+  entries: Vec<SessionPickerEntry>,
   active_entry: Option<usize>,
-  problems_per_entry: Vec<usize>,
   /// Stores the last confirmed entry for the workspace to read.
   confirmed: (usize, usize),
 }
 
 impl SessionPickerDelegate {
   pub fn new(projects: &[ProjectState], active_project_index: usize) -> Self {
-    let mut labels = Vec::new();
+    use jc_core::session::{discover_session_groups, format_relative_time};
+    use std::collections::HashMap;
+
     let mut entries = Vec::new();
-    let mut problems_per_entry = Vec::new();
     let mut active_entry = None;
 
     for (pi, project) in projects.iter().enumerate() {
+      // Build a map from slug -> relative_time for this project.
+      let groups = discover_session_groups(&project.path);
+      let mut slug_time_strings: HashMap<String, String> = HashMap::default();
+      for group in &groups {
+        slug_time_strings.insert(group.slug.clone(), format_relative_time(group.latest_mtime));
+      }
+
       for (si, session) in project.sessions.iter().enumerate() {
         let is_active = pi == active_project_index && Some(si) == project.active_session_index;
         if is_active {
-          active_entry = Some(labels.len());
+          active_entry = Some(entries.len());
         }
-        labels.push(format!("{} / {}: {}", project.name, session.slug, session.label));
-        entries.push((pi, si));
-        problems_per_entry.push(session.problems.len());
+        let relative_time = slug_time_strings.get(&session.slug).cloned().unwrap_or_default();
+        entries.push(SessionPickerEntry {
+          project_index: pi,
+          session_index: si,
+          project_name: project.name.clone(),
+          label: session.label.clone(),
+          slug: session.slug.clone(),
+          relative_time,
+          ambiguous_label: false, // computed below
+          problems: session.problems.len(),
+        });
       }
     }
 
-    Self { labels, entries, active_entry, problems_per_entry, confirmed: (0, 0) }
+    // Detect ambiguous labels: a label is ambiguous if more than one entry shares it.
+    let mut label_counts: HashMap<String, usize> = HashMap::default();
+    for e in &entries {
+      *label_counts.entry(e.label.clone()).or_default() += 1;
+    }
+    for e in &mut entries {
+      e.ambiguous_label = label_counts.get(&e.label).copied().unwrap_or(0) > 1;
+    }
+
+    // Build fuzzy-filterable labels.
+    let labels: Vec<String> =
+      entries.iter().map(|e| format!("{} / {} {}", e.project_name, e.label, e.slug)).collect();
+
+    Self { labels, entries, active_entry, confirmed: (0, 0) }
   }
 
   pub fn confirmed_entry(&self) -> (usize, usize) {
@@ -836,19 +876,20 @@ impl PickerDelegate for SessionPickerDelegate {
   }
 
   fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
-    self.confirmed = self.entries[index];
+    let e = &self.entries[index];
+    self.confirmed = (e.project_index, e.session_index);
   }
 
   fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
     let theme = cx.theme();
-    let label = &self.labels[index];
+    let entry = &self.entries[index];
     let is_active = self.active_entry == Some(index);
-    let has_problems = self.problems_per_entry[index] > 0;
+    let has_problems = entry.problems > 0;
 
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    // Active session marker
+    // Active session marker.
     let marker = if is_active {
       let color =
         if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
@@ -860,7 +901,19 @@ impl PickerDelegate for SessionPickerDelegate {
       div().text_xs().w(px(10.0))
     };
 
-    row.child(marker).child(label.clone())
+    // Main text: "project / label".
+    let main_text = format!("{} / {}", entry.project_name, entry.label);
+
+    // Muted right section: optional "(slug)" + recency.
+    let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
+    let right = if entry.ambiguous_label {
+      format!("({}) {}", entry.slug, entry.relative_time)
+    } else {
+      entry.relative_time.clone()
+    };
+    let right_el = div().ml_auto().text_xs().text_color(muted_color).child(right);
+
+    row.child(marker).child(main_text).child(right_el)
   }
 }
 
@@ -869,12 +922,22 @@ impl PickerDelegate for SessionPickerDelegate {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
+pub enum SlugAction {
+  /// Switch to an already-adopted session.
+  Switch(usize),
+  /// Adopt an orphaned slug (not yet in TODO.md).
+  Attach(String),
+  /// Create a brand new Claude session.
+  New,
+}
+
+#[derive(Clone)]
 pub struct SlugEntry {
+  pub action: SlugAction,
+  pub project_name: String,
+  /// Display label: the TODO label, "Attach", or "NEW".
+  pub display_label: String,
   pub slug: String,
-  /// Index in ProjectState.sessions, None if not yet adopted.
-  pub session_index: Option<usize>,
-  /// Label from TODO.md, empty if not adopted.
-  pub label: String,
   pub relative_time: String,
 }
 
@@ -889,35 +952,34 @@ impl SlugPickerDelegate {
     use jc_core::session::{discover_session_groups, format_relative_time};
 
     let groups = discover_session_groups(&project.path);
-    let mut labels = Vec::new();
-    let mut entries = Vec::new();
+    // "NEW" entry first.
+    let mut labels = vec![format!("{} / NEW", project.name)];
+    let mut entries = vec![SlugEntry {
+      action: SlugAction::New,
+      project_name: project.name.clone(),
+      display_label: "NEW".to_string(),
+      slug: String::new(),
+      relative_time: String::new(),
+    }];
 
     for group in &groups {
       // Check if this slug is already adopted in project.sessions.
-      let session_match = project
-        .sessions
-        .iter()
-        .enumerate()
-        .find(|(_, s)| s.slug == group.slug);
+      let session_match = project.sessions.iter().enumerate().find(|(_, s)| s.slug == group.slug);
 
-      let (session_index, label) = match session_match {
-        Some((idx, s)) => (Some(idx), s.label.clone()),
-        None => (None, String::new()),
+      let (action, display_label) = match session_match {
+        Some((idx, s)) => (SlugAction::Switch(idx), s.label.clone()),
+        None => (SlugAction::Attach(group.slug.clone()), "Attach".to_string()),
       };
 
       let relative_time = format_relative_time(group.latest_mtime);
 
-      let display = if label.is_empty() {
-        format!("{} ({})", group.slug, relative_time)
-      } else {
-        format!("{}: {} ({})", group.slug, label, relative_time)
-      };
-
-      labels.push(display);
+      // Fuzzy-filterable label includes project, display label, and slug.
+      labels.push(format!("{} / {} {}", project.name, display_label, group.slug));
       entries.push(SlugEntry {
+        action,
+        project_name: project.name.clone(),
+        display_label,
         slug: group.slug.clone(),
-        session_index,
-        label,
         relative_time,
       });
     }
@@ -942,37 +1004,51 @@ impl PickerDelegate for SlugPickerDelegate {
   fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
     let theme = cx.theme();
     let entry = &self.entries[index];
-    let adopted = entry.session_index.is_some();
 
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    // Left marker: ✓ (green) if adopted, + (blue) if not.
-    let (marker_text, marker_color) = if adopted {
-      let color =
-        if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
-      ("✓", color)
-    } else {
-      let color =
-        if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
-      ("+", color)
+    // Left marker.
+    let (marker_text, marker_color) = match &entry.action {
+      SlugAction::Switch(_) => {
+        let color =
+          if selected { theme.accent_foreground } else { gpui::hsla(120. / 360., 0.6, 0.4, 1.0) };
+        ("✓", color)
+      }
+      SlugAction::Attach(_) => {
+        let color =
+          if selected { theme.accent_foreground } else { gpui::hsla(210. / 360., 0.6, 0.5, 1.0) };
+        ("+", color)
+      }
+      SlugAction::New => {
+        let color =
+          if selected { theme.accent_foreground } else { gpui::hsla(50. / 360., 0.8, 0.5, 1.0) };
+        ("*", color)
+      }
     };
 
-    let marker =
-      div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).w(px(14.0)).child(marker_text);
+    let marker = div()
+      .text_xs()
+      .text_color(marker_color)
+      .font_weight(FontWeight::BOLD)
+      .w(px(14.0))
+      .child(marker_text);
 
-    // Middle: slug (+ ": label" if adopted).
-    let middle = if !entry.label.is_empty() {
-      format!("{}: {}", entry.slug, entry.label)
+    // Main text: "project / label".
+    let main_text = format!("{} / {}", entry.project_name, entry.display_label);
+
+    // Muted right section: "(slug) recency" (omit for NEW).
+    let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
+    let right = if entry.slug.is_empty() {
+      String::new()
+    } else if entry.relative_time.is_empty() {
+      format!("({})", entry.slug)
     } else {
-      entry.slug.clone()
+      format!("({}) {}", entry.slug, entry.relative_time)
     };
+    let right_el = div().ml_auto().text_xs().text_color(muted_color).child(right);
 
-    // Right: relative time, right-aligned.
-    let time_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
-    let time_el = div().ml_auto().text_xs().text_color(time_color).child(entry.relative_time.clone());
-
-    row.child(marker).child(middle).child(time_el)
+    row.child(marker).child(main_text).child(right_el)
   }
 }
 

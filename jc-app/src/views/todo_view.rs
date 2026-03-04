@@ -74,16 +74,17 @@ impl TodoView {
     &self.problems
   }
 
-  /// Insert a `## Session <slug>: New session` heading into the TODO.md,
+  /// Insert a `## Session <slug>: <label>` heading into the TODO.md,
   /// save, and revalidate.
   pub fn insert_session_heading(
     &mut self,
     slug: &str,
+    label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let text = self.code_view.read(cx).editor_text(cx);
-    let new_text = todo::insert_session_heading(&text, &self.document, slug);
+    let new_text = todo::insert_session_heading(&text, &self.document, slug, label);
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {
         state.set_value(new_text, window, cx);

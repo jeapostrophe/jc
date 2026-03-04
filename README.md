@@ -70,9 +70,9 @@ The slug links a session to a group of Claude Code JSONL files in `~/.claude/pro
 **State model:** `state.toml` holds only a project registry (list of project paths). All session state is derived from TODO.md files. When the user picks between projects and sessions, the picker reads `## Session` headings from each project's TODO.md.
 
 **Creating sessions:** Slugs are assigned by Claude Code, not invented by the user. The app creates sessions programmatically:
-- **Project init:** When a project is first added to jc, the app scans for existing JSONL files. If any exist, the most recent session's slug is adopted and a `## Session` heading is written into TODO.md. If none exist, the app launches Claude Code fresh, waits for the JSONL file to appear, extracts the slug, and writes the heading.
-- **New session:** From the picker, the user selects "New session." The app launches a fresh Claude Code instance, discovers the resulting slug from the new JSONL file, and inserts a `## Session <slug>: <label>` heading into TODO.md (prompting for a label).
-- **Adopt existing:** The picker also lists discovered slugs from the JSONL directory that aren't yet in TODO.md, so the user can adopt an orphaned or external session.
+- **Project init:** When a project is first added to jc, the app scans for existing JSONL files. If any exist, the most recent session's slug is adopted and a `## Session <slug>: <slug>` heading is written into TODO.md (using the slug as the initial label). If none exist, the app launches Claude Code fresh, waits for the JSONL file to appear, extracts the slug, and writes the heading.
+- **New session:** From the slug picker (Cmd-Shift-P), the user selects "NEW." The app launches a fresh Claude Code instance, polls for the new JSONL file, discovers the resulting slug, and inserts a `## Session <slug>: <slug>` heading into TODO.md.
+- **Adopt existing:** The slug picker lists discovered slugs from the JSONL directory that aren't yet in TODO.md as "Attach" entries. Selecting one adopts the session, inserting a `## Session <slug>: <slug>` heading.
 
 To find all JSONL files for a slug, scan the session directory and match on the `slug` field. The most recently modified file in the group is the "active" one.
 
@@ -84,7 +84,8 @@ Key design points:
 - Separate terminal instances per session (switching sessions does not disconnect terminals)
 - Session state derived from TODO.md `## Session` headings, not persisted separately
 - `Problem { rank, description }` tracks validation issues (invalid slugs, dirty working directory) — extensible for future checks
-- Session picker (Cmd-P) shows all sessions across all projects with `>` for active and `!` for sessions with problems
+- **Session picker (Cmd-P):** Shows all adopted sessions across all projects. Format: `project / label    (slug) recency`. The `(slug)` is only shown when the label is ambiguous (appears on more than one session). Markers: `>` for active, `!` for problems.
+- **Slug picker (Cmd-Shift-P):** Shows all discovered sessions for the current project plus a "NEW" entry. Format: `project / label    (slug) recency`. Adopted sessions show their TODO label; orphaned sessions show "Attach". Selecting "NEW" launches a fresh Claude instance and auto-detects the slug.
 - Title bar shows `project > session` with problem indicators
 
 ### TODO.md
@@ -305,8 +306,8 @@ It is deliberately *not* a full code editor on mobile.
 ### Managing Projects and Sessions
 
 1. Add a project: run `jc .` from a repo, or use an in-app command. The app discovers or creates a Claude Code session and writes the `## Session` heading into TODO.md.
-2. Create additional sessions from the picker ("New session" launches Claude Code, discovers the slug, inserts the heading). Or adopt an existing orphaned session.
-3. Use the fuzzy picker to switch between projects and sessions.
+2. Use the session picker (Cmd-P) to switch between adopted sessions across all projects.
+3. Use the slug picker (Cmd-Shift-P) to manage the current project's sessions: switch to an adopted session, attach an orphaned one, or select "NEW" to launch a fresh Claude instance.
 
 ## Task Checklist
 
@@ -325,7 +326,6 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Cursor not blinking properly in the Claude terminal — Claude Code does its own cursor management; need to properly signal focus state and respect its cursor escape sequences
 
 ### TODO.md System
-- [x] [D] Implement interactive correction of invalid session slugs in TODO.md (e.g., picker showing discovered slugs to replace an invalid one)
 - [ ] [D] Implement "select and send" flow: selection -> new Message heading -> send to terminal -> move WAIT
 - [ ] [D] Implement conflict resolution (git-style merge of buffer vs disk)
 - [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
@@ -345,9 +345,6 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
 
 ### Notifications & Status
-- [x] [E] Usage: pace multiplier (`limit_pct / working_pct` as `0.7x`)
-- [x] [E] Usage: projected remaining working hours at current burn rate
-- [x] [H] Implement Claude usage dashboard: poll OAuth usage API, display 5h/7d %, par calculation
 - [ ] [H] Implement local HTTP server to receive Claude Code hook events (Stop, Notification, PermissionRequest)
 - [ ] [E] Implement in-app status bar showing waiting sessions (driven by hook events)
 - [ ] [E] Jump to next problem keybinding on Cmd-;

@@ -5,7 +5,7 @@ use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
   LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
   ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines, SessionPickerDelegate,
-  ShowSessionPicker, ShowSlugPicker, SlugPickerDelegate, TodoHeaderPickerDelegate,
+  ShowSessionPicker, ShowSlugPicker, SlugAction, SlugPickerDelegate, TodoHeaderPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
@@ -553,12 +553,7 @@ impl Workspace {
     cx.notify();
   }
 
-  fn open_slug_picker(
-    &mut self,
-    _: &ShowSlugPicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
+  fn open_slug_picker(&mut self, _: &ShowSlugPicker, window: &mut Window, cx: &mut Context<Self>) {
     if self.active_picker.is_some() {
       return;
     }
@@ -573,19 +568,26 @@ impl Workspace {
       cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
         match event {
           PickerEvent::Confirmed => {
-            let entry = picker_entity.read(cx).delegate().confirmed_entry().cloned();
-            if let Some(entry) = entry {
-              if let Some(session_idx) = entry.session_index {
-                // switch_to_session sets focus to the left pane; drop stale pre_picker_focus.
+            let action =
+              picker_entity.read(cx).delegate().confirmed_entry().map(|e| e.action.clone());
+            match action {
+              Some(SlugAction::Switch(session_idx)) => {
                 this.pre_picker_focus.take();
                 this.switch_to_session(project_idx, session_idx, window, cx);
-              } else {
-                // adopt_slug calls switch_to_session internally; same reasoning.
-                this.pre_picker_focus.take();
-                this.adopt_slug(project_idx, &entry.slug, window, cx);
               }
-            } else if let Some(focus) = this.pre_picker_focus.take() {
-              focus.focus(window);
+              Some(SlugAction::Attach(slug)) => {
+                this.pre_picker_focus.take();
+                this.adopt_slug(project_idx, &slug, window, cx);
+              }
+              Some(SlugAction::New) => {
+                this.pre_picker_focus.take();
+                this.create_new_session(project_idx, window, cx);
+              }
+              None => {
+                if let Some(focus) = this.pre_picker_focus.take() {
+                  focus.focus(window);
+                }
+              }
             }
             this.dismiss_picker();
             cx.notify();
@@ -619,16 +621,45 @@ impl Workspace {
 
     // Insert heading in TODO.md.
     todo_view.update(cx, |tv, cx| {
-      tv.insert_session_heading(slug, window, cx);
+      tv.insert_session_heading(slug, slug, window, cx);
       tv.save(cx);
     });
 
     // Build palette and create session state.
     let appearance = appearance_from_window(window.appearance());
     let palette = Palette::for_appearance(appearance);
+    let session =
+      SessionState::create(slug.to_string(), slug.to_string(), &project_path, &palette, window, cx);
+
+    let project = &mut self.projects[project_idx];
+    project.sessions.push(session);
+    let new_idx = project.sessions.len() - 1;
+    self.switch_to_session(project_idx, new_idx, window, cx);
+  }
+
+  /// Launch a brand new Claude session (no --resume), detect the slug once
+  /// the JSONL file appears, and adopt it into TODO.md.
+  fn create_new_session(
+    &mut self,
+    project_idx: usize,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    use jc_core::session::discover_session_groups;
+    use std::collections::HashSet;
+
+    let project_path = self.projects[project_idx].path.clone();
+
+    // Snapshot existing slugs so we can detect the new one.
+    let existing_slugs: HashSet<String> =
+      discover_session_groups(&project_path).into_iter().map(|g| g.slug).collect();
+
+    // Create a session that runs plain `claude` (no resume).
+    let appearance = appearance_from_window(window.appearance());
+    let palette = Palette::for_appearance(appearance);
     let session = SessionState::create(
-      slug.to_string(),
-      "New session".to_string(),
+      String::new(), // empty slug -> falls back to plain `claude`
+      String::new(),
       &project_path,
       &palette,
       window,
@@ -639,6 +670,50 @@ impl Workspace {
     project.sessions.push(session);
     let new_idx = project.sessions.len() - 1;
     self.switch_to_session(project_idx, new_idx, window, cx);
+
+    // Poll for the new JSONL file in the background. Once a new slug appears,
+    // update the session and insert a TODO heading.
+    cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+      for _ in 0..120 {
+        Timer::after(StdDuration::from_millis(500)).await;
+
+        let path = project_path.clone();
+        let slugs = existing_slugs.clone();
+        let new_slug = std::thread::spawn(move || {
+          discover_session_groups(&path)
+            .into_iter()
+            .find(|g| !slugs.contains(&g.slug))
+            .map(|g| g.slug)
+        })
+        .join()
+        .ok()
+        .flatten();
+
+        if let Some(slug) = new_slug {
+          let _ = this.update_in(cx, |workspace, window, cx| {
+            let project = &mut workspace.projects[project_idx];
+            project.sessions[new_idx].slug = slug.clone();
+            project.sessions[new_idx].label = slug.clone();
+
+            // Update the reply view to track the new slug.
+            project.sessions[new_idx].reply_view.update(cx, |rv, cx| {
+              rv.set_session_slug(Some(slug.clone()), window, cx);
+            });
+
+            // Insert TODO heading.
+            let todo_view = project.todo_view.clone();
+            todo_view.update(cx, |tv, cx| {
+              tv.insert_session_heading(&slug, &slug, window, cx);
+              tv.save(cx);
+            });
+
+            cx.notify();
+          });
+          return;
+        }
+      }
+    })
+    .detach();
   }
 
   // ---------------------------------------------------------------------------

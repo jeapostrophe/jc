@@ -38,7 +38,7 @@ impl ProjectState {
       && let Some(group) = discover_latest_session_group(&path)
     {
       todo_view.update(cx, |tv, cx| {
-        tv.insert_session_heading(&group.slug, window, cx);
+        tv.insert_session_heading(&group.slug, &group.slug, window, cx);
       });
     }
 
