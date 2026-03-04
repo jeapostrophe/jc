@@ -44,6 +44,7 @@ actions!(
     ShowReplyViewer,
     OpenCommentPanel,
     SaveFile,
+    SendToTerminal,
   ]
 );
 
@@ -988,6 +989,57 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
+  // Send to terminal
+  // ---------------------------------------------------------------------------
+
+  fn send_to_terminal(
+    &mut self,
+    _: &SendToTerminal,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let project = &self.projects[self.active_project_index];
+    let Some(slug) = project.active_slug().map(str::to_string) else {
+      return;
+    };
+    let Some(session) = project.active_session() else {
+      return;
+    };
+    let claude_terminal = session.claude_terminal.clone();
+
+    let Some((message_text, _)) =
+      project.todo_view.update(cx, |tv, cx| tv.send_selection(&slug, window, cx))
+    else {
+      return;
+    };
+
+    // Paste the message into the Claude terminal, then send Enter to submit.
+    let bracketed = claude_terminal.read(cx).bracketed_paste_mode();
+    let pty = claude_terminal.read(cx).pty_handle();
+
+    if bracketed {
+      let mut buf = Vec::with_capacity(message_text.len() + 12);
+      buf.extend_from_slice(b"\x1b[200~");
+      buf.extend_from_slice(message_text.as_bytes());
+      buf.extend_from_slice(b"\x1b[201~");
+      let _ = pty.write_all(&buf);
+    } else {
+      let _ = pty.write_all(message_text.as_bytes());
+    }
+
+    // Send Enter (\r) from a background thread after a delay so the
+    // application has time to process the pasted content.
+    std::thread::spawn(move || {
+      std::thread::sleep(StdDuration::from_millis(200));
+      let _ = pty.write_all(b"\r");
+    });
+
+    // Switch left pane to Claude terminal so the user can see it working.
+    self.active_pane = ActivePane::Left;
+    self.set_active_pane_view(PaneContentKind::ClaudeTerminal, window, cx);
+  }
+
+  // ---------------------------------------------------------------------------
   // Labels
   // ---------------------------------------------------------------------------
 
@@ -1218,6 +1270,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::search_lines))
       .on_action(cx.listener(Self::open_comment_panel))
       .on_action(cx.listener(Self::save_file))
+      .on_action(cx.listener(Self::send_to_terminal))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable(("main-split", self.split_generation))
@@ -1266,6 +1319,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-shift-p", ShowSlugPicker, Some("Workspace")),
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Workspace")),
     KeyBinding::new("cmd-s", SaveFile, Some("Workspace")),
+    KeyBinding::new("cmd-enter", SendToTerminal, Some("Workspace")),
   ]);
 
   cx.bind_keys([
@@ -1273,5 +1327,6 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-]", FocusRightPane, Some("Input")),
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Input")),
     KeyBinding::new("cmd-s", SaveFile, Some("Input")),
+    KeyBinding::new("cmd-enter", SendToTerminal, Some("Input")),
   ]);
 }

@@ -114,6 +114,34 @@ impl TodoView {
     });
   }
 
+  /// Extract the selected text (or entire WAIT body if no selection) from the
+  /// active session's WAIT section, wrap it in a new `### Message N` heading,
+  /// and update the editor. Returns `(message_text, message_index)` on success.
+  pub fn send_selection(
+    &mut self,
+    slug: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> Option<(String, usize)> {
+    let text = self.editor_text(cx);
+    let selection = self
+      .code_view
+      .read(cx)
+      .editor()
+      .read(cx)
+      .selection_byte_range();
+    let session = self.document.session_by_slug(slug)?;
+    let result = todo::send_from_wait(&text, session, selection)?;
+    self.code_view.update(cx, |cv, cx| {
+      cv.editor().update(cx, |state, cx| {
+        state.set_value(result.new_text, window, cx);
+      });
+    });
+    self.revalidate(cx);
+    self.save(cx);
+    Some((result.message_text, result.message_index))
+  }
+
   /// Re-validate and refresh diagnostics. Call after loading or when the user
   /// explicitly requests a check (not on every keystroke, since it hits the FS).
   pub fn revalidate(&mut self, cx: &mut Context<Self>) {

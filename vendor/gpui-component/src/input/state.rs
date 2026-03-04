@@ -797,6 +797,11 @@ impl InputState {
     (start, end)
   }
 
+  /// Return the current selection as a byte offset range.
+  pub fn selection_byte_range(&self) -> Range<usize> {
+    self.selected_range.start..self.selected_range.end
+  }
+
   /// Set (0-based) [`Position`] of the cursor.
   ///
   /// This will move the cursor to the specified line and column, and update the selection range.

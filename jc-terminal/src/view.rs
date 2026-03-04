@@ -204,6 +204,21 @@ impl TerminalView {
     self.palette = palette;
   }
 
+  /// Write raw bytes to the terminal's PTY.
+  pub fn write_bytes_to_pty(&self, bytes: &[u8]) {
+    let _ = self.pty.write_all(bytes);
+  }
+
+  /// Returns true if the terminal has bracketed-paste mode enabled.
+  pub fn bracketed_paste_mode(&self) -> bool {
+    self.state.with_term(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
+  }
+
+  /// Get a clone of the PTY handle for use in background threads.
+  pub fn pty_handle(&self) -> Arc<PtyHandle> {
+    self.pty.clone()
+  }
+
   fn reset_cursor_blink(&mut self) {
     self.cursor_visible = true;
     self.cursor_reset_at = Instant::now();

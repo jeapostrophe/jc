@@ -256,6 +256,83 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, slug: &str, label:
 }
 
 // ---------------------------------------------------------------------------
+// Send from WAIT
+// ---------------------------------------------------------------------------
+
+pub struct SendResult {
+  pub new_text: String,
+  pub message_text: String,
+  pub message_index: usize,
+}
+
+/// Extract text from the WAIT section and turn it into a new `### Message N`.
+///
+/// `selection` is a byte range in the full document. If it's empty (collapsed
+/// cursor), the entire WAIT body is sent. Returns `None` if there's no WAIT
+/// section or the effective text is empty.
+pub fn send_from_wait(
+  text: &str,
+  session: &TodoSession,
+  selection: Range<usize>,
+) -> Option<SendResult> {
+  let wait = session.wait.as_ref()?;
+  let body_range = wait.body_byte_range.clone();
+
+  // Determine the effective range within the body.
+  let effective = if selection.start == selection.end {
+    // No selection — send the whole body.
+    body_range.clone()
+  } else {
+    // Intersect selection with the body range.
+    let start = selection.start.max(body_range.start);
+    let end = selection.end.min(body_range.end);
+    if start >= end {
+      return None;
+    }
+    start..end
+  };
+
+  let selected_text = text[effective.clone()].trim();
+  if selected_text.is_empty() {
+    return None;
+  }
+  let message_text = selected_text.to_string();
+
+  // Compute next message index.
+  let message_index = session
+    .messages
+    .iter()
+    .map(|m| m.index + 1)
+    .max()
+    .unwrap_or(0);
+
+  // Build remaining body (parts of the body before and after the effective range).
+  let before_sel = &text[body_range.start..effective.start];
+  let after_sel = &text[effective.end..body_range.end];
+  let remaining = format!("{}{}", before_sel, after_sel);
+
+  // Rebuild the document:
+  //   everything before WAIT heading
+  //   + ### Message N\n{text}\n
+  //   + ### WAIT\n{remaining}
+  //   + everything after body end
+  let before_wait = &text[..wait.heading_byte_range.start];
+  let after_body = &text[body_range.end..];
+
+  let mut new_text =
+    String::with_capacity(text.len() + message_text.len() + 32);
+  new_text.push_str(before_wait);
+  new_text.push_str(&format!("### Message {}\n", message_index));
+  new_text.push_str(&message_text);
+  new_text.push('\n');
+  new_text.push_str("### WAIT\n");
+  new_text.push_str(&remaining);
+  new_text.push_str(after_body);
+
+  Some(SendResult { new_text, message_text, message_index })
+}
+
+// ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
@@ -561,5 +638,153 @@ notes
     assert_eq!(new_doc.sessions.len(), 2);
     assert_eq!(new_doc.sessions[0].slug, "new-slug");
     assert_eq!(new_doc.sessions[1].slug, "old");
+  }
+
+  // -------------------------------------------------------------------------
+  // send_from_wait tests
+  // -------------------------------------------------------------------------
+
+  #[test]
+  fn send_from_wait_basic() {
+    let text = "\
+# Claude
+## Session s: S
+### Message 0
+hello
+### WAIT
+draft text
+";
+    let doc = parse(text);
+    let session = doc.session_by_slug("s").unwrap();
+    let wait = session.wait.as_ref().unwrap();
+
+    // Select just "draft text" within the body.
+    let body_start = wait.body_byte_range.start;
+    let sel_start = body_start + text[body_start..].find("draft text").unwrap();
+    let sel_end = sel_start + "draft text".len();
+
+    let result = send_from_wait(text, session, sel_start..sel_end).unwrap();
+    assert_eq!(result.message_text, "draft text");
+    assert_eq!(result.message_index, 1);
+    assert!(result.new_text.contains("### Message 1\ndraft text\n### WAIT\n"));
+
+    // Re-parse to verify structure.
+    let new_doc = parse(&result.new_text);
+    let new_session = new_doc.session_by_slug("s").unwrap();
+    assert_eq!(new_session.messages.len(), 2);
+    assert!(new_session.wait.is_some());
+  }
+
+  #[test]
+  fn send_from_wait_no_selection_sends_all() {
+    let text = "\
+# Claude
+## Session s: S
+### WAIT
+all body content
+";
+    let doc = parse(text);
+    let session = doc.session_by_slug("s").unwrap();
+
+    // Empty selection (collapsed cursor) → send entire body.
+    let result = send_from_wait(text, session, 0..0).unwrap();
+    assert_eq!(result.message_text, "all body content");
+    assert_eq!(result.message_index, 0);
+    assert!(result.new_text.contains("### Message 0\nall body content\n### WAIT\n"));
+  }
+
+  #[test]
+  fn send_from_wait_partial_selection() {
+    let text = "\
+# Claude
+## Session s: S
+### WAIT
+line one
+line two
+line three
+";
+    let doc = parse(text);
+    let session = doc.session_by_slug("s").unwrap();
+    let wait = session.wait.as_ref().unwrap();
+    let body = &text[wait.body_byte_range.clone()];
+
+    // Select just "line two".
+    let offset_in_body = body.find("line two").unwrap();
+    let sel_start = wait.body_byte_range.start + offset_in_body;
+    let sel_end = sel_start + "line two".len();
+
+    let result = send_from_wait(text, session, sel_start..sel_end).unwrap();
+    assert_eq!(result.message_text, "line two");
+
+    // Remaining body should have line one and line three.
+    let new_doc = parse(&result.new_text);
+    let new_wait = new_doc.session_by_slug("s").unwrap().wait.as_ref().unwrap();
+    let new_body = &result.new_text[new_wait.body_byte_range.clone()];
+    assert!(new_body.contains("line one"));
+    assert!(new_body.contains("line three"));
+    assert!(!new_body.contains("line two"));
+  }
+
+  #[test]
+  fn send_from_wait_empty_body() {
+    let text = "\
+# Claude
+## Session s: S
+### WAIT
+";
+    let doc = parse(text);
+    let session = doc.session_by_slug("s").unwrap();
+
+    // Empty body → should return None.
+    assert!(send_from_wait(text, session, 0..0).is_none());
+  }
+
+  #[test]
+  fn send_from_wait_no_wait_section() {
+    let text = "\
+# Claude
+## Session s: S
+### Message 0
+hello
+";
+    let doc = parse(text);
+    let session = doc.session_by_slug("s").unwrap();
+    assert!(send_from_wait(text, session, 0..0).is_none());
+  }
+
+  #[test]
+  fn send_from_wait_multiple_messages() {
+    let text = "\
+# Claude
+## Session s: S
+### Message 0
+first
+### Message 1
+second
+### WAIT
+third
+";
+    let doc = parse(text);
+    let session = doc.session_by_slug("s").unwrap();
+    let result = send_from_wait(text, session, 0..0).unwrap();
+    assert_eq!(result.message_index, 2);
+    assert_eq!(result.message_text, "third");
+  }
+
+  #[test]
+  fn send_from_wait_selection_outside_body() {
+    let text = "\
+# Claude
+## Session s: S
+### Message 0
+hello
+### WAIT
+draft
+";
+    let doc = parse(text);
+    let session = doc.session_by_slug("s").unwrap();
+
+    // Selection entirely before the WAIT body.
+    assert!(send_from_wait(text, session, 0..5).is_none());
   }
 }
