@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::views::code_view;
 use crate::views::comment_panel;
 use crate::views::diff_view;
-use crate::views::mobile_qr;
 use crate::views::picker;
 use crate::views::reply_view;
 use crate::views::workspace::{self, Workspace};
@@ -181,7 +180,6 @@ pub fn run(state: AppState, config: AppConfig) {
     diff_view::init(cx);
     reply_view::init(cx);
     comment_panel::init(cx);
-    mobile_qr::init(cx);
 
     // Register the bundled Lilex font family.
     cx.text_system()

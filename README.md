@@ -25,7 +25,7 @@ Config and state live in `~/.config/jc/` (`config.toml`, `state.toml`, and `them
 
 ### App Icon
 
-`icon.png` is the app icon (1024x1024). Use it for the `.app` bundle's `AppIcon.icns` and the iOS companion app's asset catalog.
+`icon.png` is the app icon (1024x1024). Use it for the `.app` bundle's `AppIcon.icns`.
 
 ### Project Structure
 
@@ -296,33 +296,50 @@ Always visible in a corner. Shows:
 - **Par indicator:** compares usage % against elapsed working time %. "Under par" means you have budget to spare; "over par" means you're consuming faster than your pace.
 - Configurable working hours (e.g., exclude Sunday, reduce Saturday) so par calculations reflect actual work schedule, not raw calendar time.
 
-## Mobile App
+## Remote Workflow: Hooks, Skills & Bang Commands
 
-A lightweight companion app that connects to the desktop app over the local network.
+Rather than building a custom mobile app, jc exposes its workflow to Claude Code's native extension points. This means any Claude Code client — including Claude Code Remote Control on a phone — can interact with jc's session management, problem tracking, and TODO-driven instruction flow.
 
-### Connection
+### Design
 
-The desktop app displays a QR code embedding an auth key. The mobile app scans it to pair. Communication uses TLS. For remote access, the user handles tunneling externally (e.g., Tailscale).
+The integration has three layers:
 
-### Capabilities
+1. **Hooks** (push, event-driven) — Claude Code already fires hook events on stop, permission prompt, idle, and API error. jc's hook server receives these and updates problem state. The same hooks can trigger external notification services (e.g., Pushover, ntfy) for phone alerts when away from the desktop.
 
-The mobile app is optimized for:
-- **Dashboard:** See project/session status, which sessions are waiting, usage stats
-- **Reviewing:** Read Claude responses and diffs (not optimized for code editing)
-- **Note-taking:** Add comments and notes to TODO.md
-- **Permissions:** Handle Claude permission requests (approve/deny tool use)
-- **Sending commands:** Send instructions to Claude from the TODO
+2. **Skills** (pull, user-invoked) — Claude Code skills (`/skill-name`) are user-invocable commands that Claude executes. jc provides skills that expose its data model:
+   - `/jc-status` — List all projects and sessions with problem counts, active session indicator, and usage par. Equivalent to the session picker's view.
+   - `/jc-problems` — Show all current problems across sessions, ranked by severity. Equivalent to the problem picker.
+   - `/jc-wait` — Show the current session's WAIT content (drafted but unsent instructions).
+   - `/jc-send` — Send the current WAIT content to the Claude terminal (triggers the same flow as Cmd-Enter in the TODO editor).
+   - `/jc-note` — Append text below the WAIT marker in the current session's TODO.md.
+   - `/jc-turns` — List recent conversation turns for the current session with timestamps and user message previews.
+   - `/jc-diff` — Show git diff summary with per-file change stats.
 
-It is deliberately *not* a full code editor on mobile.
+3. **Bang commands** (inline, mid-conversation) — Short commands prefixed with `!` that Claude can execute during a conversation without switching context. These map to the same operations as skills but are designed for quick one-shot actions:
+   - `!status` — One-line summary of session states and problems.
+   - `!approve` / `!deny` — Respond to a pending permission prompt.
+   - `!send` — Send WAIT content.
+   - `!note <text>` — Quick note appended below WAIT.
 
-### Mobile Server Design
+### Implementation
 
-The mobile server uses `tungstenite` + `rustls` on plain `std::thread` rather than `axum` + `tokio`. Rationale:
+Skills and bang commands are thin wrappers around a `jc` CLI subcommand interface:
 
-- **No async runtime conflict.** GPUI has its own async executor. Running tokio alongside it creates a two-runtime situation with potential footguns (blocking the wrong runtime, confusion about which executor runs what).
-- **Simpler dependency tree.** Avoids pulling in tokio, hyper, tower, and axum for what is fundamentally one-connection-per-client WebSocket streaming.
-- **The hook server (`tiny_http`) is a separate concern.** Hooks need plain HTTP on localhost; the mobile server needs TLS on all interfaces. They can't share a single listener, so the "single axum server" benefit is mostly code organization. Both servers already share state through `push_mobile_state()`.
-- **Phase 2 client→server messages** (terminal input, send-from-WAIT) are just a `match` on deserialized `ClientMessage` variants in the existing tungstenite read loop --- not complex enough to justify a framework.
+```
+jc status              # JSON output of projects/sessions/problems/usage
+jc problems            # JSON list of all problems with ranks
+jc wait [--session S]  # Print WAIT content for a session
+jc send [--session S]  # Trigger send-from-WAIT
+jc note <text>         # Append text below WAIT
+jc turns [--session S] # List recent turns
+jc diff                # Git diff summary
+```
+
+The CLI reads from the same state sources as the GUI (TODO.md files, JSONL session files, `git2`). Skills invoke these subcommands. The GUI and CLI are peers — neither wraps the other.
+
+### Why Not a Custom Mobile App
+
+Claude Code Remote Control provides the mobile transport layer. Skills and hooks provide the jc integration layer. This avoids maintaining a separate iOS app, TLS WebSocket server, QR pairing protocol, and mobile UI — while getting Anthropic's ongoing improvements to the remote experience for free.
 
 ## Architecture & Components
 
@@ -339,9 +356,6 @@ The mobile server uses `tungstenite` + `rustls` on plain `std::thread` rather th
 | Claude reply viewer | Parse session JSONL from `~/.claude/projects/`, group into turns, render as Markdown in read-only editor |
 | Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
 | Persistent state | `~/.config/jc/` --- project registry, window layout; session state in TODO.md |
-| Mobile server | `tungstenite` (WebSocket) + `rustls` (TLS) + `rcgen` (self-signed certs); no async runtime --- see [Mobile Server Design](#mobile-server-design) |
-| Mobile QR pairing | `fast_qr` (ECL Q, render as GPUI quads) |
-| Mobile app | Separate project (Swift/native iOS likely) |
 | Desktop notifications | Dock bounce via `objc2-app-kit` (`NSApplication::requestUserAttention`); no bundling required. Banners need `.app` bundle. |
 
 ## Keybindings
@@ -466,82 +480,16 @@ The mobile server uses `tungstenite` + `rustls` on plain `std::thread` rather th
 ### Problems & Status
 - [ ] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
 
-### Mobile App
-
-A lightweight native iOS companion that connects to the desktop app over the local network (TLS). Organized in phases — each phase is independently useful.
-
-#### Mobile Phase 1: Infrastructure & Dashboard
-*See project status and usage from your phone. Push notifications for problems.*
-
-Desktop server:
-- [x] [H] Define WebSocket protocol: message types, payloads, auth handshake (document in `docs/mobile-protocol.md`)
-- [x] [H] TLS server: `tungstenite` + `rustls` + `rcgen` self-signed certs, configurable port in `config.toml`
-- [x] [H] QR code pairing: `fast_qr`, encode `{host, port, token, cert_fingerprint}`, render as GPUI view
-- [x] [H] WebSocket endpoint: authenticate via QR token, maintain client connection set
-- [x] [E] Server→client: full state sync on connect (projects, sessions, problems, usage)
-- [x] [E] Server→client: incremental problem and usage updates on change
-
-iOS app:
-- [x] [H] Project setup: Swift, networking layer, cert-pinned WebSocket client
-- [x] [H] QR scanner: camera permission, decode pairing payload, store connection config
-- [x] [H] Dashboard: project/session list with problem badges and active session indicator
-- [x] [H] Usage view: 5h/7d progress bars, par status, reset countdowns
-- [x] [E] Local notifications: fire on problem events when app is backgrounded
-- [x] [E] Auto-reconnect on network change or app foreground
-- [x] [E] Show connection status (dot + label) on dashboard, not just settings
-
-#### Mobile Phase 2: Quick Actions
-*Unblock Claude from your phone. Approve permissions, send queued instructions.*
-
-Desktop server:
-- [ ] [E] Client→server: terminal input (send text to a session's Claude terminal PTY)
-- [ ] [E] Client→server: send-from-WAIT (trigger TODO.md send flow for a session)
-- [ ] [E] Client→server: acknowledge session (clear pending events)
-
-iOS app:
-- [ ] [H] Permission prompt view: approve/deny buttons (sends `y\n` or `n\n` to Claude terminal)
-- [ ] [E] Send instructions: show WAIT content preview, confirm-to-send
-- [ ] [E] Problem actions: tap to acknowledge stop/idle/bell
-
-#### Mobile Phase 3: Reading & Notes
-*Review Claude's work and add notes from the couch.*
-
-Desktop server:
-- [ ] [E] API: list turns for a session (index, user message preview, timestamp)
-- [ ] [E] API: fetch rendered turn content (markdown)
-- [ ] [E] API: fetch TODO.md content for a project
-- [ ] [E] Client→server: append text below WAIT marker in TODO.md
-- [ ] [E] API: git diff file list with per-file change stats (+/- lines)
-
-iOS app:
-- [ ] [H] Reply viewer: turn list (newest first), tap for rendered markdown detail
-- [ ] [H] TODO viewer: rendered markdown
-- [ ] [E] Note input: text field, appends below WAIT for current session
-- [ ] [E] Diff summary: file list with +/- counts, reviewed/unreviewed badges
-
-#### Mobile Phase 4: Richer Interaction
-*More context for permission decisions. Readable diffs.*
-
-Desktop server:
-- [ ] [E] API: recent terminal scrollback text (for permission context)
-- [ ] [E] API: diff content for a specific file
-
-iOS app:
-- [ ] [H] Terminal text view: raw scrollback around permission prompt, scrollable + pinch-to-zoom
-- [ ] [H] Diff file viewer: colored +/- lines, scrollable
-- [ ] [E] Mark file as reviewed from diff summary
-
-#### Mobile Phase 5: Structured Review
-*Rich permission data. Comment from mobile.*
-
-Desktop server:
-- [ ] [H] Parse Claude's structured permission data from JSONL (tool name, file paths, action)
-- [ ] [E] Client→server: submit comment annotation (file:line-range + text → append to TODO.md)
-
-iOS app:
-- [ ] [H] Rich permission view: tool name, files, action description
-- [ ] [H] Comment on diffs: select region, type comment → flows to TODO.md
-- [ ] [H] Comment on replies: select text, type comment → flows to TODO.md
+### Remote Workflow (Skills & CLI)
+- [ ] [H] `jc status` subcommand: JSON output of projects, sessions, problems, usage
+- [ ] [H] `jc problems` subcommand: JSON list of all problems with ranks
+- [ ] [E] `jc wait` subcommand: print WAIT content for a session
+- [ ] [E] `jc send` subcommand: trigger send-from-WAIT
+- [ ] [E] `jc note` subcommand: append text below WAIT marker
+- [ ] [E] `jc turns` subcommand: list recent conversation turns
+- [ ] [E] `jc diff` subcommand: git diff summary with per-file stats
+- [ ] [H] Claude Code skill definitions (`.claude/skills/`) wrapping CLI subcommands
+- [ ] [E] External notification hook (push problem events to ntfy/Pushover)
 
 ### Git Worktrees
 - [ ] [H] Implement git worktree creation/deletion via `git2` worktree API

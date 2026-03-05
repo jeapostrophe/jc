@@ -12,21 +12,6 @@ pub struct AppConfig {
   pub editor: String,
   pub window: WindowLayout,
   pub working_hours: WorkingHours,
-  pub mobile: MobileConfig,
-}
-
-/// Configuration for the mobile companion WebSocket server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MobileConfig {
-  pub enabled: bool,
-  pub port: u16,
-}
-
-impl Default for MobileConfig {
-  fn default() -> Self {
-    Self { enabled: false, port: 9210 }
-  }
 }
 
 /// App-managed state (~/.config/jc/state.toml).
