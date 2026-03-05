@@ -14,6 +14,8 @@ use crate::views::project_state::ProjectState;
 use crate::views::reply_view::ReplyView;
 use crate::views::todo_view::TodoView;
 use jc_core::problem::{ProblemTarget, ProjectProblem, SessionProblem};
+use jc_core::snippets::Snippet;
+use jc_terminal::TerminalView;
 
 actions!(
   picker,
@@ -30,6 +32,7 @@ actions!(
     SearchLines,
     ShowSlugPicker,
     ShowProblemPicker,
+    ShowSnippetPicker,
   ]
 );
 
@@ -1250,5 +1253,81 @@ impl PickerDelegate for ProblemPickerDelegate {
     let marker = picker_marker_base().text_color(marker_color).child("!");
 
     row.child(marker).child(entry.description.clone())
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SnippetPickerDelegate
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnippetTarget {
+  TodoCursor,
+  TodoWait,
+  ClaudeTerminal,
+}
+
+pub struct SnippetPickerDelegate {
+  items: Vec<String>,
+  snippets: Vec<Snippet>,
+  todo_view: Entity<TodoView>,
+  active_slug: Option<String>,
+  claude_terminal: Option<Entity<TerminalView>>,
+  insert_target: SnippetTarget,
+}
+
+impl SnippetPickerDelegate {
+  pub fn new(
+    snippets: Vec<Snippet>,
+    todo_view: Entity<TodoView>,
+    active_slug: Option<String>,
+    claude_terminal: Option<Entity<TerminalView>>,
+    insert_target: SnippetTarget,
+  ) -> Self {
+    let items: Vec<String> = snippets.iter().map(|s| s.heading.clone()).collect();
+    Self { items, snippets, todo_view, active_slug, claude_terminal, insert_target }
+  }
+}
+
+impl PickerDelegate for SnippetPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.items
+  }
+
+  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
+    let snippet = &self.snippets[index];
+    let text = &snippet.content;
+    if text.is_empty() {
+      return;
+    }
+
+    match self.insert_target {
+      SnippetTarget::TodoCursor => {
+        self.todo_view.update(cx, |tv, cx| {
+          tv.insert_at_cursor(text, window, cx);
+        });
+      }
+      SnippetTarget::TodoWait => {
+        if let Some(slug) = &self.active_slug {
+          let comment = format!("{text}\n");
+          self.todo_view.update(cx, |tv, cx| {
+            tv.insert_comment(slug, &comment, window, cx);
+          });
+        }
+      }
+      SnippetTarget::ClaudeTerminal => {
+        if let Some(terminal) = &self.claude_terminal {
+          terminal.read(cx).write_text(text);
+        }
+      }
+    }
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let heading = &self.items[index];
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+    row.child(heading.clone())
   }
 }

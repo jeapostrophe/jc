@@ -5,8 +5,9 @@ use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
   LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
   ProblemPickerDelegate, ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines,
-  SessionPickerDelegate, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker, SlugAction,
-  SlugPickerDelegate, TodoHeaderPickerDelegate,
+  SessionPickerDelegate, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker,
+  ShowSnippetPicker, SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget,
+  TodoHeaderPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
@@ -21,9 +22,11 @@ use gpui_component::tooltip::Tooltip;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
 use jc_core::problem::ProblemTarget;
+use jc_core::snippets::{self, SnippetDocument};
 use jc_core::theme::Appearance;
 use jc_core::usage::{FullUsageReport, ParStatus};
 use jc_terminal::{Palette, TerminalView, TerminalViewEvent};
+use notify::{EventKind, RecursiveMode, Watcher};
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
@@ -93,6 +96,8 @@ pub struct Workspace {
   _bell_subscriptions: Vec<Subscription>,
   _problems_poll_task: Option<Task<()>>,
   last_jumped_target: Option<ProblemTarget>,
+  snippets: SnippetDocument,
+  _snippet_watcher: Option<notify::RecommendedWatcher>,
   window_active: bool,
   _window_activation_subscription: Subscription,
 }
@@ -276,6 +281,11 @@ impl Workspace {
       }
     });
 
+    // Load snippets and set up file watcher.
+    snippets::ensure_file_exists();
+    let snippets = snippets::load();
+    let snippet_watcher = Self::setup_snippet_watcher(window, cx);
+
     let mut ws = Self {
       left_pane,
       right_pane,
@@ -303,6 +313,8 @@ impl Workspace {
       _bell_subscriptions: bell_subscriptions,
       _problems_poll_task: Some(problems_poll_task),
       last_jumped_target: None,
+      snippets,
+      _snippet_watcher: snippet_watcher,
       window_active: true,
       _window_activation_subscription: window_activation_subscription,
     };
@@ -1358,21 +1370,11 @@ impl Workspace {
     };
 
     // Paste the message into the Claude terminal, then send Enter to submit.
-    let bracketed = claude_terminal.read(cx).bracketed_paste_mode();
-    let pty = claude_terminal.read(cx).pty_handle();
-
-    if bracketed {
-      let mut buf = Vec::with_capacity(message_text.len() + 12);
-      buf.extend_from_slice(b"\x1b[200~");
-      buf.extend_from_slice(message_text.as_bytes());
-      buf.extend_from_slice(b"\x1b[201~");
-      let _ = pty.write_all(&buf);
-    } else {
-      let _ = pty.write_all(message_text.as_bytes());
-    }
+    claude_terminal.read(cx).write_text(&message_text);
 
     // Send Enter (\r) from a background thread after a delay so the
     // application has time to process the pasted content.
+    let pty = claude_terminal.read(cx).pty_handle();
     std::thread::spawn(move || {
       std::thread::sleep(StdDuration::from_millis(200));
       let _ = pty.write_all(b"\r");
@@ -1381,6 +1383,83 @@ impl Workspace {
     // Switch left pane to Claude terminal so the user can see it working.
     self.active_pane = ActivePane::Left;
     self.set_active_pane_view(PaneContentKind::ClaudeTerminal, window, cx);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Snippet picker
+  // ---------------------------------------------------------------------------
+
+  fn setup_snippet_watcher(
+    window: &Window,
+    cx: &mut Context<Self>,
+  ) -> Option<notify::RecommendedWatcher> {
+    let path = snippets::snippet_file_path();
+    let watched_file = path.file_name()?.to_os_string();
+    let parent = path.parent()?.to_path_buf();
+
+    let (notify_tx, notify_rx) = flume::unbounded::<()>();
+
+    let mut watcher =
+      notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(event) = res {
+          match event.kind {
+            EventKind::Modify(_) | EventKind::Create(_) => {
+              if event.paths.iter().any(|p| p.ends_with(&watched_file)) {
+                let _ = notify_tx.send(());
+              }
+            }
+            _ => {}
+          }
+        }
+      })
+      .ok()?;
+
+    let _ = watcher.watch(&parent, RecursiveMode::NonRecursive);
+
+    cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+      while notify_rx.recv_async().await.is_ok() {
+        while notify_rx.try_recv().is_ok() {}
+        let _ = this.update_in(cx, |view, _window, _cx| {
+          view.snippets = snippets::load();
+        });
+      }
+    })
+    .detach();
+
+    Some(watcher)
+  }
+
+  fn show_snippet_picker(
+    &mut self,
+    _: &ShowSnippetPicker,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.active_picker.is_some() || self.snippets.items.is_empty() {
+      return;
+    }
+
+    let pane = self.active_pane_entity().clone();
+    let kind = pane.read(cx).content_kind();
+    let project = self.active_project();
+
+    let insert_target = match kind {
+      Some(PaneContentKind::TodoEditor) => SnippetTarget::TodoCursor,
+      Some(PaneContentKind::ClaudeTerminal) => SnippetTarget::ClaudeTerminal,
+      _ => SnippetTarget::TodoWait,
+    };
+
+    let active_slug = project.active_slug().map(str::to_string);
+    let claude_terminal = project.active_session().map(|s| s.claude_terminal.clone());
+
+    let delegate = SnippetPickerDelegate::new(
+      self.snippets.items.clone(),
+      project.todo_view.clone(),
+      active_slug,
+      claude_terminal,
+      insert_target,
+    );
+    self.show_picker(delegate, window, cx);
   }
 
   // ---------------------------------------------------------------------------
@@ -1750,6 +1829,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::send_to_terminal))
       .on_action(cx.listener(Self::next_problem))
       .on_action(cx.listener(Self::open_problem_picker))
+      .on_action(cx.listener(Self::show_snippet_picker))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable(("main-split", self.split_generation))
@@ -1801,6 +1881,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Workspace")),
     KeyBinding::new("cmd-;", NextProblem, Some("Workspace")),
     KeyBinding::new("cmd-:", ShowProblemPicker, Some("Workspace")),
+    KeyBinding::new("cmd-shift-k", ShowSnippetPicker, Some("Workspace")),
   ]);
 
   cx.bind_keys([
@@ -1809,5 +1890,6 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Input")),
     KeyBinding::new("cmd-s", SaveFile, Some("Input")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Input")),
+    KeyBinding::new("cmd-shift-k", ShowSnippetPicker, Some("Input")),
   ]);
 }

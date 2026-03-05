@@ -436,10 +436,6 @@ It is deliberately *not* a full code editor on mobile.
 >
 > *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox. If the item doesn't fit under an existing section, create a new `###` section for it.*
 
-### Snippet Reference (`~/.claude/jc.md`)
-- [ ] [H] Parse `~/.claude/jc.md` as flat `# Heading` + content blocks; watch file for changes
-- [ ] [H] Snippet picker (Cmd-Shift-K): fuzzy-search headings, preview shows content. Context-sensitive insertion: TODO view inserts at cursor, Claude terminal types content, other views insert below `### WAIT`
-
 ### Claude Reply Viewer
 - [ ] [H] Full conversation rendering: tool use summaries, thinking blocks as additional headings
 
@@ -479,6 +475,7 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] CLI-to-GUI IPC: Unix domain socket (`~/.config/jc/jc.sock`) so `jc .` sends project path to running instance; startup binds socket or connects to existing one
 
 ### Code Quality
+- [ ] [H] file watcher boilerplate (larger cross-crate refactor)
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically

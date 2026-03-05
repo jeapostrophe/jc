@@ -271,6 +271,24 @@ impl TerminalView {
     self.pty.clone()
   }
 
+  /// Write text to the terminal PTY, using bracketed paste if the terminal
+  /// expects it. Sanitizes ESC characters and normalizes newlines.
+  pub fn write_text(&self, text: &str) {
+    let bracketed = self.bracketed_paste_mode();
+    let pty = self.pty.clone();
+    if bracketed {
+      let mut buf = Vec::with_capacity(text.len() + 12);
+      buf.extend_from_slice(b"\x1b[200~");
+      let sanitized = text.replace('\x1b', "");
+      buf.extend_from_slice(sanitized.as_bytes());
+      buf.extend_from_slice(b"\x1b[201~");
+      let _ = pty.write_all(&buf);
+    } else {
+      let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+      let _ = pty.write_all(normalized.as_bytes());
+    }
+  }
+
   /// Get the selected text from the terminal, if any.
   pub fn selected_text(&self) -> Option<String> {
     self.state.with_term(|term| term.selection_to_string())
@@ -354,21 +372,7 @@ impl TerminalView {
     if let Some(item) = cx.read_from_clipboard()
       && let Some(text) = item.text()
     {
-      let bracketed = self.bracketed_paste_mode();
-      let pty = self.pty.clone();
-      std::thread::spawn(move || {
-        if bracketed {
-          let _ = pty.write_all(b"\x1b[200~");
-          // Strip ESC chars from pasted text in bracketed mode (security).
-          let sanitized = text.replace('\x1b', "");
-          let _ = pty.write_all(sanitized.as_bytes());
-          let _ = pty.write_all(b"\x1b[201~");
-        } else {
-          // Normalize newlines: terminals expect \r.
-          let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-          let _ = pty.write_all(normalized.as_bytes());
-        }
-      });
+      self.write_text(&text);
     }
   }
 

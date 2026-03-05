@@ -134,6 +134,15 @@ impl TodoView {
     self.save(cx);
   }
 
+  pub fn insert_at_cursor(&self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    let insert_text = format!("{text}\n");
+    self.code_view.update(cx, |cv, cx| {
+      cv.editor().update(cx, |state, cx| {
+        state.insert(insert_text, window, cx);
+      });
+    });
+  }
+
   pub fn insert_comment(
     &self,
     session_slug: &str,
