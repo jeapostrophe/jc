@@ -454,13 +454,80 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
 
 ### Mobile App
-- [ ] [D] Design mobile app protocol (WebSocket messages: status updates, TODO edits, permission requests, commands)
-- [ ] [H] Implement TLS server (`axum` + `axum-server` + `rcgen` self-signed certs)
-- [ ] [H] Implement QR code pairing flow (`fast_qr`, encode host + port + cert fingerprint)
-- [ ] [H] Build mobile app: dashboard view
-- [ ] [H] Build mobile app: TODO review and note-taking
-- [ ] [H] Build mobile app: Claude permission handling (relay from hooks)
-- [ ] [H] Build mobile app: send commands to Claude
+
+A lightweight native iOS companion that connects to the desktop app over the local network (TLS). Organized in phases — each phase is independently useful.
+
+#### Mobile Phase 1: Infrastructure & Dashboard
+*See project status and usage from your phone. Push notifications for problems.*
+
+Desktop server:
+- [ ] [H] Define WebSocket protocol: message types, payloads, auth handshake (document in `docs/mobile-protocol.md`)
+- [ ] [H] TLS server: `axum` + `axum-server` + `rcgen` self-signed certs, configurable port in `config.toml`
+- [ ] [H] QR code pairing: `fast_qr`, encode `{host, port, token, cert_fingerprint}`, render as GPUI quads
+- [ ] [H] WebSocket endpoint: authenticate via QR token, maintain client connection set
+- [ ] [E] Server→client: full state sync on connect (projects, sessions, problems, usage)
+- [ ] [E] Server→client: incremental problem and usage updates on change
+
+iOS app:
+- [ ] [H] Project setup: Swift, networking layer, cert-pinned WebSocket client
+- [ ] [H] QR scanner: camera permission, decode pairing payload, store connection config
+- [ ] [H] Dashboard: project/session list with problem badges and active session indicator
+- [ ] [H] Usage view: 5h/7d progress bars, par status, reset countdowns
+- [ ] [E] Local notifications: fire on problem events when app is backgrounded
+- [ ] [E] Auto-reconnect on network change or app foreground
+
+#### Mobile Phase 2: Quick Actions
+*Unblock Claude from your phone. Approve permissions, send queued instructions.*
+
+Desktop server:
+- [ ] [E] Client→server: terminal input (send text to a session's Claude terminal PTY)
+- [ ] [E] Client→server: send-from-WAIT (trigger TODO.md send flow for a session)
+- [ ] [E] Client→server: acknowledge session (clear pending events)
+
+iOS app:
+- [ ] [H] Permission prompt view: approve/deny buttons (sends `y\n` or `n\n` to Claude terminal)
+- [ ] [E] Send instructions: show WAIT content preview, confirm-to-send
+- [ ] [E] Problem actions: tap to acknowledge stop/idle/bell
+
+#### Mobile Phase 3: Reading & Notes
+*Review Claude's work and add notes from the couch.*
+
+Desktop server:
+- [ ] [E] API: list turns for a session (index, user message preview, timestamp)
+- [ ] [E] API: fetch rendered turn content (markdown)
+- [ ] [E] API: fetch TODO.md content for a project
+- [ ] [E] Client→server: append text below WAIT marker in TODO.md
+- [ ] [E] API: git diff file list with per-file change stats (+/- lines)
+
+iOS app:
+- [ ] [H] Reply viewer: turn list (newest first), tap for rendered markdown detail
+- [ ] [H] TODO viewer: rendered markdown
+- [ ] [E] Note input: text field, appends below WAIT for current session
+- [ ] [E] Diff summary: file list with +/- counts, reviewed/unreviewed badges
+
+#### Mobile Phase 4: Richer Interaction
+*More context for permission decisions. Readable diffs.*
+
+Desktop server:
+- [ ] [E] API: recent terminal scrollback text (for permission context)
+- [ ] [E] API: diff content for a specific file
+
+iOS app:
+- [ ] [H] Terminal text view: raw scrollback around permission prompt, scrollable + pinch-to-zoom
+- [ ] [H] Diff file viewer: colored +/- lines, scrollable
+- [ ] [E] Mark file as reviewed from diff summary
+
+#### Mobile Phase 5: Structured Review
+*Rich permission data. Comment from mobile.*
+
+Desktop server:
+- [ ] [H] Parse Claude's structured permission data from JSONL (tool name, file paths, action)
+- [ ] [E] Client→server: submit comment annotation (file:line-range + text → append to TODO.md)
+
+iOS app:
+- [ ] [H] Rich permission view: tool name, files, action description
+- [ ] [H] Comment on diffs: select region, type comment → flows to TODO.md
+- [ ] [H] Comment on replies: select text, type comment → flows to TODO.md
 
 ### Git Worktrees
 - [ ] [H] Implement git worktree creation/deletion via `git2` worktree API
