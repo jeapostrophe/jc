@@ -412,7 +412,9 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] Persistent state: survive app restart without losing session state or terminal sessions [perhaps use 'tmux' behind the scenes]
 - [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
-- [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing for distribution (and prerequisite for `objc2-user-notifications` upgrade)
+- [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing via `scripts/bundle.sh` (prerequisite for `objc2-user-notifications` upgrade)
+- [ ] [H] Single-instance guard: `NSRunningApplication` check on startup to prevent duplicate `.app` launches (activate existing window and exit)
+- [ ] [H] CLI-to-GUI IPC: Unix domain socket (`~/.config/jc/jc.sock`) so `jc .` sends project path to running instance; startup binds socket or connects to existing one
 
 ### Code Quality
 
