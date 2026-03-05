@@ -1,3 +1,4 @@
+use crate::file_watcher::watch_dir;
 use crate::views::comment_panel::CommentContext;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -5,7 +6,6 @@ use gpui_component::input::{Input, InputState};
 use jc_core::session::{
   Turn, discover_latest_session_group, discover_session_group, parse_session_group, session_dir,
 };
-use notify::{EventKind, RecursiveMode, Watcher};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -145,35 +145,14 @@ impl ReplyView {
       return;
     }
 
-    let (notify_tx, notify_rx) = flume::unbounded::<()>();
-
-    let mut watcher =
-      notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(event) = res
-          && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
-          && event.paths.iter().any(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
-        {
-          let _ = notify_tx.send(());
-        }
-      })
-      .ok();
-
-    if let Some(ref mut w) = watcher {
-      let _ = w.watch(&dir, RecursiveMode::NonRecursive);
-    }
-
-    cx.spawn_in(window, async move |this: WeakEntity<ReplyView>, cx: &mut AsyncWindowContext| {
-      while notify_rx.recv_async().await.is_ok() {
-        // Drain queued events.
-        while notify_rx.try_recv().is_ok() {}
-        let _ = this.update_in(cx, |view, window, cx| {
-          view.refresh(window, cx);
-        });
-      }
-    })
-    .detach();
-
-    self._watcher = watcher;
+    self._watcher = watch_dir(
+      &dir,
+      |p| p.extension().is_some_and(|ext| ext == "jsonl"),
+      None,
+      |view, window, cx| view.refresh(window, cx),
+      window,
+      cx,
+    );
   }
 
   fn write_turn_file(&mut self, content: &str) {

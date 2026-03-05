@@ -1,3 +1,4 @@
+use crate::file_watcher::watch_dir;
 use crate::views::comment_panel::{CommentPanel, CommentPanelEvent};
 use crate::views::diff_view::DiffViewEvent;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
@@ -5,9 +6,8 @@ use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
   LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
   ProblemPickerDelegate, ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines,
-  SessionPickerDelegate, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker,
-  ShowSnippetPicker, SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget,
-  TodoHeaderPickerDelegate,
+  SessionPickerDelegate, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker, ShowSnippetPicker,
+  SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget, TodoHeaderPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
@@ -26,7 +26,6 @@ use jc_core::snippets::{self, SnippetDocument};
 use jc_core::theme::Appearance;
 use jc_core::usage::{FullUsageReport, ParStatus};
 use jc_terminal::{Palette, TerminalView, TerminalViewEvent};
-use notify::{EventKind, RecursiveMode, Watcher};
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
@@ -1397,36 +1396,16 @@ impl Workspace {
     let watched_file = path.file_name()?.to_os_string();
     let parent = path.parent()?.to_path_buf();
 
-    let (notify_tx, notify_rx) = flume::unbounded::<()>();
-
-    let mut watcher =
-      notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(event) = res {
-          match event.kind {
-            EventKind::Modify(_) | EventKind::Create(_) => {
-              if event.paths.iter().any(|p| p.ends_with(&watched_file)) {
-                let _ = notify_tx.send(());
-              }
-            }
-            _ => {}
-          }
-        }
-      })
-      .ok()?;
-
-    let _ = watcher.watch(&parent, RecursiveMode::NonRecursive);
-
-    cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
-      while notify_rx.recv_async().await.is_ok() {
-        while notify_rx.try_recv().is_ok() {}
-        let _ = this.update_in(cx, |view, _window, _cx| {
-          view.snippets = snippets::load();
-        });
-      }
-    })
-    .detach();
-
-    Some(watcher)
+    watch_dir(
+      &parent,
+      move |p| p.ends_with(&watched_file),
+      None,
+      |view, _window, _cx| {
+        view.snippets = snippets::load();
+      },
+      window,
+      cx,
+    )
   }
 
   fn show_snippet_picker(

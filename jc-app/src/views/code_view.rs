@@ -1,8 +1,8 @@
+use crate::file_watcher::watch_dir;
 use crate::language::Language;
 use crate::views::comment_panel::CommentContext;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
-use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,48 +73,23 @@ impl CodeView {
       None => return,
     };
 
-    let (notify_tx, notify_rx) = flume::unbounded::<()>();
-    let saving = self.saving.clone();
-
-    let mut watcher =
-      notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        if let Ok(event) = res {
-          match event.kind {
-            EventKind::Modify(_) | EventKind::Create(_) => {
-              if event.paths.iter().any(|p| p.ends_with(&watched_file))
-                && !saving.load(Ordering::Relaxed)
-              {
-                let _ = notify_tx.send(());
-              }
-            }
-            _ => {}
+    self._watcher = watch_dir(
+      &parent,
+      move |p| p.ends_with(&watched_file),
+      Some(self.saving.clone()),
+      |view, window, cx| {
+        if view.dirty {
+          if !view.try_merge(window, cx) {
+            view.externally_modified = true;
+            cx.notify();
           }
+        } else {
+          view.load_current(window, cx);
         }
-      })
-      .ok();
-
-    if let Some(ref mut w) = watcher {
-      let _ = w.watch(&parent, RecursiveMode::NonRecursive);
-    }
-
-    cx.spawn_in(window, async move |this: WeakEntity<CodeView>, cx: &mut AsyncWindowContext| {
-      while notify_rx.recv_async().await.is_ok() {
-        while notify_rx.try_recv().is_ok() {}
-        let _ = this.update_in(cx, |view, window, cx| {
-          if view.dirty {
-            if !view.try_merge(window, cx) {
-              view.externally_modified = true;
-              cx.notify();
-            }
-          } else {
-            view.load_current(window, cx);
-          }
-        });
-      }
-    })
-    .detach();
-
-    self._watcher = watcher;
+      },
+      window,
+      cx,
+    );
   }
 
   fn load_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {

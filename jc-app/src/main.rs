@@ -1,4 +1,5 @@
 mod app;
+mod file_watcher;
 mod language;
 mod notify;
 mod outline;

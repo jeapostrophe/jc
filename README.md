@@ -475,7 +475,6 @@ It is deliberately *not* a full code editor on mobile.
 - [ ] [H] CLI-to-GUI IPC: Unix domain socket (`~/.config/jc/jc.sock`) so `jc .` sends project path to running instance; startup binds socket or connects to existing one
 
 ### Code Quality
-- [ ] [H] file watcher boilerplate (larger cross-crate refactor)
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically
