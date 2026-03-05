@@ -6,8 +6,9 @@ use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
   LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
   ProblemPickerDelegate, ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines,
-  SessionPickerDelegate, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker, ShowSnippetPicker,
-  SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget, TodoHeaderPickerDelegate,
+  SessionPickerDelegate, SessionPickerResult, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker,
+  ShowSnippetPicker, SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget,
+  TodoHeaderPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
@@ -888,11 +889,20 @@ impl Workspace {
       cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
         match event {
           PickerEvent::Confirmed => {
-            let (project_idx, session_idx) = picker_entity.read(cx).delegate().confirmed_entry();
-            // switch_to_session sets focus to the left pane; drop stale pre_picker_focus.
+            let Some(result) = picker_entity.read(cx).delegate().confirmed_entry() else {
+              return;
+            };
+            // switch_to_session / init both set focus; drop stale pre_picker_focus.
             this.pre_picker_focus.take();
-            this.switch_to_session(project_idx, session_idx, window, cx);
             this.dismiss_picker();
+            match result {
+              SessionPickerResult::Session(pi, si) => {
+                this.switch_to_session(pi, si, window, cx);
+              }
+              SessionPickerResult::InitProject(pi) => {
+                this.init_empty_project(pi, window, cx);
+              }
+            }
             cx.notify();
           }
           PickerEvent::Dismissed => {
@@ -1082,6 +1092,29 @@ impl Workspace {
       }
     })
     .detach();
+  }
+
+  /// Activate an empty project: discover existing JSONL sessions and adopt the
+  /// most recent one, or create a brand new Claude session if none exist.
+  fn init_empty_project(
+    &mut self,
+    project_idx: usize,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    use jc_core::session::discover_latest_session_group;
+
+    let project_path = self.projects[project_idx].path.clone();
+
+    if let Some(group) = discover_latest_session_group(&project_path) {
+      // Existing JSONL files found — adopt the most recent slug.
+      let slug = group.slug.clone();
+      let label = group.summary().unwrap_or_else(|| slug.clone());
+      self.adopt_slug(project_idx, &slug, &label, window, cx);
+    } else {
+      // No JSONL files — launch a fresh Claude session.
+      self.create_new_session(project_idx, window, cx);
+    }
   }
 
   // ---------------------------------------------------------------------------

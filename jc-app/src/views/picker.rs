@@ -799,8 +799,8 @@ impl PickerDelegate for ReplyHeadingPickerDelegate {
 // ---------------------------------------------------------------------------
 
 struct SessionPickerEntry {
+  kind: SessionPickerEntryKind,
   project_index: usize,
-  session_index: usize,
   project_name: String,
   label: String,
   slug: String,
@@ -811,13 +811,29 @@ struct SessionPickerEntry {
   problems: usize,
 }
 
+#[derive(Clone, Copy)]
+enum SessionPickerEntryKind {
+  /// An adopted session — stores its index within the project's session list.
+  Session(usize),
+  /// A project with no sessions — selecting it will discover-or-create a session.
+  EmptyProject,
+}
+
+#[derive(Clone, Copy)]
+pub enum SessionPickerResult {
+  /// Switch to an existing session: (project_index, session_index).
+  Session(usize, usize),
+  /// Initialize a project that has no sessions yet: project_index.
+  InitProject(usize),
+}
+
 pub struct SessionPickerDelegate {
   /// Labels used for fuzzy filtering (format: "project / label slug").
   labels: Vec<String>,
   entries: Vec<SessionPickerEntry>,
   active_entry: Option<usize>,
   /// Stores the last confirmed entry for the workspace to read.
-  confirmed: (usize, usize),
+  confirmed: Option<SessionPickerResult>,
 }
 
 impl SessionPickerDelegate {
@@ -829,6 +845,21 @@ impl SessionPickerDelegate {
     let mut active_entry = None;
 
     for (pi, project) in projects.iter().enumerate() {
+      if project.sessions.is_empty() {
+        // Project with no sessions — add a single entry so it's reachable.
+        entries.push(SessionPickerEntry {
+          kind: SessionPickerEntryKind::EmptyProject,
+          project_index: pi,
+          project_name: project.name.clone(),
+          label: String::new(),
+          slug: String::new(),
+          relative_time: String::new(),
+          ambiguous_label: false,
+          problems: project.problems.len(),
+        });
+        continue;
+      }
+
       // Build a map from slug -> relative_time for this project.
       let groups = discover_session_groups(&project.path);
       let mut slug_time_strings: HashMap<String, String> = HashMap::default();
@@ -843,8 +874,8 @@ impl SessionPickerDelegate {
         }
         let relative_time = slug_time_strings.get(&session.slug).cloned().unwrap_or_default();
         entries.push(SessionPickerEntry {
+          kind: SessionPickerEntryKind::Session(si),
           project_index: pi,
-          session_index: si,
           project_name: project.name.clone(),
           label: session.label.clone(),
           slug: session.slug.clone(),
@@ -858,20 +889,31 @@ impl SessionPickerDelegate {
     // Detect ambiguous labels: a label is ambiguous if more than one entry shares it.
     let mut label_counts: HashMap<String, usize> = HashMap::default();
     for e in &entries {
-      *label_counts.entry(e.label.clone()).or_default() += 1;
+      if matches!(e.kind, SessionPickerEntryKind::Session(_)) {
+        *label_counts.entry(e.label.clone()).or_default() += 1;
+      }
     }
     for e in &mut entries {
-      e.ambiguous_label = label_counts.get(&e.label).copied().unwrap_or(0) > 1;
+      if matches!(e.kind, SessionPickerEntryKind::Session(_)) {
+        e.ambiguous_label = label_counts.get(&e.label).copied().unwrap_or(0) > 1;
+      }
     }
 
     // Build fuzzy-filterable labels.
-    let labels: Vec<String> =
-      entries.iter().map(|e| format!("{} / {} {}", e.project_name, e.label, e.slug)).collect();
+    let labels: Vec<String> = entries
+      .iter()
+      .map(|e| match e.kind {
+        SessionPickerEntryKind::Session(_) => {
+          format!("{} / {} {}", e.project_name, e.label, e.slug)
+        }
+        SessionPickerEntryKind::EmptyProject => e.project_name.clone(),
+      })
+      .collect();
 
-    Self { labels, entries, active_entry, confirmed: (0, 0) }
+    Self { labels, entries, active_entry, confirmed: None }
   }
 
-  pub fn confirmed_entry(&self) -> (usize, usize) {
+  pub fn confirmed_entry(&self) -> Option<SessionPickerResult> {
     self.confirmed
   }
 }
@@ -883,7 +925,10 @@ impl PickerDelegate for SessionPickerDelegate {
 
   fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
     let e = &self.entries[index];
-    self.confirmed = (e.project_index, e.session_index);
+    self.confirmed = Some(match e.kind {
+      SessionPickerEntryKind::Session(si) => SessionPickerResult::Session(e.project_index, si),
+      SessionPickerEntryKind::EmptyProject => SessionPickerResult::InitProject(e.project_index),
+    });
   }
 
   fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
@@ -895,25 +940,36 @@ impl PickerDelegate for SessionPickerDelegate {
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    let marker = if has_problems {
-      let color = if selected { theme.accent_foreground } else { theme.red };
-      picker_marker_base().text_color(color).child(format!("{}", entry.problems))
-    } else if is_active {
-      let color = if selected { theme.accent_foreground } else { theme.green };
-      picker_marker_base().text_color(color).child(">")
-    } else {
-      picker_marker_base()
+    let marker = match entry.kind {
+      SessionPickerEntryKind::EmptyProject => {
+        let color = if selected { theme.accent_foreground } else { theme.blue };
+        picker_marker_base().text_color(color).child("+")
+      }
+      SessionPickerEntryKind::Session(_) if has_problems => {
+        let color = if selected { theme.accent_foreground } else { theme.red };
+        picker_marker_base().text_color(color).child(format!("{}", entry.problems))
+      }
+      SessionPickerEntryKind::Session(_) if is_active => {
+        let color = if selected { theme.accent_foreground } else { theme.green };
+        picker_marker_base().text_color(color).child(">")
+      }
+      SessionPickerEntryKind::Session(_) => picker_marker_base(),
     };
 
-    // Main text: "project / label".
-    let main_text = format!("{} / {}", entry.project_name, entry.label);
+    // Main text: "project / label" for sessions, just project name for empty projects.
+    let main_text = match entry.kind {
+      SessionPickerEntryKind::Session(_) => format!("{} / {}", entry.project_name, entry.label),
+      SessionPickerEntryKind::EmptyProject => entry.project_name.clone(),
+    };
 
-    // Muted right section: optional "(slug)" + recency.
+    // Muted right section: optional "(slug)" + recency, or "(no sessions)" for empty projects.
     let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
-    let right = if entry.ambiguous_label {
-      format!("({}) {}", entry.slug, entry.relative_time)
-    } else {
-      entry.relative_time.clone()
+    let right = match entry.kind {
+      SessionPickerEntryKind::EmptyProject => "(no sessions)".to_string(),
+      SessionPickerEntryKind::Session(_) if entry.ambiguous_label => {
+        format!("({}) {}", entry.slug, entry.relative_time)
+      }
+      SessionPickerEntryKind::Session(_) => entry.relative_time.clone(),
     };
     let right_el = div().ml_auto().text_xs().text_color(muted_color).child(right);
 
