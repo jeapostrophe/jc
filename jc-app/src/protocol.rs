@@ -17,7 +17,7 @@ pub enum ClientMessage {
 }
 
 /// Full state snapshot pushed to connected mobile clients.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MobileStateSnapshot {
   pub projects: Vec<MobileProject>,
   pub active_project_index: usize,
@@ -25,7 +25,7 @@ pub struct MobileStateSnapshot {
 }
 
 /// Lightweight project representation for the mobile client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MobileProject {
   pub name: String,
   pub sessions: Vec<MobileSession>,
@@ -34,7 +34,7 @@ pub struct MobileProject {
 }
 
 /// Lightweight session representation for the mobile client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MobileSession {
   pub slug: String,
   pub label: String,
@@ -42,17 +42,17 @@ pub struct MobileSession {
 }
 
 /// A single problem visible on mobile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MobileProblem {
   pub rank: i8,
   pub description: String,
 }
 
 /// Usage stats visible on mobile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MobileUsage {
   pub par: f64,
-  pub par_status: String,
+  pub par_status: jc_core::usage::ParStatus,
   pub limit_pct: f64,
   pub working_pct: f64,
   pub five_hour_pct: f64,

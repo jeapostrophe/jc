@@ -6,7 +6,7 @@ use crate::protocol::{
 use crate::qr::QrPayload;
 use crate::views::comment_panel::{CommentPanel, CommentPanelEvent};
 use crate::views::diff_view::DiffViewEvent;
-use crate::views::mobile_qr::{MobileQrEvent, MobileQrView};
+use crate::views::mobile_qr::MobileQrView;
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
@@ -1768,7 +1768,7 @@ impl Workspace {
 
     let usage = self.usage_report.as_ref().map(|r| MobileUsage {
       par: r.report.par(),
-      par_status: format!("{:?}", r.par_status()),
+      par_status: r.par_status(),
       limit_pct: r.report.limit_pct,
       working_pct: r.report.working_pct,
       five_hour_pct: r.five_hour_pct,
@@ -1807,7 +1807,9 @@ impl Workspace {
     };
 
     let payload = QrPayload {
-      host: local_ip_string(),
+      host: crate::tls::local_lan_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string()),
       port: server.port,
       token: server.token.clone(),
       fingerprint: server.fingerprint.clone(),
@@ -1816,14 +1818,12 @@ impl Workspace {
     self.pre_qr_focus = window.focused(cx);
     let qr_view = cx.new(|cx| MobileQrView::new(payload, window, cx));
     let subscription =
-      cx.subscribe_in(&qr_view, window, |this: &mut Self, _, event, window, cx| {
-        if let MobileQrEvent::Dismissed = event {
-          if let Some(focus) = this.pre_qr_focus.take() {
-            focus.focus(window);
-          }
-          this.dismiss_qr();
-          cx.notify();
+      cx.subscribe_in(&qr_view, window, |this: &mut Self, _, _event, window, cx| {
+        if let Some(focus) = this.pre_qr_focus.take() {
+          focus.focus(window);
         }
+        this.dismiss_qr();
+        cx.notify();
       });
 
     self.active_qr = Some(qr_view.clone().into());
@@ -2005,18 +2005,6 @@ fn modal_overlay(content: &AnyView) -> Deferred {
       .child(content.clone()),
   )
   .with_priority(1)
-}
-
-/// Get the local LAN IP address as a string, falling back to "127.0.0.1".
-fn local_ip_string() -> String {
-  if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-    if socket.connect("8.8.8.8:80").is_ok()
-      && let Ok(addr) = socket.local_addr()
-    {
-      return addr.ip().to_string();
-    }
-  }
-  "127.0.0.1".to_string()
 }
 
 pub fn init(cx: &mut App) {

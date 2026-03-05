@@ -38,26 +38,23 @@ fn san_entries() -> Vec<SanType> {
   ];
 
   // Add LAN IP addresses for direct device connections.
-  if let Ok(addrs) = local_ipv4_addresses() {
-    for addr in addrs {
-      sans.push(SanType::IpAddress(std::net::IpAddr::V4(addr)));
-    }
+  if let Some(addr) = local_lan_ip() {
+    sans.push(SanType::IpAddress(std::net::IpAddr::V4(addr)));
   }
 
   sans
 }
 
-/// Discover non-loopback IPv4 addresses on this machine.
-fn local_ipv4_addresses() -> Result<Vec<std::net::Ipv4Addr>> {
-  let mut addrs = Vec::new();
-  // Use a UDP socket trick to discover the default route address.
-  if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
-    && socket.connect("8.8.8.8:80").is_ok()
-    && let Ok(local_addr) = socket.local_addr()
-    && let std::net::IpAddr::V4(v4) = local_addr.ip()
-    && !v4.is_loopback()
-  {
-    addrs.push(v4);
+/// Discover the local LAN IPv4 address via the default route.
+///
+/// Uses the UDP socket trick: bind to 0.0.0.0, "connect" to a public IP (no
+/// packets sent), then read back the local address the OS selected.
+pub fn local_lan_ip() -> Option<std::net::Ipv4Addr> {
+  let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+  socket.connect("8.8.8.8:80").ok()?;
+  let addr = socket.local_addr().ok()?;
+  match addr.ip() {
+    std::net::IpAddr::V4(v4) if !v4.is_loopback() => Some(v4),
+    _ => None,
   }
-  Ok(addrs)
 }

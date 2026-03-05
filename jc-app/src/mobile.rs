@@ -4,10 +4,14 @@ use anyhow::Result;
 use rand::Rng;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tungstenite::WebSocket;
 use tungstenite::protocol::Message;
+
+/// Maximum simultaneous mobile client connections.
+const MAX_CLIENTS: usize = 8;
 
 /// In-process WebSocket server for the mobile companion app.
 ///
@@ -19,7 +23,7 @@ pub struct MobileServer {
   pub token: String,
   pub fingerprint: String,
   state: Arc<Mutex<MobileStateSnapshot>>,
-  shutdown: Arc<std::sync::atomic::AtomicBool>,
+  shutdown: Arc<AtomicBool>,
   _listener_thread: thread::JoinHandle<()>,
 }
 
@@ -34,7 +38,8 @@ impl MobileServer {
 
     let token = generate_token();
     let state = Arc::new(Mutex::new(MobileStateSnapshot::default()));
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let client_count = Arc::new(AtomicUsize::new(0));
 
     let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
       .map_err(|e| anyhow::anyhow!("failed to bind mobile server on port {port}: {e}"))?;
@@ -46,9 +51,10 @@ impl MobileServer {
     let accept_state = state.clone();
     let accept_shutdown = shutdown.clone();
     let accept_tls = tls_config;
+    let accept_count = client_count.clone();
 
     let listener_thread = thread::spawn(move || {
-      accept_loop(listener, accept_tls, &accept_token, accept_state, accept_shutdown);
+      accept_loop(listener, accept_tls, &accept_token, accept_state, accept_shutdown, accept_count);
     });
 
     eprintln!("mobile server listening on port {actual_port}");
@@ -71,7 +77,7 @@ impl MobileServer {
   }
 
   pub fn shutdown(&self) {
-    self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    self.shutdown.store(true, Ordering::Relaxed);
     // Connect to ourselves to unblock the accept call.
     let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
   }
@@ -82,33 +88,43 @@ fn accept_loop(
   tls_config: Arc<rustls::ServerConfig>,
   token: &str,
   state: Arc<Mutex<MobileStateSnapshot>>,
-  shutdown: Arc<std::sync::atomic::AtomicBool>,
+  shutdown: Arc<AtomicBool>,
+  client_count: Arc<AtomicUsize>,
 ) {
   for stream in listener.incoming() {
-    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+    if shutdown.load(Ordering::Relaxed) {
       break;
     }
     let stream = match stream {
       Ok(s) => s,
       Err(e) => {
-        if !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        if !shutdown.load(Ordering::Relaxed) {
           eprintln!("mobile server accept error: {e}");
         }
         continue;
       }
     };
 
+    if client_count.load(Ordering::Relaxed) >= MAX_CLIENTS {
+      eprintln!("mobile server: rejecting connection (max {MAX_CLIENTS} clients)");
+      drop(stream);
+      continue;
+    }
+
     let tls_config = tls_config.clone();
     let client_token = token.to_string();
     let client_state = state.clone();
     let client_shutdown = shutdown.clone();
+    let client_counter = client_count.clone();
 
+    client_count.fetch_add(1, Ordering::Relaxed);
     thread::spawn(move || {
       if let Err(e) =
         handle_client(stream, tls_config, &client_token, client_state, client_shutdown)
       {
         eprintln!("mobile client error: {e}");
       }
+      client_counter.fetch_sub(1, Ordering::Relaxed);
     });
   }
 }
@@ -118,7 +134,7 @@ fn handle_client(
   tls_config: Arc<rustls::ServerConfig>,
   token: &str,
   state: Arc<Mutex<MobileStateSnapshot>>,
-  shutdown: Arc<std::sync::atomic::AtomicBool>,
+  shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
   // Set a read timeout so the broadcast loop can check for shutdown.
   stream.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
@@ -156,12 +172,11 @@ fn handle_client(
   }
 
   // Send initial state snapshot.
-  let snapshot = state.lock().unwrap().clone();
-  send_message(&mut ws, &ServerMessage::StateSnapshot(snapshot))?;
+  let mut last_snapshot = state.lock().unwrap().clone();
+  send_message(&mut ws, &ServerMessage::StateSnapshot(last_snapshot.clone()))?;
 
   // Broadcast loop: check for state changes after each read timeout.
-  let mut last_snapshot = String::default();
-  while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+  while !shutdown.load(Ordering::Relaxed) {
     // Read with timeout — handles pings and detects disconnects.
     match ws.read() {
       Ok(Message::Close(_)) => break,
@@ -178,14 +193,9 @@ fn handle_client(
       _ => {}
     }
 
-    let current = {
-      let s = state.lock().unwrap();
-      serde_json::to_string(&*s).unwrap_or_default()
-    };
-
+    let current = state.lock().unwrap().clone();
     if current != last_snapshot {
-      let snapshot: MobileStateSnapshot = serde_json::from_str(&current).unwrap_or_default();
-      if send_message(&mut ws, &ServerMessage::StateSnapshot(snapshot)).is_err() {
+      if send_message(&mut ws, &ServerMessage::StateSnapshot(current.clone())).is_err() {
         break;
       }
       last_snapshot = current;
