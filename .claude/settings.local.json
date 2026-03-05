@@ -7,7 +7,13 @@
       "Bash(cargo metadata:*)",
       "Bash(cargo doc:*)",
       "Bash(cargo tree:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(./make.sh build:*)",
+      "Bash(xcodebuild:*)",
+      "Bash(./make.sh deploy:*)",
+      "mcp__drawthings__check_status",
+      "mcp__drawthings__get_config",
+      "mcp__drawthings__generate_image"
     ]
   }
 }

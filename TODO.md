@@ -8,28 +8,50 @@ Test
 
 Review @README.md
 
-Look at this problem:
+Plan the iOS part of phase 1 of the mobile app.
 
-- [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
+---
 
-Basically, I have my own personal repository of skills and common phrases that I send to Claude. Right now, I store them in my various TODO files but they aren't consistent across repos. I probably should just make skills of them, but I'm pretty sure that I would forget the name of the command.
+Two things:
+* The paired mode should have an unpair path
 
-I'm thinking of having a file in my ~/.claude that has a list of this notes and /command references. I'm thinking that maybe it would be shown inside the TODO view in the bottom portion of the screen or maybe there would be a picker for the contents of this file which would be formatted like:
+*  Ideally, I will have a build script that will make it so I don't have to use Xcode at all. I don't know if this is possible. If it is, the interface I want is:
 
-```
-# Heading
-<content>
-```
+./make.sh 
+--> calls ./jc-mobile/make.sh
+[eventually it will also do the desktop bundling, but not yet]
 
-and I'd "pick" the Header and it would splice in the content. An example might be
+./jc-mobile/make.sh
+--> calls all the command line versions of xcode build /etc
 
-```
-# Commit and then simplify
-Commit the recent changes and then run /simplify
-```
+./jc-mobile/make.sh deploy
+--> builds and uploads to my connected phone (I already do this in Xcode with a different app, but I don't like opening up Xcode for it)
 
-This "picking" version that would be visible in either Claude or the TODO seems like the best option.
+Is this possible? Can it be included in the plan?
 
+---
+
+I deployed, restarted the app, and the "disconnected" changed to "connection failed" with no message. The desktop console read
+
+mobile client error: IO error: unexpected end of file
+mobile client error: IO error: unexpected end of file
+
+Then I unpaired and paired again, the mobile had "Connecting..." spinning for a long time and the desktop printed
+
+mobile client error: IO error: unexpected end of file
+
+Then eventually the mobile showed a new error.
+
+---
+
+I ran and saw the same things in the desktop and app, the logs were:
+❯     xcrun devicectl device process launch --console --device FB7C82EB-5C1A-549D-B981-8D054CF9A584 dev.jc.jc-mobile
+
+03:12:04  Acquired tunnel connection to device.
+03:12:04  Enabling developer disk image services.
+03:12:04  Acquired usage assertion.
+Launched application with dev.jc.jc-mobile bundle identifier.
+Waiting for the application to terminate…
 
 ---
 
@@ -40,8 +62,20 @@ Limit scope relative to an expectation of how the context window will grow.
 
 XXX focus on one panel only
 XXX the Cmd-N buttons are hard to remember
+XXX make a skill that uses DrawThings? --- use the DT mcp server other places
 
-banana
+---
+Review @README.md
+I'm working on the mobile app. I know that you cannot do image generation, but can you generate a prompt that I can manually give to a Stable Diffusion based generator to get a high quality mobile and desktop app icon?
+
+---
+
+Review @README.md
+We're in the middle of working on the mobile app.
+I just learned about Claude Code Remote Control.
+It does 90% of what I care about for the mobile side of this and I'm sure that Anthropic will just make it better and better over time.
+Convince me that I should cancel the mobile app and just do the desktop version.
+Then argument against that argument, so I can weigh the options and decide.
 
 ---
 

@@ -1,0 +1,341 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1000001 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000001 /* App.swift */; };
+		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000002 /* ContentView.swift */; };
+		A1000003 /* Protocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000003 /* Protocol.swift */; };
+		A1000004 /* ConnectionConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000004 /* ConnectionConfig.swift */; };
+		A1000005 /* WebSocketClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000005 /* WebSocketClient.swift */; };
+		A1000006 /* ConnectionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000006 /* ConnectionManager.swift */; };
+		A1000007 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000007 /* NotificationManager.swift */; };
+		A1000020 /* QRScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000020 /* QRScannerView.swift */; };
+		A1000021 /* UsageCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000021 /* UsageCardView.swift */; };
+		A1000022 /* SessionRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000022 /* SessionRow.swift */; };
+		A1000023 /* ProjectSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000023 /* ProjectSection.swift */; };
+		A1000024 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000024 /* DashboardView.swift */; };
+		A1000025 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000025 /* SettingsView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		C1000001 /* jc-mobile.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "jc-mobile.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		B1000001 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
+		B1000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		B1000003 /* Protocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Protocol.swift; sourceTree = "<group>"; };
+		B1000004 /* ConnectionConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionConfig.swift; sourceTree = "<group>"; };
+		B1000010 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B1000005 /* WebSocketClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSocketClient.swift; sourceTree = "<group>"; };
+		B1000006 /* ConnectionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionManager.swift; sourceTree = "<group>"; };
+		B1000007 /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
+		B1000020 /* QRScannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRScannerView.swift; sourceTree = "<group>"; };
+		B1000021 /* UsageCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageCardView.swift; sourceTree = "<group>"; };
+		B1000022 /* SessionRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionRow.swift; sourceTree = "<group>"; };
+		B1000023 /* ProjectSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectSection.swift; sourceTree = "<group>"; };
+		B1000024 /* DashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardView.swift; sourceTree = "<group>"; };
+		B1000025 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		D1000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		E1000001 = {
+			isa = PBXGroup;
+			children = (
+				E1000002 /* jc-mobile */,
+				E1000099 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		E1000002 /* jc-mobile */ = {
+			isa = PBXGroup;
+			children = (
+				B1000001 /* App.swift */,
+				B1000002 /* ContentView.swift */,
+				E1000003 /* Models */,
+				E1000004 /* Networking */,
+				E1000005 /* Views */,
+				E1000006 /* Notifications */,
+				B1000010 /* Info.plist */,
+			);
+			path = "jc-mobile";
+			sourceTree = "<group>";
+		};
+		E1000003 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				B1000003 /* Protocol.swift */,
+				B1000004 /* ConnectionConfig.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		E1000004 /* Networking */ = {
+			isa = PBXGroup;
+			children = (
+				B1000005 /* WebSocketClient.swift */,
+				B1000006 /* ConnectionManager.swift */,
+			);
+			path = Networking;
+			sourceTree = "<group>";
+		};
+		E1000005 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				B1000020 /* QRScannerView.swift */,
+				B1000024 /* DashboardView.swift */,
+				B1000021 /* UsageCardView.swift */,
+				B1000023 /* ProjectSection.swift */,
+				B1000022 /* SessionRow.swift */,
+				B1000025 /* SettingsView.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		E1000006 /* Notifications */ = {
+			isa = PBXGroup;
+			children = (
+				B1000007 /* NotificationManager.swift */,
+			);
+			path = Notifications;
+			sourceTree = "<group>";
+		};
+		E1000099 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				C1000001 /* jc-mobile.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		F1000001 /* jc-mobile */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = G1000003 /* Build configuration list for PBXNativeTarget "jc-mobile" */;
+			buildPhases = (
+				F1000002 /* Sources */,
+				D1000001 /* Frameworks */,
+				F1000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "jc-mobile";
+			productName = "jc-mobile";
+			productReference = C1000001 /* jc-mobile.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		H1000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					F1000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = G1000001 /* Build configuration list for PBXProject "jc-mobile" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = E1000001;
+			productRefGroup = E1000099 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				F1000001 /* jc-mobile */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		F1000003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		F1000002 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000001 /* App.swift in Sources */,
+				A1000002 /* ContentView.swift in Sources */,
+				A1000003 /* Protocol.swift in Sources */,
+				A1000004 /* ConnectionConfig.swift in Sources */,
+				A1000005 /* WebSocketClient.swift in Sources */,
+				A1000006 /* ConnectionManager.swift in Sources */,
+				A1000007 /* NotificationManager.swift in Sources */,
+				A1000020 /* QRScannerView.swift in Sources */,
+				A1000021 /* UsageCardView.swift in Sources */,
+				A1000022 /* SessionRow.swift in Sources */,
+				A1000023 /* ProjectSection.swift in Sources */,
+				A1000024 /* DashboardView.swift in Sources */,
+				A1000025 /* SettingsView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		G1000010 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) DEBUG";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		G1000011 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		G1000020 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = LDTXSSWX72;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "jc-mobile/Info.plist";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.jc.jc-mobile";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		G1000021 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = LDTXSSWX72;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "jc-mobile/Info.plist";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "dev.jc.jc-mobile";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		G1000001 /* Build configuration list for PBXProject "jc-mobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				G1000010 /* Debug */,
+				G1000011 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		G1000003 /* Build configuration list for PBXNativeTarget "jc-mobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				G1000020 /* Debug */,
+				G1000021 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = H1000001 /* Project object */;
+}

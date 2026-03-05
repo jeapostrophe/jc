@@ -3,7 +3,7 @@ use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, Tim
 use serde::{Deserialize, Serialize};
 
 const BAR_WIDTH: usize = 40;
-const THRESHOLD: f64 = 10.0;
+const THRESHOLD: f64 = 5.0;
 
 fn default_weekday() -> [u8; 2] {
   [9, 17]

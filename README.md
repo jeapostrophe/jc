@@ -23,6 +23,10 @@ cargo run -p jc-terminal --example terminal_window
 
 Config and state live in `~/.config/jc/` (`config.toml`, `state.toml`, and `theme.toml`).
 
+### App Icon
+
+`icon.png` is the app icon (1024x1024). Use it for the `.app` bundle's `AppIcon.icns` and the iOS companion app's asset catalog.
+
 ### Project Structure
 
 ```
@@ -478,12 +482,13 @@ Desktop server:
 - [x] [E] Server→client: incremental problem and usage updates on change
 
 iOS app:
-- [ ] [H] Project setup: Swift, networking layer, cert-pinned WebSocket client
-- [ ] [H] QR scanner: camera permission, decode pairing payload, store connection config
-- [ ] [H] Dashboard: project/session list with problem badges and active session indicator
-- [ ] [H] Usage view: 5h/7d progress bars, par status, reset countdowns
-- [ ] [E] Local notifications: fire on problem events when app is backgrounded
-- [ ] [E] Auto-reconnect on network change or app foreground
+- [x] [H] Project setup: Swift, networking layer, cert-pinned WebSocket client
+- [x] [H] QR scanner: camera permission, decode pairing payload, store connection config
+- [x] [H] Dashboard: project/session list with problem badges and active session indicator
+- [x] [H] Usage view: 5h/7d progress bars, par status, reset countdowns
+- [x] [E] Local notifications: fire on problem events when app is backgrounded
+- [x] [E] Auto-reconnect on network change or app foreground
+- [x] [E] Show connection status (dot + label) on dashboard, not just settings
 
 #### Mobile Phase 2: Quick Actions
 *Unblock Claude from your phone. Approve permissions, send queued instructions.*
