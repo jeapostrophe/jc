@@ -1,6 +1,12 @@
 use crate::file_watcher::watch_dir;
+use crate::mobile::MobileServer;
+use crate::protocol::{
+  MobileProblem, MobileProject, MobileSession, MobileStateSnapshot, MobileUsage,
+};
+use crate::qr::QrPayload;
 use crate::views::comment_panel::{CommentPanel, CommentPanelEvent};
 use crate::views::diff_view::DiffViewEvent;
+use crate::views::mobile_qr::{MobileQrEvent, MobileQrView};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
@@ -52,6 +58,7 @@ actions!(
     SaveFile,
     SendToTerminal,
     NextProblem,
+    ShowMobileQr,
   ]
 );
 
@@ -100,6 +107,10 @@ pub struct Workspace {
   _snippet_watcher: Option<notify::RecommendedWatcher>,
   window_active: bool,
   _window_activation_subscription: Subscription,
+  _mobile_server: Option<MobileServer>,
+  active_qr: Option<AnyView>,
+  pre_qr_focus: Option<FocusHandle>,
+  _qr_subscription: Option<Subscription>,
 }
 
 impl Workspace {
@@ -176,6 +187,7 @@ impl Workspace {
           if let Some(entity) = this.upgrade() {
             entity.update(cx, |view, cx| {
               view.usage_report = result;
+              view.push_mobile_state();
               cx.notify();
             });
             true
@@ -264,6 +276,7 @@ impl Workspace {
                 changed |= project.refresh_problems(cx);
               }
               if changed {
+                view.push_mobile_state();
                 cx.notify();
               }
             });
@@ -285,6 +298,19 @@ impl Workspace {
     snippets::ensure_file_exists();
     let snippets = snippets::load();
     let snippet_watcher = Self::setup_snippet_watcher(window, cx);
+
+    // Start mobile companion server when enabled.
+    let mobile_server = if config.mobile.enabled {
+      match MobileServer::start(config.mobile.port) {
+        Ok(server) => Some(server),
+        Err(e) => {
+          eprintln!("failed to start mobile server: {e}");
+          None
+        }
+      }
+    } else {
+      None
+    };
 
     let mut ws = Self {
       left_pane,
@@ -317,6 +343,10 @@ impl Workspace {
       _snippet_watcher: snippet_watcher,
       window_active: true,
       _window_activation_subscription: window_activation_subscription,
+      _mobile_server: mobile_server,
+      active_qr: None,
+      pre_qr_focus: None,
+      _qr_subscription: None,
     };
 
     ws.subscribe_active_project(window, cx);
@@ -834,6 +864,7 @@ impl Workspace {
 
     // Refresh problems after acknowledge.
     self.projects[project_idx].refresh_problems(cx);
+    self.push_mobile_state();
 
     // Rebind panes to the new session's views.
     let project = &self.projects[self.active_project_index];
@@ -1707,6 +1738,105 @@ impl Workspace {
       .child(right_el)
   }
 
+  fn build_mobile_snapshot(&self) -> MobileStateSnapshot {
+    let projects = self
+      .projects
+      .iter()
+      .map(|p| MobileProject {
+        name: p.name.clone(),
+        sessions: p
+          .sessions
+          .iter()
+          .map(|s| MobileSession {
+            slug: s.slug.clone(),
+            label: s.label.clone(),
+            problems: s
+              .problems
+              .iter()
+              .map(|pr| MobileProblem { rank: pr.rank(), description: pr.description() })
+              .collect(),
+          })
+          .collect(),
+        active_session_index: p.active_session_index,
+        problems: p
+          .problems
+          .iter()
+          .map(|pr| MobileProblem { rank: pr.rank(), description: pr.description() })
+          .collect(),
+      })
+      .collect();
+
+    let usage = self.usage_report.as_ref().map(|r| MobileUsage {
+      par: r.report.par(),
+      par_status: format!("{:?}", r.par_status()),
+      limit_pct: r.report.limit_pct,
+      working_pct: r.report.working_pct,
+      five_hour_pct: r.five_hour_pct,
+      pace: r.pace(),
+      remaining_hours: r.projected_remaining_hours(),
+    });
+
+    MobileStateSnapshot { projects, active_project_index: self.active_project_index, usage }
+  }
+
+  fn push_mobile_state(&self) {
+    if let Some(server) = &self._mobile_server {
+      server.push_state(self.build_mobile_snapshot());
+    }
+  }
+
+  fn toggle_mobile_qr(&mut self, _: &ShowMobileQr, window: &mut Window, cx: &mut Context<Self>) {
+    // Dismiss if already showing.
+    if self.active_qr.is_some() {
+      if let Some(focus) = self.pre_qr_focus.take() {
+        focus.focus(window);
+      }
+      self.dismiss_qr();
+      cx.notify();
+      return;
+    }
+
+    // Don't open if another modal is active.
+    if self.active_picker.is_some() || self.active_comment_panel.is_some() {
+      return;
+    }
+
+    let Some(server) = &self._mobile_server else {
+      eprintln!("mobile server not running (enable in config.toml: [mobile] enabled = true)");
+      return;
+    };
+
+    let payload = QrPayload {
+      host: local_ip_string(),
+      port: server.port,
+      token: server.token.clone(),
+      fingerprint: server.fingerprint.clone(),
+    };
+
+    self.pre_qr_focus = window.focused(cx);
+    let qr_view = cx.new(|cx| MobileQrView::new(payload, window, cx));
+    let subscription =
+      cx.subscribe_in(&qr_view, window, |this: &mut Self, _, event, window, cx| {
+        if let MobileQrEvent::Dismissed = event {
+          if let Some(focus) = this.pre_qr_focus.take() {
+            focus.focus(window);
+          }
+          this.dismiss_qr();
+          cx.notify();
+        }
+      });
+
+    self.active_qr = Some(qr_view.clone().into());
+    self._qr_subscription = Some(subscription);
+    qr_view.read(cx).focus_handle(cx).focus(window);
+    cx.notify();
+  }
+
+  fn dismiss_qr(&mut self) {
+    self.active_qr = None;
+    self._qr_subscription = None;
+  }
+
   fn handle_hook_event(&mut self, event: HookEvent, cx: &mut Context<Self>) {
     eprintln!("hook: {:?} session={} slug={:?}", event.kind, event.session_id, event.slug);
 
@@ -1734,6 +1864,8 @@ impl Workspace {
       }
     }
 
+    self.push_mobile_state();
+
     // Notify when the window is not active (user is in another app).
     if let (Some(project_name), Some(session_label)) = (matched_project, matched_label) {
       if !self.window_active {
@@ -1758,6 +1890,9 @@ impl Drop for Workspace {
       let _ = jc_core::hooks_settings::uninstall_hooks(&project.path);
     }
     if let Some(server) = &self._hook_server {
+      server.shutdown();
+    }
+    if let Some(server) = &self._mobile_server {
       server.shutdown();
     }
   }
@@ -1842,6 +1977,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::next_problem))
       .on_action(cx.listener(Self::open_problem_picker))
       .on_action(cx.listener(Self::show_snippet_picker))
+      .on_action(cx.listener(Self::toggle_mobile_qr))
       .child(self.render_title_bar(cx))
       .child(
         h_resizable(("main-split", self.split_generation))
@@ -1850,6 +1986,7 @@ impl Render for Workspace {
       )
       .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
       .when_some(self.active_comment_panel.as_ref(), |el, v| el.child(modal_overlay(v)))
+      .when_some(self.active_qr.as_ref(), |el, v| el.child(modal_overlay(v)))
   }
 }
 
@@ -1868,6 +2005,18 @@ fn modal_overlay(content: &AnyView) -> Deferred {
       .child(content.clone()),
   )
   .with_priority(1)
+}
+
+/// Get the local LAN IP address as a string, falling back to "127.0.0.1".
+fn local_ip_string() -> String {
+  if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+    if socket.connect("8.8.8.8:80").is_ok()
+      && let Ok(addr) = socket.local_addr()
+    {
+      return addr.ip().to_string();
+    }
+  }
+  "127.0.0.1".to_string()
 }
 
 pub fn init(cx: &mut App) {
@@ -1894,6 +2043,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-;", NextProblem, Some("Workspace")),
     KeyBinding::new("cmd-:", ShowProblemPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-k", ShowSnippetPicker, Some("Workspace")),
+    KeyBinding::new("cmd-shift-m", ShowMobileQr, Some("Workspace")),
   ]);
 
   cx.bind_keys([

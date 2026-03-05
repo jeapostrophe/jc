@@ -36,3 +36,10 @@ tiny_http = "0.12"
 ureq = { version = "3", features = ["json"] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication"] }
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+sha2 = "0.10"
+hex = "0.4"
+fast_qr = "0.12"
+tungstenite = "0.26"
+rand = "0.8"

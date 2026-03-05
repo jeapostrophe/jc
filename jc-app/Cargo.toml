@@ -8,6 +8,7 @@ jc-core = { path = "../jc-core" }
 jc-terminal = { path = "../jc-terminal" }
 gpui.workspace = true
 gpui-component.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 gpui-component-assets.workspace = true
 clap.workspace = true
@@ -26,3 +27,10 @@ tree-sitter-typescript.workspace = true
 diffy.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+sha2.workspace = true
+hex.workspace = true
+fast_qr.workspace = true
+tungstenite.workspace = true
+rand.workspace = true

@@ -1,0 +1,210 @@
+use crate::protocol::{ClientMessage, MobileStateSnapshot, ServerMessage};
+use crate::tls;
+use anyhow::Result;
+use rand::Rng;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use tungstenite::WebSocket;
+use tungstenite::protocol::Message;
+
+/// In-process WebSocket server for the mobile companion app.
+///
+/// Architecture follows the same pattern as `HookServer` in `jc-core/src/hooks.rs`:
+/// spawns a background thread that accepts connections, with clean shutdown
+/// via a flag.
+pub struct MobileServer {
+  pub port: u16,
+  pub token: String,
+  pub fingerprint: String,
+  state: Arc<Mutex<MobileStateSnapshot>>,
+  shutdown: Arc<std::sync::atomic::AtomicBool>,
+  _listener_thread: thread::JoinHandle<()>,
+}
+
+impl MobileServer {
+  pub fn start(port: u16) -> Result<Self> {
+    // Ensure a crypto provider is installed. gpui pulls in rustls with both
+    // aws-lc-rs and ring, so neither is auto-selected as the default.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (tls_config, fingerprint) = tls::generate_self_signed()?;
+    let tls_config = Arc::new(tls_config);
+
+    let token = generate_token();
+    let state = Arc::new(Mutex::new(MobileStateSnapshot::default()));
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
+      .map_err(|e| anyhow::anyhow!("failed to bind mobile server on port {port}: {e}"))?;
+
+    // Use the actual bound port (in case port was 0).
+    let actual_port = listener.local_addr()?.port();
+
+    let accept_token = token.clone();
+    let accept_state = state.clone();
+    let accept_shutdown = shutdown.clone();
+    let accept_tls = tls_config;
+
+    let listener_thread = thread::spawn(move || {
+      accept_loop(listener, accept_tls, &accept_token, accept_state, accept_shutdown);
+    });
+
+    eprintln!("mobile server listening on port {actual_port}");
+
+    Ok(Self {
+      port: actual_port,
+      token,
+      fingerprint,
+      state,
+      shutdown,
+      _listener_thread: listener_thread,
+    })
+  }
+
+  /// Push a new state snapshot to all connected clients.
+  /// The snapshot is stored and will be sent to newly connecting clients too.
+  pub fn push_state(&self, snapshot: MobileStateSnapshot) {
+    *self.state.lock().unwrap() = snapshot;
+    // Connected client threads will pick up the new state on their next poll cycle.
+  }
+
+  pub fn shutdown(&self) {
+    self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Connect to ourselves to unblock the accept call.
+    let _ = TcpStream::connect(format!("127.0.0.1:{}", self.port));
+  }
+}
+
+fn accept_loop(
+  listener: TcpListener,
+  tls_config: Arc<rustls::ServerConfig>,
+  token: &str,
+  state: Arc<Mutex<MobileStateSnapshot>>,
+  shutdown: Arc<std::sync::atomic::AtomicBool>,
+) {
+  for stream in listener.incoming() {
+    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+      break;
+    }
+    let stream = match stream {
+      Ok(s) => s,
+      Err(e) => {
+        if !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+          eprintln!("mobile server accept error: {e}");
+        }
+        continue;
+      }
+    };
+
+    let tls_config = tls_config.clone();
+    let client_token = token.to_string();
+    let client_state = state.clone();
+    let client_shutdown = shutdown.clone();
+
+    thread::spawn(move || {
+      if let Err(e) =
+        handle_client(stream, tls_config, &client_token, client_state, client_shutdown)
+      {
+        eprintln!("mobile client error: {e}");
+      }
+    });
+  }
+}
+
+fn handle_client(
+  stream: TcpStream,
+  tls_config: Arc<rustls::ServerConfig>,
+  token: &str,
+  state: Arc<Mutex<MobileStateSnapshot>>,
+  shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+  // Set a read timeout so the broadcast loop can check for shutdown.
+  stream.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
+
+  // Wrap in TLS.
+  let tls_conn = rustls::ServerConnection::new(tls_config)?;
+  let tls_stream = rustls::StreamOwned::new(tls_conn, stream);
+
+  // Upgrade to WebSocket.
+  let mut ws = tungstenite::accept(tls_stream)?;
+
+  // Auth handshake: send challenge, expect correct token back.
+  let challenge = ServerMessage::AuthChallenge { token: token.to_string() };
+  send_message(&mut ws, &challenge)?;
+
+  // Wait for auth response.
+  let auth_msg = ws.read()?;
+  let authenticated = match auth_msg {
+    Message::Text(text) => {
+      if let Ok(ClientMessage::Auth { token: client_token }) = serde_json::from_str(&text) {
+        client_token == token
+      } else {
+        false
+      }
+    }
+    _ => false,
+  };
+
+  let result = ServerMessage::AuthResult { success: authenticated };
+  send_message(&mut ws, &result)?;
+
+  if !authenticated {
+    let _ = ws.close(None);
+    return Ok(());
+  }
+
+  // Send initial state snapshot.
+  let snapshot = state.lock().unwrap().clone();
+  send_message(&mut ws, &ServerMessage::StateSnapshot(snapshot))?;
+
+  // Broadcast loop: check for state changes after each read timeout.
+  let mut last_snapshot = String::default();
+  while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+    // Read with timeout — handles pings and detects disconnects.
+    match ws.read() {
+      Ok(Message::Close(_)) => break,
+      Ok(Message::Ping(data)) => {
+        let _ = ws.send(Message::Pong(data));
+      }
+      Err(tungstenite::Error::Io(ref e))
+        if e.kind() == std::io::ErrorKind::WouldBlock
+          || e.kind() == std::io::ErrorKind::TimedOut =>
+      {
+        // Timeout — expected, just continue to check for new state.
+      }
+      Err(_) => break, // Real error or disconnect
+      _ => {}
+    }
+
+    let current = {
+      let s = state.lock().unwrap();
+      serde_json::to_string(&*s).unwrap_or_default()
+    };
+
+    if current != last_snapshot {
+      let snapshot: MobileStateSnapshot = serde_json::from_str(&current).unwrap_or_default();
+      if send_message(&mut ws, &ServerMessage::StateSnapshot(snapshot)).is_err() {
+        break;
+      }
+      last_snapshot = current;
+    }
+  }
+
+  let _ = ws.close(None);
+  Ok(())
+}
+
+fn send_message<S: Read + Write>(ws: &mut WebSocket<S>, msg: &ServerMessage) -> Result<()> {
+  let json = serde_json::to_string(msg)?;
+  ws.send(Message::Text(json.into()))?;
+  ws.flush()?;
+  Ok(())
+}
+
+fn generate_token() -> String {
+  let mut rng = rand::thread_rng();
+  let bytes: Vec<u8> = (0..32).map(|_| rng.r#gen::<u8>()).collect();
+  hex::encode(bytes)
+}

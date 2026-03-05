@@ -311,6 +311,15 @@ The mobile app is optimized for:
 
 It is deliberately *not* a full code editor on mobile.
 
+### Mobile Server Design
+
+The mobile server uses `tungstenite` + `rustls` on plain `std::thread` rather than `axum` + `tokio`. Rationale:
+
+- **No async runtime conflict.** GPUI has its own async executor. Running tokio alongside it creates a two-runtime situation with potential footguns (blocking the wrong runtime, confusion about which executor runs what).
+- **Simpler dependency tree.** Avoids pulling in tokio, hyper, tower, and axum for what is fundamentally one-connection-per-client WebSocket streaming.
+- **The hook server (`tiny_http`) is a separate concern.** Hooks need plain HTTP on localhost; the mobile server needs TLS on all interfaces. They can't share a single listener, so the "single axum server" benefit is mostly code organization. Both servers already share state through `push_mobile_state()`.
+- **Phase 2 client→server messages** (terminal input, send-from-WAIT) are just a `match` on deserialized `ClientMessage` variants in the existing tungstenite read loop --- not complex enough to justify a framework.
+
 ## Architecture & Components
 
 | Component | Approach |
@@ -326,7 +335,7 @@ It is deliberately *not* a full code editor on mobile.
 | Claude reply viewer | Parse session JSONL from `~/.claude/projects/`, group into turns, render as Markdown in read-only editor |
 | Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
 | Persistent state | `~/.config/jc/` --- project registry, window layout; session state in TODO.md |
-| Mobile server | `axum` + `axum-server` (tls-rustls) + `rcgen` (self-signed certs) |
+| Mobile server | `tungstenite` (WebSocket) + `rustls` (TLS) + `rcgen` (self-signed certs); no async runtime --- see [Mobile Server Design](#mobile-server-design) |
 | Mobile QR pairing | `fast_qr` (ECL Q, render as GPUI quads) |
 | Mobile app | Separate project (Swift/native iOS likely) |
 | Desktop notifications | Dock bounce via `objc2-app-kit` (`NSApplication::requestUserAttention`); no bundling required. Banners need `.app` bundle. |
@@ -461,12 +470,12 @@ A lightweight native iOS companion that connects to the desktop app over the loc
 *See project status and usage from your phone. Push notifications for problems.*
 
 Desktop server:
-- [ ] [H] Define WebSocket protocol: message types, payloads, auth handshake (document in `docs/mobile-protocol.md`)
-- [ ] [H] TLS server: `axum` + `axum-server` + `rcgen` self-signed certs, configurable port in `config.toml`
-- [ ] [H] QR code pairing: `fast_qr`, encode `{host, port, token, cert_fingerprint}`, render as GPUI quads
-- [ ] [H] WebSocket endpoint: authenticate via QR token, maintain client connection set
-- [ ] [E] Server→client: full state sync on connect (projects, sessions, problems, usage)
-- [ ] [E] Server→client: incremental problem and usage updates on change
+- [x] [H] Define WebSocket protocol: message types, payloads, auth handshake (document in `docs/mobile-protocol.md`)
+- [x] [H] TLS server: `tungstenite` + `rustls` + `rcgen` self-signed certs, configurable port in `config.toml`
+- [x] [H] QR code pairing: `fast_qr`, encode `{host, port, token, cert_fingerprint}`, render as GPUI view
+- [x] [H] WebSocket endpoint: authenticate via QR token, maintain client connection set
+- [x] [E] Server→client: full state sync on connect (projects, sessions, problems, usage)
+- [x] [E] Server→client: incremental problem and usage updates on change
 
 iOS app:
 - [ ] [H] Project setup: Swift, networking layer, cert-pinned WebSocket client

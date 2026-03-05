@@ -1,6 +1,7 @@
 pub mod code_view;
 pub mod comment_panel;
 pub mod diff_view;
+pub mod mobile_qr;
 pub mod pane;
 pub mod picker;
 pub mod project_state;

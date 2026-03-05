@@ -1,8 +1,12 @@
 mod app;
 mod file_watcher;
 mod language;
+mod mobile;
 mod notify;
 mod outline;
+mod protocol;
+mod qr;
+mod tls;
 mod views;
 
 use clap::{Parser, Subcommand};
