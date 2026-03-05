@@ -331,6 +331,67 @@ It is deliberately *not* a full code editor on mobile.
 | Mobile app | Separate project (Swift/native iOS likely) |
 | Desktop notifications | Dock bounce via `objc2-app-kit` (`NSApplication::requestUserAttention`); no bundling required. Banners need `.app` bundle. |
 
+## Keybindings
+
+### Global (Workspace)
+
+| Key | Action | Context |
+|---|---|---|
+| Cmd-1 | Show Claude terminal | |
+| Cmd-2 | Show general terminal | |
+| Cmd-3 | Show git diff | |
+| Cmd-4 | Show code viewer | |
+| Cmd-5 | Show TODO editor | |
+| Cmd-6 | Show reply viewer | |
+| Cmd-[ | Focus left pane | |
+| Cmd-] | Focus right pane | |
+| Cmd-\| | Even split panes | |
+| Cmd-P | Session picker | |
+| Cmd-Shift-P | Slug picker (current project) | |
+| Cmd-O | File picker | |
+| Cmd-T | Context picker (symbols / headings / modified files) | |
+| Cmd-Shift-O | Git log picker | |
+| Cmd-F | Search lines | |
+| Cmd-K | Open comment panel | |
+| Cmd-Shift-K | Snippet picker (`~/.claude/jc.md`) | |
+| Cmd-S | Save file | |
+| Cmd-Enter | Send to terminal | |
+| Cmd-; | Jump to next problem | |
+| Cmd-: | Show problem picker | |
+| Cmd-Shift-E | Open in external editor | |
+| Cmd-W | Close window | |
+| Cmd-M | Minimize window | |
+| Cmd-Q | Quit | |
+
+### View-Specific
+
+| Key | Action | View |
+|---|---|---|
+| Cmd-R | Reload from disk | Code viewer |
+| Cmd-R | Mark file reviewed | Diff view |
+| Cmd-C | Copy selection | Terminal |
+| Cmd-V | Paste | Terminal |
+| Cmd-= / Cmd-+ | Increase font size | Terminal |
+| Cmd-- | Decrease font size | Terminal |
+| Cmd-0 | Reset font size | Terminal |
+
+### Picker
+
+| Key | Action |
+|---|---|
+| Enter | Confirm |
+| Escape / Ctrl-C | Cancel |
+| Down / Ctrl-N | Next item |
+| Up / Ctrl-P | Previous item |
+| Page Down / Page Up | Page navigation |
+
+### Comment Panel
+
+| Key | Action |
+|---|---|
+| Cmd-Enter | Submit comment |
+| Escape / Cmd-W | Dismiss |
+
 ## Workflow Walkthrough
 
 ### Reviewing Claude's Output
@@ -375,8 +436,9 @@ It is deliberately *not* a full code editor on mobile.
 >
 > *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox. If the item doesn't fit under an existing section, create a new `###` section for it.*
 
-### TODO.md System
-- [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
+### Snippet Reference (`~/.claude/jc.md`)
+- [ ] [H] Parse `~/.claude/jc.md` as flat `# Heading` + content blocks; watch file for changes
+- [ ] [H] Snippet picker (Cmd-Shift-K): fuzzy-search headings, preview shows content. Context-sensitive insertion: TODO view inserts at cursor, Claude terminal types content, other views insert below `### WAIT`
 
 ### Claude Reply Viewer
 - [ ] [H] Full conversation rendering: tool use summaries, thinking blocks as additional headings

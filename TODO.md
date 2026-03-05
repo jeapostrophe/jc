@@ -8,12 +8,28 @@ Test
 
 Review @README.md
 
-Look at this issue
-- [ ] [H] Implement macOS desktop notifications via `objc2-user-notifications` (action buttons: "Switch to Session")
+Look at this problem:
 
-I don't like needing to do the bundling/etc, maybe I am too nervous about that concern. I don't want to be running Xcode and dealing with all sorts of Apple account setup. Am I too nervous?
+- [ ] [D] Have a shared place outside of all repositories to have a skill/pattern reference (like the "optimize plan" thing) [Perhaps it shows ~/.claude/jc.md]
 
-If it is a valid concern, is there some system level command line tool that I can run to pop up a notification? Can I just make the app icon jump?
+Basically, I have my own personal repository of skills and common phrases that I send to Claude. Right now, I store them in my various TODO files but they aren't consistent across repos. I probably should just make skills of them, but I'm pretty sure that I would forget the name of the command.
+
+I'm thinking of having a file in my ~/.claude that has a list of this notes and /command references. I'm thinking that maybe it would be shown inside the TODO view in the bottom portion of the screen or maybe there would be a picker for the contents of this file which would be formatted like:
+
+```
+# Heading
+<content>
+```
+
+and I'd "pick" the Header and it would splice in the content. An example might be
+
+```
+# Commit and then simplify
+Commit the recent changes and then run /simplify
+```
+
+This "picking" version that would be visible in either Claude or the TODO seems like the best option.
+
 
 ---
 
