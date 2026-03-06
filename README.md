@@ -296,50 +296,51 @@ Always visible in a corner. Shows:
 - **Par indicator:** compares usage % against elapsed working time %. "Under par" means you have budget to spare; "over par" means you're consuming faster than your pace.
 - Configurable working hours (e.g., exclude Sunday, reduce Saturday) so par calculations reflect actual work schedule, not raw calendar time.
 
-## Remote Workflow: Hooks, Skills & Bang Commands
+## Remote Workflow
 
-Rather than building a custom mobile app, jc exposes its workflow to Claude Code's native extension points. This means any Claude Code client — including Claude Code Remote Control on a phone — can interact with jc's session management, problem tracking, and TODO-driven instruction flow.
-
-### Design
-
-The integration has three layers:
-
-1. **Hooks** (push, event-driven) — Claude Code already fires hook events on stop, permission prompt, idle, and API error. jc's hook server receives these and updates problem state. The same hooks can trigger external notification services (e.g., Pushover, ntfy) for phone alerts when away from the desktop.
-
-2. **Skills** (pull, user-invoked) — Claude Code skills (`/skill-name`) are user-invocable commands that Claude executes. jc provides skills that expose its data model:
-   - `/jc-status` — List all projects and sessions with problem counts, active session indicator, and usage par. Equivalent to the session picker's view.
-   - `/jc-problems` — Show all current problems across sessions, ranked by severity. Equivalent to the problem picker.
-   - `/jc-wait` — Show the current session's WAIT content (drafted but unsent instructions).
-   - `/jc-send` — Send the current WAIT content to the Claude terminal (triggers the same flow as Cmd-Enter in the TODO editor).
-   - `/jc-note` — Append text below the WAIT marker in the current session's TODO.md.
-   - `/jc-turns` — List recent conversation turns for the current session with timestamps and user message previews.
-   - `/jc-diff` — Show git diff summary with per-file change stats.
-
-3. **Bang commands** (inline, mid-conversation) — Short commands prefixed with `!` that Claude can execute during a conversation without switching context. These map to the same operations as skills but are designed for quick one-shot actions:
-   - `!status` — One-line summary of session states and problems.
-   - `!approve` / `!deny` — Respond to a pending permission prompt.
-   - `!send` — Send WAIT content.
-   - `!note <text>` — Quick note appended below WAIT.
-
-### Implementation
-
-Skills and bang commands are thin wrappers around a `jc` CLI subcommand interface:
-
-```
-jc status              # JSON output of projects/sessions/problems/usage
-jc problems            # JSON list of all problems with ranks
-jc wait [--session S]  # Print WAIT content for a session
-jc send [--session S]  # Trigger send-from-WAIT
-jc note <text>         # Append text below WAIT
-jc turns [--session S] # List recent turns
-jc diff                # Git diff summary
-```
-
-The CLI reads from the same state sources as the GUI (TODO.md files, JSONL session files, `git2`). Skills invoke these subcommands. The GUI and CLI are peers — neither wraps the other.
+Rather than building a custom mobile app, jc relies on Claude Code Remote Control for mobile access. The question is how deeply jc should integrate with Claude Code's extension points (hooks, skills, bang commands) to expose its workflow remotely.
 
 ### Why Not a Custom Mobile App
 
-Claude Code Remote Control provides the mobile transport layer. Skills and hooks provide the jc integration layer. This avoids maintaining a separate iOS app, TLS WebSocket server, QR pairing protocol, and mobile UI — while getting Anthropic's ongoing improvements to the remote experience for free.
+Claude Code Remote Control provides the mobile transport layer --- a polished, first-party mobile client that Anthropic will keep improving. Building a custom iOS app + TLS WebSocket server + QR pairing protocol is a large maintenance surface for one developer. Remote Control handles notifications, terminal access, and permission approvals out of the box.
+
+### Why Not an Editor Plugin
+
+It's tempting to decompose jc into a Zed or nvim plugin + tmux + scripts. Editors already provide editing, diffs, syntax highlighting, and terminals. But jc's value is the *opinionated workflow orchestration* --- the thing that makes managing 5 concurrent Claude sessions tractable. Problem-driven navigation that crosses terminal/diff/code/TODO boundaries, the session picker model (Cmd-P across all projects with problem badges), and terminal-as-first-class-view are hard to replicate in an editor that thinks in terms of files and buffers, not Claude conversations. You'd end up rebuilding half of jc inside the editor.
+
+### The Skills & Bang Command Problem
+
+Claude Code offers two extension mechanisms for user-invoked commands:
+
+1. **Skills** (`/skill-name`) — Claude executes a prompt that can include shell commands. The problem: skills cause Claude to *think*. For deterministic operations ("show me the problem list"), thinking is pure waste --- tokens spent interpreting intent and generating prose around data you just want printed.
+
+2. **Bang commands** (`!command`) — Run shell commands directly. Closer to what we want, but: (a) namespace collision (`!status` is valuable `$PATH` space), so you'd need `!jc-status` which gets tiresome across 7+ commands; (b) all output enters Claude's context window, consuming tokens. Checking status 10 times in a session fills context with repetitive tabular data Claude doesn't need to see.
+
+The fundamental gap: **there is no Claude Code mechanism for "show the user something without putting it in context."** jc's desktop app solves this by being a separate viewport --- you see problems, diffs, usage, and session state without Claude ever knowing you looked. Any pure-Claude-Code solution loses this property.
+
+### What's Worth Implementing Anyway
+
+Despite the limitations, a small subset of CLI subcommands are useful for scripting, interop, and the occasional Remote Control check-in:
+
+```
+jc status              # JSON: projects, sessions, problems, usage
+jc problems            # JSON: all problems with ranks
+jc note <text>         # Append text below WAIT marker
+```
+
+These three cover the most common remote needs: "what's happening?", "what needs attention?", and "add a quick note." They're useful from any terminal --- Remote Control, SSH, scripts, cron jobs --- without needing skills or bang commands as wrappers.
+
+The remaining operations (`wait`, `send`, `turns`, `diff`) are better performed in the desktop app where you have the full viewport. Wrapping them as skills would burn tokens for a worse experience.
+
+### The Missing Primitive
+
+The right solution is a Claude Code feature: **user-side commands that produce output the user sees but Claude does not.** A sideband display channel. This would let tools like jc expose rich status dashboards, problem lists, and session state inside the Claude Code experience without polluting context.
+
+This is worth a feature request to Anthropic. If Claude Code is meant to be the primary developer environment, users need a way to see ambient information (build status, test results, project dashboards) without paying for it in tokens. The analogy is an IDE's status bar or panel --- always visible, never in the conversation.
+
+### Hooks
+
+Hooks are the one extension point that works well today. Claude Code fires events on stop, permission prompt, idle, and API error. jc's hook server already receives these and updates problem state. The same hooks can trigger external notification services (e.g., ntfy, Pushover) for phone alerts when away from the desktop. No skills or context pollution required --- hooks are push-only and invisible to the conversation.
 
 ## Architecture & Components
 
@@ -480,16 +481,12 @@ Claude Code Remote Control provides the mobile transport layer. Skills and hooks
 ### Problems & Status
 - [ ] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
 
-### Remote Workflow (Skills & CLI)
+### Remote Workflow (CLI & Hooks)
 - [ ] [H] `jc status` subcommand: JSON output of projects, sessions, problems, usage
 - [ ] [H] `jc problems` subcommand: JSON list of all problems with ranks
-- [ ] [E] `jc wait` subcommand: print WAIT content for a session
-- [ ] [E] `jc send` subcommand: trigger send-from-WAIT
 - [ ] [E] `jc note` subcommand: append text below WAIT marker
-- [ ] [E] `jc turns` subcommand: list recent conversation turns
-- [ ] [E] `jc diff` subcommand: git diff summary with per-file stats
-- [ ] [H] Claude Code skill definitions (`.claude/skills/`) wrapping CLI subcommands
 - [ ] [E] External notification hook (push problem events to ntfy/Pushover)
+- [ ] [D] Draft feature request: Claude Code user-side sideband display (output user sees but Claude does not)
 
 ### Git Worktrees
 - [ ] [H] Implement git worktree creation/deletion via `git2` worktree API
