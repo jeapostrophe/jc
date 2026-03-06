@@ -33,6 +33,7 @@ actions!(
     ShowSlugPicker,
     ShowProblemPicker,
     ShowSnippetPicker,
+    ShowViewPicker,
   ]
 );
 
@@ -1309,6 +1310,40 @@ impl PickerDelegate for ProblemPickerDelegate {
     let marker = picker_marker_base().text_color(marker_color).child("!");
 
     row.child(marker).child(entry.description.clone())
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ViewPickerDelegate
+// ---------------------------------------------------------------------------
+
+use crate::views::pane::PaneContentKind;
+
+pub struct ViewPickerDelegate {
+  labels: Vec<String>,
+  kinds: Vec<PaneContentKind>,
+  confirmed_kind: Option<PaneContentKind>,
+}
+
+impl ViewPickerDelegate {
+  pub fn new() -> Self {
+    let kinds: Vec<PaneContentKind> = PaneContentKind::ALL.to_vec();
+    let labels: Vec<String> = kinds.iter().map(|k| k.label().to_string()).collect();
+    Self { labels, kinds, confirmed_kind: None }
+  }
+
+  pub fn confirmed_kind(&self) -> Option<PaneContentKind> {
+    self.confirmed_kind
+  }
+}
+
+impl PickerDelegate for ViewPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
+    self.confirmed_kind = Some(self.kinds[index]);
   }
 }
 

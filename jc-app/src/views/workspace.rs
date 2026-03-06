@@ -7,8 +7,8 @@ use crate::views::picker::{
   LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
   ProblemPickerDelegate, ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines,
   SessionPickerDelegate, SessionPickerResult, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker,
-  ShowSnippetPicker, SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget,
-  TodoHeaderPickerDelegate,
+  ShowSnippetPicker, ShowViewPicker, SlugAction, SlugPickerDelegate, SnippetPickerDelegate,
+  SnippetTarget, TodoHeaderPickerDelegate, ViewPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
@@ -36,15 +36,17 @@ actions!(
     CloseWindow,
     MinimizeWindow,
     Quit,
-    FocusLeftPane,
-    FocusRightPane,
+    FocusPrevPane,
+    FocusNextPane,
+    SetLayoutOne,
+    SetLayoutTwo,
+    SetLayoutThree,
     ShowClaudeTerminal,
     ShowGeneralTerminal,
     ShowGitDiff,
     ShowCodeViewer,
     ShowTodoEditor,
     OpenInExternalEditor,
-    EvenSplit,
     OpenGitLogPicker,
     ShowReplyViewer,
     OpenCommentPanel,
@@ -54,10 +56,12 @@ actions!(
   ]
 );
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivePane {
-  Left,
-  Right,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneLayout {
+  One,
+  #[default]
+  Two,
+  Three,
 }
 
 /// Map a GPUI WindowAppearance to our Appearance enum.
@@ -69,9 +73,9 @@ fn appearance_from_window(appearance: WindowAppearance) -> Appearance {
 }
 
 pub struct Workspace {
-  left_pane: Entity<Pane>,
-  right_pane: Entity<Pane>,
-  active_pane: ActivePane,
+  panes: Vec<Entity<Pane>>,
+  active_pane_index: usize,
+  layout: PaneLayout,
   projects: Vec<ProjectState>,
   active_project_index: usize,
   config: AppConfig,
@@ -86,8 +90,7 @@ pub struct Workspace {
   recent_files: Vec<PathBuf>,
   _appearance_subscription: Subscription,
   _diff_view_subscription: Option<Subscription>,
-  _left_focus_in: Subscription,
-  _right_focus_in: Subscription,
+  _focus_in_subscriptions: Vec<Subscription>,
   _hook_server: Option<HookServer>,
   _hook_poll_task: Option<Task<()>>,
   _bell_subscriptions: Vec<Subscription>,
@@ -137,12 +140,13 @@ impl Workspace {
     }
 
     // Determine initial pane content from first project's first session.
-    let (left_content, right_content) = Self::initial_pane_contents(&projects[0], cx);
+    let initial_contents = Self::initial_pane_contents(&projects[0], cx);
+    let panes: Vec<Entity<Pane>> = initial_contents
+      .into_iter()
+      .map(|content| cx.new(|cx| Pane::with_content(content, cx)))
+      .collect();
 
-    let left_pane = cx.new(|cx| Pane::with_content(left_content, cx));
-    let right_pane = cx.new(|cx| Pane::with_content(right_content, cx));
-
-    left_pane.read(cx).focus_content(window);
+    panes[0].read(cx).focus_content(window);
 
     // Observe system appearance changes and update themes accordingly.
     let appearance_subscription =
@@ -156,21 +160,16 @@ impl Workspace {
         this.window_active = window.is_window_active();
       });
 
-    let left_focus = left_pane.read(cx).focus_handle(cx);
-    let right_focus = right_pane.read(cx).focus_handle(cx);
-
-    let left_focus_in = cx.on_focus_in(&left_focus, window, |this, _window, cx| {
-      if this.active_pane != ActivePane::Left {
-        this.active_pane = ActivePane::Left;
-        cx.notify();
-      }
-    });
-    let right_focus_in = cx.on_focus_in(&right_focus, window, |this, _window, cx| {
-      if this.active_pane != ActivePane::Right {
-        this.active_pane = ActivePane::Right;
-        cx.notify();
-      }
-    });
+    let mut focus_in_subscriptions = Vec::new();
+    for (i, pane) in panes.iter().enumerate() {
+      let focus = pane.read(cx).focus_handle(cx);
+      focus_in_subscriptions.push(cx.on_focus_in(&focus, window, move |this, _window, cx| {
+        if this.active_pane_index != i {
+          this.active_pane_index = i;
+          cx.notify();
+        }
+      }));
+    }
 
     // Start hook server for Claude Code integration.
     let project_paths: Vec<PathBuf> = projects.iter().map(|p| p.path.clone()).collect();
@@ -250,9 +249,9 @@ impl Workspace {
     let snippet_watcher = Self::setup_snippet_watcher(window, cx);
 
     let mut ws = Self {
-      left_pane,
-      right_pane,
-      active_pane: ActivePane::Left,
+      panes,
+      active_pane_index: 0,
+      layout: PaneLayout::default(),
       projects,
       active_project_index: 0,
       config,
@@ -267,8 +266,7 @@ impl Workspace {
       recent_files: Vec::new(),
       _appearance_subscription: appearance_subscription,
       _diff_view_subscription: None,
-      _left_focus_in: left_focus_in,
-      _right_focus_in: right_focus_in,
+      _focus_in_subscriptions: focus_in_subscriptions,
       _hook_server: hook_server,
       _hook_poll_task: hook_poll_task,
       _bell_subscriptions: bell_subscriptions,
@@ -284,9 +282,9 @@ impl Workspace {
     ws
   }
 
-  /// Build initial PaneContent for left and right panes from a project.
-  fn initial_pane_contents(project: &ProjectState, cx: &App) -> (PaneContent, PaneContent) {
-    let left = if let Some(session) = project.active_session() {
+  /// Build initial PaneContent for all 3 panes from a project.
+  fn initial_pane_contents(project: &ProjectState, cx: &App) -> Vec<PaneContent> {
+    let first = if let Some(session) = project.active_session() {
       let focus = session.claude_terminal.read(cx).focus_handle(cx);
       PaneContent {
         kind: PaneContentKind::ClaudeTerminal,
@@ -302,7 +300,7 @@ impl Workspace {
       }
     };
 
-    let right = if let Some(session) = project.active_session() {
+    let second = if let Some(session) = project.active_session() {
       let focus = session.general_terminal.read(cx).focus_handle(cx);
       PaneContent {
         kind: PaneContentKind::GeneralTerminal,
@@ -314,7 +312,12 @@ impl Workspace {
       PaneContent { kind: PaneContentKind::GitDiff, view: project.diff_view.clone().into(), focus }
     };
 
-    (left, right)
+    let third = {
+      let focus = project.diff_view.read(cx).focus_handle(cx);
+      PaneContent { kind: PaneContentKind::GitDiff, view: project.diff_view.clone().into(), focus }
+    };
+
+    vec![first, second, third]
   }
 
   /// Subscribe to bell events from all sessions' claude terminals.
@@ -433,23 +436,55 @@ impl Workspace {
   // Pane focus
   // ---------------------------------------------------------------------------
 
-  fn focus_left_pane(&mut self, _: &FocusLeftPane, window: &mut Window, cx: &mut Context<Self>) {
-    self.active_pane = ActivePane::Left;
-    self.left_pane.read(cx).focus_content(window);
+  fn visible_pane_count(&self) -> usize {
+    match self.layout {
+      PaneLayout::One => 1,
+      PaneLayout::Two => 2,
+      PaneLayout::Three => 3,
+    }
+  }
+
+  fn focus_prev_pane(&mut self, _: &FocusPrevPane, window: &mut Window, cx: &mut Context<Self>) {
+    let count = self.visible_pane_count();
+    self.active_pane_index = (self.active_pane_index + count - 1) % count;
+    self.panes[self.active_pane_index].read(cx).focus_content(window);
     cx.notify();
   }
 
-  fn focus_right_pane(&mut self, _: &FocusRightPane, window: &mut Window, cx: &mut Context<Self>) {
-    self.active_pane = ActivePane::Right;
-    self.right_pane.read(cx).focus_content(window);
+  fn focus_next_pane(&mut self, _: &FocusNextPane, window: &mut Window, cx: &mut Context<Self>) {
+    let count = self.visible_pane_count();
+    self.active_pane_index = (self.active_pane_index + 1) % count;
+    self.panes[self.active_pane_index].read(cx).focus_content(window);
     cx.notify();
+  }
+
+  fn set_layout(&mut self, layout: PaneLayout, window: &mut Window, cx: &mut Context<Self>) {
+    self.layout = layout;
+    let count = self.visible_pane_count();
+    // If the focused pane would be hidden, swap it into a visible position.
+    if self.active_pane_index >= count {
+      self.panes.swap(0, self.active_pane_index);
+      self.active_pane_index = 0;
+    }
+    self.panes[self.active_pane_index].read(cx).focus_content(window);
+    self.split_generation += 1;
+    cx.notify();
+  }
+
+  fn set_layout_one(&mut self, _: &SetLayoutOne, window: &mut Window, cx: &mut Context<Self>) {
+    self.set_layout(PaneLayout::One, window, cx);
+  }
+
+  fn set_layout_two(&mut self, _: &SetLayoutTwo, window: &mut Window, cx: &mut Context<Self>) {
+    self.set_layout(PaneLayout::Two, window, cx);
+  }
+
+  fn set_layout_three(&mut self, _: &SetLayoutThree, window: &mut Window, cx: &mut Context<Self>) {
+    self.set_layout(PaneLayout::Three, window, cx);
   }
 
   fn active_pane_entity(&self) -> &Entity<Pane> {
-    match self.active_pane {
-      ActivePane::Left => &self.left_pane,
-      ActivePane::Right => &self.right_pane,
-    }
+    &self.panes[self.active_pane_index]
   }
 
   // ---------------------------------------------------------------------------
@@ -732,8 +767,41 @@ impl Workspace {
     cx.notify();
   }
 
-  fn even_split(&mut self, _: &EvenSplit, _window: &mut Window, cx: &mut Context<Self>) {
-    self.split_generation += 1;
+  fn show_view_picker(&mut self, _: &ShowViewPicker, window: &mut Window, cx: &mut Context<Self>) {
+    if self.active_picker.is_some() {
+      return;
+    }
+
+    let delegate = ViewPickerDelegate::new();
+    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
+    self.pre_picker_focus = window.focused(cx);
+
+    let subscription =
+      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
+        match event {
+          PickerEvent::Confirmed => {
+            let kind = picker_entity.read(cx).delegate().confirmed_kind();
+            this.pre_picker_focus.take();
+            this.dismiss_picker();
+            if let Some(kind) = kind {
+              this.set_active_pane_view(kind, window, cx);
+            }
+            cx.notify();
+          }
+          PickerEvent::Dismissed => {
+            if let Some(focus) = this.pre_picker_focus.take() {
+              focus.focus(window);
+            }
+            this.dismiss_picker();
+            cx.notify();
+          }
+        }
+      });
+
+    self.active_picker = Some(picker.clone().into());
+    self._picker_subscription = Some(subscription);
+
+    picker.read(cx).input_focus_handle(cx).focus(window);
     cx.notify();
   }
 
@@ -799,9 +867,9 @@ impl Workspace {
     // Rebind panes to the new session's views.
     let project = &self.projects[self.active_project_index];
     if let Some(session) = project.active_session() {
-      // Set left pane to claude terminal.
+      // Set first pane to claude terminal.
       let focus = session.claude_terminal.read(cx).focus_handle(cx);
-      self.left_pane.update(cx, |p, cx| {
+      self.panes[0].update(cx, |p, cx| {
         p.set_content(
           PaneContent {
             kind: PaneContentKind::ClaudeTerminal,
@@ -812,9 +880,9 @@ impl Workspace {
         );
       });
 
-      // Set right pane to general terminal.
+      // Set second pane to general terminal.
       let focus = session.general_terminal.read(cx).focus_handle(cx);
-      self.right_pane.update(cx, |p, cx| {
+      self.panes[1].update(cx, |p, cx| {
         p.set_content(
           PaneContent {
             kind: PaneContentKind::GeneralTerminal,
@@ -825,8 +893,8 @@ impl Workspace {
         );
       });
 
-      self.left_pane.read(cx).focus_content(window);
-      self.active_pane = ActivePane::Left;
+      self.panes[0].read(cx).focus_content(window);
+      self.active_pane_index = 0;
     }
 
     cx.notify();
@@ -1373,8 +1441,8 @@ impl Workspace {
       let _ = pty.write_all(b"\r");
     });
 
-    // Switch left pane to Claude terminal so the user can see it working.
-    self.active_pane = ActivePane::Left;
+    // Switch first pane to Claude terminal so the user can see it working.
+    self.active_pane_index = 0;
     self.set_active_pane_view(PaneContentKind::ClaudeTerminal, window, cx);
   }
 
@@ -1670,12 +1738,7 @@ impl Render for Workspace {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let theme = cx.theme();
     let active_border = theme.accent;
-
-    let left_active = self.active_pane == ActivePane::Left;
-    let right_active = self.active_pane == ActivePane::Right;
-
-    let left_label = self.pane_header_label(&self.left_pane, cx);
-    let right_label = self.pane_header_label(&self.right_pane, cx);
+    let visible = self.visible_pane_count();
 
     let pane_header = |label: String, active: bool| {
       div()
@@ -1690,23 +1753,30 @@ impl Render for Workspace {
         .child(label)
     };
 
-    let left_wrapper = div()
-      .size_full()
-      .flex()
-      .flex_col()
-      .border_l_2()
-      .border_color(if left_active { active_border } else { gpui::transparent_black() })
-      .child(pane_header(left_label, left_active))
-      .child(div().flex_1().min_h_0().overflow_hidden().child(self.left_pane.clone()));
+    let build_pane_wrapper = |i: usize, pane: &Entity<Pane>| {
+      let active = self.active_pane_index == i;
+      let label = self.pane_header_label(pane, cx);
+      div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .border_l_2()
+        .border_color(if active { active_border } else { gpui::transparent_black() })
+        .child(pane_header(label, active))
+        .child(div().flex_1().min_h_0().overflow_hidden().child(pane.clone()))
+    };
 
-    let right_wrapper = div()
-      .size_full()
-      .flex()
-      .flex_col()
-      .border_l_2()
-      .border_color(if right_active { active_border } else { gpui::transparent_black() })
-      .child(pane_header(right_label, right_active))
-      .child(div().flex_1().min_h_0().overflow_hidden().child(self.right_pane.clone()));
+    // Build the pane area: single full-width pane, or h_resizable with 2-3 panels.
+    let pane_area = if visible == 1 {
+      div().flex_1().min_h_0().child(build_pane_wrapper(0, &self.panes[0])).into_any_element()
+    } else {
+      let mut resizable = h_resizable(("main-split", self.split_generation));
+      for i in 0..visible {
+        resizable = resizable
+          .child(resizable_panel().size(px(600.0)).child(build_pane_wrapper(i, &self.panes[i])));
+      }
+      resizable.into_any_element()
+    };
 
     div()
       .id("workspace")
@@ -1717,8 +1787,11 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::close_window))
       .on_action(cx.listener(Self::minimize_window))
       .on_action(cx.listener(Self::quit))
-      .on_action(cx.listener(Self::focus_left_pane))
-      .on_action(cx.listener(Self::focus_right_pane))
+      .on_action(cx.listener(Self::focus_prev_pane))
+      .on_action(cx.listener(Self::focus_next_pane))
+      .on_action(cx.listener(Self::set_layout_one))
+      .on_action(cx.listener(Self::set_layout_two))
+      .on_action(cx.listener(Self::set_layout_three))
       .on_action(cx.listener(Self::show_claude_terminal))
       .on_action(cx.listener(Self::show_general_terminal))
       .on_action(cx.listener(Self::show_git_diff))
@@ -1728,7 +1801,6 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::open_in_external_editor))
       .on_action(cx.listener(Self::open_file_picker))
       .on_action(cx.listener(Self::open_context_picker))
-      .on_action(cx.listener(Self::even_split))
       .on_action(cx.listener(Self::open_git_log_picker))
       .on_action(cx.listener(Self::open_session_picker))
       .on_action(cx.listener(Self::open_slug_picker))
@@ -1739,12 +1811,9 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::next_problem))
       .on_action(cx.listener(Self::open_problem_picker))
       .on_action(cx.listener(Self::show_snippet_picker))
+      .on_action(cx.listener(Self::show_view_picker))
       .child(self.render_title_bar(cx))
-      .child(
-        h_resizable(("main-split", self.split_generation))
-          .child(resizable_panel().size(px(600.0)).child(left_wrapper))
-          .child(resizable_panel().size(px(600.0)).child(right_wrapper)),
-      )
+      .child(pane_area)
       .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
       .when_some(self.active_comment_panel.as_ref(), |el, v| el.child(modal_overlay(v)))
   }
@@ -1772,16 +1841,13 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-w", CloseWindow, Some("Workspace")),
     KeyBinding::new("cmd-m", MinimizeWindow, Some("Workspace")),
     KeyBinding::new("cmd-q", Quit, Some("Workspace")),
-    KeyBinding::new("cmd-[", FocusLeftPane, Some("Workspace")),
-    KeyBinding::new("cmd-]", FocusRightPane, Some("Workspace")),
-    KeyBinding::new("cmd-1", ShowClaudeTerminal, Some("Workspace")),
-    KeyBinding::new("cmd-2", ShowGeneralTerminal, Some("Workspace")),
-    KeyBinding::new("cmd-3", ShowGitDiff, Some("Workspace")),
-    KeyBinding::new("cmd-4", ShowCodeViewer, Some("Workspace")),
-    KeyBinding::new("cmd-5", ShowTodoEditor, Some("Workspace")),
-    KeyBinding::new("cmd-6", ShowReplyViewer, Some("Workspace")),
+    KeyBinding::new("cmd-[", FocusPrevPane, Some("Workspace")),
+    KeyBinding::new("cmd-]", FocusNextPane, Some("Workspace")),
+    KeyBinding::new("cmd-1", SetLayoutOne, Some("Workspace")),
+    KeyBinding::new("cmd-2", SetLayoutTwo, Some("Workspace")),
+    KeyBinding::new("cmd-3", SetLayoutThree, Some("Workspace")),
+    KeyBinding::new("cmd-.", ShowViewPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
-    KeyBinding::new("cmd-|", EvenSplit, Some("Workspace")),
     KeyBinding::new("cmd-shift-o", OpenGitLogPicker, Some("Workspace")),
     KeyBinding::new("cmd-p", ShowSessionPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-p", ShowSlugPicker, Some("Workspace")),
@@ -1794,8 +1860,9 @@ pub fn init(cx: &mut App) {
   ]);
 
   cx.bind_keys([
-    KeyBinding::new("cmd-[", FocusLeftPane, Some("Input")),
-    KeyBinding::new("cmd-]", FocusRightPane, Some("Input")),
+    KeyBinding::new("cmd-.", ShowViewPicker, Some("Input")),
+    KeyBinding::new("cmd-[", FocusPrevPane, Some("Input")),
+    KeyBinding::new("cmd-]", FocusNextPane, Some("Input")),
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Input")),
     KeyBinding::new("cmd-s", SaveFile, Some("Input")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Input")),

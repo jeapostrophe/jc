@@ -365,15 +365,12 @@ Hooks are the one extension point that works well today. Claude Code fires event
 
 | Key | Action | Context |
 |---|---|---|
-| Cmd-1 | Show Claude terminal | |
-| Cmd-2 | Show general terminal | |
-| Cmd-3 | Show git diff | |
-| Cmd-4 | Show code viewer | |
-| Cmd-5 | Show TODO editor | |
-| Cmd-6 | Show reply viewer | |
+| Cmd-1 | 1-pane layout (focused pane goes full-screen) | |
+| Cmd-2 | 2-pane layout (equal widths) | |
+| Cmd-3 | 3-pane layout (equal widths) | |
+| Cmd-. | View picker (place view in focused pane) | |
 | Cmd-[ | Focus left pane | |
 | Cmd-] | Focus right pane | |
-| Cmd-\| | Even split panes | |
 | Cmd-P | Session picker | |
 | Cmd-Shift-P | Slug picker (current project) | |
 | Cmd-O | File picker | |
@@ -384,8 +381,9 @@ Hooks are the one extension point that works well today. Claude Code fires event
 | Cmd-Shift-K | Snippet picker (`~/.claude/jc.md`) | |
 | Cmd-S | Save file | |
 | Cmd-Enter | Send to terminal | |
-| Cmd-; | Jump to next problem | |
-| Cmd-: | Show problem picker | |
+| Cmd-; | Next problem (current project) / jump to WAIT if none | |
+| Cmd-: | Urgency-sorted session picker | |
+| Cmd-? | Keybinding help overlay | |
 | Cmd-Shift-E | Open in external editor | |
 | Cmd-W | Close window | |
 | Cmd-M | Minimize window | |
@@ -477,9 +475,15 @@ Hooks are the one extension point that works well today. Claude Code fires event
 
 ### Navigation & Pickers
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
+- [x] [D] View picker (Cmd-.): replace Cmd-1..6 view bindings with a picker that shows view names and places the selected view in the focused pane
+- [ ] [H] Support multiple Code Viewers
+- [x] [H] Pane layout (Cmd-1/2/3): Cmd-1 makes the focused pane full-screen, Cmd-2/3 splits into 2/3 equal-width panes. Replaces the old Cmd-1..6 view bindings.
+- [ ] [E] Keybinding help overlay (Cmd-?): shows all keybindings in an overlay. Future task: filter to context-sensitive bindings.
 
 ### Problems & Status
 - [ ] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
+- [ ] [T] Cmd-; problem cycling: navigate problems within current project, end at WAIT-has-content as the submit signal, fall through to TODO editor at WAIT position when no problems remain ("show me what to do next")
+- [ ] [E] Cmd-: urgency-sorted session picker: same sessions as Cmd-P but sorted by oldest-unattended-problem first, so Enter jumps to the neediest session
 
 ### Remote Workflow (CLI & Hooks)
 - [ ] [H] `jc status` subcommand: JSON output of projects, sessions, problems, usage
@@ -487,6 +491,9 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [ ] [E] `jc note` subcommand: append text below WAIT marker
 - [ ] [E] External notification hook (push problem events to ntfy/Pushover)
 - [x] [D] Draft feature request: Claude Code user-side sideband display (output user sees but Claude does not)
+
+### Workflow
+- [ ] [E] Auto-show Claude terminal on submit: when sending from TODO, focus the "other" pane and show Claude terminal there. In 1-pane mode, switch the pane; in 2-pane, use the other pane; in 3-pane, use the leftmost pane that isn't the current one.
 
 ### Git Worktrees
 - [ ] [H] Implement git worktree creation/deletion via `git2` worktree API

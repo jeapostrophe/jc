@@ -199,7 +199,7 @@ pub fn run(state: AppState, config: AppConfig) {
     .detach();
 
     let opts = WindowOptions {
-      window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+      window_bounds: Some(WindowBounds::Maximized(Bounds::centered(
         None,
         size(px(1200.0), px(800.0)),
         cx,

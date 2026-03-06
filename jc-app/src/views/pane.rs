@@ -12,6 +12,15 @@ pub enum PaneContentKind {
 }
 
 impl PaneContentKind {
+  pub const ALL: [PaneContentKind; 6] = [
+    Self::ClaudeTerminal,
+    Self::GeneralTerminal,
+    Self::GitDiff,
+    Self::CodeViewer,
+    Self::TodoEditor,
+    Self::ReplyViewer,
+  ];
+
   pub fn label(self) -> &'static str {
     match self {
       Self::ClaudeTerminal => "Claude",
