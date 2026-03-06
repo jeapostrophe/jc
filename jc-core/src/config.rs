@@ -1,5 +1,4 @@
 use crate::model::{Project, WindowLayout};
-use crate::usage::WorkingHours;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -11,7 +10,6 @@ use std::path::{Path, PathBuf};
 pub struct AppConfig {
   pub editor: String,
   pub window: WindowLayout,
-  pub working_hours: WorkingHours,
 }
 
 /// App-managed state (~/.config/jc/state.toml).

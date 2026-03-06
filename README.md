@@ -486,7 +486,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [ ] [H] `jc problems` subcommand: JSON list of all problems with ranks
 - [ ] [E] `jc note` subcommand: append text below WAIT marker
 - [ ] [E] External notification hook (push problem events to ntfy/Pushover)
-- [ ] [D] Draft feature request: Claude Code user-side sideband display (output user sees but Claude does not)
+- [x] [D] Draft feature request: Claude Code user-side sideband display (output user sees but Claude does not)
 
 ### Git Worktrees
 - [ ] [H] Implement git worktree creation/deletion via `git2` worktree API

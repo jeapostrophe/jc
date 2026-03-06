@@ -1,4 +1,3 @@
-pub mod claude_api;
 pub mod config;
 pub mod hooks;
 pub mod hooks_settings;
@@ -9,4 +8,3 @@ pub mod snippets;
 pub mod status_script;
 pub mod theme;
 pub mod todo;
-pub mod usage;
