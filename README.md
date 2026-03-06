@@ -135,7 +135,7 @@ From any view (diff, terminal, code, reply), the user can press a comment keybin
 
 ## Views & Panels
 
-The window has a **left pane** and a **right pane**. Any view can appear in either pane with independent scroll positions. A **Quake-style terminal** can be toggled at the bottom of the window via a keybinding for quick commands.
+The window supports **1, 2, or 3 panes** (Cmd-1/2/3). Any view can appear in any pane via the view picker (Cmd-.). Cmd-[/] cycle focus between visible panes. When reducing pane count, the focused pane swaps into a visible position so you never lose your place. A **Quake-style terminal** can be toggled at the bottom of the window via a keybinding for quick commands.
 
 Multiple windows can be open simultaneously. Windows share state: if two windows show the same session's Claude terminal, scrolling or changes in one are reflected in the other.
 
@@ -369,8 +369,8 @@ Hooks are the one extension point that works well today. Claude Code fires event
 | Cmd-2 | 2-pane layout (equal widths) | |
 | Cmd-3 | 3-pane layout (equal widths) | |
 | Cmd-. | View picker (place view in focused pane) | |
-| Cmd-[ | Focus left pane | |
-| Cmd-] | Focus right pane | |
+| Cmd-[ | Focus previous pane | |
+| Cmd-] | Focus next pane | |
 | Cmd-P | Session picker | |
 | Cmd-Shift-P | Slug picker (current project) | |
 | Cmd-O | File picker | |
@@ -423,12 +423,12 @@ Hooks are the one extension point that works well today. Claude Code fires event
 ### Reviewing Claude's Output
 
 1. Claude finishes working. A desktop notification fires and the in-app indicator lights up.
-2. Press a keybinding to switch the left pane to Claude's terminal.
+2. Use the view picker (Cmd-.) to show Claude's terminal in a pane.
 3. Press a keybinding to switch to the diff view. Scroll through changes.
 4. Highlight a region (with mouse or keybindings) in the diff, press the comment key, type a note. It appears in TODO.md under `### WAIT`.
 5. Mark reviewed files as done (they collapse).
 6. Switch to the general terminal to run tests or inspect behavior. Highlight output, press comment key.
-7. Switch to the reply viewer (Cmd-6). Use Cmd-Shift-O to pick a turn. Scroll through the rendered conversation and annotate.
+7. Switch to the reply viewer (Cmd-. → Reply). Use Cmd-Shift-O to pick a turn. Scroll through the rendered conversation and annotate.
 
 ### Navigating Code
 

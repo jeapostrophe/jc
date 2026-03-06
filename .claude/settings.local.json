@@ -13,7 +13,9 @@
       "Bash(./make.sh deploy:*)",
       "mcp__drawthings__check_status",
       "mcp__drawthings__get_config",
-      "mcp__drawthings__generate_image"
+      "mcp__drawthings__generate_image",
+      "Bash(/usr/bin/date:*)",
+      "Bash(./scripts/claude-usage.sh:*)"
     ]
   }
 }
