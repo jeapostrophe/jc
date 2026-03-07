@@ -11,7 +11,7 @@ use crate::views::picker::{
   ShowViewPicker, SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget,
   TodoHeaderPickerDelegate, ViewPickerDelegate,
 };
-use crate::views::project_state::ProjectState;
+use crate::views::project_state::{ProjectState, SavedPaneLayout};
 use crate::views::reply_view::gc_stale_replies;
 use crate::views::session_state::{PendingEvent, SessionState};
 use gpui::prelude::FluentBuilder as _;
@@ -111,6 +111,7 @@ pub struct Workspace {
   pre_help_focus: Option<FocusHandle>,
   window_active: bool,
   _window_activation_subscription: Subscription,
+  _notification_poll_task: Option<Task<()>>,
 }
 
 impl Workspace {
@@ -274,6 +275,29 @@ impl Workspace {
         }
       });
 
+    // Initialize notification system and poll for notification action responses.
+    let notification_action_rx = crate::notify::action_receiver();
+    crate::notify::init();
+    let notification_poll_task =
+      cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+        while let Ok(slug) = notification_action_rx.recv_async().await {
+          let Ok(should_continue) = cx.update(|window, cx| {
+            if let Some(entity) = this.upgrade() {
+              entity.update(cx, |ws, cx| ws.switch_to_slug(&slug, window, cx));
+              window.activate_window();
+              true
+            } else {
+              false
+            }
+          }) else {
+            break;
+          };
+          if !should_continue {
+            break;
+          }
+        }
+      });
+
     // Create global TODO view (~/.claude/TODO.md) as a read-only CodeView.
     let global_todo_path =
       PathBuf::from(std::env::var("HOME").expect("HOME not set")).join(".claude/TODO.md");
@@ -322,6 +346,7 @@ impl Workspace {
       pre_help_focus: None,
       window_active: true,
       _window_activation_subscription: window_activation_subscription,
+      _notification_poll_task: Some(notification_poll_task),
     };
 
     ws.subscribe_active_project(window, cx);
@@ -988,6 +1013,17 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     let project_changed = project_idx != self.active_project_index;
+
+    // Save the current project's pane layout before switching away.
+    if project_changed {
+      let saved = SavedPaneLayout {
+        pane_kinds: std::array::from_fn(|i| self.panes[i].read(cx).content_kind()),
+        active_pane_index: self.active_pane_index,
+        layout: self.layout,
+      };
+      self.projects[self.active_project_index].saved_layout = Some(saved);
+    }
+
     self.active_project_index = project_idx;
     self.projects[project_idx].active_session_index = Some(session_idx);
 
@@ -1010,40 +1046,126 @@ impl Workspace {
     // Refresh problems after acknowledge.
     self.projects[project_idx].refresh_problems(cx);
 
-    // Rebind panes to the new session's views.
-    let project = &self.projects[self.active_project_index];
-    if let Some(session) = project.active_session() {
-      // Set first pane to claude terminal.
-      let focus = session.claude_terminal.read(cx).focus_handle(cx);
-      self.panes[0].update(cx, |p, cx| {
-        p.set_content(
-          PaneContent {
-            kind: PaneContentKind::ClaudeTerminal,
-            view: session.claude_terminal.clone().into(),
-            focus: focus.clone(),
-          },
-          cx,
-        );
-      });
-
-      // Set second pane to general terminal.
-      let focus = session.general_terminal.read(cx).focus_handle(cx);
-      self.panes[1].update(cx, |p, cx| {
-        p.set_content(
-          PaneContent {
-            kind: PaneContentKind::GeneralTerminal,
-            view: session.general_terminal.clone().into(),
-            focus: focus.clone(),
-          },
-          cx,
-        );
-      });
-
-      self.panes[0].read(cx).focus_content(window);
-      self.active_pane_index = 0;
+    if project_changed {
+      self.restore_or_default_panes(window, cx);
+    } else {
+      self.rebind_session_panes(window, cx);
     }
 
     cx.notify();
+  }
+
+  /// Find a session by slug across all projects and switch to it.
+  fn switch_to_slug(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+    for (pi, project) in self.projects.iter().enumerate() {
+      for (si, session) in project.sessions.iter().enumerate() {
+        if session.slug == slug {
+          self.switch_to_session(pi, si, window, cx);
+          return;
+        }
+      }
+    }
+  }
+
+  /// Restore saved pane layout for the active project, or use defaults.
+  fn restore_or_default_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    // Copy saved layout data to avoid borrow conflict with set_pane_view.
+    let saved = self.projects[self.active_project_index]
+      .saved_layout
+      .as_ref()
+      .map(|s| (s.pane_kinds, s.active_pane_index, s.layout));
+
+    if let Some((kinds, active, layout)) = saved {
+      self.layout = layout;
+      for (i, kind) in kinds.iter().enumerate() {
+        if let Some(kind) = kind {
+          self.set_pane_view(i, *kind, cx);
+        }
+      }
+      self.active_pane_index = active.min(self.visible_pane_count() - 1);
+      self.split_generation += 1;
+      self.panes[self.active_pane_index].read(cx).focus_content(window);
+    } else {
+      // First visit: default layout.
+      self.set_pane_view(0, PaneContentKind::ClaudeTerminal, cx);
+      self.set_pane_view(1, PaneContentKind::GeneralTerminal, cx);
+      self.panes[0].read(cx).focus_content(window);
+      self.active_pane_index = 0;
+    }
+  }
+
+  /// When switching sessions within the same project, swap session-bound views
+  /// in-place (Claude terminal, general terminal, reply viewer) without
+  /// disturbing the pane layout or non-session views.
+  fn rebind_session_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.projects[self.active_project_index].active_session().is_none() {
+      return;
+    }
+
+    // Collect which panes need rebinding (avoids borrow conflict with set_pane_view).
+    let mut to_rebind: Vec<(usize, PaneContentKind)> = Vec::new();
+    for i in 0..self.panes.len() {
+      if let Some(kind) = self.panes[i].read(cx).content_kind() {
+        match kind {
+          PaneContentKind::ClaudeTerminal
+          | PaneContentKind::GeneralTerminal
+          | PaneContentKind::ReplyViewer => to_rebind.push((i, kind)),
+          _ => {}
+        }
+      }
+    }
+
+    if to_rebind.is_empty() {
+      // No pane shows a session view; put claude terminal in active pane.
+      self.set_pane_view(self.active_pane_index, PaneContentKind::ClaudeTerminal, cx);
+    } else {
+      for (i, kind) in to_rebind {
+        self.set_pane_view(i, kind, cx);
+      }
+    }
+
+    self.panes[self.active_pane_index].read(cx).focus_content(window);
+  }
+
+  /// Set a specific pane to show a view kind from the active project/session.
+  fn set_pane_view(&mut self, pane_idx: usize, kind: PaneContentKind, cx: &mut App) {
+    let project = &self.projects[self.active_project_index];
+    let result: Option<(AnyView, FocusHandle)> = match kind {
+      PaneContentKind::ClaudeTerminal => project.active_session().map(|s| {
+        let focus = s.claude_terminal.read(cx).focus_handle(cx);
+        (s.claude_terminal.clone().into(), focus)
+      }),
+      PaneContentKind::GeneralTerminal => project.active_session().map(|s| {
+        let focus = s.general_terminal.read(cx).focus_handle(cx);
+        (s.general_terminal.clone().into(), focus)
+      }),
+      PaneContentKind::GitDiff => {
+        let focus = project.diff_view.read(cx).focus_handle(cx);
+        Some((project.diff_view.clone().into(), focus))
+      }
+      PaneContentKind::CodeViewer => {
+        let focus = project.code_view.read(cx).focus_handle(cx);
+        Some((project.code_view.clone().into(), focus))
+      }
+      PaneContentKind::TodoEditor => {
+        let focus = project.todo_view.read(cx).focus_handle(cx);
+        Some((project.todo_view.clone().into(), focus))
+      }
+      PaneContentKind::ReplyViewer => project.active_session().map(|s| {
+        let focus = s.reply_view.read(cx).focus_handle(cx);
+        (s.reply_view.clone().into(), focus)
+      }),
+      PaneContentKind::GlobalTodo => {
+        let focus = self.global_todo_view.read(cx).focus_handle(cx);
+        Some((self.global_todo_view.clone().into(), focus))
+      }
+    };
+
+    if let Some((view, focus)) = result {
+      self.panes[pane_idx].update(cx, |p, cx| {
+        p.set_content(PaneContent { kind, view, focus }, cx);
+      });
+    }
   }
 
   fn open_session_picker(
@@ -1864,7 +1986,7 @@ impl Workspace {
           HookEventKind::PermissionPrompt => "Permission needed",
           HookEventKind::IdlePrompt => "Claude is idle",
         };
-        crate::notify::notify(&title, message, critical);
+        crate::notify::notify(&title, message, critical, event.slug.as_deref());
       }
     }
 

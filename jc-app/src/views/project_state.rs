@@ -12,6 +12,15 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use super::pane::PaneContentKind;
+use super::workspace::PaneLayout;
+
+pub struct SavedPaneLayout {
+  pub pane_kinds: [Option<PaneContentKind>; 3],
+  pub active_pane_index: usize,
+  pub layout: PaneLayout,
+}
+
 pub struct ProjectState {
   pub path: PathBuf,
   pub name: String,
@@ -23,6 +32,7 @@ pub struct ProjectState {
   pub problems: Vec<ProjectProblem>,
   pub script_problems: Vec<ScriptProblem>,
   pub last_script_run: Option<Instant>,
+  pub saved_layout: Option<SavedPaneLayout>,
 }
 
 impl ProjectState {
@@ -93,6 +103,7 @@ impl ProjectState {
       problems: Vec::new(),
       script_problems: Vec::new(),
       last_script_run: None,
+      saved_layout: None,
     }
   }
 

@@ -33,5 +33,12 @@ tree-sitter-go = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-typescript = "0.23"
 tiny_http = "0.12"
+block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSSet", "NSDictionary", "NSEnumerator"] }
+objc2-user-notifications = { version = "0.3", features = [
+  "UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest",
+  "UNNotificationAction", "UNNotificationCategory", "UNNotificationSound",
+  "UNNotificationResponse", "UNNotificationSettings",
+] }

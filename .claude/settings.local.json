@@ -15,7 +15,8 @@
       "mcp__drawthings__get_config",
       "mcp__drawthings__generate_image",
       "Bash(/usr/bin/date:*)",
-      "Bash(./scripts/claude-usage.sh:*)"
+      "Bash(./scripts/claude-usage.sh:*)",
+      "Bash(cargo search:*)"
     ]
   }
 }

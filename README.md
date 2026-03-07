@@ -469,15 +469,11 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [ ] [H] Add word-level inline highlighting via `similar` with background highlights NOT diagnostics
 
 ### Window & Pane Management
-- [ ] [E] Implement independent scroll positions per project (go back to a project and everything is as you left it)
+- [x] [E] Implement independent scroll positions per project (go back to a project and everything is as you left it)
 - [ ] [H] Implement multi-window with shared session state
-- [x] [E] Add a global TODO view (always shows `~/.claude/TODO.md` in every project; called "Global TDOO")
-
-### Navigation & Pickers
-- [x] [E] Keybinding help overlay (Cmd-?): shows all keybindings in an overlay. Future task: filter to context-sensitive bindings.
 
 ### Problems & Status
-- [ ] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
+- [x] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
 
 ### Remote Workflow (CLI & Hooks)
 - [ ] [H] `jc status` subcommand: JSON output of projects, sessions, problems, usage
@@ -485,18 +481,12 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [ ] [E] `jc note` subcommand: append text below WAIT marker
 - [ ] [E] External notification hook (push problem events to ntfy/Pushover)
 
-### Workflow
-- [x] [E] Auto-show Claude terminal on submit: when sending from TODO, focus the "other" pane and show Claude terminal there. In 1-pane mode, switch the pane; in 2-pane, use the other pane; in 3-pane, use the leftmost pane that isn't the current one.
-
 ### Git Worktrees
 - [ ] [H] Implement git worktree creation/deletion via `git2` worktree API
 
 ### Polish & Integration
 - [ ] [H] End-to-end test: full workflow from project creation to Claude review cycle
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
-
-### Code Quality
-- [x] [T] Simplify state.toml format --- no id, no name, no tasks, no added_at
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically
