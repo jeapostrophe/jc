@@ -9,8 +9,9 @@ Test
 Review @README.md
 
 Make a plan for these issues:
-- [ ] [T] Cmd-; problem cycling: navigate problems within current project, end at WAIT-has-content as the submit signal, fall through to TODO editor at WAIT position when no problems remain ("show me what to do next")
-- [ ] [E] Cmd-: urgency-sorted session picker: same sessions as Cmd-P but sorted by oldest-unattended-problem first, so Enter jumps to the neediest session
+- [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing via `scripts/bundle.sh` (prerequisite for `objc2-user-notifications` upgrade); use icon.png
+- [ ] [H] Single-instance guard: `NSRunningApplication` check on startup to prevent duplicate `.app` launches (activate existing window and exit)
+- [ ] [H] CLI-to-GUI IPC: Unix domain socket (`~/.config/jc/jc.sock`) so `jc .` sends project path to running instance; startup binds socket or connects to existing one
 
 ---
 

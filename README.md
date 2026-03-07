@@ -472,6 +472,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [ ] [E] Implement independent scroll positions per pane
 - [ ] [H] Implement Quake-style bottom terminal overlay
 - [ ] [H] Implement multi-window with shared session state
+- [ ] [E] Add a global TODO view
 
 ### Navigation & Pickers
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
