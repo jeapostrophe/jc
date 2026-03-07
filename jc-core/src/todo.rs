@@ -342,9 +342,6 @@ pub fn validate(doc: &TodoDocument, project_path: &Path, text: &str) -> Vec<Todo
         slug_byte_range: session.slug_byte_range.clone(),
       });
     }
-  }
-
-  for session in &doc.sessions {
     if let Some(wait) = &session.wait {
       let body = &text[wait.body_byte_range.clone()];
       if !body.trim().is_empty() {

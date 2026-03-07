@@ -68,9 +68,7 @@ pub fn theme_path() -> PathBuf {
   config_dir().join("theme.toml")
 }
 
-fn load_toml<T: Default + for<'de> serde::de::Deserialize<'de>>(
-  path: &std::path::Path,
-) -> Result<T> {
+fn load_toml<T: Default + serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
   match fs::read_to_string(path) {
     Ok(contents) => {
       toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))

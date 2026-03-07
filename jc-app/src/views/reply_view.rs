@@ -6,10 +6,7 @@ use gpui_component::input::{Input, InputState};
 use jc_core::session::{
   Turn, discover_latest_session_group, discover_session_group, parse_session_group, session_dir,
 };
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-
-pub fn init(_cx: &mut App) {}
 
 pub fn gc_stale_replies(project_path: &Path) {
   let replies_dir = project_path.join(".jc/replies");
@@ -88,7 +85,7 @@ impl ReplyView {
 
   pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let prev_turn_count = self.turns.len();
-    let was_at_latest = self.current_turn_index + 1 >= prev_turn_count || prev_turn_count == 0;
+    let was_at_latest = self.current_turn_index + 1 >= prev_turn_count;
     let prev_index = self.current_turn_index;
 
     self.discover_and_parse();
@@ -117,9 +114,7 @@ impl ReplyView {
     };
 
     // Skip editor update if content hasn't changed to preserve scroll/cursor.
-    let mut hasher = DefaultHasher::default();
-    content.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = super::compute_checksum(&content);
     if hash == self.last_shown_hash {
       return;
     }
@@ -156,9 +151,7 @@ impl ReplyView {
   }
 
   fn write_turn_file(&mut self, content: &str) {
-    let mut hasher = DefaultHasher::default();
-    content.hash(&mut hasher);
-    let hash = hasher.finish();
+    let hash = super::compute_checksum(content);
     if hash == self.last_written_hash {
       return;
     }
@@ -174,19 +167,11 @@ impl ReplyView {
     &self.turns
   }
 
-  pub fn current_turn_index(&self) -> usize {
-    self.current_turn_index
-  }
-
   pub fn current_turn_label(&self) -> String {
     if self.turns.is_empty() {
       return "No session".to_string();
     }
     self.turns[self.current_turn_index].label()
-  }
-
-  pub fn editor(&self) -> &Entity<InputState> {
-    &self.editor
   }
 
   pub fn editor_text(&self, cx: &App) -> String {
@@ -221,10 +206,6 @@ impl super::LineSearchable for ReplyView {
 }
 
 impl ReplyView {
-  pub fn project_path(&self) -> &Path {
-    &self.project_path
-  }
-
   pub fn set_session_slug(
     &mut self,
     slug: Option<String>,

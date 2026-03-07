@@ -7,7 +7,6 @@ use crate::views::comment_panel;
 use crate::views::diff_view;
 use crate::views::keybinding_help;
 use crate::views::picker;
-use crate::views::reply_view;
 use crate::views::workspace::{self, Workspace};
 use gpui::*;
 use gpui_component::TitleBar;
@@ -126,11 +125,11 @@ fn apply_unified_themes(cx: &mut App) {
   let light_config = Rc::new(build_gpui_theme(&ThemeConfig::light(), ThemeMode::Light));
 
   let theme = Theme::global_mut(cx);
-  theme.dark_theme = dark_config.clone();
-  theme.light_theme = light_config.clone();
+  theme.dark_theme = dark_config;
+  theme.light_theme = light_config;
 
   // Apply the highlight theme for the current mode.
-  let current_config = if theme.mode.is_dark() { &dark_config } else { &light_config };
+  let current_config = if theme.mode.is_dark() { &theme.dark_theme } else { &theme.light_theme };
   if let Some(style) = &current_config.highlight {
     theme.highlight_theme = Arc::new(gpui_component::highlighter::HighlightTheme {
       name: current_config.name.to_string(),
@@ -179,7 +178,6 @@ pub fn run(state: AppState, config: AppConfig, ipc_rx: flume::Receiver<std::path
     picker::init(cx);
     code_view::init(cx);
     diff_view::init(cx);
-    reply_view::init(cx);
     comment_panel::init(cx);
     keybinding_help::init(cx);
 

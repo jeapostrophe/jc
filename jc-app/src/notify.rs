@@ -103,63 +103,61 @@ pub fn notify(title: &str, message: &str, critical: bool, slug: Option<&str>) {
 }
 
 unsafe fn post_notification(title: &str, message: &str, slug: Option<&str>) {
-  unsafe {
-    let content: Retained<AnyObject> =
-      msg_send![AnyClass::get(c"UNMutableNotificationContent").unwrap(), new];
+  let content: Retained<AnyObject> =
+    msg_send![AnyClass::get(c"UNMutableNotificationContent").unwrap(), new];
 
-    let ns_title = NSString::from_str(title);
-    let ns_body = NSString::from_str(message);
-    let () = msg_send![&*content, setTitle: &*ns_title];
-    let () = msg_send![&*content, setBody: &*ns_body];
+  let ns_title = NSString::from_str(title);
+  let ns_body = NSString::from_str(message);
+  let () = msg_send![&*content, setTitle: &*ns_title];
+  let () = msg_send![&*content, setBody: &*ns_body];
 
-    // Default notification sound.
-    let sound: Retained<AnyObject> =
-      msg_send![AnyClass::get(c"UNNotificationSound").unwrap(), defaultSound];
-    let () = msg_send![&*content, setSound: &*sound];
+  // Default notification sound.
+  let sound: Retained<AnyObject> =
+    msg_send![AnyClass::get(c"UNNotificationSound").unwrap(), defaultSound];
+  let () = msg_send![&*content, setSound: &*sound];
 
-    // Category enables the "Switch to Session" action button.
-    let cat_id = NSString::from_str(CATEGORY_ID);
-    let () = msg_send![&*content, setCategoryIdentifier: &*cat_id];
+  // Category enables the "Switch to Session" action button.
+  let cat_id = NSString::from_str(CATEGORY_ID);
+  let () = msg_send![&*content, setCategoryIdentifier: &*cat_id];
 
-    // Thread identifier groups notifications by slug.
-    if let Some(slug) = slug {
-      let thread_id = NSString::from_str(slug);
-      let () = msg_send![&*content, setThreadIdentifier: &*thread_id];
+  // Thread identifier groups notifications by slug.
+  if let Some(slug) = slug {
+    let thread_id = NSString::from_str(slug);
+    let () = msg_send![&*content, setThreadIdentifier: &*thread_id];
 
-      // Store slug in userInfo so the action handler can route to the session.
-      let slug_key = NSString::from_str("slug");
-      let slug_val = NSString::from_str(slug);
-      let user_info: Retained<AnyObject> = msg_send![
-        AnyClass::get(c"NSDictionary").unwrap(),
-        dictionaryWithObject: &*slug_val,
-        forKey: &*slug_key
-      ];
-      let () = msg_send![&*content, setUserInfo: &*user_info];
-    }
-
-    // Unique request identifier.
-    let ts = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap_or_default()
-      .as_nanos();
-    let request_id = NSString::from_str(&format!("jc-{ts}"));
-    let null: *const AnyObject = std::ptr::null();
-    let request: Retained<AnyObject> = msg_send![
-      AnyClass::get(c"UNNotificationRequest").unwrap(),
-      requestWithIdentifier: &*request_id,
-      content: &*content,
-      trigger: null
+    // Store slug in userInfo so the action handler can route to the session.
+    let slug_key = NSString::from_str("slug");
+    let slug_val = NSString::from_str(slug);
+    let user_info: Retained<AnyObject> = msg_send![
+      AnyClass::get(c"NSDictionary").unwrap(),
+      dictionaryWithObject: &*slug_val,
+      forKey: &*slug_key
     ];
-
-    let center: Retained<AnyObject> =
-      msg_send![AnyClass::get(c"UNUserNotificationCenter").unwrap(), currentNotificationCenter];
-    let handler = RcBlock::new(|_error: *mut AnyObject| {});
-    let () = msg_send![
-      &*center,
-      addNotificationRequest: &*request,
-      withCompletionHandler: &*handler
-    ];
+    let () = msg_send![&*content, setUserInfo: &*user_info];
   }
+
+  // Unique request identifier.
+  let ts = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_nanos();
+  let request_id = NSString::from_str(&format!("jc-{ts}"));
+  let null: *const AnyObject = std::ptr::null();
+  let request: Retained<AnyObject> = msg_send![
+    AnyClass::get(c"UNNotificationRequest").unwrap(),
+    requestWithIdentifier: &*request_id,
+    content: &*content,
+    trigger: null
+  ];
+
+  let center: Retained<AnyObject> =
+    msg_send![AnyClass::get(c"UNUserNotificationCenter").unwrap(), currentNotificationCenter];
+  let handler = RcBlock::new(|_error: *mut AnyObject| {});
+  let () = msg_send![
+    &*center,
+    addNotificationRequest: &*request,
+    withCompletionHandler: &*handler
+  ];
 }
 
 fn bounce_dock_icon(critical: bool) {

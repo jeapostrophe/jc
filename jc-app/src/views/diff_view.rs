@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
 use crate::language::Language;
@@ -122,7 +122,6 @@ impl DiffView {
     if let Some(fd) = self.file_diffs.get(self.current_file_index) {
       let name = fd.name.clone();
       let checksum = fd.checksum;
-      use std::collections::hash_map::Entry;
       match self.reviewed.entry(name) {
         Entry::Occupied(e) => {
           e.remove();
@@ -173,10 +172,6 @@ impl DiffView {
 
   pub fn project_path(&self) -> &Path {
     &self.project_path
-  }
-
-  pub fn editor(&self) -> &Entity<InputState> {
-    &self.editor
   }
 
   pub fn editor_text(&self, cx: &App) -> String {
@@ -261,19 +256,7 @@ fn generate_diff_inner(path: &Path) -> Result<String, git2::Error> {
   let head = repo.head()?;
   let tree = head.peel_to_tree()?;
   let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None)?;
-
-  let mut output = String::default();
-  diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
-    match line.origin() {
-      '+' | '-' | ' ' => output.push(line.origin()),
-      _ => {}
-    }
-    let content = std::str::from_utf8(line.content()).unwrap_or("");
-    output.push_str(content);
-    true
-  })?;
-
-  Ok(output)
+  diff_to_string(&diff)
 }
 
 fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
@@ -285,7 +268,7 @@ fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
     if let Some(rest) = line.strip_prefix("diff --git a/") {
       // Flush previous file diff.
       if let Some(name) = current_name.take() {
-        let checksum = compute_checksum(&current_content);
+        let checksum = super::compute_checksum(&current_content);
         diffs.push(FileDiff { name, content: std::mem::take(&mut current_content), checksum });
       }
       let name = rest.split(" b/").next().unwrap_or(rest).to_string();
@@ -300,17 +283,11 @@ fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
 
   // Flush last file.
   if let Some(name) = current_name {
-    let checksum = compute_checksum(&current_content);
+    let checksum = super::compute_checksum(&current_content);
     diffs.push(FileDiff { name, content: current_content, checksum });
   }
 
   diffs
-}
-
-fn compute_checksum(content: &str) -> u64 {
-  let mut hasher = DefaultHasher::default();
-  content.hash(&mut hasher);
-  hasher.finish()
 }
 
 fn generate_commit_diff(path: &Path, oid: git2::Oid) -> String {
@@ -328,7 +305,10 @@ fn generate_commit_diff_inner(path: &Path, oid: git2::Oid) -> Result<String, git
   let parent_tree = if commit.parent_count() > 0 { Some(commit.parent(0)?.tree()?) } else { None };
 
   let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+  diff_to_string(&diff)
+}
 
+fn diff_to_string(diff: &git2::Diff) -> Result<String, git2::Error> {
   let mut output = String::default();
   diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
     match line.origin() {
@@ -339,7 +319,6 @@ fn generate_commit_diff_inner(path: &Path, oid: git2::Oid) -> Result<String, git
     output.push_str(content);
     true
   })?;
-
   Ok(output)
 }
 

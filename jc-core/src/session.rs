@@ -68,21 +68,23 @@ impl Turn {
   pub fn label(&self) -> String {
     let text = self.user.text.trim();
     let first_line = text.lines().next().unwrap_or(text);
-    if first_line.len() > 80 {
-      // Find a char boundary at or before byte 80 to avoid panicking on multi-byte UTF-8.
-      let truncate_at = first_line
-        .char_indices()
-        .take_while(|(i, _)| *i <= 80)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(first_line.len());
-      let mut label = first_line[..truncate_at].to_string();
-      label.push_str("...");
-      label
-    } else {
-      first_line.to_string()
-    }
+    truncate_utf8(first_line, 80)
   }
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+  if s.len() <= max_bytes {
+    return s.to_string();
+  }
+  let truncate_at = s
+    .char_indices()
+    .take_while(|(i, _)| *i <= max_bytes)
+    .last()
+    .map(|(i, c)| i + c.len_utf8())
+    .unwrap_or(s.len());
+  let mut result = s[..truncate_at].to_string();
+  result.push_str("...");
+  result
 }
 
 // ---------------------------------------------------------------------------
@@ -177,19 +179,7 @@ pub fn extract_first_user_summary(path: &Path) -> Option<String> {
       if l.is_empty() {
         continue;
       }
-      // Truncate to 80 chars (UTF-8 safe).
-      if l.len() > 80 {
-        let truncate_at = l
-          .char_indices()
-          .take_while(|(i, _)| *i <= 80)
-          .last()
-          .map(|(i, c)| i + c.len_utf8())
-          .unwrap_or(l.len());
-        let mut s = l[..truncate_at].to_string();
-        s.push_str("...");
-        return Some(s);
-      }
-      return Some(l.to_string());
+      return Some(truncate_utf8(l, 80));
     }
   }
   None
@@ -241,11 +231,24 @@ fn collect_session_files(project_path: &Path) -> Vec<(PathBuf, SystemTime, Strin
     .collect()
 }
 
+/// Sort entries newest-first by mtime and build a `SessionGroup`.
+/// Returns `None` if `entries` is empty.
+fn build_session_group(
+  slug: String,
+  mut entries: Vec<(PathBuf, SystemTime)>,
+) -> Option<SessionGroup> {
+  if entries.is_empty() {
+    return None;
+  }
+  entries.sort_by(|a, b| b.1.cmp(&a.1));
+  let latest_mtime = entries[0].1;
+  Some(SessionGroup { slug, files: entries.into_iter().map(|(p, _)| p).collect(), latest_mtime })
+}
+
 /// Build all session groups from the project's session directory.
 pub fn discover_session_groups(project_path: &Path) -> Vec<SessionGroup> {
   let files = collect_session_files(project_path);
 
-  // Group by slug, keeping mtimes.
   let mut slug_groups: HashMap<String, Vec<(PathBuf, SystemTime)>> = HashMap::default();
   for (path, mtime, slug) in files {
     slug_groups.entry(slug).or_default().push((path, mtime));
@@ -253,59 +256,28 @@ pub fn discover_session_groups(project_path: &Path) -> Vec<SessionGroup> {
 
   let mut groups: Vec<SessionGroup> = slug_groups
     .into_iter()
-    .map(|(slug, mut entries)| {
-      entries.sort_by(|a, b| b.1.cmp(&a.1));
-      let latest_mtime = entries[0].1;
-      SessionGroup { slug, files: entries.into_iter().map(|(p, _)| p).collect(), latest_mtime }
-    })
+    .filter_map(|(slug, entries)| build_session_group(slug, entries))
     .collect();
 
-  // Sort groups by most recent file mtime (newest group first).
   groups.sort_by(|a, b| b.latest_mtime.cmp(&a.latest_mtime));
-
   groups
 }
 
 /// Find all JSONL files belonging to a specific slug.
 pub fn discover_session_group(project_path: &Path, slug: &str) -> Option<SessionGroup> {
   let files = collect_session_files(project_path);
-
-  let mut matching: Vec<(PathBuf, SystemTime)> =
-    files.into_iter().filter(|(_, _, s)| s == slug).map(|(p, m, _)| (p, m)).collect();
-
-  if matching.is_empty() {
-    return None;
-  }
-  matching.sort_by(|a, b| b.1.cmp(&a.1));
-  let latest_mtime = matching[0].1;
-  Some(SessionGroup {
-    slug: slug.to_string(),
-    files: matching.into_iter().map(|(p, _)| p).collect(),
-    latest_mtime,
-  })
+  let matching = files.into_iter().filter(|(_, _, s)| s == slug).map(|(p, m, _)| (p, m)).collect();
+  build_session_group(slug.to_string(), matching)
 }
 
 /// Discover the most recently active session group for a project.
 pub fn discover_latest_session_group(project_path: &Path) -> Option<SessionGroup> {
   let files = collect_session_files(project_path);
-  if files.is_empty() {
-    return None;
-  }
-
-  // Find the file with the newest mtime to determine which slug is "latest".
   let (_, _, latest_slug) = files.iter().max_by_key(|(_, mtime, _)| mtime)?;
   let latest_slug = latest_slug.clone();
-
-  let mut matching: Vec<(PathBuf, SystemTime)> =
+  let matching =
     files.into_iter().filter(|(_, _, s)| *s == latest_slug).map(|(p, m, _)| (p, m)).collect();
-
-  matching.sort_by(|a, b| b.1.cmp(&a.1));
-  let latest_mtime = matching[0].1;
-  Some(SessionGroup {
-    slug: latest_slug,
-    files: matching.into_iter().map(|(p, _)| p).collect(),
-    latest_mtime,
-  })
+  build_session_group(latest_slug, matching)
 }
 
 pub fn format_relative_time(time: SystemTime) -> String {
@@ -336,7 +308,7 @@ pub fn parse_session_group(group: &SessionGroup) -> Vec<Turn> {
 #[derive(Default)]
 struct SessionAccumulator {
   user_messages: Vec<UserMessage>,
-  assistant_entries: Vec<(String, AssistantResponse)>,
+  assistant_entries: Vec<AssistantResponse>,
   /// Map message_id -> index in assistant_entries for O(1) dedup lookups.
   assistant_index: HashMap<String, usize>,
 }
@@ -384,7 +356,7 @@ impl SessionAccumulator {
           // Skip dedup for entries with no message id (empty string).
           if !message_id.is_empty() {
             if let Some(&idx) = self.assistant_index.get(&message_id) {
-              let existing = &mut self.assistant_entries[idx].1;
+              let existing = &mut self.assistant_entries[idx];
               let existing_len: usize = existing.text_blocks.iter().map(|b| b.len()).sum();
               let new_len: usize = text_blocks.iter().map(|b| b.len()).sum();
               if new_len > existing_len {
@@ -394,9 +366,7 @@ impl SessionAccumulator {
             }
             self.assistant_index.insert(message_id.clone(), self.assistant_entries.len());
           }
-          self
-            .assistant_entries
-            .push((message_id.clone(), AssistantResponse { message_id, text_blocks }));
+          self.assistant_entries.push(AssistantResponse { message_id, text_blocks });
         }
         _ => continue,
       }
@@ -453,7 +423,7 @@ fn extract_assistant_text_blocks(content: &serde_json::Value) -> Vec<String> {
 
 fn group_into_turns(
   user_messages: Vec<UserMessage>,
-  assistant_entries: Vec<(String, AssistantResponse)>,
+  assistant_entries: Vec<AssistantResponse>,
 ) -> Vec<Turn> {
   if user_messages.is_empty() {
     return Vec::new();
@@ -464,17 +434,14 @@ fn group_into_turns(
 
   for (i, user) in user_messages.into_iter().enumerate() {
     let mut responses = Vec::new();
-    // Take one assistant response per user message. The last user message
-    // gets all remaining responses (appended below).
-    if let Some((_, resp)) = assistant_iter.next() {
+    if let Some(resp) = assistant_iter.next() {
       responses.push(resp);
     }
     turns.push(Turn { index: i, user, responses });
   }
 
-  // If there are leftover assistant responses, append them to the last turn.
   if let Some(last_turn) = turns.last_mut() {
-    for (_, resp) in assistant_iter {
+    for resp in assistant_iter {
       last_turn.responses.push(resp);
     }
   }

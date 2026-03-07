@@ -12,10 +12,7 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 echo "Building jc-app (release)..."
 cargo build --release -p jc-app
 
-# Clean any previous bundle
-if [ -d "$APP_BUNDLE" ]; then
-    rm -rf "$APP_BUNDLE"
-fi
+rm -rf "$APP_BUNDLE"
 
 # Create bundle structure
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"

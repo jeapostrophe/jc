@@ -128,31 +128,24 @@ impl ProjectState {
 
     // Run status.sh at most once every 10 seconds.
     let script_interval = std::time::Duration::from_secs(10);
-    let should_run_script = self.last_script_run.map_or(true, |t| t.elapsed() >= script_interval);
+    let should_run_script = self.last_script_run.is_none_or(|t| t.elapsed() >= script_interval);
     if should_run_script {
       self.script_problems = status_script::run_status_script(&self.path);
       self.last_script_run = Some(Instant::now());
     }
 
     // Project-level problems: unreviewed diff files + script problems.
-    let mut problems = Vec::<ProjectProblem>::new();
-    for path in self.diff_view.read(cx).unreviewed_files() {
-      problems.push(ProjectProblem::Diff(DiffProblem::UnreviewedFile(path)));
-    }
-    for sp in &self.script_problems {
-      problems.push(ProjectProblem::Script(sp.clone()));
-    }
+    let mut problems: Vec<ProjectProblem> = self
+      .diff_view
+      .read(cx)
+      .unreviewed_files()
+      .into_iter()
+      .map(|path| ProjectProblem::Diff(DiffProblem::UnreviewedFile(path)))
+      .chain(self.script_problems.iter().map(|sp| ProjectProblem::Script(sp.clone())))
+      .collect();
     problems.sort_by_key(|p| p.rank());
-    if self.problems != problems {
-      changed = true;
-    }
+    changed |= self.problems != problems;
     self.problems = problems;
     changed
-  }
-
-  /// Total problem count across all sessions and the project.
-  pub fn total_problem_count(&self) -> usize {
-    let session_count: usize = self.sessions.iter().map(|s| s.problems.len()).sum();
-    session_count + self.problems.len()
   }
 }

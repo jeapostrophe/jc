@@ -75,7 +75,7 @@ impl SessionState {
   /// Rebuild `self.problems` from pending events and todo problems.
   /// Returns `true` if the problem list changed.
   pub fn refresh_problems(&mut self, todo_problems: &[TodoProblem]) -> bool {
-    let mut problems = Vec::<SessionProblem>::new();
+    let mut problems = Vec::new();
 
     for event in &self.pending_events {
       let sp = match event {

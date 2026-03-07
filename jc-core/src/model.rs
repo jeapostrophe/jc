@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
@@ -22,20 +22,11 @@ impl From<PathBuf> for Project {
   }
 }
 
-impl From<&Path> for Project {
-  fn from(path: &Path) -> Self {
-    Self { path: path.to_path_buf() }
-  }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct WindowLayout {
-  #[serde(default)]
   pub width: Option<u32>,
-  #[serde(default)]
   pub height: Option<u32>,
-  #[serde(default)]
   pub x: Option<i32>,
-  #[serde(default)]
   pub y: Option<i32>,
 }

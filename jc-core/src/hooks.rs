@@ -28,11 +28,10 @@ pub struct HookServer {
   server: std::sync::Arc<tiny_http::Server>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Default, serde::Deserialize)]
 struct HookPayload {
   session_id: Option<String>,
   cwd: Option<String>,
-  /// For Notification events, the type of notification (e.g. "idle_prompt", "permission_prompt").
   notification_type: Option<String>,
 }
 
@@ -85,11 +84,7 @@ fn accept_loop(
       continue;
     }
 
-    let payload: HookPayload = serde_json::from_str(&body).unwrap_or(HookPayload {
-      session_id: None,
-      cwd: None,
-      notification_type: None,
-    });
+    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
 
     let session_id = payload.session_id.unwrap_or_default();
 

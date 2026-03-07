@@ -19,7 +19,7 @@ pub fn install_hooks(project_path: &Path, port: u16) -> Result<()> {
     .entry("hooks")
     .or_insert_with(|| Value::Object(serde_json::Map::default()));
 
-  let hooks_obj = hooks.as_object_mut().unwrap_or_else(|| panic!("hooks should be an object"));
+  let hooks_obj = hooks.as_object_mut().expect("hooks should be an object");
 
   let base = format!("http://127.0.0.1:{port}{HOOK_PATH_PREFIX}");
 

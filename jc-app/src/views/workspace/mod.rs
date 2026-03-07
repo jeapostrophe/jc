@@ -1,26 +1,15 @@
-use crate::file_watcher::watch_dir;
-use crate::views::comment_panel::{CommentPanel, CommentPanelEvent};
+mod pickers;
+mod problems;
+mod render;
+
 use crate::views::diff_view::DiffViewEvent;
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
-use crate::views::picker::{
-  CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
-  LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
-  ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines, SessionPickerDelegate,
-  SessionPickerResult, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker, ShowSnippetPicker,
-  ShowViewPicker, SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget,
-  TodoHeaderPickerDelegate, ViewPickerDelegate,
-};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
 use crate::views::reply_view::gc_stale_replies;
 use crate::views::session_state::{PendingEvent, SessionState};
-use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::ActiveTheme;
-use gpui_component::TitleBar;
-use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::theme::Theme;
-use gpui_component::tooltip::Tooltip;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
 use jc_core::problem::ProblemTarget;
@@ -454,10 +443,6 @@ impl Workspace {
     &self.projects[self.active_project_index]
   }
 
-  fn project_path(&self) -> PathBuf {
-    self.active_project().path.clone()
-  }
-
   // ---------------------------------------------------------------------------
   // Appearance
   // ---------------------------------------------------------------------------
@@ -582,10 +567,10 @@ impl Workspace {
     if kind == PaneContentKind::GitDiff {
       self.projects[self.active_project_index].diff_view.update(cx, |v, cx| v.refresh(window, cx));
     }
-    if kind == PaneContentKind::ReplyViewer {
-      if let Some(s) = self.projects[self.active_project_index].active_session() {
-        s.reply_view.update(cx, |v, cx| v.refresh(window, cx));
-      }
+    if kind == PaneContentKind::ReplyViewer
+      && let Some(s) = self.projects[self.active_project_index].active_session()
+    {
+      s.reply_view.update(cx, |v, cx| v.refresh(window, cx));
     }
 
     let pane_idx = self.active_pane_index;
@@ -601,7 +586,7 @@ impl Workspace {
         let text = tv.editor_text(cx);
         if let Some(wait_line) = tv.document().wait_body_end_line(slug, &text) {
           let wait_line_0 = wait_line.saturating_sub(1);
-          drop(tv);
+          let _ = tv;
           project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
         }
       }
@@ -661,7 +646,7 @@ impl Workspace {
       cx.notify();
     } else {
       self.pre_help_focus = window.focused(cx);
-      let view = cx.new(|cx| KeybindingHelp::new(cx));
+      let view = cx.new(KeybindingHelp::new);
       let sub =
         cx.subscribe_in(&view, window, |this: &mut Self, _, _: &DismissHelpEvent, window, cx| {
           this.keybinding_help = None;
@@ -677,239 +662,8 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
-  // Problem navigation
+  // External editor
   // ---------------------------------------------------------------------------
-
-  fn next_problem(&mut self, _: &NextProblem, window: &mut Window, cx: &mut Context<Self>) {
-    let project = &self.projects[self.active_project_index];
-
-    // Collect all problem targets sorted by rank.
-    let mut ranked: Vec<(i8, ProblemTarget)> = Vec::new();
-    if let Some(session) = project.active_session() {
-      for p in &session.problems {
-        ranked.push((p.rank(), p.target()));
-      }
-    }
-    for p in &project.problems {
-      ranked.push((p.rank(), p.target()));
-    }
-
-    if ranked.is_empty() {
-      // No problems — go straight to TODO/WAIT.
-      self.last_jumped_target = None;
-      self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
-      return;
-    }
-
-    ranked.sort_by_key(|(rank, _)| *rank);
-
-    // Find position of last jumped target; advance to next (or start at 0).
-    let next = match &self.last_jumped_target {
-      Some(prev) => {
-        let pos = ranked.iter().position(|(_, t)| t == prev);
-        match pos {
-          Some(i) if i + 1 >= ranked.len() => None, // past last → sentinel
-          Some(i) => Some(i + 1),
-          None => Some(0),
-        }
-      }
-      None => Some(0),
-    };
-
-    match next {
-      Some(i) => {
-        let target = ranked.into_iter().nth(i).unwrap().1;
-        self.jump_to_problem_target(target, window, cx);
-      }
-      None => {
-        // End-of-cycle sentinel: jump to TODO/WAIT, reset so next press restarts.
-        self.last_jumped_target = None;
-        self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
-      }
-    }
-  }
-
-  fn jump_to_problem_target(
-    &mut self,
-    target: ProblemTarget,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    self.last_jumped_target = Some(target.clone());
-
-    let kind = match &target {
-      ProblemTarget::ClaudeTerminal => PaneContentKind::ClaudeTerminal,
-      ProblemTarget::GeneralTerminal => PaneContentKind::GeneralTerminal,
-      ProblemTarget::TodoEditor => PaneContentKind::TodoEditor,
-      ProblemTarget::DiffView { .. } => PaneContentKind::GitDiff,
-      ProblemTarget::CodeView { .. } => PaneContentKind::CodeViewer,
-    };
-
-    let project = &self.projects[self.active_project_index];
-    let result: Option<(AnyView, FocusHandle)> = match kind {
-      PaneContentKind::ClaudeTerminal => project.active_session().map(|s| {
-        let focus = s.claude_terminal.read(cx).focus_handle(cx);
-        (s.claude_terminal.clone().into(), focus)
-      }),
-      PaneContentKind::GeneralTerminal => project.active_session().map(|s| {
-        let focus = s.general_terminal.read(cx).focus_handle(cx);
-        (s.general_terminal.clone().into(), focus)
-      }),
-      PaneContentKind::GitDiff => {
-        project.diff_view.update(cx, |v, cx| v.refresh(window, cx));
-        let focus = project.diff_view.read(cx).focus_handle(cx);
-        Some((project.diff_view.clone().into(), focus))
-      }
-      PaneContentKind::CodeViewer => {
-        let focus = project.code_view.read(cx).focus_handle(cx);
-        Some((project.code_view.clone().into(), focus))
-      }
-      PaneContentKind::TodoEditor => {
-        let focus = project.todo_view.read(cx).focus_handle(cx);
-        Some((project.todo_view.clone().into(), focus))
-      }
-      PaneContentKind::ReplyViewer | PaneContentKind::GlobalTodo => None,
-    };
-
-    if let Some((view, focus)) = result {
-      let pane = self.active_pane_entity().clone();
-      pane.update(cx, |p, cx| {
-        p.set_content(PaneContent { kind, view, focus: focus.clone() }, cx);
-      });
-      focus.focus(window);
-
-      // Post-navigation: open file in code view, or navigate to diff file.
-      match target {
-        ProblemTarget::CodeView { file, line } => {
-          let project_path = self.projects[self.active_project_index].path.clone();
-          let full_path = project_path.join(&file);
-          let code_view = self.projects[self.active_project_index].code_view.clone();
-          code_view.update(cx, |v, cx| {
-            v.open_file(full_path, window, cx);
-            if let Some(line) = line {
-              v.scroll_to_line(line as u32, window, cx);
-            }
-          });
-        }
-        ProblemTarget::DiffView { file } => {
-          let diff_view = self.projects[self.active_project_index].diff_view.clone();
-          let file_str = file.to_string_lossy();
-          let idx = {
-            let dv = diff_view.read(cx);
-            dv.file_diffs().iter().position(|fd| fd.name == *file_str)
-          };
-          if let Some(idx) = idx {
-            diff_view.update(cx, |v, cx| v.set_file_index(idx, window, cx));
-          }
-        }
-        ProblemTarget::TodoEditor => {
-          let project = &self.projects[self.active_project_index];
-          let tv = project.todo_view.read(cx);
-          if let Some(slug) = project.active_slug() {
-            let text = tv.editor_text(cx);
-            if let Some(wait_line) = tv.document().wait_body_end_line(slug, &text) {
-              let wait_line_0 = wait_line.saturating_sub(1);
-              let _ = tv;
-              project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
-            }
-          }
-        }
-        _ => {}
-      }
-
-      cx.notify();
-    }
-  }
-
-  fn open_problem_picker(
-    &mut self,
-    _: &ShowProblemPicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let delegate =
-      SessionPickerDelegate::new_urgency_sorted(&self.projects, self.active_project_index);
-    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
-    self.pre_picker_focus = window.focused(cx);
-
-    let subscription =
-      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
-        match event {
-          PickerEvent::Confirmed => {
-            let Some(result) = picker_entity.read(cx).delegate().confirmed_entry() else {
-              return;
-            };
-            // switch_to_session sets focus itself; drop stale pre_picker_focus.
-            this.pre_picker_focus.take();
-            this.dismiss_picker();
-            match result {
-              SessionPickerResult::Session(pi, si) => {
-                this.switch_to_session(pi, si, window, cx);
-              }
-              SessionPickerResult::InitProject(pi) => {
-                this.init_empty_project(pi, window, cx);
-              }
-            }
-            cx.notify();
-          }
-          PickerEvent::Dismissed => {
-            if let Some(focus) = this.pre_picker_focus.take() {
-              focus.focus(window);
-            }
-            this.dismiss_picker();
-            cx.notify();
-          }
-        }
-      });
-
-    self.active_picker = Some(picker.clone().into());
-    self._picker_subscription = Some(subscription);
-
-    picker.read(cx).input_focus_handle(cx).focus(window);
-    cx.notify();
-  }
-
-  fn show_view_picker(&mut self, _: &ShowViewPicker, window: &mut Window, cx: &mut Context<Self>) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let delegate = ViewPickerDelegate::new();
-    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
-    self.pre_picker_focus = window.focused(cx);
-
-    let subscription =
-      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
-        match event {
-          PickerEvent::Confirmed => {
-            let kind = picker_entity.read(cx).delegate().confirmed_kind();
-            this.pre_picker_focus.take();
-            this.dismiss_picker();
-            if let Some(kind) = kind {
-              this.set_active_pane_view(kind, window, cx);
-            }
-            cx.notify();
-          }
-          PickerEvent::Dismissed => {
-            if let Some(focus) = this.pre_picker_focus.take() {
-              focus.focus(window);
-            }
-            this.dismiss_picker();
-            cx.notify();
-          }
-        }
-      });
-
-    self.active_picker = Some(picker.clone().into());
-    self._picker_subscription = Some(subscription);
-
-    picker.read(cx).input_focus_handle(cx).focus(window);
-    cx.notify();
-  }
 
   fn open_in_external_editor(
     &mut self,
@@ -1141,112 +895,9 @@ impl Workspace {
     }
   }
 
-  fn open_session_picker(
-    &mut self,
-    _: &ShowSessionPicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let delegate = SessionPickerDelegate::new(&self.projects, self.active_project_index);
-    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
-    self.pre_picker_focus = window.focused(cx);
-
-    let subscription =
-      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
-        match event {
-          PickerEvent::Confirmed => {
-            let Some(result) = picker_entity.read(cx).delegate().confirmed_entry() else {
-              return;
-            };
-            // switch_to_session / init both set focus; drop stale pre_picker_focus.
-            this.pre_picker_focus.take();
-            this.dismiss_picker();
-            match result {
-              SessionPickerResult::Session(pi, si) => {
-                this.switch_to_session(pi, si, window, cx);
-              }
-              SessionPickerResult::InitProject(pi) => {
-                this.init_empty_project(pi, window, cx);
-              }
-            }
-            cx.notify();
-          }
-          PickerEvent::Dismissed => {
-            if let Some(focus) = this.pre_picker_focus.take() {
-              focus.focus(window);
-            }
-            this.dismiss_picker();
-            cx.notify();
-          }
-        }
-      });
-
-    self.active_picker = Some(picker.clone().into());
-    self._picker_subscription = Some(subscription);
-
-    picker.read(cx).input_focus_handle(cx).focus(window);
-    cx.notify();
-  }
-
-  fn open_slug_picker(&mut self, _: &ShowSlugPicker, window: &mut Window, cx: &mut Context<Self>) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let project = &self.projects[self.active_project_index];
-    let delegate = SlugPickerDelegate::new(project);
-    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
-    self.pre_picker_focus = window.focused(cx);
-
-    let project_idx = self.active_project_index;
-    let subscription =
-      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
-        match event {
-          PickerEvent::Confirmed => {
-            let action =
-              picker_entity.read(cx).delegate().confirmed_entry().map(|e| e.action.clone());
-            match action {
-              Some(SlugAction::Switch(session_idx)) => {
-                this.pre_picker_focus.take();
-                this.switch_to_session(project_idx, session_idx, window, cx);
-              }
-              Some(SlugAction::Attach(slug, label)) => {
-                this.pre_picker_focus.take();
-                this.adopt_slug(project_idx, &slug, &label, window, cx);
-              }
-              Some(SlugAction::New) => {
-                this.pre_picker_focus.take();
-                this.create_new_session(project_idx, window, cx);
-              }
-              None => {
-                if let Some(focus) = this.pre_picker_focus.take() {
-                  focus.focus(window);
-                }
-              }
-            }
-            this.dismiss_picker();
-            cx.notify();
-          }
-          PickerEvent::Dismissed => {
-            if let Some(focus) = this.pre_picker_focus.take() {
-              focus.focus(window);
-            }
-            this.dismiss_picker();
-            cx.notify();
-          }
-        }
-      });
-
-    self.active_picker = Some(picker.clone().into());
-    self._picker_subscription = Some(subscription);
-
-    picker.read(cx).input_focus_handle(cx).focus(window);
-    cx.notify();
-  }
+  // ---------------------------------------------------------------------------
+  // Session creation
+  // ---------------------------------------------------------------------------
 
   fn adopt_slug(
     &mut self,
@@ -1386,250 +1037,6 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
-  // Pickers
-  // ---------------------------------------------------------------------------
-
-  fn open_file_picker(&mut self, _: &OpenFilePicker, window: &mut Window, cx: &mut Context<Self>) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let project = self.active_project();
-    let delegate = FilePickerDelegate::new(
-      project.path.clone(),
-      project.code_view.clone(),
-      self.recent_files.clone(),
-    );
-    self.show_picker_with_confirm(delegate, Some(PaneContentKind::CodeViewer), window, cx);
-  }
-
-  fn open_context_picker(
-    &mut self,
-    _: &OpenContextPicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let pane = self.active_pane_entity().clone();
-    let kind = pane.read(cx).content_kind();
-    let project = self.active_project();
-
-    match kind {
-      Some(PaneContentKind::GitDiff) => {
-        self.open_diff_picker(window, cx);
-      }
-      Some(PaneContentKind::TodoEditor) => {
-        let delegate = TodoHeaderPickerDelegate::new(project.todo_view.clone(), cx);
-        self.show_picker(delegate, window, cx);
-      }
-      Some(PaneContentKind::CodeViewer) => {
-        let delegate = CodeSymbolPickerDelegate::new(project.code_view.clone(), cx);
-        self.show_picker(delegate, window, cx);
-      }
-      Some(PaneContentKind::ReplyViewer) => {
-        if let Some(session) = project.active_session() {
-          let delegate = ReplyHeadingPickerDelegate::new(session.reply_view.clone(), cx);
-          self.show_picker(delegate, window, cx);
-        }
-      }
-      _ => {}
-    }
-  }
-
-  fn open_diff_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    if self.active_picker.is_some() {
-      return;
-    }
-    let delegate = DiffFilePickerDelegate::new(self.active_project().diff_view.clone(), cx);
-    self.show_picker(delegate, window, cx);
-  }
-
-  fn open_git_log_picker(
-    &mut self,
-    _: &OpenGitLogPicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let pane = self.active_pane_entity().clone();
-    let kind = pane.read(cx).content_kind();
-    let project = self.active_project();
-
-    if kind == Some(PaneContentKind::ReplyViewer) {
-      if let Some(session) = project.active_session() {
-        let delegate = ReplyTurnPickerDelegate::new(session.reply_view.clone(), cx);
-        self.show_picker(delegate, window, cx);
-      }
-    } else {
-      let delegate = GitLogPickerDelegate::new(project.diff_view.clone(), cx);
-      self.show_picker_with_confirm(delegate, Some(PaneContentKind::GitDiff), window, cx);
-    }
-  }
-
-  fn search_lines(&mut self, _: &SearchLines, window: &mut Window, cx: &mut Context<Self>) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let pane = self.active_pane_entity().clone();
-    let kind = pane.read(cx).content_kind();
-    let project = self.active_project();
-
-    match kind {
-      Some(PaneContentKind::CodeViewer) => {
-        let delegate = LineSearchPickerDelegate::for_view(&project.code_view, cx);
-        self.show_picker(delegate, window, cx);
-      }
-      Some(PaneContentKind::TodoEditor) => {
-        let delegate = LineSearchPickerDelegate::for_view(&project.todo_view, cx);
-        self.show_picker(delegate, window, cx);
-      }
-      Some(PaneContentKind::GitDiff) => {
-        let delegate = LineSearchPickerDelegate::for_view(&project.diff_view, cx);
-        self.show_picker(delegate, window, cx);
-      }
-      Some(PaneContentKind::ReplyViewer) => {
-        if let Some(session) = project.active_session() {
-          let delegate = LineSearchPickerDelegate::for_view(&session.reply_view, cx);
-          self.show_picker(delegate, window, cx);
-        }
-      }
-      _ => {}
-    }
-  }
-
-  fn show_picker_with_confirm<D: crate::views::picker::PickerDelegate>(
-    &mut self,
-    delegate: D,
-    switch_pane: Option<PaneContentKind>,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
-    self.pre_picker_focus = window.focused(cx);
-
-    let subscription =
-      cx.subscribe_in(&picker, window, move |this: &mut Self, _, event, window, cx| match event {
-        PickerEvent::Confirmed => {
-          if let Some(path) = this.active_project().code_view.read(cx).file_path() {
-            let path = path.to_path_buf();
-            this.recent_files.retain(|p| p != &path);
-            this.recent_files.insert(0, path);
-            this.recent_files.truncate(50);
-          }
-          if let Some(kind) = switch_pane {
-            // set_active_pane_view focuses the new view; don't override with pre_picker_focus.
-            this.set_active_pane_view(kind, window, cx);
-          } else if let Some(focus) = this.pre_picker_focus.take() {
-            focus.focus(window);
-          }
-          this.dismiss_picker();
-          cx.notify();
-        }
-        PickerEvent::Dismissed => {
-          if let Some(focus) = this.pre_picker_focus.take() {
-            focus.focus(window);
-          }
-          this.dismiss_picker();
-          cx.notify();
-        }
-      });
-
-    self.active_picker = Some(picker.clone().into());
-    self._picker_subscription = Some(subscription);
-
-    picker.read(cx).input_focus_handle(cx).focus(window);
-    cx.notify();
-  }
-
-  fn show_picker<D: crate::views::picker::PickerDelegate>(
-    &mut self,
-    delegate: D,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    self.show_picker_with_confirm(delegate, None, window, cx);
-  }
-
-  fn dismiss_picker(&mut self) {
-    self.active_picker = None;
-    self._picker_subscription = None;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Comment panel
-  // ---------------------------------------------------------------------------
-
-  fn open_comment_panel(
-    &mut self,
-    _: &OpenCommentPanel,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_comment_panel.is_some() || self.active_picker.is_some() {
-      return;
-    }
-
-    let pane = self.active_pane_entity().clone();
-    let kind = pane.read(cx).content_kind();
-    let project = self.active_project();
-
-    let context = match kind {
-      Some(PaneContentKind::CodeViewer) => {
-        project.code_view.read(cx).comment_context(&project.path, cx)
-      }
-      Some(PaneContentKind::GitDiff) => project.diff_view.read(cx).comment_context(cx),
-      Some(PaneContentKind::ReplyViewer) => {
-        project.active_session().and_then(|s| s.reply_view.read(cx).comment_context(cx))
-      }
-      _ => None,
-    };
-
-    let Some(context) = context else { return };
-
-    // Save focus before creating the panel — CommentPanel::new calls
-    // set_cursor_position which steals focus to the panel's input.
-    self.pre_comment_focus = window.focused(cx);
-    let panel = cx.new(|cx| CommentPanel::new(context, window, cx));
-
-    let subscription = cx.subscribe_in(&panel, window, |this: &mut Self, _, event, window, cx| {
-      if let CommentPanelEvent::Confirmed(text) = event {
-        // Insert comment into active session's WAIT section.
-        let project = &this.projects[this.active_project_index];
-        if let Some(session) = project.active_session() {
-          let comment = format!("{text}\n");
-          project.todo_view.update(cx, |tv, cx| {
-            tv.insert_comment(&session.slug, &comment, window, cx);
-            tv.save(cx);
-          });
-        }
-      }
-      if let Some(focus) = this.pre_comment_focus.take() {
-        focus.focus(window);
-      }
-      this.dismiss_comment_panel();
-      cx.notify();
-    });
-
-    self.active_comment_panel = Some(panel.clone().into());
-    self._comment_subscription = Some(subscription);
-
-    panel.read(cx).input_focus_handle(cx).focus(window);
-    cx.notify();
-  }
-
-  fn dismiss_comment_panel(&mut self) {
-    self.active_comment_panel = None;
-    self._comment_subscription = None;
-  }
-
-  // ---------------------------------------------------------------------------
   // Save file
   // ---------------------------------------------------------------------------
 
@@ -1681,246 +1088,14 @@ impl Workspace {
     });
 
     // Show Claude terminal in the "other" pane so the user can see it working.
-    let target = match self.panes.len() {
-      1 => 0,
-      2 => 1 - self.active_pane_index,
-      _ => {
-        if self.active_pane_index == 0 {
-          1
-        } else {
-          0
-        }
-      }
-    };
+    let target = if self.active_pane_index == 0 { 1.min(self.panes.len() - 1) } else { 0 };
     self.active_pane_index = target;
     self.set_active_pane_view(PaneContentKind::ClaudeTerminal, window, cx);
   }
 
   // ---------------------------------------------------------------------------
-  // Snippet picker
+  // Hook events
   // ---------------------------------------------------------------------------
-
-  fn setup_snippet_watcher(
-    window: &Window,
-    cx: &mut Context<Self>,
-  ) -> Option<notify::RecommendedWatcher> {
-    let path = snippets::snippet_file_path();
-    let watched_file = path.file_name()?.to_os_string();
-    let parent = path.parent()?.to_path_buf();
-
-    watch_dir(
-      &parent,
-      move |p| p.ends_with(&watched_file),
-      None,
-      |view, _window, _cx| {
-        view.snippets = snippets::load();
-      },
-      window,
-      cx,
-    )
-  }
-
-  fn show_snippet_picker(
-    &mut self,
-    _: &ShowSnippetPicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_picker.is_some() || self.snippets.items.is_empty() {
-      return;
-    }
-
-    let pane = self.active_pane_entity().clone();
-    let kind = pane.read(cx).content_kind();
-    let project = self.active_project();
-
-    let insert_target = match kind {
-      Some(PaneContentKind::TodoEditor) => SnippetTarget::TodoCursor,
-      Some(PaneContentKind::ClaudeTerminal) => SnippetTarget::ClaudeTerminal,
-      _ => SnippetTarget::TodoWait,
-    };
-
-    let active_slug = project.active_slug().map(str::to_string);
-    let claude_terminal = project.active_session().map(|s| s.claude_terminal.clone());
-
-    let delegate = SnippetPickerDelegate::new(
-      self.snippets.items.clone(),
-      project.todo_view.clone(),
-      active_slug,
-      claude_terminal,
-      insert_target,
-    );
-    self.show_picker(delegate, window, cx);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Labels
-  // ---------------------------------------------------------------------------
-
-  fn pane_header_label(&self, pane: &Entity<Pane>, cx: &App) -> String {
-    let project = self.active_project();
-    match pane.read(cx).content_kind() {
-      Some(PaneContentKind::CodeViewer) => {
-        let cv = project.code_view.read(cx);
-        let dirty = if cv.is_dirty(cx) { " [+]" } else { "" };
-        if let Some(path) = cv.file_path() {
-          let relative = path.strip_prefix(&project.path).ok().unwrap_or(path);
-          format!("Code: {}{dirty}", relative.display())
-        } else {
-          format!("Code{dirty}")
-        }
-      }
-      Some(PaneContentKind::TodoEditor) => {
-        let dirty = if project.todo_view.read(cx).is_dirty(cx) { " [+]" } else { "" };
-        format!("TODO{dirty}")
-      }
-      Some(PaneContentKind::GitDiff) => {
-        let dv = project.diff_view.read(cx);
-        let reviewed = dv.reviewed_count();
-        let total = dv.file_count();
-        let source_label = dv.source().label();
-        if let Some(name) = dv.current_file_name() {
-          format!("Diff [{source_label}]: {name} ({reviewed}/{total})")
-        } else {
-          format!("Diff [{source_label}] ({reviewed}/{total})")
-        }
-      }
-      Some(PaneContentKind::ReplyViewer) => {
-        if let Some(session) = project.active_session() {
-          let label = session.reply_view.read(cx).current_turn_label();
-          format!("Reply: {label}")
-        } else {
-          "Reply: No session".to_string()
-        }
-      }
-      Some(kind) => kind.label().to_string(),
-      None => "Empty".to_string(),
-    }
-  }
-
-  fn render_title_bar(&self, cx: &mut Context<Self>) -> TitleBar {
-    let theme = cx.theme();
-    let project = self.active_project();
-
-    let mut title = project.name.clone();
-    if let Some(session) = project.active_session() {
-      title = format!("{} > {}", title, session.slug);
-    }
-
-    let project_problem_count = project.problems.len();
-    let current_total =
-      project.active_session().map(|s| s.problems.len()).unwrap_or(0) + project_problem_count;
-
-    // Collect active-session + project problems for the title tooltip.
-    let active_session_problems: Vec<String> = project
-      .active_session()
-      .map(|s| s.problems.iter().map(|p| p.description()).collect())
-      .unwrap_or_default();
-    let active_project_problems: Vec<String> =
-      project.problems.iter().map(|p| p.description()).collect();
-
-    // Collect problems for all OTHER sessions, grouped by project > session.
-    let other_problems: Vec<(String, Vec<String>)> = self
-      .projects
-      .iter()
-      .enumerate()
-      .flat_map(|(pi, p)| {
-        let project_descs: Vec<String> = p.problems.iter().map(|pr| pr.description()).collect();
-        p.sessions.iter().enumerate().filter_map(move |(si, s)| {
-          let is_active = pi == self.active_project_index && Some(si) == p.active_session_index;
-          if is_active {
-            return None;
-          }
-          let mut descs: Vec<String> = s.problems.iter().map(|sp| sp.description()).collect();
-          descs.extend(project_descs.clone());
-          if descs.is_empty() {
-            return None;
-          }
-          let header = format!("{} > {}", p.name, s.slug);
-          Some((header, descs))
-        })
-      })
-      .collect();
-    let other_sessions_with_problems = other_problems.len();
-
-    let title_el = {
-      let el =
-        div().id("title-problems").flex().items_center().text_sm().text_color(theme.foreground);
-      if current_total > 0 {
-        el.child(div().mr_1().text_xs().text_color(theme.red).child("!")).child(title).child(
-          div()
-            .id("title-problem-count")
-            .ml_1()
-            .text_xs()
-            .text_color(theme.red)
-            .child(format!("{current_total}"))
-            .tooltip(move |window, cx| {
-              let session_problems = active_session_problems.clone();
-              let project_problems = active_project_problems.clone();
-              Tooltip::element(move |_window, cx| {
-                let theme = cx.theme();
-                let fg = theme.foreground;
-                let dim = theme.muted_foreground;
-                let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
-                for desc in &session_problems {
-                  col = col.child(div().text_color(fg).child(desc.clone()));
-                }
-                if !session_problems.is_empty() && !project_problems.is_empty() {
-                  col = col.child(div().text_color(dim).child("—"));
-                }
-                for desc in &project_problems {
-                  col = col.child(div().text_color(fg).child(desc.clone()));
-                }
-                col
-              })
-              .build(window, cx)
-            }),
-        )
-      } else {
-        el.child(title)
-      }
-    };
-
-    let right_el = {
-      let mut el = div().flex().items_center().ml_auto().gap_2();
-      if other_sessions_with_problems > 0 {
-        let other = other_problems.clone();
-        el = el.child(
-          div()
-            .id("global-problems")
-            .text_xs()
-            .text_color(theme.yellow)
-            .child(format!("{other_sessions_with_problems}"))
-            .tooltip(move |window, cx| {
-              let other = other.clone();
-              Tooltip::element(move |_window, cx| {
-                let theme = cx.theme();
-                let fg = theme.foreground;
-                let dim = theme.muted_foreground;
-                let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
-                for (i, (header, descs)) in other.iter().enumerate() {
-                  if i > 0 {
-                    col = col.child(div().text_color(dim).child("—"));
-                  }
-                  col = col.child(div().text_color(dim).child(header.clone()));
-                  for desc in descs {
-                    col = col.child(div().text_color(fg).pl_2().child(desc.clone()));
-                  }
-                }
-                col
-              })
-              .build(window, cx)
-            }),
-        );
-      }
-      el.mr_2()
-    };
-
-    TitleBar::new()
-      .font_family("Lilex")
-      .child(div().flex().items_center().gap_1().mr_auto().child(title_el))
-      .child(right_el)
-  }
 
   fn handle_hook_event(&mut self, event: HookEvent, cx: &mut Context<Self>) {
     eprintln!("hook: {:?} session={} slug={:?}", event.kind, event.session_id, event.slug);
@@ -1950,17 +1125,17 @@ impl Workspace {
     }
 
     // Notify when the window is not active (user is in another app).
-    if let (Some(project_name), Some(session_label)) = (matched_project, matched_label) {
-      if !self.window_active {
-        let critical = matches!(event.kind, HookEventKind::PermissionPrompt);
-        let title = format!("{project_name} > {session_label}");
-        let message = match event.kind {
-          HookEventKind::Stop => "Claude finished",
-          HookEventKind::PermissionPrompt => "Permission needed",
-          HookEventKind::IdlePrompt => "Claude is idle",
-        };
-        crate::notify::notify(&title, message, critical, event.slug.as_deref());
-      }
+    if let (Some(project_name), Some(session_label)) = (matched_project, matched_label)
+      && !self.window_active
+    {
+      let critical = matches!(event.kind, HookEventKind::PermissionPrompt);
+      let title = format!("{project_name} > {session_label}");
+      let message = match event.kind {
+        HookEventKind::Stop => "Claude finished",
+        HookEventKind::PermissionPrompt => "Permission needed",
+        HookEventKind::IdlePrompt => "Claude is idle",
+      };
+      crate::notify::notify(&title, message, critical, event.slug.as_deref());
     }
 
     cx.notify();
@@ -1984,110 +1159,6 @@ impl Focusable for Workspace {
   }
 }
 
-impl Render for Workspace {
-  fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    let theme = cx.theme();
-    let active_border = theme.accent;
-    let visible = self.visible_pane_count();
-
-    let pane_header = |label: String, active: bool| {
-      div()
-        .px_2()
-        .py_1()
-        .text_sm()
-        .text_color(if active { theme.foreground } else { theme.muted_foreground })
-        .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
-        .border_b_1()
-        .border_color(theme.border)
-        .truncate()
-        .child(label)
-    };
-
-    let build_pane_wrapper = |i: usize, pane: &Entity<Pane>| {
-      let active = self.active_pane_index == i;
-      let label = self.pane_header_label(pane, cx);
-      div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .border_l_2()
-        .border_color(if active { active_border } else { gpui::transparent_black() })
-        .child(pane_header(label, active))
-        .child(div().flex_1().min_h_0().overflow_hidden().child(pane.clone()))
-    };
-
-    // Build the pane area: single full-width pane, or h_resizable with 2-3 panels.
-    let pane_area = if visible == 1 {
-      div().flex_1().min_h_0().child(build_pane_wrapper(0, &self.panes[0])).into_any_element()
-    } else {
-      let mut resizable = h_resizable(("main-split", self.split_generation));
-      for i in 0..visible {
-        resizable = resizable
-          .child(resizable_panel().size(px(600.0)).child(build_pane_wrapper(i, &self.panes[i])));
-      }
-      resizable.into_any_element()
-    };
-
-    div()
-      .id("workspace")
-      .key_context("Workspace")
-      .track_focus(&self.focus)
-      .size_full()
-      .bg(theme.background)
-      .on_action(cx.listener(Self::close_window))
-      .on_action(cx.listener(Self::minimize_window))
-      .on_action(cx.listener(Self::quit))
-      .on_action(cx.listener(Self::focus_prev_pane))
-      .on_action(cx.listener(Self::focus_next_pane))
-      .on_action(cx.listener(Self::set_layout_one))
-      .on_action(cx.listener(Self::set_layout_two))
-      .on_action(cx.listener(Self::set_layout_three))
-      .on_action(cx.listener(Self::show_claude_terminal))
-      .on_action(cx.listener(Self::show_general_terminal))
-      .on_action(cx.listener(Self::show_git_diff))
-      .on_action(cx.listener(Self::show_code_viewer))
-      .on_action(cx.listener(Self::show_todo_editor))
-      .on_action(cx.listener(Self::show_reply_viewer))
-      .on_action(cx.listener(Self::open_in_external_editor))
-      .on_action(cx.listener(Self::open_file_picker))
-      .on_action(cx.listener(Self::open_context_picker))
-      .on_action(cx.listener(Self::open_git_log_picker))
-      .on_action(cx.listener(Self::open_session_picker))
-      .on_action(cx.listener(Self::open_slug_picker))
-      .on_action(cx.listener(Self::search_lines))
-      .on_action(cx.listener(Self::open_comment_panel))
-      .on_action(cx.listener(Self::save_file))
-      .on_action(cx.listener(Self::send_to_terminal))
-      .on_action(cx.listener(Self::next_problem))
-      .on_action(cx.listener(Self::toggle_keybinding_help))
-      .on_action(cx.listener(Self::open_problem_picker))
-      .on_action(cx.listener(Self::show_snippet_picker))
-      .on_action(cx.listener(Self::show_view_picker))
-      .child(self.render_title_bar(cx))
-      .child(pane_area)
-      .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
-      .when_some(self.active_comment_panel.as_ref(), |el, v| el.child(modal_overlay(v)))
-      .when_some(self.keybinding_help.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))
-  }
-}
-
-fn modal_overlay(content: &AnyView) -> Deferred {
-  deferred(
-    div()
-      .absolute()
-      .size_full()
-      .top_0()
-      .left_0()
-      .flex()
-      .justify_center()
-      .pt(px(80.0))
-      .bg(hsla(0., 0., 0., 0.3))
-      .on_mouse_down(MouseButton::Left, |_, _, _cx| {})
-      .child(content.clone()),
-  )
-  .with_priority(1)
-}
-
 pub fn init(cx: &mut App) {
   cx.bind_keys([
     KeyBinding::new("cmd-w", CloseWindow, Some("Workspace")),
@@ -2098,27 +1169,27 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-1", SetLayoutOne, Some("Workspace")),
     KeyBinding::new("cmd-2", SetLayoutTwo, Some("Workspace")),
     KeyBinding::new("cmd-3", SetLayoutThree, Some("Workspace")),
-    KeyBinding::new("cmd-.", ShowViewPicker, Some("Workspace")),
+    KeyBinding::new("cmd-.", crate::views::picker::ShowViewPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
     KeyBinding::new("cmd-shift-o", OpenGitLogPicker, Some("Workspace")),
-    KeyBinding::new("cmd-p", ShowSessionPicker, Some("Workspace")),
-    KeyBinding::new("cmd-shift-p", ShowSlugPicker, Some("Workspace")),
+    KeyBinding::new("cmd-p", crate::views::picker::ShowSessionPicker, Some("Workspace")),
+    KeyBinding::new("cmd-shift-p", crate::views::picker::ShowSlugPicker, Some("Workspace")),
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Workspace")),
     KeyBinding::new("cmd-s", SaveFile, Some("Workspace")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Workspace")),
     KeyBinding::new("cmd-;", NextProblem, Some("Workspace")),
-    KeyBinding::new("cmd-:", ShowProblemPicker, Some("Workspace")),
-    KeyBinding::new("cmd-shift-k", ShowSnippetPicker, Some("Workspace")),
+    KeyBinding::new("cmd-:", crate::views::picker::ShowProblemPicker, Some("Workspace")),
+    KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Workspace")),
     KeyBinding::new("cmd-?", ShowKeybindingHelp, Some("Workspace")),
   ]);
 
   cx.bind_keys([
-    KeyBinding::new("cmd-.", ShowViewPicker, Some("Input")),
+    KeyBinding::new("cmd-.", crate::views::picker::ShowViewPicker, Some("Input")),
     KeyBinding::new("cmd-[", FocusPrevPane, Some("Input")),
     KeyBinding::new("cmd-]", FocusNextPane, Some("Input")),
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Input")),
     KeyBinding::new("cmd-s", SaveFile, Some("Input")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Input")),
-    KeyBinding::new("cmd-shift-k", ShowSnippetPicker, Some("Input")),
+    KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Input")),
   ]);
 }

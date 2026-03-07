@@ -28,39 +28,35 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
 
   // Handle special named keys
   let app_cursor = mode.contains(TermMode::APP_CURSOR);
-  let bytes: Option<Vec<u8>> = match keystroke.key.as_str() {
-    "enter" => Some(b"\r".to_vec()),
-    "escape" => Some(b"\x1b".to_vec()),
-    "tab" => Some(b"\t".to_vec()),
-    "backspace" => Some(vec![0x7f]),
-    "delete" => Some(b"\x1b[3~".to_vec()),
-    "up" => Some(if app_cursor { b"\x1bOA".to_vec() } else { b"\x1b[A".to_vec() }),
-    "down" => Some(if app_cursor { b"\x1bOB".to_vec() } else { b"\x1b[B".to_vec() }),
-    "right" => Some(if app_cursor { b"\x1bOC".to_vec() } else { b"\x1b[C".to_vec() }),
-    "left" => Some(if app_cursor { b"\x1bOD".to_vec() } else { b"\x1b[D".to_vec() }),
-    "home" => Some(if app_cursor { b"\x1bOH".to_vec() } else { b"\x1b[H".to_vec() }),
-    "end" => Some(if app_cursor { b"\x1bOF".to_vec() } else { b"\x1b[F".to_vec() }),
-    "pageup" => Some(b"\x1b[5~".to_vec()),
-    "pagedown" => Some(b"\x1b[6~".to_vec()),
-    "insert" => Some(b"\x1b[2~".to_vec()),
-    "f1" => Some(b"\x1bOP".to_vec()),
-    "f2" => Some(b"\x1bOQ".to_vec()),
-    "f3" => Some(b"\x1bOR".to_vec()),
-    "f4" => Some(b"\x1bOS".to_vec()),
-    "f5" => Some(b"\x1b[15~".to_vec()),
-    "f6" => Some(b"\x1b[17~".to_vec()),
-    "f7" => Some(b"\x1b[18~".to_vec()),
-    "f8" => Some(b"\x1b[19~".to_vec()),
-    "f9" => Some(b"\x1b[20~".to_vec()),
-    "f10" => Some(b"\x1b[21~".to_vec()),
-    "f11" => Some(b"\x1b[23~".to_vec()),
-    "f12" => Some(b"\x1b[24~".to_vec()),
-    "space" => Some(b" ".to_vec()),
-    _ => None,
-  };
-
-  if let Some(b) = bytes {
-    return Some(b);
+  match keystroke.key.as_str() {
+    "enter" => return Some(b"\r".to_vec()),
+    "escape" => return Some(b"\x1b".to_vec()),
+    "tab" => return Some(b"\t".to_vec()),
+    "backspace" => return Some(vec![0x7f]),
+    "delete" => return Some(b"\x1b[3~".to_vec()),
+    "up" => return Some(if app_cursor { b"\x1bOA".to_vec() } else { b"\x1b[A".to_vec() }),
+    "down" => return Some(if app_cursor { b"\x1bOB".to_vec() } else { b"\x1b[B".to_vec() }),
+    "right" => return Some(if app_cursor { b"\x1bOC".to_vec() } else { b"\x1b[C".to_vec() }),
+    "left" => return Some(if app_cursor { b"\x1bOD".to_vec() } else { b"\x1b[D".to_vec() }),
+    "home" => return Some(if app_cursor { b"\x1bOH".to_vec() } else { b"\x1b[H".to_vec() }),
+    "end" => return Some(if app_cursor { b"\x1bOF".to_vec() } else { b"\x1b[F".to_vec() }),
+    "pageup" => return Some(b"\x1b[5~".to_vec()),
+    "pagedown" => return Some(b"\x1b[6~".to_vec()),
+    "insert" => return Some(b"\x1b[2~".to_vec()),
+    "f1" => return Some(b"\x1bOP".to_vec()),
+    "f2" => return Some(b"\x1bOQ".to_vec()),
+    "f3" => return Some(b"\x1bOR".to_vec()),
+    "f4" => return Some(b"\x1bOS".to_vec()),
+    "f5" => return Some(b"\x1b[15~".to_vec()),
+    "f6" => return Some(b"\x1b[17~".to_vec()),
+    "f7" => return Some(b"\x1b[18~".to_vec()),
+    "f8" => return Some(b"\x1b[19~".to_vec()),
+    "f9" => return Some(b"\x1b[20~".to_vec()),
+    "f10" => return Some(b"\x1b[21~".to_vec()),
+    "f11" => return Some(b"\x1b[23~".to_vec()),
+    "f12" => return Some(b"\x1b[24~".to_vec()),
+    "space" => return Some(b" ".to_vec()),
+    _ => {}
   }
 
   // Regular character input

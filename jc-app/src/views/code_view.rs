@@ -64,17 +64,12 @@ impl CodeView {
   }
 
   fn setup_watcher(&mut self, path: &Path, window: &Window, cx: &mut Context<Self>) {
-    let watched_file = match path.file_name() {
-      Some(f) => f.to_os_string(),
-      None => return,
-    };
-    let parent = match path.parent() {
-      Some(p) => p.to_path_buf(),
-      None => return,
-    };
+    let Some(watched_file) = path.file_name() else { return };
+    let watched_file = watched_file.to_os_string();
+    let Some(parent) = path.parent() else { return };
 
     self._watcher = watch_dir(
-      &parent,
+      parent,
       move |p| p.ends_with(&watched_file),
       Some(self.saving.clone()),
       |view, window, cx| {

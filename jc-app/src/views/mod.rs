@@ -5,11 +5,12 @@ pub mod keybinding_help;
 pub mod pane;
 pub mod picker;
 pub mod project_state;
-pub mod project_view;
 pub mod reply_view;
 pub mod session_state;
 pub mod todo_view;
 pub mod workspace;
+
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -51,6 +52,12 @@ pub fn scroll_editor_to_line<V: 'static>(
     editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
     editor.scroll_to_center_line(line, cx);
   });
+}
+
+pub fn compute_checksum(content: &str) -> u64 {
+  let mut hasher = DefaultHasher::default();
+  content.hash(&mut hasher);
+  hasher.finish()
 }
 
 /// Renders a warning banner when a file has been externally modified and auto-merge failed.

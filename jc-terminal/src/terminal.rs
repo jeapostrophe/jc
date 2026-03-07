@@ -10,9 +10,9 @@ use std::sync::Arc;
 pub enum TerminalEvent {
   Wakeup,
   Bell,
-  Title(String),
+  Title,
   Exit,
-  ChildExit(i32),
+  ChildExit,
   PtyWrite(String),
   CursorBlinkingChange,
 }
@@ -33,9 +33,9 @@ impl EventListener for EventProxy {
     let terminal_event = match event {
       Event::Wakeup => TerminalEvent::Wakeup,
       Event::Bell => TerminalEvent::Bell,
-      Event::Title(s) => TerminalEvent::Title(s),
+      Event::Title(_) => TerminalEvent::Title,
       Event::Exit => TerminalEvent::Exit,
-      Event::ChildExit(code) => TerminalEvent::ChildExit(code),
+      Event::ChildExit(_) => TerminalEvent::ChildExit,
       Event::PtyWrite(s) => TerminalEvent::PtyWrite(s),
       Event::CursorBlinkingChange => TerminalEvent::CursorBlinkingChange,
       _ => return,
@@ -83,6 +83,12 @@ impl TerminalState {
   pub fn with_term<R>(&self, f: impl FnOnce(&Term<EventProxy>) -> R) -> R {
     let term = self.term.lock();
     f(&term)
+  }
+
+  /// Mutable access to the terminal.
+  pub fn with_term_mut<R>(&self, f: impl FnOnce(&mut Term<EventProxy>) -> R) -> R {
+    let mut term = self.term.lock();
+    f(&mut term)
   }
 
   /// Get a clone of the Arc for use in canvas closures.

@@ -122,11 +122,11 @@ impl Render for KeybindingHelp {
     let theme = cx.theme();
 
     // Left column: Global bindings. Right column: everything else.
-    let left = div().flex().flex_col().gap_4().child(render_section(&SECTIONS[0], &theme));
+    let left = div().flex().flex_col().gap_4().child(render_section(&SECTIONS[0], theme));
 
     let mut right = div().flex().flex_col().gap_4();
     for section in &SECTIONS[1..] {
-      right = right.child(render_section(section, &theme));
+      right = right.child(render_section(section, theme));
     }
 
     div()

@@ -74,7 +74,7 @@ pub fn compute_outline(text: &str, language: Language) -> Vec<OutlineItem> {
   let mut items: Vec<OutlineItem> = Vec::with_capacity(raw_items.len());
   let mut stack: Vec<usize> = Vec::new(); // indices into `items`
 
-  for (i, (name, context, line, range)) in raw_items.iter().enumerate() {
+  for (name, context, line, range) in raw_items {
     // Pop stack entries that don't contain the current item.
     while let Some(&top) = stack.last() {
       if items[top].byte_range.end < range.end {
@@ -88,17 +88,8 @@ pub fn compute_outline(text: &str, language: Language) -> Vec<OutlineItem> {
     let depth = stack.len();
     let label = if context.is_empty() { name.clone() } else { format!("{context} {name}") };
 
-    items.push(OutlineItem {
-      label,
-      name: name.clone(),
-      context: context.clone(),
-      line: *line,
-      depth,
-      parent,
-      byte_range: range.clone(),
-    });
-
-    stack.push(i);
+    stack.push(items.len());
+    items.push(OutlineItem { label, name, context, line, depth, parent, byte_range: range });
   }
 
   items

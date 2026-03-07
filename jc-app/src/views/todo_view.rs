@@ -3,8 +3,7 @@ use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::highlighter::{Diagnostic, DiagnosticSeverity};
 use gpui_component::input::{InputEvent, Position, Rope};
-use jc_core::todo::{self, TodoDocument, TodoProblem, TodoSession};
-use std::ops::Range;
+use jc_core::todo::{self, TodoDocument, TodoProblem};
 use std::path::{Path, PathBuf};
 
 /// TodoView wraps a [`CodeView`] opened on the project's `TODO.md` file,
@@ -154,11 +153,10 @@ impl TodoView {
       return;
     };
     self.code_view.update(cx, |cv, cx| {
-      let text = cv.editor_text(cx);
-      let mut new_text = text;
-      new_text.insert_str(offset, comment);
+      let mut text = cv.editor_text(cx);
+      text.insert_str(offset, comment);
       cv.editor().update(cx, |state, cx| {
-        state.set_value(new_text, window, cx);
+        state.set_value(text, window, cx);
       });
     });
   }
@@ -231,36 +229,22 @@ impl TodoView {
   /// Apply foreground highlights to the active session's headings.
   /// h2 (`## Session`) → `@type` color, h3 (`### Message` / `### WAIT`) → `@function` color.
   fn apply_session_highlights(&self, cx: &mut Context<Self>) {
-    let slug = match &self.active_slug {
-      Some(s) => s.as_str(),
-      None => {
-        // Clear highlights.
-        self.code_view.update(cx, |cv, cx| {
-          cv.editor().update(cx, |state, cx| {
-            state.set_extra_highlights(Vec::new(), cx);
-          });
-        });
-        return;
-      }
-    };
+    let session = self.active_slug.as_deref().and_then(|slug| self.document.session_by_slug(slug));
 
-    let session = match self.document.session_by_slug(slug) {
-      Some(s) => s,
-      None => {
-        self.code_view.update(cx, |cv, cx| {
-          cv.editor().update(cx, |state, cx| {
-            state.set_extra_highlights(Vec::new(), cx);
-          });
+    let Some(session) = session else {
+      self.code_view.update(cx, |cv, cx| {
+        cv.editor().update(cx, |state, cx| {
+          state.set_extra_highlights(Vec::new(), cx);
         });
-        return;
-      }
+      });
+      return;
     };
 
     let theme = &cx.theme().highlight_theme;
     let h2_style = theme.style("type").unwrap_or_default();
     let h3_style = theme.style("function").unwrap_or_default();
 
-    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut highlights = Vec::new();
 
     // Highlight the session heading (## Session slug: label).
     highlights.push((session.heading_byte_range.clone(), h2_style));
@@ -279,20 +263,6 @@ impl TodoView {
       });
     });
   }
-}
-
-/// Compute the full byte range of a session (heading through content,
-/// up to the next session's heading or end of document).
-#[allow(dead_code)]
-fn session_full_range(session: &TodoSession, doc: &TodoDocument, text_len: usize) -> Range<usize> {
-  let start = session.heading_byte_range.start;
-  let end = doc
-    .sessions
-    .iter()
-    .find(|s| s.heading_byte_range.start > start)
-    .map(|next| next.heading_byte_range.start)
-    .unwrap_or(text_len);
-  start..end
 }
 
 impl Render for TodoView {

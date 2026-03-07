@@ -29,11 +29,8 @@ enum Command {
 fn main() -> anyhow::Result<()> {
   let cli = Cli::parse();
 
-  match cli.command {
-    Some(Command::CleanHooks) => {
-      return cmd_clean_hooks();
-    }
-    None => {}
+  if let Some(Command::CleanHooks) = cli.command {
+    return cmd_clean_hooks();
   }
 
   // Resolve the project path early.
@@ -82,7 +79,7 @@ fn cmd_clean_hooks() -> anyhow::Result<()> {
   // Also include cwd if it's not already in the list.
   if let Ok(cwd) = std::env::current_dir() {
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    if !paths.iter().any(|p| *p == cwd) {
+    if !paths.contains(&cwd) {
       paths.push(cwd);
     }
   }

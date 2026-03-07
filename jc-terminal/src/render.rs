@@ -53,7 +53,6 @@ pub struct TerminalRenderState<'a> {
   pub palette: &'a Palette,
   pub font_family: &'a SharedString,
   pub font_size: Pixels,
-  pub line_height: f32,
   pub focused: bool,
   pub cursor_visible: bool,
   pub selection: Option<SelectionRange>,
@@ -71,16 +70,14 @@ pub fn paint_terminal(
   let grid = term.grid();
   let num_lines = grid.screen_lines();
   let num_cols = grid.columns();
-  let cursor = term.grid().cursor.point;
+  let cursor = grid.cursor.point;
   let cursor_shape = term.cursor_style().shape;
   let show_cursor = term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
 
   let palette = state.palette;
   let font_size = state.font_size;
-  let line_height = state.line_height;
 
   let origin = bounds.origin;
-  let line_height_px = font_size * line_height;
 
   let selection_color = Hsla { h: 210.0 / 360.0, s: 0.6, l: 0.5, a: 0.35 };
 
@@ -168,7 +165,7 @@ pub fn paint_terminal(
 
       let x = origin.x + layout.width * col_idx as f32;
       let y = origin.y + layout.height * line_idx as f32;
-      let _ = shaped.paint(point(x, y), line_height_px, window, cx);
+      let _ = shaped.paint(point(x, y), layout.height, window, cx);
     }
   }
 
@@ -199,11 +196,6 @@ pub fn paint_terminal(
     } else if state.cursor_visible {
       // Focused + visible blink phase: solid cursor
       match cursor_shape {
-        CursorShape::Block => {
-          let mut color = cursor_color;
-          color.a = 0.5;
-          window.paint_quad(fill(cursor_bounds, color));
-        }
         CursorShape::Beam => {
           window
             .paint_quad(fill(Bounds::new(point(x, y), size(px(2.0), layout.height)), cursor_color));

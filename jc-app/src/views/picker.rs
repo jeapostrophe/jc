@@ -1180,17 +1180,24 @@ struct LineEntry {
   content: String,
 }
 
-pub struct LineSearchPickerDelegate<F: Fn(u32, &mut Window, &mut App) + 'static> {
+pub struct LineSearchPickerDelegate {
   labels: Vec<String>,
   entries: Vec<LineEntry>,
   /// Syntax highlighter with the parsed tree — styles are queried on demand in render_item.
   highlighter: SyntaxHighlighter,
-  scroll_to_line: F,
+  scroll_to_line: ScrollCallback,
 }
 
-impl<F: Fn(u32, &mut Window, &mut App) + 'static> LineSearchPickerDelegate<F> {
-  fn build(text: &str, language: &str, scroll_to_line: F, _cx: &App) -> Self {
-    let rope = Rope::from(text);
+impl LineSearchPickerDelegate {
+  pub fn for_view<V: super::LineSearchable>(view: &Entity<V>, cx: &App) -> Self {
+    let text = view.read(cx).editor_text(cx);
+    let language = view.read(cx).language_name().name();
+    let entity = view.clone();
+    let callback: ScrollCallback = Box::new(move |line, window, cx| {
+      entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
+    });
+
+    let rope = Rope::from(text.as_str());
     let mut highlighter = SyntaxHighlighter::new(language);
     highlighter.update(None, &rope);
 
@@ -1213,26 +1220,14 @@ impl<F: Fn(u32, &mut Window, &mut App) + 'static> LineSearchPickerDelegate<F> {
       }
 
       // +1 for the '\n' separator (or end of string).
-      byte_offset = byte_offset + line.len() + 1;
+      byte_offset += line.len() + 1;
     }
 
-    Self { labels, entries, highlighter, scroll_to_line }
+    Self { labels, entries, highlighter, scroll_to_line: callback }
   }
 }
 
-impl LineSearchPickerDelegate<ScrollCallback> {
-  pub fn for_view<V: super::LineSearchable>(view: &Entity<V>, cx: &App) -> Self {
-    let text = view.read(cx).editor_text(cx);
-    let language = view.read(cx).language_name().name();
-    let entity = view.clone();
-    let callback: ScrollCallback = Box::new(move |line, window, cx| {
-      entity.update(cx, |v, cx| v.scroll_to_line(line, window, cx));
-    });
-    Self::build(&text, language, callback, cx)
-  }
-}
-
-impl<F: Fn(u32, &mut Window, &mut App) + 'static> PickerDelegate for LineSearchPickerDelegate<F> {
+impl PickerDelegate for LineSearchPickerDelegate {
   fn items(&self) -> &[String] {
     &self.labels
   }
@@ -1389,13 +1384,5 @@ impl PickerDelegate for SnippetPickerDelegate {
         }
       }
     }
-  }
-
-  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
-    let theme = cx.theme();
-    let heading = &self.items[index];
-    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
-    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
-    row.child(heading.clone())
   }
 }

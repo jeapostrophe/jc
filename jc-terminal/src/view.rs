@@ -134,18 +134,15 @@ impl TerminalView {
     let pty = Arc::new(pty);
 
     // Background thread: blocking PTY reads -> channel
-    std::thread::spawn({
-      let tx = bytes_tx;
+    std::thread::spawn(move || {
       let mut reader = reader;
-      move || {
-        let mut buf = [0u8; 4096];
-        loop {
-          match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-              if tx.send(buf[..n].to_vec()).is_err() {
-                break;
-              }
+      let mut buf = [0u8; 4096];
+      loop {
+        match reader.read(&mut buf) {
+          Ok(0) | Err(_) => break,
+          Ok(n) => {
+            if bytes_tx.send(buf[..n].to_vec()).is_err() {
+              break;
             }
           }
         }
@@ -183,7 +180,6 @@ impl TerminalView {
                 }
               });
             }
-            TerminalEvent::CursorBlinkingChange => {}
             _ => {}
           }
         }
@@ -274,18 +270,16 @@ impl TerminalView {
   /// Write text to the terminal PTY, using bracketed paste if the terminal
   /// expects it. Sanitizes ESC characters and normalizes newlines.
   pub fn write_text(&self, text: &str) {
-    let bracketed = self.bracketed_paste_mode();
-    let pty = self.pty.clone();
-    if bracketed {
+    if self.bracketed_paste_mode() {
       let mut buf = Vec::with_capacity(text.len() + 12);
       buf.extend_from_slice(b"\x1b[200~");
       let sanitized = text.replace('\x1b', "");
       buf.extend_from_slice(sanitized.as_bytes());
       buf.extend_from_slice(b"\x1b[201~");
-      let _ = pty.write_all(&buf);
+      let _ = self.pty.write_all(&buf);
     } else {
       let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-      let _ = pty.write_all(normalized.as_bytes());
+      let _ = self.pty.write_all(normalized.as_bytes());
     }
   }
 
@@ -302,13 +296,12 @@ impl TerminalView {
 
   fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {
     self.focused = true;
-    {
-      let handle = self.state.term_handle();
-      let mut term = handle.lock();
+    let send_focus = self.state.with_term_mut(|term| {
       term.is_focused = true;
-      if term.mode().contains(TermMode::FOCUS_IN_OUT) {
-        let _ = self.pty.write_all(b"\x1b[I");
-      }
+      term.mode().contains(TermMode::FOCUS_IN_OUT)
+    });
+    if send_focus {
+      let _ = self.pty.write_all(b"\x1b[I");
     }
     self.reset_cursor_blink();
     cx.notify();
@@ -316,13 +309,12 @@ impl TerminalView {
 
   fn on_blur(&mut self, _: &mut Window, cx: &mut Context<Self>) {
     self.focused = false;
-    {
-      let handle = self.state.term_handle();
-      let mut term = handle.lock();
+    let send_blur = self.state.with_term_mut(|term| {
       term.is_focused = false;
-      if term.mode().contains(TermMode::FOCUS_IN_OUT) {
-        let _ = self.pty.write_all(b"\x1b[O");
-      }
+      term.mode().contains(TermMode::FOCUS_IN_OUT)
+    });
+    if send_blur {
+      let _ = self.pty.write_all(b"\x1b[O");
     }
     cx.notify();
   }
@@ -381,43 +373,33 @@ impl TerminalView {
     let selection_type = match click_count {
       1 => SelectionType::Simple,
       2 => SelectionType::Semantic,
-      3 => SelectionType::Lines,
       _ => SelectionType::Lines,
     };
     let selection = Selection::new(selection_type, point, side);
-    let handle = self.state.term_handle();
-    let mut term = handle.lock();
-    term.selection = Some(selection);
+    self.state.with_term_mut(|term| term.selection = Some(selection));
   }
 
   fn mouse_drag(&mut self, position: gpui::Point<Pixels>, layout: CellLayout) {
     let (point, side) = self.grid_point_and_side(position, layout);
-    let handle = self.state.term_handle();
-    let mut term = handle.lock();
-    if let Some(ref mut selection) = term.selection {
-      selection.update(point, side);
-    }
+    self.state.with_term_mut(|term| {
+      if let Some(ref mut selection) = term.selection {
+        selection.update(point, side);
+      }
+    });
   }
 
   fn mouse_up(&mut self, position: gpui::Point<Pixels>, click_count: usize, layout: CellLayout) {
     let (point, side) = self.grid_point_and_side(position, layout);
-    let handle = self.state.term_handle();
-    let mut term = handle.lock();
-    if let Some(ref mut selection) = term.selection {
-      selection.update(point, side);
-    }
-    // Single-click with no drag (start == end): clear selection.
-    if click_count == 1
-      && let Some(ref sel) = term.selection
-      && sel.ty == SelectionType::Simple
-    {
-      // Check if selection resolves to empty.
-      drop(term);
+    let is_simple_click = self.state.with_term_mut(|term| {
+      if let Some(ref mut selection) = term.selection {
+        selection.update(point, side);
+      }
+      click_count == 1 && term.selection.as_ref().is_some_and(|sel| sel.ty == SelectionType::Simple)
+    });
+    if is_simple_click {
       let text = self.state.with_term(|t| t.selection_to_string());
-      if text.is_none() || text.as_deref() == Some("") {
-        let handle = self.state.term_handle();
-        let mut term = handle.lock();
-        term.selection = None;
+      if text.is_none_or(|s| s.is_empty()) {
+        self.state.with_term_mut(|term| term.selection = None);
       }
     }
   }
@@ -486,12 +468,7 @@ impl Render for TerminalView {
           this.reset_cursor_blink();
           let mode = this.state.with_term(|t| *t.mode());
           if let Some(bytes) = keystroke_to_bytes(&event.keystroke, mode) {
-            // Clear selection on any key press that generates terminal input.
-            {
-              let handle = this.state.term_handle();
-              let mut term = handle.lock();
-              term.selection = None;
-            }
+            this.state.with_term_mut(|term| term.selection = None);
             let _ = pty.write_all(&bytes);
           }
         }
@@ -535,7 +512,6 @@ impl Render for TerminalView {
               palette: &palette,
               font_family: &font_family,
               font_size,
-              line_height,
               focused,
               cursor_visible,
               selection: selection_range,
