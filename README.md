@@ -475,22 +475,16 @@ Hooks are the one extension point that works well today. Claude Code fires event
 
 ### Navigation & Pickers
 - [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
-- [x] [D] View picker (Cmd-.): replace Cmd-1..6 view bindings with a picker that shows view names and places the selected view in the focused pane
-- [w] ~~[H] Support multiple Code Viewers~~ — **Won't do.** Each `ProjectState` owns a single `CodeView`; ~15 workspace call sites assume this. Supporting pane-owned code views would require a `HashMap<Entity<Pane>, Entity<CodeView>>` lookup at every site plus lifecycle management on layout changes. The app's philosophy is "not a full IDE" — open a second file in Zed instead.
-- [x] [H] Pane layout (Cmd-1/2/3): Cmd-1 makes the focused pane full-screen, Cmd-2/3 splits into 2/3 equal-width panes. Replaces the old Cmd-1..6 view bindings.
 - [ ] [E] Keybinding help overlay (Cmd-?): shows all keybindings in an overlay. Future task: filter to context-sensitive bindings.
 
 ### Problems & Status
 - [ ] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
-- [x] [T] Cmd-; problem cycling: navigate problems within current project, end at WAIT-has-content as the submit signal, fall through to TODO editor at WAIT position when no problems remain ("show me what to do next")
-- [x] [E] Cmd-: urgency-sorted session picker: same sessions as Cmd-P but sorted by oldest-unattended-problem first, so Enter jumps to the neediest session
 
 ### Remote Workflow (CLI & Hooks)
 - [ ] [H] `jc status` subcommand: JSON output of projects, sessions, problems, usage
 - [ ] [H] `jc problems` subcommand: JSON list of all problems with ranks
 - [ ] [E] `jc note` subcommand: append text below WAIT marker
 - [ ] [E] External notification hook (push problem events to ntfy/Pushover)
-- [x] [D] Draft feature request: Claude Code user-side sideband display (output user sees but Claude does not)
 
 ### Workflow
 - [ ] [E] Auto-show Claude terminal on submit: when sending from TODO, focus the "other" pane and show Claude terminal there. In 1-pane mode, switch the pane; in 2-pane, use the other pane; in 3-pane, use the leftmost pane that isn't the current one.
@@ -500,12 +494,11 @@ Hooks are the one extension point that works well today. Claude Code fires event
 
 ### Polish & Integration
 - [ ] [H] End-to-end test: full workflow from project creation to Claude review cycle
-- [ ] [H] Persistent state: survive app restart without losing session state or terminal sessions [perhaps use 'tmux' behind the scenes]
-- [ ] [H] Performance: handle multiple concurrent terminal sessions smoothly
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
-- [ ] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing via `scripts/bundle.sh` (prerequisite for `objc2-user-notifications` upgrade)
-- [ ] [H] Single-instance guard: `NSRunningApplication` check on startup to prevent duplicate `.app` launches (activate existing window and exit)
-- [ ] [H] CLI-to-GUI IPC: Unix domain socket (`~/.config/jc/jc.sock`) so `jc .` sends project path to running instance; startup binds socket or connects to existing one
+- [x] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing via `scripts/bundle.sh` (prerequisite for `objc2-user-notifications` upgrade)
+- [x] [H] Single-instance guard: Unix domain socket check on startup; second launch sends project path to running instance and exits
+- [x] [H] CLI-to-GUI IPC: Unix domain socket (`~/.config/jc/jc.sock`) so `jc .` sends project path to running instance; startup binds socket or connects to existing one
+- [ ] [E] IPC window activation: pass `AsyncAppContext` into `SocketServer` callback so incoming `open_project` messages switch the running app to the new project and activate the window
 
 ### Code Quality
 

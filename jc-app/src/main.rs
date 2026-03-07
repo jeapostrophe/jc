@@ -1,5 +1,6 @@
 mod app;
 mod file_watcher;
+mod ipc;
 mod language;
 mod notify;
 mod outline;
@@ -35,10 +36,21 @@ fn main() -> anyhow::Result<()> {
     None => {}
   }
 
+  // Resolve the project path early.
+  let project_path =
+    cli.path.as_ref().map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()));
+
+  // Try to send to an already-running instance.
+  if let Some(path) = &project_path
+    && ipc::try_send_to_running(path)
+  {
+    return Ok(());
+  }
+
   let config = config::load_config()?;
   let mut state = config::load_state()?;
 
-  if let Some(path) = &cli.path {
+  if let Some(path) = &project_path {
     state.register_project(path);
     config::save_state(&state)?;
   } else if state.projects.is_empty() {
@@ -46,6 +58,15 @@ fn main() -> anyhow::Result<()> {
     state.register_project(&cwd);
     config::save_state(&state)?;
   }
+
+  // Start IPC server so subsequent `jc .` invocations can reach us.
+  let _server = ipc::SocketServer::bind(|path| {
+    if let Ok(mut st) = config::load_state() {
+      st.register_project(&path);
+      let _ = config::save_state(&st);
+    }
+    eprintln!("ipc: received open_project for {}", path.display());
+  });
 
   // Install a SIGINT handler that cleans hooks before exiting.
   // The GPUI event loop swallows Ctrl-C, so Drop doesn't always run.
@@ -95,6 +116,8 @@ extern "C" fn sigint_handler(sig: libc::c_int) {
   // uninstall_hooks only does file I/O (open, read, write), which is
   // technically not async-signal-safe but is reliable in practice for
   // single-threaded cleanup before exit.
+  ipc::cleanup_socket();
+
   if let Ok(paths) = SIGNAL_CLEANUP_PATHS.lock() {
     for path in paths.iter() {
       let _ = jc_core::hooks_settings::uninstall_hooks(path);
