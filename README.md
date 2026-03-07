@@ -469,11 +469,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [ ] [H] Add word-level inline highlighting via `similar` with background highlights NOT diagnostics
 
 ### Window & Pane Management
-- [x] [E] Implement independent scroll positions per project (go back to a project and everything is as you left it)
 - [ ] [H] Implement multi-window with shared session state
-
-### Problems & Status
-- [x] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
 
 ### Remote Workflow (CLI & Hooks)
 - [ ] [H] `jc status` subcommand: JSON output of projects, sessions, problems, usage

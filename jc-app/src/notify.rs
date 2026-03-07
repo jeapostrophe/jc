@@ -218,12 +218,9 @@ struct BlockLayout {
 }
 
 unsafe fn build_delegate() -> Retained<AnyObject> {
-  use std::sync::Once;
+  static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
 
-  static REGISTER: Once = Once::new();
-  static mut CLASS: Option<&'static AnyClass> = None;
-
-  REGISTER.call_once(|| {
+  let cls = CLASS.get_or_init(|| {
     let superclass = AnyClass::get(c"NSObject").unwrap();
     let mut builder = ClassBuilder::new(c"JCNotificationDelegate", superclass).unwrap();
 
@@ -246,10 +243,8 @@ unsafe fn build_delegate() -> Retained<AnyObject> {
       );
     }
 
-    // SAFETY: Static only written inside Once::call_once.
-    unsafe { CLASS = Some(builder.register()) };
+    builder.register()
   });
 
-  // SAFETY: CLASS is initialized by the Once above.
-  unsafe { msg_send![CLASS.unwrap(), new] }
+  unsafe { msg_send![*cls, new] }
 }

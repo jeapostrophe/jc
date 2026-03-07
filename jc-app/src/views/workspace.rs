@@ -578,58 +578,31 @@ impl Workspace {
       }
     }
 
-    let project = &self.projects[self.active_project_index];
-    let result: Option<(AnyView, FocusHandle)> = match kind {
-      PaneContentKind::ClaudeTerminal => project.active_session().map(|s| {
-        let focus = s.claude_terminal.read(cx).focus_handle(cx);
-        (s.claude_terminal.clone().into(), focus)
-      }),
-      PaneContentKind::GeneralTerminal => project.active_session().map(|s| {
-        let focus = s.general_terminal.read(cx).focus_handle(cx);
-        (s.general_terminal.clone().into(), focus)
-      }),
-      PaneContentKind::GitDiff => {
-        project.diff_view.update(cx, |v, cx| v.refresh(window, cx));
-        let focus = project.diff_view.read(cx).focus_handle(cx);
-        Some((project.diff_view.clone().into(), focus))
-      }
-      PaneContentKind::CodeViewer => {
-        let focus = project.code_view.read(cx).focus_handle(cx);
-        Some((project.code_view.clone().into(), focus))
-      }
-      PaneContentKind::TodoEditor => {
-        let focus = project.todo_view.read(cx).focus_handle(cx);
-        Some((project.todo_view.clone().into(), focus))
-      }
-      PaneContentKind::ReplyViewer => project.active_session().map(|s| {
+    // Refresh views that need it when actively switched to.
+    if kind == PaneContentKind::GitDiff {
+      self.projects[self.active_project_index].diff_view.update(cx, |v, cx| v.refresh(window, cx));
+    }
+    if kind == PaneContentKind::ReplyViewer {
+      if let Some(s) = self.projects[self.active_project_index].active_session() {
         s.reply_view.update(cx, |v, cx| v.refresh(window, cx));
-        let focus = s.reply_view.read(cx).focus_handle(cx);
-        (s.reply_view.clone().into(), focus)
-      }),
-      PaneContentKind::GlobalTodo => {
-        let focus = self.global_todo_view.read(cx).focus_handle(cx);
-        Some((self.global_todo_view.clone().into(), focus))
       }
-    };
+    }
 
-    if let Some((view, focus)) = result {
-      let pane = self.active_pane_entity().clone();
-      pane.update(cx, |p, cx| {
-        p.set_content(PaneContent { kind, view, focus: focus.clone() }, cx);
-      });
-      focus.focus(window);
+    let pane_idx = self.active_pane_index;
+    self.set_pane_view(pane_idx, kind, cx);
 
-      // When switching to the TODO editor, auto-scroll to the end of the active session's WAIT body.
-      if kind == PaneContentKind::TodoEditor {
-        let project = &self.projects[self.active_project_index];
-        let tv = project.todo_view.read(cx);
-        if let Some(slug) = project.active_slug() {
-          let text = tv.editor_text(cx);
-          if let Some(wait_line) = tv.document().wait_body_end_line(slug, &text) {
-            let wait_line_0 = wait_line.saturating_sub(1);
-            drop(tv);
-            project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
-          }
+    self.panes[pane_idx].read(cx).focus_content(window);
+
+    // When switching to the TODO editor, auto-scroll to the end of the active session's WAIT body.
+    if kind == PaneContentKind::TodoEditor {
+      let project = &self.projects[self.active_project_index];
+      let tv = project.todo_view.read(cx);
+      if let Some(slug) = project.active_slug() {
+        let text = tv.editor_text(cx);
+        if let Some(wait_line) = tv.document().wait_body_end_line(slug, &text) {
+          let wait_line_0 = wait_line.saturating_sub(1);
+          drop(tv);
+          project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
         }
       }
     }
