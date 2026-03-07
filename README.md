@@ -469,14 +469,12 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [ ] [H] Add word-level inline highlighting via `similar` with background highlights NOT diagnostics
 
 ### Window & Pane Management
-- [ ] [E] Implement independent scroll positions per pane
-- [ ] [H] Implement Quake-style bottom terminal overlay
+- [ ] [E] Implement independent scroll positions per project (go back to a project and everything is as you left it)
 - [ ] [H] Implement multi-window with shared session state
-- [ ] [E] Add a global TODO view
+- [x] [E] Add a global TODO view (always shows `~/.claude/TODO.md` in every project; called "Global TDOO")
 
 ### Navigation & Pickers
-- [ ] [D] Implement keybinding system (configurable, emacs-style defaults)
-- [ ] [E] Keybinding help overlay (Cmd-?): shows all keybindings in an overlay. Future task: filter to context-sensitive bindings.
+- [x] [E] Keybinding help overlay (Cmd-?): shows all keybindings in an overlay. Future task: filter to context-sensitive bindings.
 
 ### Problems & Status
 - [ ] [H] Upgrade to `objc2-user-notifications` for action buttons ("Switch to Session") and notification grouping (requires app bundling)
@@ -488,7 +486,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [ ] [E] External notification hook (push problem events to ntfy/Pushover)
 
 ### Workflow
-- [ ] [E] Auto-show Claude terminal on submit: when sending from TODO, focus the "other" pane and show Claude terminal there. In 1-pane mode, switch the pane; in 2-pane, use the other pane; in 3-pane, use the leftmost pane that isn't the current one.
+- [x] [E] Auto-show Claude terminal on submit: when sending from TODO, focus the "other" pane and show Claude terminal there. In 1-pane mode, switch the pane; in 2-pane, use the other pane; in 3-pane, use the leftmost pane that isn't the current one.
 
 ### Git Worktrees
 - [ ] [H] Implement git worktree creation/deletion via `git2` worktree API
@@ -496,13 +494,9 @@ Hooks are the one extension point that works well today. Claude Code fires event
 ### Polish & Integration
 - [ ] [H] End-to-end test: full workflow from project creation to Claude review cycle
 - [ ] [H] Error handling: graceful recovery from Claude crashes, terminal failures, disk issues
-- [x] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing via `scripts/bundle.sh` (prerequisite for `objc2-user-notifications` upgrade)
-- [x] [H] Single-instance guard: Unix domain socket check on startup; second launch sends project path to running instance and exits
-- [x] [H] CLI-to-GUI IPC: Unix domain socket (`~/.config/jc/jc.sock`) so `jc .` sends project path to running instance; startup binds socket or connects to existing one
-- [X] [E] IPC window activation: pass `AsyncAppContext` into `SocketServer` callback so incoming `open_project` messages switch the running app to the new project and activate the window
 
 ### Code Quality
-- [ ] [T] Simplify state.toml format --- no id, no name, no tasks, no added_at
+- [x] [T] Simplify state.toml format --- no id, no name, no tasks, no added_at
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically

@@ -1,6 +1,7 @@
 use crate::file_watcher::watch_dir;
 use crate::views::comment_panel::{CommentPanel, CommentPanelEvent};
 use crate::views::diff_view::DiffViewEvent;
+use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
@@ -53,6 +54,7 @@ actions!(
     SaveFile,
     SendToTerminal,
     NextProblem,
+    ShowKeybindingHelp,
   ]
 );
 
@@ -104,6 +106,9 @@ pub struct Workspace {
   last_jumped_target: Option<ProblemTarget>,
   snippets: SnippetDocument,
   _snippet_watcher: Option<notify::RecommendedWatcher>,
+  global_todo_view: Entity<crate::views::code_view::CodeView>,
+  keybinding_help: Option<(AnyView, Subscription)>,
+  pre_help_focus: Option<FocusHandle>,
   window_active: bool,
   _window_activation_subscription: Subscription,
 }
@@ -123,7 +128,7 @@ impl Workspace {
     for project in &state.projects {
       projects.push(ProjectState::create(
         project.path.clone(),
-        project.name.clone(),
+        project.name(),
         &palette,
         window,
         cx,
@@ -269,6 +274,17 @@ impl Workspace {
         }
       });
 
+    // Create global TODO view (~/.claude/TODO.md) as a read-only CodeView.
+    let global_todo_path =
+      PathBuf::from(std::env::var("HOME").expect("HOME not set")).join(".claude/TODO.md");
+    let global_todo_view = cx.new(|cx| {
+      let mut cv = crate::views::code_view::CodeView::new(window, cx);
+      if global_todo_path.exists() {
+        cv.open_file(global_todo_path, window, cx);
+      }
+      cv
+    });
+
     // Load snippets and set up file watcher.
     snippets::ensure_file_exists();
     let snippets = snippets::load();
@@ -301,6 +317,9 @@ impl Workspace {
       last_jumped_target: None,
       snippets,
       _snippet_watcher: snippet_watcher,
+      global_todo_view,
+      keybinding_help: None,
+      pre_help_focus: None,
       window_active: true,
       _window_activation_subscription: window_activation_subscription,
     };
@@ -562,6 +581,10 @@ impl Workspace {
         let focus = s.reply_view.read(cx).focus_handle(cx);
         (s.reply_view.clone().into(), focus)
       }),
+      PaneContentKind::GlobalTodo => {
+        let focus = self.global_todo_view.read(cx).focus_handle(cx);
+        Some((self.global_todo_view.clone().into(), focus))
+      }
     };
 
     if let Some((view, focus)) = result {
@@ -624,6 +647,35 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     self.set_active_pane_view(PaneContentKind::ReplyViewer, window, cx);
+  }
+
+  fn toggle_keybinding_help(
+    &mut self,
+    _: &ShowKeybindingHelp,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.keybinding_help.is_some() {
+      self.keybinding_help = None;
+      if let Some(focus) = self.pre_help_focus.take() {
+        focus.focus(window);
+      }
+      cx.notify();
+    } else {
+      self.pre_help_focus = window.focused(cx);
+      let view = cx.new(|cx| KeybindingHelp::new(cx));
+      let sub =
+        cx.subscribe_in(&view, window, |this: &mut Self, _, _: &DismissHelpEvent, window, cx| {
+          this.keybinding_help = None;
+          if let Some(focus) = this.pre_help_focus.take() {
+            focus.focus(window);
+          }
+          cx.notify();
+        });
+      view.read(cx).focus_handle(cx).focus(window);
+      self.keybinding_help = Some((view.into(), sub));
+      cx.notify();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -718,7 +770,7 @@ impl Workspace {
         let focus = project.todo_view.read(cx).focus_handle(cx);
         Some((project.todo_view.clone().into(), focus))
       }
-      PaneContentKind::ReplyViewer => None,
+      PaneContentKind::ReplyViewer | PaneContentKind::GlobalTodo => None,
     };
 
     if let Some((view, focus)) = result {
@@ -1533,8 +1585,19 @@ impl Workspace {
       let _ = pty.write_all(b"\r");
     });
 
-    // Switch first pane to Claude terminal so the user can see it working.
-    self.active_pane_index = 0;
+    // Show Claude terminal in the "other" pane so the user can see it working.
+    let target = match self.panes.len() {
+      1 => 0,
+      2 => 1 - self.active_pane_index,
+      _ => {
+        if self.active_pane_index == 0 {
+          1
+        } else {
+          0
+        }
+      }
+    };
+    self.active_pane_index = target;
     self.set_active_pane_view(PaneContentKind::ClaudeTerminal, window, cx);
   }
 
@@ -1901,6 +1964,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::save_file))
       .on_action(cx.listener(Self::send_to_terminal))
       .on_action(cx.listener(Self::next_problem))
+      .on_action(cx.listener(Self::toggle_keybinding_help))
       .on_action(cx.listener(Self::open_problem_picker))
       .on_action(cx.listener(Self::show_snippet_picker))
       .on_action(cx.listener(Self::show_view_picker))
@@ -1908,6 +1972,7 @@ impl Render for Workspace {
       .child(pane_area)
       .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
       .when_some(self.active_comment_panel.as_ref(), |el, v| el.child(modal_overlay(v)))
+      .when_some(self.keybinding_help.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))
   }
 }
 
@@ -1949,6 +2014,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-;", NextProblem, Some("Workspace")),
     KeyBinding::new("cmd-:", ShowProblemPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-k", ShowSnippetPicker, Some("Workspace")),
+    KeyBinding::new("cmd-?", ShowKeybindingHelp, Some("Workspace")),
   ]);
 
   cx.bind_keys([

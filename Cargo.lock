@@ -1076,7 +1076,6 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
- "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
 ]
@@ -3834,14 +3833,12 @@ name = "jc-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "dirs 6.0.0",
  "flume",
  "serde",
  "serde_json",
  "tiny_http",
  "toml 0.8.23",
- "uuid",
 ]
 
 [[package]]

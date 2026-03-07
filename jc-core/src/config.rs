@@ -37,7 +37,7 @@ impl AppState {
     match pos {
       Some(i) => &mut self.projects[i],
       None => {
-        let project = Project::from_path(&canonical);
+        let project = Project::from(canonical);
         self.projects.push(project);
         self.projects.last_mut().unwrap()
       }

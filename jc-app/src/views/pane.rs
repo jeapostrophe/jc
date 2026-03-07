@@ -9,16 +9,18 @@ pub enum PaneContentKind {
   CodeViewer,
   TodoEditor,
   ReplyViewer,
+  GlobalTodo,
 }
 
 impl PaneContentKind {
-  pub const ALL: [PaneContentKind; 6] = [
+  pub const ALL: [PaneContentKind; 7] = [
     Self::ClaudeTerminal,
     Self::GeneralTerminal,
     Self::GitDiff,
     Self::CodeViewer,
     Self::TodoEditor,
     Self::ReplyViewer,
+    Self::GlobalTodo,
   ];
 
   pub fn label(self) -> &'static str {
@@ -29,6 +31,7 @@ impl PaneContentKind {
       Self::CodeViewer => "Code",
       Self::TodoEditor => "TODO",
       Self::ReplyViewer => "Reply",
+      Self::GlobalTodo => "Global TODO",
     }
   }
 }

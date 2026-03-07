@@ -41,7 +41,7 @@ impl Render for ProjectView {
       col = col.child(div().text_xl().text_color(theme.foreground).child("Projects"));
 
       for project in &self.state.projects {
-        let mut project_div = div()
+        let project_div = div()
           .flex()
           .flex_col()
           .gap_1()
@@ -53,7 +53,7 @@ impl Render for ProjectView {
               .text_base()
               .font_weight(FontWeight::SEMIBOLD)
               .text_color(theme.foreground)
-              .child(project.name.clone()),
+              .child(project.name()),
           )
           .child(
             div()
@@ -61,19 +61,6 @@ impl Render for ProjectView {
               .text_color(theme.muted_foreground)
               .child(project.path.display().to_string()),
           );
-
-        if !project.tasks.is_empty() {
-          let mut task_list = div().flex().flex_col().gap_1().mt_2();
-          for task in &project.tasks {
-            task_list = task_list.child(
-              div()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(format!("  {} ({:?})", task.name, task.status)),
-            );
-          }
-          project_div = project_div.child(task_list);
-        }
 
         col = col.child(project_div);
       }
