@@ -72,6 +72,11 @@ fn appearance_from_window(appearance: WindowAppearance) -> Appearance {
   }
 }
 
+/// Get the terminal palette matching the current window appearance.
+fn palette_from_window(window: &Window) -> Palette {
+  Palette::for_appearance(appearance_from_window(window.appearance()))
+}
+
 pub struct Workspace {
   panes: Vec<Entity<Pane>>,
   active_pane_index: usize,
@@ -111,9 +116,7 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> Self {
-    // Detect the current system appearance and pick the right terminal palette.
-    let appearance = appearance_from_window(window.appearance());
-    let palette = Palette::for_appearance(appearance);
+    let palette = palette_from_window(window);
 
     // Build a ProjectState per registered project.
     let mut projects = Vec::new();
@@ -894,13 +897,11 @@ impl Workspace {
     if let Some(idx) = self.projects.iter().position(|p| p.path == canonical) {
       let session_idx = self.projects[idx].active_session_index.unwrap_or(0);
       self.switch_to_session(idx, session_idx, window, cx);
-      cx.notify();
       return;
     }
 
     // Create a new ProjectState and switch to it.
-    let appearance = appearance_from_window(window.appearance());
-    let palette = Palette::for_appearance(appearance);
+    let palette = palette_from_window(window);
     let name = canonical
       .file_name()
       .map(|n| n.to_string_lossy().into_owned())
@@ -921,8 +922,6 @@ impl Workspace {
       state.register_project(&canonical);
       let _ = jc_core::config::save_state(&state);
     }
-
-    cx.notify();
   }
 
   // ---------------------------------------------------------------------------
@@ -1120,8 +1119,7 @@ impl Workspace {
     });
 
     // Build palette and create session state.
-    let appearance = appearance_from_window(window.appearance());
-    let palette = Palette::for_appearance(appearance);
+    let palette = palette_from_window(window);
     let session = SessionState::create(
       slug.to_string(),
       label.to_string(),
@@ -1156,8 +1154,7 @@ impl Workspace {
       discover_session_groups(&project_path).into_iter().map(|g| g.slug).collect();
 
     // Create a session that runs plain `claude` (no resume).
-    let appearance = appearance_from_window(window.appearance());
-    let palette = Palette::for_appearance(appearance);
+    let palette = palette_from_window(window);
     let session = SessionState::create(
       String::new(), // empty slug -> falls back to plain `claude`
       String::new(),
