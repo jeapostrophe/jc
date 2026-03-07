@@ -498,9 +498,10 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [x] [H] App bundling: `.app` bundle with `Info.plist`, ad-hoc code signing via `scripts/bundle.sh` (prerequisite for `objc2-user-notifications` upgrade)
 - [x] [H] Single-instance guard: Unix domain socket check on startup; second launch sends project path to running instance and exits
 - [x] [H] CLI-to-GUI IPC: Unix domain socket (`~/.config/jc/jc.sock`) so `jc .` sends project path to running instance; startup binds socket or connects to existing one
-- [ ] [E] IPC window activation: pass `AsyncAppContext` into `SocketServer` callback so incoming `open_project` messages switch the running app to the new project and activate the window
+- [X] [E] IPC window activation: pass `AsyncAppContext` into `SocketServer` callback so incoming `open_project` messages switch the running app to the new project and activate the window
 
 ### Code Quality
+- [ ] [T] Simplify state.toml format --- no id, no name, no tasks, no added_at
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically

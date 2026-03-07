@@ -93,6 +93,7 @@ pub struct Workspace {
   _focus_in_subscriptions: Vec<Subscription>,
   _hook_server: Option<HookServer>,
   _hook_poll_task: Option<Task<()>>,
+  _ipc_poll_task: Option<Task<()>>,
   _bell_subscriptions: Vec<Subscription>,
   _problems_poll_task: Option<Task<()>>,
   last_jumped_target: Option<ProblemTarget>,
@@ -106,6 +107,7 @@ impl Workspace {
   pub fn new(
     state: AppState,
     config: AppConfig,
+    ipc_rx: flume::Receiver<PathBuf>,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> Self {
@@ -243,6 +245,27 @@ impl Workspace {
       }
     });
 
+    // Poll IPC channel for open_project requests from other `jc` invocations.
+    let ipc_poll_task =
+      cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+        while let Ok(path) = ipc_rx.recv_async().await {
+          let Ok(should_continue) = cx.update(|window, cx| {
+            if let Some(entity) = this.upgrade() {
+              entity.update(cx, |ws, cx| ws.open_project(path, window, cx));
+              window.activate_window();
+              true
+            } else {
+              false
+            }
+          }) else {
+            break;
+          };
+          if !should_continue {
+            break;
+          }
+        }
+      });
+
     // Load snippets and set up file watcher.
     snippets::ensure_file_exists();
     let snippets = snippets::load();
@@ -269,6 +292,7 @@ impl Workspace {
       _focus_in_subscriptions: focus_in_subscriptions,
       _hook_server: hook_server,
       _hook_poll_task: hook_poll_task,
+      _ipc_poll_task: Some(ipc_poll_task),
       _bell_subscriptions: bell_subscriptions,
       _problems_poll_task: Some(problems_poll_task),
       last_jumped_target: None,
@@ -857,6 +881,48 @@ impl Workspace {
         if self.config.editor.is_empty() { "open".to_string() } else { self.config.editor.clone() };
       let _ = std::process::Command::new(&editor).arg(path).spawn();
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Project opening (from IPC)
+  // ---------------------------------------------------------------------------
+
+  pub fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+
+    // If the project is already loaded, just switch to it.
+    if let Some(idx) = self.projects.iter().position(|p| p.path == canonical) {
+      let session_idx = self.projects[idx].active_session_index.unwrap_or(0);
+      self.switch_to_session(idx, session_idx, window, cx);
+      cx.notify();
+      return;
+    }
+
+    // Create a new ProjectState and switch to it.
+    let appearance = appearance_from_window(window.appearance());
+    let palette = Palette::for_appearance(appearance);
+    let name = canonical
+      .file_name()
+      .map(|n| n.to_string_lossy().into_owned())
+      .unwrap_or_else(|| "unknown".into());
+
+    let gc_path = canonical.clone();
+    std::thread::spawn(move || gc_stale_replies(&gc_path));
+
+    let project = ProjectState::create(canonical.clone(), name, &palette, window, cx);
+    self.projects.push(project);
+
+    let project_idx = self.projects.len() - 1;
+    let session_idx = self.projects[project_idx].active_session_index.unwrap_or(0);
+    self.switch_to_session(project_idx, session_idx, window, cx);
+
+    // Persist to state.toml.
+    if let Ok(mut state) = jc_core::config::load_state() {
+      state.register_project(&canonical);
+      let _ = jc_core::config::save_state(&state);
+    }
+
+    cx.notify();
   }
 
   // ---------------------------------------------------------------------------

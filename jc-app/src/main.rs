@@ -60,19 +60,17 @@ fn main() -> anyhow::Result<()> {
   }
 
   // Start IPC server so subsequent `jc .` invocations can reach us.
-  let _server = ipc::SocketServer::bind(|path| {
-    if let Ok(mut st) = config::load_state() {
-      st.register_project(&path);
-      let _ = config::save_state(&st);
-    }
-    eprintln!("ipc: received open_project for {}", path.display());
+  // The channel bridges the IPC thread to the GPUI main thread.
+  let (ipc_tx, ipc_rx) = flume::unbounded::<PathBuf>();
+  let _server = ipc::SocketServer::bind(move |path| {
+    let _ = ipc_tx.send(path);
   });
 
   // Install a SIGINT handler that cleans hooks before exiting.
   // The GPUI event loop swallows Ctrl-C, so Drop doesn't always run.
   install_signal_handler(&state);
 
-  app::run(state, config);
+  app::run(state, config, ipc_rx);
   Ok(())
 }
 

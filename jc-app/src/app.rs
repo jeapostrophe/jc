@@ -166,7 +166,7 @@ fn register_todo_language() {
   registry.register("todo-markdown", &config);
 }
 
-pub fn run(state: AppState, config: AppConfig) {
+pub fn run(state: AppState, config: AppConfig, ipc_rx: flume::Receiver<std::path::PathBuf>) {
   let app = Application::new().with_assets(gpui_component_assets::Assets);
 
   app.run(move |cx| {
@@ -210,7 +210,7 @@ pub fn run(state: AppState, config: AppConfig) {
 
     cx.open_window(opts, |window, cx| {
       window.activate_window();
-      let view = cx.new(|cx| Workspace::new(state, config, window, cx));
+      let view = cx.new(|cx| Workspace::new(state, config, ipc_rx, window, cx));
       cx.new(|cx| gpui_component::Root::new(view, window, cx))
     })
     .expect("failed to open window");
