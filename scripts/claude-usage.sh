@@ -225,6 +225,13 @@ resolve_seven_day() {
   local json="$1" model="$2"
   limit_pct="" seven_reset_iso=""
 
+  # Always grab the "all models" aggregate
+  local agg_pct="" agg_iso=""
+  eval "$(echo "$json" | jq -r '
+    .seven_day // empty
+    | "agg_pct=\(.utilization)\nagg_iso=\(.resets_at)"
+  ')"
+
   if [[ -n "$model" ]]; then
     local model_lower
     model_lower=$(echo "$model" | tr '[:upper:]' '[:lower:]')
@@ -236,6 +243,14 @@ resolve_seven_day() {
       | sort_by(-.value.utilization) | first // empty
       | "limit_pct=\(.value.utilization)\nseven_reset_iso=\(.value.resets_at)"
     ')"
+    # Use aggregate if it's higher than the model-specific value (or if model is missing)
+    if [[ -n "$agg_pct" && -n "$agg_iso" && "$agg_iso" != "null" ]]; then
+      local specific="${limit_pct:-0}"
+      if awk "BEGIN { exit ($agg_pct > $specific) ? 0 : 1 }"; then
+        limit_pct="$agg_pct"
+        seven_reset_iso="$agg_iso"
+      fi
+    fi
   fi
 
   # Only fall back to aggregate when no specific model was requested
@@ -394,6 +409,13 @@ output_all() {
   format_five_hour "$json"
   echo ""
 
+  # Grab "all models" aggregate for comparison
+  local agg_util="" agg_reset=""
+  eval "$(echo "$json" | jq -r '
+    .seven_day // empty
+    | "agg_util=\(.utilization)\nagg_reset=\(.resets_at)"
+  ')"
+
   # One block per model
   local first=true
   for key in $keys; do
@@ -401,6 +423,14 @@ output_all() {
     eval "$(echo "$json" | jq -r --arg k "seven_day_${key}" '
       .[$k] | "util=\(.utilization)\nreset_iso=\(.resets_at)"
     ')"
+
+    # Use aggregate if higher than model-specific
+    if [[ -n "$agg_util" && -n "$agg_reset" && "$agg_reset" != "null" ]]; then
+      if awk "BEGIN { exit ($agg_util > ${util:-0}) ? 0 : 1 }"; then
+        util="$agg_util"
+        reset_iso="$agg_reset"
+      fi
+    fi
 
     $first || echo ""
     first=false
