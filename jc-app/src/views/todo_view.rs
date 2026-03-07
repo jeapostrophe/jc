@@ -90,7 +90,7 @@ impl super::LineSearchable for TodoView {
     crate::language::Language::Markdown
   }
   fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
-    self.scroll_to_line(line, window, cx)
+    self.code_view.update(cx, |cv, cx| cv.scroll_to_line(line, window, cx));
   }
 }
 

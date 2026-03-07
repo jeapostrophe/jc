@@ -13,7 +13,6 @@ use crate::views::diff_view::{DiffSource, DiffView, GitLogEntry, git_log};
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::ReplyView;
 use crate::views::todo_view::TodoView;
-use jc_core::problem::{ProblemTarget, ProjectProblem, SessionProblem};
 use jc_core::snippets::Snippet;
 use jc_terminal::TerminalView;
 
@@ -799,6 +798,7 @@ impl PickerDelegate for ReplyHeadingPickerDelegate {
 // SessionPickerDelegate
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct SessionPickerEntry {
   kind: SessionPickerEntryKind,
   project_index: usize,
@@ -810,6 +810,8 @@ struct SessionPickerEntry {
   ambiguous_label: bool,
   /// Total problem count (session + project).
   problems: usize,
+  /// Minimum problem rank (lower = more urgent). `i8::MAX` if no problems.
+  min_rank: i8,
 }
 
 #[derive(Clone, Copy)]
@@ -848,6 +850,7 @@ impl SessionPickerDelegate {
     for (pi, project) in projects.iter().enumerate() {
       if project.sessions.is_empty() {
         // Project with no sessions — add a single entry so it's reachable.
+        let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);
         entries.push(SessionPickerEntry {
           kind: SessionPickerEntryKind::EmptyProject,
           project_index: pi,
@@ -857,6 +860,7 @@ impl SessionPickerDelegate {
           relative_time: String::new(),
           ambiguous_label: false,
           problems: project.problems.len(),
+          min_rank,
         });
         continue;
       }
@@ -874,6 +878,13 @@ impl SessionPickerDelegate {
           active_entry = Some(entries.len());
         }
         let relative_time = slug_time_strings.get(&session.slug).cloned().unwrap_or_default();
+        let min_rank = session
+          .problems
+          .iter()
+          .map(|p| p.rank())
+          .chain(project.problems.iter().map(|p| p.rank()))
+          .min()
+          .unwrap_or(i8::MAX);
         entries.push(SessionPickerEntry {
           kind: SessionPickerEntryKind::Session(si),
           project_index: pi,
@@ -883,6 +894,7 @@ impl SessionPickerDelegate {
           relative_time,
           ambiguous_label: false, // computed below
           problems: session.problems.len() + project.problems.len(),
+          min_rank,
         });
       }
     }
@@ -912,6 +924,35 @@ impl SessionPickerDelegate {
       .collect();
 
     Self { labels, entries, active_entry, confirmed: None }
+  }
+
+  /// Like `new()` but sorted by urgency: sessions with problems first (lowest rank = most urgent).
+  /// The first entry is pre-selected so Enter immediately confirms the neediest session.
+  pub fn new_urgency_sorted(projects: &[ProjectState], active_project_index: usize) -> Self {
+    let mut delegate = Self::new(projects, active_project_index);
+
+    // Build a permutation sorted by urgency.
+    let mut indices: Vec<usize> = (0..delegate.entries.len()).collect();
+    indices.sort_by(|&a, &b| {
+      let ea = &delegate.entries[a];
+      let eb = &delegate.entries[b];
+      // Primary: has_problems DESC (problems first).
+      let pa = if ea.problems > 0 { 0 } else { 1 };
+      let pb = if eb.problems > 0 { 0 } else { 1 };
+      pa.cmp(&pb)
+        // Secondary: min_rank ASC (most severe first).
+        .then(ea.min_rank.cmp(&eb.min_rank))
+        // Tertiary: original order.
+        .then(a.cmp(&b))
+    });
+
+    let sorted_entries: Vec<_> = indices.iter().map(|&i| delegate.entries[i].clone()).collect();
+    let sorted_labels: Vec<_> = indices.iter().map(|&i| delegate.labels[i].clone()).collect();
+
+    delegate.entries = sorted_entries;
+    delegate.labels = sorted_labels;
+    delegate.active_entry = Some(0);
+    delegate
   }
 
   pub fn confirmed_entry(&self) -> Option<SessionPickerResult> {
@@ -1246,70 +1287,6 @@ impl<F: Fn(u32, &mut Window, &mut App) + 'static> PickerDelegate for LineSearchP
     };
 
     row.child(line_num).child(styled)
-  }
-}
-
-// ---------------------------------------------------------------------------
-// ProblemPickerDelegate
-// ---------------------------------------------------------------------------
-
-struct ProblemPickerEntry {
-  description: String,
-  target: ProblemTarget,
-}
-
-pub struct ProblemPickerDelegate {
-  labels: Vec<String>,
-  entries: Vec<ProblemPickerEntry>,
-  confirmed_target: Option<ProblemTarget>,
-}
-
-impl ProblemPickerDelegate {
-  pub fn new(session_problems: &[SessionProblem], project_problems: &[ProjectProblem]) -> Self {
-    let mut ranked: Vec<(i8, ProblemPickerEntry)> = Vec::new();
-
-    for p in session_problems {
-      ranked
-        .push((p.rank(), ProblemPickerEntry { description: p.description(), target: p.target() }));
-    }
-    for p in project_problems {
-      ranked
-        .push((p.rank(), ProblemPickerEntry { description: p.description(), target: p.target() }));
-    }
-
-    ranked.sort_by_key(|(rank, _)| *rank);
-    let entries: Vec<ProblemPickerEntry> = ranked.into_iter().map(|(_, e)| e).collect();
-
-    let labels: Vec<String> = entries.iter().map(|e| e.description.clone()).collect();
-
-    Self { labels, entries, confirmed_target: None }
-  }
-
-  pub fn confirmed_target(&self) -> Option<&ProblemTarget> {
-    self.confirmed_target.as_ref()
-  }
-}
-
-impl PickerDelegate for ProblemPickerDelegate {
-  fn items(&self) -> &[String] {
-    &self.labels
-  }
-
-  fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
-    self.confirmed_target = Some(self.entries[index].target.clone());
-  }
-
-  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
-    let theme = cx.theme();
-    let entry = &self.entries[index];
-
-    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
-    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
-
-    let marker_color = if selected { theme.accent_foreground } else { theme.red };
-    let marker = picker_marker_base().text_color(marker_color).child("!");
-
-    row.child(marker).child(entry.description.clone())
   }
 }
 

@@ -8,50 +8,9 @@ Test
 
 Review @README.md
 
-Plan the iOS part of phase 1 of the mobile app.
-
----
-
-Two things:
-* The paired mode should have an unpair path
-
-*  Ideally, I will have a build script that will make it so I don't have to use Xcode at all. I don't know if this is possible. If it is, the interface I want is:
-
-./make.sh 
---> calls ./jc-mobile/make.sh
-[eventually it will also do the desktop bundling, but not yet]
-
-./jc-mobile/make.sh
---> calls all the command line versions of xcode build /etc
-
-./jc-mobile/make.sh deploy
---> builds and uploads to my connected phone (I already do this in Xcode with a different app, but I don't like opening up Xcode for it)
-
-Is this possible? Can it be included in the plan?
-
----
-
-I deployed, restarted the app, and the "disconnected" changed to "connection failed" with no message. The desktop console read
-
-mobile client error: IO error: unexpected end of file
-mobile client error: IO error: unexpected end of file
-
-Then I unpaired and paired again, the mobile had "Connecting..." spinning for a long time and the desktop printed
-
-mobile client error: IO error: unexpected end of file
-
-Then eventually the mobile showed a new error.
-
----
-
-I ran and saw the same things in the desktop and app, the logs were:
-❯     xcrun devicectl device process launch --console --device FB7C82EB-5C1A-549D-B981-8D054CF9A584 dev.jc.jc-mobile
-
-03:12:04  Acquired tunnel connection to device.
-03:12:04  Enabling developer disk image services.
-03:12:04  Acquired usage assertion.
-Launched application with dev.jc.jc-mobile bundle identifier.
-Waiting for the application to terminate…
+Make a plan for these issues:
+- [ ] [T] Cmd-; problem cycling: navigate problems within current project, end at WAIT-has-content as the submit signal, fall through to TODO editor at WAIT position when no problems remain ("show me what to do next")
+- [ ] [E] Cmd-: urgency-sorted session picker: same sessions as Cmd-P but sorted by oldest-unattended-problem first, so Enter jumps to the neediest session
 
 ---
 
@@ -60,7 +19,6 @@ Review @README.md
 Optimize the plan for context window usage and parallelization. Branch and fork the context/tasks into parallel jobs as appropriate.
 Limit scope relative to an expectation of how the context window will grow.
 
-XXX the Cmd-N buttons are hard to remember
 XXX make a skill that uses DrawThings? --- use the DT mcp server other places
 
 ---

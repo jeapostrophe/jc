@@ -5,10 +5,10 @@ use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
   LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
-  ProblemPickerDelegate, ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines,
-  SessionPickerDelegate, SessionPickerResult, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker,
-  ShowSnippetPicker, ShowViewPicker, SlugAction, SlugPickerDelegate, SnippetPickerDelegate,
-  SnippetTarget, TodoHeaderPickerDelegate, ViewPickerDelegate,
+  ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines, SessionPickerDelegate,
+  SessionPickerResult, ShowProblemPicker, ShowSessionPicker, ShowSlugPicker, ShowSnippetPicker,
+  ShowViewPicker, SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget,
+  TodoHeaderPickerDelegate, ViewPickerDelegate,
 };
 use crate::views::project_state::ProjectState;
 use crate::views::reply_view::gc_stale_replies;
@@ -618,6 +618,9 @@ impl Workspace {
     }
 
     if ranked.is_empty() {
+      // No problems — go straight to TODO/WAIT.
+      self.last_jumped_target = None;
+      self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
       return;
     }
 
@@ -628,15 +631,25 @@ impl Workspace {
       Some(prev) => {
         let pos = ranked.iter().position(|(_, t)| t == prev);
         match pos {
-          Some(i) => (i + 1) % ranked.len(),
-          None => 0,
+          Some(i) if i + 1 >= ranked.len() => None, // past last → sentinel
+          Some(i) => Some(i + 1),
+          None => Some(0),
         }
       }
-      None => 0,
+      None => Some(0),
     };
 
-    let target = ranked.into_iter().nth(next).unwrap().1;
-    self.jump_to_problem_target(target, window, cx);
+    match next {
+      Some(i) => {
+        let target = ranked.into_iter().nth(i).unwrap().1;
+        self.jump_to_problem_target(target, window, cx);
+      }
+      None => {
+        // End-of-cycle sentinel: jump to TODO/WAIT, reset so next press restarts.
+        self.last_jumped_target = None;
+        self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
+      }
+    }
   }
 
   fn jump_to_problem_target(
@@ -712,6 +725,18 @@ impl Workspace {
             diff_view.update(cx, |v, cx| v.set_file_index(idx, window, cx));
           }
         }
+        ProblemTarget::TodoEditor => {
+          let project = &self.projects[self.active_project_index];
+          let tv = project.todo_view.read(cx);
+          if let Some(slug) = project.active_slug() {
+            let text = tv.editor_text(cx);
+            if let Some(wait_line) = tv.document().wait_body_end_line(slug, &text) {
+              let wait_line_0 = wait_line.saturating_sub(1);
+              let _ = tv;
+              project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
+            }
+          }
+        }
         _ => {}
       }
 
@@ -729,11 +754,8 @@ impl Workspace {
       return;
     }
 
-    let project = &self.projects[self.active_project_index];
-    let session_problems: &[_] =
-      project.active_session().map(|s| s.problems.as_slice()).unwrap_or(&[]);
-    let delegate = ProblemPickerDelegate::new(session_problems, &project.problems);
-
+    let delegate =
+      SessionPickerDelegate::new_urgency_sorted(&self.projects, self.active_project_index);
     let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
     self.pre_picker_focus = window.focused(cx);
 
@@ -741,13 +763,20 @@ impl Workspace {
       cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
         match event {
           PickerEvent::Confirmed => {
-            let target = picker_entity.read(cx).delegate().confirmed_target().cloned();
-            // jump_to_problem_target sets focus itself; drop stale pre_picker_focus.
+            let Some(result) = picker_entity.read(cx).delegate().confirmed_entry() else {
+              return;
+            };
+            // switch_to_session sets focus itself; drop stale pre_picker_focus.
             this.pre_picker_focus.take();
-            if let Some(target) = target {
-              this.jump_to_problem_target(target, window, cx);
-            }
             this.dismiss_picker();
+            match result {
+              SessionPickerResult::Session(pi, si) => {
+                this.switch_to_session(pi, si, window, cx);
+              }
+              SessionPickerResult::InitProject(pi) => {
+                this.init_empty_project(pi, window, cx);
+              }
+            }
             cx.notify();
           }
           PickerEvent::Dismissed => {
