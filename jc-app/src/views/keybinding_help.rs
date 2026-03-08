@@ -59,6 +59,7 @@ const SECTIONS: &[Section] = &[
       ("Escape", "Cancel"),
       ("Down / Ctrl-N", "Next item"),
       ("Up / Ctrl-P", "Previous item"),
+      ("Cmd-Shift-Bksp", "Remove session"),
     ],
   },
   Section {

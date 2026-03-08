@@ -110,8 +110,11 @@ pub fn parse(text: &str) -> TodoDocument {
       finalize_session(&mut doc, &mut current_session, line_start);
 
       if let Some(rest) = after_h2.strip_prefix("Session ") {
-        // Split on first `: ` to get slug and label.
-        if let Some(colon_pos) = rest.find(": ") {
+        // Skip sessions marked as DELETED.
+        if rest.starts_with("DELETED ") {
+          // Don't create a session for deleted headings.
+        } else if let Some(colon_pos) = rest.find(": ") {
+          // Split on first `: ` to get slug and label.
           let slug = &rest[..colon_pos];
           let label = &rest[colon_pos + ": ".len()..];
 
@@ -254,6 +257,40 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, slug: &str, label:
   new_text.push_str("# Claude\n");
   new_text.push_str(&heading);
   new_text
+}
+
+// ---------------------------------------------------------------------------
+// Session deletion marking
+// ---------------------------------------------------------------------------
+
+/// Mark a session heading as deleted by changing `## Session <slug>:` to
+/// `## Session DELETED <slug>:`. Returns the modified text, or `None` if the
+/// slug was not found in the document.
+pub fn mark_session_deleted(text: &str, doc: &TodoDocument, slug: &str) -> Option<String> {
+  let session = doc.session_by_slug(slug)?;
+  let heading = &text[session.heading_byte_range.clone()];
+  let new_heading =
+    heading.replacen(&format!("## Session {slug}:"), &format!("## Session DELETED {slug}:"), 1);
+  let mut new_text = String::with_capacity(text.len() + "DELETED ".len());
+  new_text.push_str(&text[..session.heading_byte_range.start]);
+  new_text.push_str(&new_heading);
+  new_text.push_str(&text[session.heading_byte_range.end..]);
+  Some(new_text)
+}
+
+/// Unmark a deleted session heading by removing the `DELETED ` prefix from
+/// `## Session DELETED <slug>:`. Scans the raw text since deleted sessions
+/// are not in the parsed document. Returns the modified text, or `None` if
+/// no matching deleted heading was found.
+pub fn unmark_session_deleted(text: &str, slug: &str) -> Option<String> {
+  let needle = format!("## Session DELETED {slug}:");
+  let pos = text.find(&needle)?;
+  let replacement = format!("## Session {slug}:");
+  let mut new_text = String::with_capacity(text.len());
+  new_text.push_str(&text[..pos]);
+  new_text.push_str(&replacement);
+  new_text.push_str(&text[pos + needle.len()..]);
+  Some(new_text)
 }
 
 // ---------------------------------------------------------------------------
@@ -770,6 +807,51 @@ third
     let result = send_from_wait(text, session, 0..0).unwrap();
     assert_eq!(result.message_index, 2);
     assert_eq!(result.message_text, "third");
+  }
+
+  #[test]
+  fn deleted_sessions_are_skipped() {
+    let text = "\
+# Claude
+## Session DELETED old-slug: Old Label
+### WAIT
+stale draft
+## Session active: Active Session
+### WAIT
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions.len(), 1);
+    assert_eq!(doc.sessions[0].slug, "active");
+  }
+
+  #[test]
+  fn mark_session_deleted_roundtrip() {
+    let text = "\
+# Claude
+## Session my-slug: My Label
+### WAIT
+draft
+";
+    let doc = parse(text);
+    let marked = mark_session_deleted(text, &doc, "my-slug").unwrap();
+    assert!(marked.contains("## Session DELETED my-slug: My Label"));
+
+    // Marked session should be skipped when parsed.
+    let doc2 = parse(&marked);
+    assert!(doc2.sessions.is_empty());
+
+    // Unmark should restore it.
+    let restored = unmark_session_deleted(&marked, "my-slug").unwrap();
+    assert!(restored.contains("## Session my-slug: My Label"));
+    let doc3 = parse(&restored);
+    assert_eq!(doc3.sessions.len(), 1);
+    assert_eq!(doc3.sessions[0].slug, "my-slug");
+  }
+
+  #[test]
+  fn unmark_nonexistent_returns_none() {
+    let text = "## Session active: Active\n";
+    assert!(unmark_session_deleted(text, "active").is_none());
   }
 
   #[test]

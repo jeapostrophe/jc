@@ -1,25 +1,21 @@
 # TODO
 
 # Claude
-## Session delightful-wibbling-pond: Revise the session attach picker to inspect something about the files to give con...
+## Session tender-enchanting-willow: How does a session get removed from jc's internal tracking? Is it just when it is...
+### WAIT
+## Session DELETED delightful-wibbling-pond: Revise the session attach picker to inspect something about the files to give con...
 ### WAIT
 Test
 # Notes
 
 Review @README.md
 
-Make a plan to solve these issues:
-- [ ] [E] Implement independent scroll positions per project (go back to a project and everything is as you left it)
-
-Optimize the plan for context window usage and parallelization. Branch and fork the context/tasks into parallel jobs as appropriate.
-Limit scope relative to an expectation of how the context window will grow.
-
----
-
-* The help-overlay should be taller and wider (two column) to show everything without scrolling
-* 
-
----
+Code:
+- I think the session state should change from Vec<SessionState> to HashMap<Slug, SessionState>; that would be cleaner and less error prone when making this change
+UI:
+- Yes, session picker is the place with Cmd-backspace as the key (remember, it is a picker, so delete is already available in the filter)
+TODO:
+- I think "Remove drives TODO" is best, but it should not delete it, it should mark it in a way that future invocations will ignore it, like "DELETED" or something. This same marking would be undone if the session were attached again.
 
 XXX unified picker for everything with quick filtering once it is open
 

@@ -112,11 +112,14 @@ impl Workspace {
             this.pre_picker_focus.take();
             this.dismiss_picker();
             match result {
-              SessionPickerResult::Session(pi, si) => {
-                this.switch_to_session(pi, si, window, cx);
+              SessionPickerResult::Session(pi, slug) => {
+                this.switch_to_session(pi, Some(slug), window, cx);
               }
               SessionPickerResult::InitProject(pi) => {
                 this.init_empty_project(pi, window, cx);
+              }
+              SessionPickerResult::Removed(pi, slug) => {
+                this.remove_session(pi, &slug, window, cx);
               }
             }
             cx.notify();
@@ -161,9 +164,9 @@ impl Workspace {
             let action =
               picker_entity.read(cx).delegate().confirmed_entry().map(|e| e.action.clone());
             match action {
-              Some(SlugAction::Switch(session_idx)) => {
+              Some(SlugAction::Switch(slug)) => {
                 this.pre_picker_focus.take();
-                this.switch_to_session(project_idx, session_idx, window, cx);
+                this.switch_to_session(project_idx, Some(slug), window, cx);
               }
               Some(SlugAction::Attach(slug, label)) => {
                 this.pre_picker_focus.take();

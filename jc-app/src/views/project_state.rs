@@ -8,7 +8,7 @@ use jc_core::session::discover_latest_session_group;
 use jc_core::status_script;
 use jc_core::todo;
 use jc_terminal::Palette;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -24,8 +24,8 @@ pub struct SavedPaneLayout {
 pub struct ProjectState {
   pub path: PathBuf,
   pub name: String,
-  pub sessions: Vec<SessionState>,
-  pub active_session_index: Option<usize>,
+  pub sessions: HashMap<String, SessionState>,
+  pub active_session_slug: Option<String>,
   pub todo_view: Entity<TodoView>,
   pub diff_view: Entity<DiffView>,
   pub code_view: Entity<CodeView>,
@@ -70,33 +70,35 @@ impl ProjectState {
       })
       .collect();
 
-    let mut sessions = Vec::new();
+    let mut sessions = HashMap::new();
     for todo_session in &document.sessions {
       if invalid_slugs.contains(&todo_session.slug) {
         continue;
       }
-      sessions.push(SessionState::create(
+      let state = SessionState::create(
         todo_session.slug.clone(),
         todo_session.label.clone(),
         &path,
         palette,
         window,
         cx,
-      ));
+      );
+      sessions.insert(todo_session.slug.clone(), state);
     }
 
-    let active_session_index = if sessions.is_empty() { None } else { Some(0) };
+    let active_session_slug =
+      document.sessions.iter().find(|s| sessions.contains_key(&s.slug)).map(|s| s.slug.clone());
 
     // Highlight the initial active session in the TODO view.
-    if let Some(slug) = active_session_index.and_then(|i| sessions.get(i)).map(|s| s.slug.clone()) {
-      todo_view.update(cx, |tv, cx| tv.set_active_slug(Some(&slug), cx));
+    if let Some(slug) = &active_session_slug {
+      todo_view.update(cx, |tv, cx| tv.set_active_slug(Some(slug), cx));
     }
 
     Self {
       path,
       name,
       sessions,
-      active_session_index,
+      active_session_slug,
       todo_view,
       diff_view,
       code_view,
@@ -108,11 +110,15 @@ impl ProjectState {
   }
 
   pub fn active_session(&self) -> Option<&SessionState> {
-    self.active_session_index.and_then(|i| self.sessions.get(i))
+    self.active_session_slug.as_ref().and_then(|slug| self.sessions.get(slug))
+  }
+
+  pub fn active_session_mut(&mut self) -> Option<&mut SessionState> {
+    self.active_session_slug.as_ref().and_then(|slug| self.sessions.get_mut(slug))
   }
 
   pub fn active_slug(&self) -> Option<&str> {
-    self.active_session().map(|s| s.slug.as_str())
+    self.active_session_slug.as_deref()
   }
 
   /// Refresh problems for all sessions and the project itself.
@@ -122,7 +128,7 @@ impl ProjectState {
     let todo_problems = todo_view.problems();
 
     let mut changed = false;
-    for session in &mut self.sessions {
+    for session in self.sessions.values_mut() {
       changed |= session.refresh_problems(todo_problems);
     }
 

@@ -78,8 +78,9 @@ impl Workspace {
       .enumerate()
       .flat_map(|(pi, p)| {
         let project_descs: Vec<String> = p.problems.iter().map(|pr| pr.description()).collect();
-        p.sessions.iter().enumerate().filter_map(move |(si, s)| {
-          let is_active = pi == self.active_project_index && Some(si) == p.active_session_index;
+        p.sessions.iter().filter_map(move |(slug, s)| {
+          let is_active = pi == self.active_project_index
+            && p.active_session_slug.as_deref() == Some(slug.as_str());
           if is_active {
             return None;
           }

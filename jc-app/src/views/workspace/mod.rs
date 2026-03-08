@@ -384,31 +384,31 @@ impl Workspace {
   fn subscribe_bells(projects: &[ProjectState], cx: &mut Context<Self>) -> Vec<Subscription> {
     let mut subs = Vec::new();
     for (pi, project) in projects.iter().enumerate() {
-      for (si, session) in project.sessions.iter().enumerate() {
-        subs.push(Self::make_bell_subscription(&session.claude_terminal, pi, si, cx));
+      for (slug, session) in &project.sessions {
+        subs.push(Self::make_bell_subscription(&session.claude_terminal, pi, slug.clone(), cx));
       }
     }
     subs
   }
 
   /// Subscribe to bell events for a single newly-created session.
-  fn subscribe_session_bell(&mut self, pi: usize, si: usize, cx: &mut Context<Self>) {
-    let terminal = &self.projects[pi].sessions[si].claude_terminal;
-    let sub = Self::make_bell_subscription(terminal, pi, si, cx);
+  fn subscribe_session_bell(&mut self, pi: usize, slug: &str, cx: &mut Context<Self>) {
+    let terminal = &self.projects[pi].sessions[slug].claude_terminal;
+    let sub = Self::make_bell_subscription(terminal, pi, slug.to_string(), cx);
     self._bell_subscriptions.push(sub);
   }
 
   fn make_bell_subscription(
     terminal: &Entity<TerminalView>,
     pi: usize,
-    si: usize,
+    slug: String,
     cx: &mut Context<Self>,
   ) -> Subscription {
     cx.subscribe(
       terminal,
       move |this: &mut Self, _, event: &TerminalViewEvent, cx: &mut Context<Self>| match event {
         TerminalViewEvent::Bell => {
-          if let Some(session) = this.projects.get_mut(pi).and_then(|p| p.sessions.get_mut(si)) {
+          if let Some(session) = this.projects.get_mut(pi).and_then(|p| p.sessions.get_mut(&slug)) {
             session.pending_events.insert(PendingEvent::TerminalBell);
           }
           cx.notify();
@@ -461,7 +461,7 @@ impl Workspace {
   fn update_terminal_palettes(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
     let palette = Palette::for_appearance(appearance);
     for project in &self.projects {
-      for session in &project.sessions {
+      for session in project.sessions.values() {
         session.claude_terminal.update(cx, |view, _cx| {
           view.set_palette(palette.clone());
         });
@@ -554,13 +554,10 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     // Clear bell when user switches to the claude terminal.
-    if kind == PaneContentKind::ClaudeTerminal {
-      let si = self.projects[self.active_project_index].active_session_index;
-      if let Some(si) = si
-        && let Some(session) = self.projects[self.active_project_index].sessions.get_mut(si)
-      {
-        session.pending_events.remove(&PendingEvent::TerminalBell);
-      }
+    if kind == PaneContentKind::ClaudeTerminal
+      && let Some(session) = self.projects[self.active_project_index].active_session_mut()
+    {
+      session.pending_events.remove(&PendingEvent::TerminalBell);
     }
 
     // Refresh views that need it when actively switched to.
@@ -699,8 +696,8 @@ impl Workspace {
 
     // If the project is already loaded, just switch to it.
     if let Some(idx) = self.projects.iter().position(|p| p.path == canonical) {
-      let session_idx = self.projects[idx].active_session_index.unwrap_or(0);
-      self.switch_to_session(idx, session_idx, window, cx);
+      let slug = self.projects[idx].active_session_slug.clone();
+      self.switch_to_session(idx, slug, window, cx);
       return;
     }
 
@@ -718,8 +715,8 @@ impl Workspace {
     self.projects.push(project);
 
     let project_idx = self.projects.len() - 1;
-    let session_idx = self.projects[project_idx].active_session_index.unwrap_or(0);
-    self.switch_to_session(project_idx, session_idx, window, cx);
+    let slug = self.projects[project_idx].active_session_slug.clone();
+    self.switch_to_session(project_idx, slug, window, cx);
 
     // Persist to state.toml.
     if let Ok(mut state) = jc_core::config::load_state() {
@@ -735,7 +732,7 @@ impl Workspace {
   fn switch_to_session(
     &mut self,
     project_idx: usize,
-    session_idx: usize,
+    slug: Option<String>,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -752,16 +749,15 @@ impl Workspace {
     }
 
     self.active_project_index = project_idx;
-    self.projects[project_idx].active_session_index = Some(session_idx);
+    self.projects[project_idx].active_session_slug = slug.clone();
 
     // Acknowledge pending events for this session (user is switching to it).
-    if let Some(session) = self.projects[project_idx].sessions.get_mut(session_idx) {
+    if let Some(session) = self.projects[project_idx].active_session_mut() {
       session.acknowledge();
     }
 
     // Update the TODO view's active session highlight.
     {
-      let slug = self.projects[project_idx].sessions.get(session_idx).map(|s| s.slug.clone());
       let todo_view = self.projects[project_idx].todo_view.clone();
       todo_view.update(cx, |tv, cx| tv.set_active_slug(slug.as_deref(), cx));
     }
@@ -785,11 +781,9 @@ impl Workspace {
   /// Find a session by slug across all projects and switch to it.
   fn switch_to_slug(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
     for (pi, project) in self.projects.iter().enumerate() {
-      for (si, session) in project.sessions.iter().enumerate() {
-        if session.slug == slug {
-          self.switch_to_session(pi, si, window, cx);
-          return;
-        }
+      if project.sessions.contains_key(slug) {
+        self.switch_to_session(pi, Some(slug.to_string()), window, cx);
+        return;
       }
     }
   }
@@ -910,9 +904,13 @@ impl Workspace {
     let todo_view = self.projects[project_idx].todo_view.clone();
     let project_path = self.projects[project_idx].path.clone();
 
-    // Insert heading in TODO.md.
+    // Try to unmark a previously deleted heading first; if not found, insert new.
     todo_view.update(cx, |tv, cx| {
-      tv.insert_session_heading(slug, label, window, cx);
+      tv.unmark_session_deleted(slug, window, cx);
+      // If unmark didn't find a deleted heading, insert a new one.
+      if tv.document().session_by_slug(slug).is_none() {
+        tv.insert_session_heading(slug, label, window, cx);
+      }
       tv.save(cx);
     });
 
@@ -927,11 +925,11 @@ impl Workspace {
       cx,
     );
 
+    let slug_owned = slug.to_string();
     let project = &mut self.projects[project_idx];
-    project.sessions.push(session);
-    let new_idx = project.sessions.len() - 1;
-    self.subscribe_session_bell(project_idx, new_idx, cx);
-    self.switch_to_session(project_idx, new_idx, window, cx);
+    project.sessions.insert(slug_owned.clone(), session);
+    self.subscribe_session_bell(project_idx, &slug_owned, cx);
+    self.switch_to_session(project_idx, Some(slug_owned), window, cx);
   }
 
   /// Launch a brand new Claude session (no --resume), detect the slug once
@@ -952,6 +950,10 @@ impl Workspace {
       discover_session_groups(&project_path).into_iter().map(|g| g.slug).collect();
 
     // Create a session that runs plain `claude` (no resume).
+    // Use a unique pending key until the real slug is discovered.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PENDING_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pending_slug = format!("__pending_{}__", PENDING_COUNTER.fetch_add(1, Ordering::Relaxed));
     let palette = palette_from_window(window);
     let session = SessionState::create(
       String::new(), // empty slug -> falls back to plain `claude`
@@ -963,10 +965,9 @@ impl Workspace {
     );
 
     let project = &mut self.projects[project_idx];
-    project.sessions.push(session);
-    let new_idx = project.sessions.len() - 1;
-    self.subscribe_session_bell(project_idx, new_idx, cx);
-    self.switch_to_session(project_idx, new_idx, window, cx);
+    project.sessions.insert(pending_slug.clone(), session);
+    self.subscribe_session_bell(project_idx, &pending_slug, cx);
+    self.switch_to_session(project_idx, Some(pending_slug.clone()), window, cx);
 
     // Poll for the new JSONL file in the background. Once a new slug appears,
     // update the session and insert a TODO heading.
@@ -987,15 +988,27 @@ impl Workspace {
         .flatten();
 
         if let Some(slug) = new_slug {
+          let pending = pending_slug.clone();
           let _ = this.update_in(cx, |workspace, window, cx| {
             let project = &mut workspace.projects[project_idx];
-            project.sessions[new_idx].slug = slug.clone();
-            project.sessions[new_idx].label = slug.clone();
 
-            // Update the reply view to track the new slug.
-            project.sessions[new_idx].reply_view.update(cx, |rv, cx| {
-              rv.set_session_slug(Some(slug.clone()), window, cx);
-            });
+            // Re-key the session from the pending key to the real slug.
+            if let Some(mut session) = project.sessions.remove(&pending) {
+              session.slug = slug.clone();
+              session.label = slug.clone();
+
+              // Update the reply view to track the new slug.
+              session.reply_view.update(cx, |rv, cx| {
+                rv.set_session_slug(Some(slug.clone()), window, cx);
+              });
+
+              project.sessions.insert(slug.clone(), session);
+
+              // Update active slug if it was pointing at the pending key.
+              if project.active_session_slug.as_ref() == Some(&pending) {
+                project.active_session_slug = Some(slug.clone());
+              }
+            }
 
             // Insert TODO heading.
             let todo_view = project.todo_view.clone();
@@ -1003,6 +1016,9 @@ impl Workspace {
               tv.insert_session_heading(&slug, &slug, window, cx);
               tv.save(cx);
             });
+
+            // Rebuild bell subscriptions since the key changed.
+            workspace._bell_subscriptions = Self::subscribe_bells(&workspace.projects, cx);
 
             cx.notify();
           });
@@ -1034,6 +1050,44 @@ impl Workspace {
       // No JSONL files — launch a fresh Claude session.
       self.create_new_session(project_idx, window, cx);
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Session removal
+  // ---------------------------------------------------------------------------
+
+  fn remove_session(
+    &mut self,
+    project_idx: usize,
+    slug: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let project = &mut self.projects[project_idx];
+
+    // Remove the session state (drops terminals).
+    project.sessions.remove(slug);
+
+    // Mark the session as deleted in TODO.md so it won't reappear on restart.
+    let todo_view = project.todo_view.clone();
+    todo_view.update(cx, |tv, cx| {
+      tv.mark_session_deleted(slug, window, cx);
+      tv.save(cx);
+    });
+
+    // If the removed session was active, pick another one.
+    if project.active_session_slug.as_deref() == Some(slug) {
+      // Pick the first remaining session, if any.
+      let next_slug = project.sessions.keys().next().cloned();
+      project.active_session_slug = next_slug;
+    }
+
+    // Rebuild bell subscriptions since a session was removed.
+    self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
+
+    // Switch to the new active session (or clear panes if none).
+    let active_slug = self.projects[project_idx].active_session_slug.clone();
+    self.switch_to_session(project_idx, active_slug, window, cx);
   }
 
   // ---------------------------------------------------------------------------
@@ -1111,15 +1165,13 @@ impl Workspace {
     let mut matched_label: Option<String> = None;
     if let Some(slug) = &event.slug {
       for project in &mut self.projects {
-        for session in &mut project.sessions {
-          if &session.slug == slug {
-            let is_new = session.pending_events.insert(pending.clone());
-            if is_new {
-              matched_project = Some(project.name.clone());
-              matched_label = Some(session.label.clone());
-            }
-            break;
+        if let Some(session) = project.sessions.get_mut(slug) {
+          let is_new = session.pending_events.insert(pending.clone());
+          if is_new {
+            matched_project = Some(project.name.clone());
+            matched_label = Some(session.label.clone());
           }
+          break;
         }
       }
     }

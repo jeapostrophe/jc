@@ -77,12 +77,14 @@ The slug links a session to a group of Claude Code JSONL files in `~/.claude/pro
 - **Project init:** When a project is first added to jc, the app scans for existing JSONL files. If any exist, the most recent session's slug is adopted and a `## Session <slug>: <slug>` heading is written into TODO.md (using the slug as the initial label). If none exist, the app launches Claude Code fresh, waits for the JSONL file to appear, extracts the slug, and writes the heading.
 - **New session:** From the slug picker (Cmd-Shift-P), the user selects "NEW." The app launches a fresh Claude Code instance, polls for the new JSONL file, discovers the resulting slug, and inserts a `## Session <slug>: <slug>` heading into TODO.md.
 - **Adopt existing:** The slug picker lists discovered slugs from the JSONL directory that aren't yet in TODO.md as "Attach" entries. Selecting one adopts the session, inserting a `## Session <slug>: <slug>` heading.
+- **Remove session:** From the session picker (Cmd-P) or problem picker (Cmd-:), press Cmd-Shift-Backspace to remove the selected session. This drops the session's terminals and marks its TODO.md heading as `## Session DELETED <slug>: <label>`, which the parser skips on future launches. The JSONL files on disk are not deleted.
+- **Re-attach deleted session:** The slug picker shows deleted sessions as "Attach" entries (since their heading is skipped by the parser). Selecting one restores the `DELETED` marker back to a normal heading and re-creates the session state.
 
 To find all JSONL files for a slug, scan the session directory and match on the `slug` field. The most recently modified file in the group is the "active" one.
 
 ### Session Architecture
 
-The app uses an `App -> Projects -> Sessions` hierarchy. Each `ProjectState` owns a TODO file, diff view, code view, and a list of `SessionState` entries. Each `SessionState` has a slug and owns a Claude terminal (resumed via `--resume <uuid>`), a general terminal, and a reply view pre-bound to the slug. The workspace has an active project with an active session; the active session drives which terminals and reply view are shown in the panes. Switching sessions swaps the pane contents without disconnecting terminals.
+The app uses an `App -> Projects -> Sessions` hierarchy. Each `ProjectState` owns a TODO file, diff view, code view, and a `HashMap<String, SessionState>` keyed by slug. Each `SessionState` owns a Claude terminal (resumed via `--resume <uuid>`), a general terminal, and a reply view pre-bound to the slug. The workspace has an active project with an active session slug; the active session drives which terminals and reply view are shown in the panes. Switching sessions swaps the pane contents without disconnecting terminals. Sessions can be removed at runtime via the session picker (Cmd-Shift-Backspace), which drops the `SessionState` and marks the TODO heading as deleted.
 
 Key design points:
 - Separate terminal instances per session (switching sessions does not disconnect terminals)
@@ -410,6 +412,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 | Down / Ctrl-N | Next item |
 | Up / Ctrl-P | Previous item |
 | Page Down / Page Up | Page navigation |
+| Cmd-Shift-Backspace | Remove session (session/problem picker only) |
 
 ### Comment Panel
 

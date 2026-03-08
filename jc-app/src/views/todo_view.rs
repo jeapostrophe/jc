@@ -161,6 +161,37 @@ impl TodoView {
     });
   }
 
+  /// Mark a session heading as deleted in the TODO text.
+  pub fn mark_session_deleted(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+    let text = self.editor_text(cx);
+    if let Some(new_text) = todo::mark_session_deleted(&text, &self.document, slug) {
+      self.code_view.update(cx, |cv, cx| {
+        cv.editor().update(cx, |state, cx| {
+          state.set_value(new_text, window, cx);
+        });
+      });
+      self.revalidate(cx);
+    }
+  }
+
+  /// Unmark a deleted session heading, restoring it to active.
+  pub fn unmark_session_deleted(
+    &mut self,
+    slug: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let text = self.editor_text(cx);
+    if let Some(new_text) = todo::unmark_session_deleted(&text, slug) {
+      self.code_view.update(cx, |cv, cx| {
+        cv.editor().update(cx, |state, cx| {
+          state.set_value(new_text, window, cx);
+        });
+      });
+      self.revalidate(cx);
+    }
+  }
+
   /// Extract the selected text (or entire WAIT body if no selection) from the
   /// active session's WAIT section, wrap it in a new `### Message N` heading,
   /// and update the editor. Returns `(message_text, message_index)` on success.
