@@ -56,7 +56,7 @@ impl Workspace {
 
     let mut title = project.name.clone();
     if let Some(session) = project.active_session() {
-      title = format!("{} > {}", title, session.slug);
+      title = format!("{} > {}", title, session.label);
     }
 
     let project_problem_count = project.problems.len();

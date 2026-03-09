@@ -5,11 +5,13 @@ use crate::render::{CellLayout, TerminalRenderState, measure_cell, paint_termina
 use crate::terminal::{TerminalEvent, TerminalState};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use gpui::{
   App, AsyncApp, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
   InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-  MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
+  MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
+  Styled, Subscription,
   Timer, WeakEntity, Window, actions, canvas, div, px,
 };
 use parking_lot::Mutex;
@@ -462,6 +464,64 @@ impl Render for TerminalView {
           cx.notify();
         }),
       )
+      .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _window, cx| {
+        let delta_lines = match event.delta {
+          gpui::ScrollDelta::Lines(delta) => -delta.y as i32,
+          gpui::ScrollDelta::Pixels(delta) => {
+            let line_height = layout.height;
+            -(delta.y / line_height).round() as i32
+          }
+        };
+        if delta_lines == 0 {
+          return;
+        }
+
+        let mode = this.state.with_term(|t| *t.mode());
+        let has_mouse = mode.intersects(TermMode::MOUSE_MODE);
+        let alt_scroll =
+          mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL);
+
+        if has_mouse || alt_scroll {
+          if alt_scroll && !has_mouse {
+            // Send cursor up/down key sequences
+            let (key, count) = if delta_lines > 0 {
+              (b"\x1b[B" as &[u8], delta_lines as usize) // Down
+            } else {
+              (b"\x1b[A" as &[u8], (-delta_lines) as usize) // Up
+            };
+            for _ in 0..count {
+              let _ = this.pty.write_all(key);
+            }
+          } else {
+            // Send SGR mouse scroll events
+            let button = if delta_lines > 0 { 65 } else { 64 };
+            let count = delta_lines.unsigned_abs() as usize;
+            let (point, _) = this.grid_point_and_side(event.position, layout);
+            let col = point.column.0 + 1;
+            let row = point.line.0 + 1;
+            if mode.contains(TermMode::SGR_MOUSE) {
+              let seq = format!("\x1b[<{button};{col};{row}M");
+              for _ in 0..count {
+                let _ = this.pty.write_all(seq.as_bytes());
+              }
+            } else {
+              let cb = (button + 32) as u8;
+              let cx_byte = (col as u8).saturating_add(32);
+              let cy_byte = (row as u8).saturating_add(32);
+              let seq = [b'\x1b', b'[', b'M', cb, cx_byte, cy_byte];
+              for _ in 0..count {
+                let _ = this.pty.write_all(&seq);
+              }
+            }
+          }
+        } else {
+          // Normal mode: scroll the scrollback buffer
+          this.state.with_term_mut(|term| {
+            term.scroll_display(Scroll::Delta(-delta_lines));
+          });
+        }
+        cx.notify();
+      }))
       .on_key_down(cx.listener({
         let pty = self.pty.clone();
         move |this, event: &KeyDownEvent, _window, _cx| {
@@ -500,7 +560,9 @@ impl Render for TerminalView {
             let mut last = last_size.lock();
             if new_cols > 0 && new_rows > 0 && (new_cols != last.0 || new_rows != last.1) {
               *last = (new_cols, new_rows);
-              let _ = pty_for_resize.resize(new_cols, new_rows);
+              let pixel_width = f32::from(prep_bounds.size.width) as u16;
+              let pixel_height = f32::from(prep_bounds.size.height) as u16;
+              let _ = pty_for_resize.resize(new_cols, new_rows, pixel_width, pixel_height);
               term.resize(crate::terminal::TermDimensions {
                 cols: new_cols as usize,
                 rows: new_rows as usize,
@@ -519,6 +581,6 @@ impl Render for TerminalView {
             paint_terminal(&term, prep_bounds, layout, &render_state, window, cx);
           }
         },
-      ))
+      ).size_full())
   }
 }

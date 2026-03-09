@@ -128,6 +128,18 @@ impl ProjectState {
     let todo_problems = todo_view.problems();
 
     let mut changed = false;
+
+    // Sync session labels from the TODO document.
+    let document = todo_view.document();
+    for todo_session in &document.sessions {
+      if let Some(session) = self.sessions.get_mut(&todo_session.slug) {
+        if session.label != todo_session.label {
+          session.label = todo_session.label.clone();
+          changed = true;
+        }
+      }
+    }
+
     for session in self.sessions.values_mut() {
       changed |= session.refresh_problems(todo_problems);
     }

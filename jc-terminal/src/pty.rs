@@ -77,8 +77,8 @@ impl PtyHandle {
   }
 
   /// Resize the PTY.
-  pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-    self.master.lock().resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+  pub fn resize(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> Result<()> {
+    self.master.lock().resize(PtySize { rows, cols, pixel_width, pixel_height })?;
     Ok(())
   }
 }
