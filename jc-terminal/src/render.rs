@@ -70,6 +70,7 @@ pub fn paint_terminal(
   let grid = term.grid();
   let num_lines = grid.screen_lines();
   let num_cols = grid.columns();
+  let display_offset = grid.display_offset() as i32;
   let cursor = grid.cursor.point;
   let cursor_shape = term.cursor_style().shape;
   let show_cursor = term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
@@ -83,7 +84,7 @@ pub fn paint_terminal(
 
   // Pass 1: Paint cell backgrounds
   for line_idx in 0..num_lines {
-    let line = Line(line_idx as i32);
+    let line = Line(line_idx as i32 - display_offset);
     for col_idx in 0..num_cols {
       let col = Column(col_idx);
       let cell = &grid[Point::new(line, col)];
@@ -104,7 +105,7 @@ pub fn paint_terminal(
   // Pass 1.5: Paint selection highlight
   if let Some(ref sel) = state.selection {
     for line_idx in 0..num_lines {
-      let line = Line(line_idx as i32);
+      let line = Line(line_idx as i32 - display_offset);
       for col_idx in 0..num_cols {
         let pt = Point::new(line, Column(col_idx));
         if sel.contains(pt) {
@@ -121,7 +122,7 @@ pub fn paint_terminal(
 
   // Pass 2: Paint text
   for line_idx in 0..num_lines {
-    let line = Line(line_idx as i32);
+    let line = Line(line_idx as i32 - display_offset);
     for col_idx in 0..num_cols {
       let col = Column(col_idx);
       let cell = &grid[Point::new(line, col)];
@@ -169,8 +170,8 @@ pub fn paint_terminal(
     }
   }
 
-  // Pass 3: Paint cursor
-  if show_cursor {
+  // Pass 3: Paint cursor (only when not scrolled into history)
+  if show_cursor && display_offset == 0 {
     let cursor_color = palette.cursor;
     let x = origin.x + layout.width * cursor.column.0 as f32;
     let y = origin.y + layout.height * cursor.line.0 as f32;

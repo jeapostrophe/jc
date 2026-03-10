@@ -24,7 +24,10 @@ const FONT_SIZE_STEP: Pixels = px(2.0);
 const FONT_SIZE_MIN: Pixels = px(8.0);
 const FONT_SIZE_MAX: Pixels = px(72.0);
 
-actions!(terminal, [IncreaseFontSize, DecreaseFontSize, ResetFontSize, Copy, Paste]);
+actions!(
+  terminal,
+  [IncreaseFontSize, DecreaseFontSize, ResetFontSize, Copy, Paste, SendTab, SendShiftTab, SendEnter, SendShiftEnter]
+);
 
 /// Register terminal keybindings. Call once during app initialization.
 pub fn init(cx: &mut App) {
@@ -35,6 +38,11 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-0", ResetFontSize, Some("Terminal")),
     KeyBinding::new("cmd-c", Copy, Some("Terminal")),
     KeyBinding::new("cmd-v", Paste, Some("Terminal")),
+    // Intercept keys that Root or Input contexts would otherwise consume.
+    KeyBinding::new("tab", SendTab, Some("Terminal")),
+    KeyBinding::new("shift-tab", SendShiftTab, Some("Terminal")),
+    KeyBinding::new("enter", SendEnter, Some("Terminal")),
+    KeyBinding::new("shift-enter", SendShiftEnter, Some("Terminal")),
   ]);
 }
 
@@ -370,6 +378,42 @@ impl TerminalView {
     }
   }
 
+  fn send_tab(&mut self, _: &SendTab, _window: &mut Window, _cx: &mut Context<Self>) {
+    self.reset_cursor_blink();
+    self.state.with_term_mut(|term| {
+      term.selection = None;
+      term.scroll_display(Scroll::Bottom);
+    });
+    let _ = self.pty.write_all(b"\t");
+  }
+
+  fn send_shift_tab(&mut self, _: &SendShiftTab, _window: &mut Window, _cx: &mut Context<Self>) {
+    self.reset_cursor_blink();
+    self.state.with_term_mut(|term| {
+      term.selection = None;
+      term.scroll_display(Scroll::Bottom);
+    });
+    let _ = self.pty.write_all(b"\x1b[Z");
+  }
+
+  fn send_enter(&mut self, _: &SendEnter, _window: &mut Window, _cx: &mut Context<Self>) {
+    self.reset_cursor_blink();
+    self.state.with_term_mut(|term| {
+      term.selection = None;
+      term.scroll_display(Scroll::Bottom);
+    });
+    let _ = self.pty.write_all(b"\r");
+  }
+
+  fn send_shift_enter(&mut self, _: &SendShiftEnter, _window: &mut Window, _cx: &mut Context<Self>) {
+    self.reset_cursor_blink();
+    self.state.with_term_mut(|term| {
+      term.selection = None;
+      term.scroll_display(Scroll::Bottom);
+    });
+    let _ = self.pty.write_all(b"\x1b[13;2u");
+  }
+
   fn mouse_down(&mut self, position: gpui::Point<Pixels>, click_count: usize, layout: CellLayout) {
     let (point, side) = self.grid_point_and_side(position, layout);
     let selection_type = match click_count {
@@ -444,6 +488,10 @@ impl Render for TerminalView {
       .on_action(cx.listener(Self::reset_font_size))
       .on_action(cx.listener(Self::copy))
       .on_action(cx.listener(Self::paste))
+      .on_action(cx.listener(Self::send_tab))
+      .on_action(cx.listener(Self::send_shift_tab))
+      .on_action(cx.listener(Self::send_enter))
+      .on_action(cx.listener(Self::send_shift_enter))
       .on_mouse_down(
         MouseButton::Left,
         cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
@@ -528,7 +576,10 @@ impl Render for TerminalView {
           this.reset_cursor_blink();
           let mode = this.state.with_term(|t| *t.mode());
           if let Some(bytes) = keystroke_to_bytes(&event.keystroke, mode) {
-            this.state.with_term_mut(|term| term.selection = None);
+            this.state.with_term_mut(|term| {
+              term.selection = None;
+              term.scroll_display(Scroll::Bottom);
+            });
             let _ = pty.write_all(&bytes);
           }
         }
@@ -554,14 +605,18 @@ impl Render for TerminalView {
                 cx: &mut App| {
             let mut term = term_handle.lock();
 
-            // Detect and apply resize
-            let new_cols = (prep_bounds.size.width / layout.width).floor() as u16;
-            let new_rows = (prep_bounds.size.height / layout.height).floor() as u16;
+            // The layout bounds may be larger than the visible area because
+            // `height: 100%` in the size_full() chain can resolve against the
+            // window rather than the flex-allocated space.  Use the content
+            // mask (set by parent overflow_hidden) to get the true visible size.
+            let visible = prep_bounds.intersect(&window.content_mask().bounds);
+            let new_cols = (visible.size.width / layout.width).floor() as u16;
+            let new_rows = (visible.size.height / layout.height).floor() as u16;
             let mut last = last_size.lock();
             if new_cols > 0 && new_rows > 0 && (new_cols != last.0 || new_rows != last.1) {
               *last = (new_cols, new_rows);
-              let pixel_width = f32::from(prep_bounds.size.width) as u16;
-              let pixel_height = f32::from(prep_bounds.size.height) as u16;
+              let pixel_width = f32::from(visible.size.width) as u16;
+              let pixel_height = f32::from(visible.size.height) as u16;
               let _ = pty_for_resize.resize(new_cols, new_rows, pixel_width, pixel_height);
               term.resize(crate::terminal::TermDimensions {
                 cols: new_cols as usize,
