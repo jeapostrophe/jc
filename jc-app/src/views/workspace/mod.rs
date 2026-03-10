@@ -809,7 +809,7 @@ impl Workspace {
     } else {
       // First visit: default layout.
       self.set_pane_view(0, PaneContentKind::ClaudeTerminal, cx);
-      self.set_pane_view(1, PaneContentKind::GeneralTerminal, cx);
+      self.set_pane_view(1, PaneContentKind::TodoEditor, cx);
       self.panes[0].read(cx).focus_content(window);
       self.active_pane_index = 0;
     }

@@ -71,30 +71,23 @@ impl Workspace {
     let active_project_problems: Vec<String> =
       project.problems.iter().map(|p| p.description()).collect();
 
-    // Collect problems for all OTHER sessions, grouped by project > session.
-    let other_problems: Vec<(String, Vec<String>)> = self
+    // Collect project names that have problems (excluding active session).
+    let other_project_names: Vec<String> = self
       .projects
       .iter()
       .enumerate()
-      .flat_map(|(pi, p)| {
-        let project_descs: Vec<String> = p.problems.iter().map(|pr| pr.description()).collect();
-        p.sessions.iter().filter_map(move |(slug, s)| {
-          let is_active = pi == self.active_project_index
+      .filter(|(pi, p)| {
+        let has_project_problems = !p.problems.is_empty();
+        let has_session_problems = p.sessions.iter().any(|(slug, s)| {
+          let is_active = *pi == self.active_project_index
             && p.active_session_slug.as_deref() == Some(slug.as_str());
-          if is_active {
-            return None;
-          }
-          let mut descs: Vec<String> = s.problems.iter().map(|sp| sp.description()).collect();
-          descs.extend(project_descs.clone());
-          if descs.is_empty() {
-            return None;
-          }
-          let header = format!("{} > {}", p.name, s.slug);
-          Some((header, descs))
-        })
+          !is_active && !s.problems.is_empty()
+        });
+        has_project_problems || has_session_problems
       })
+      .map(|(_, p)| p.name.clone())
       .collect();
-    let other_sessions_with_problems = other_problems.len();
+    let other_sessions_with_problems = other_project_names.len();
 
     let title_el = {
       let el =
@@ -115,14 +108,21 @@ impl Workspace {
                 let fg = theme.foreground;
                 let dim = theme.muted_foreground;
                 let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
-                for desc in &session_problems {
-                  col = col.child(div().text_color(fg).child(desc.clone()));
+                let all_descs: Vec<&String> = session_problems
+                  .iter()
+                  .chain(project_problems.iter())
+                  .collect();
+                let total = all_descs.len();
+                let limit = 10;
+                for desc in all_descs.iter().take(limit) {
+                  col = col.child(div().text_color(fg).child((*desc).clone()));
                 }
-                if !session_problems.is_empty() && !project_problems.is_empty() {
-                  col = col.child(div().text_color(dim).child("—"));
-                }
-                for desc in &project_problems {
-                  col = col.child(div().text_color(fg).child(desc.clone()));
+                if total > limit {
+                  col = col.child(
+                    div()
+                      .text_color(dim)
+                      .child(format!("…and {} more", total - limit)),
+                  );
                 }
                 col
               })
@@ -137,7 +137,7 @@ impl Workspace {
     let right_el = {
       let mut el = div().flex().items_center().ml_auto().gap_2();
       if other_sessions_with_problems > 0 {
-        let other = other_problems.clone();
+        let names = other_project_names.clone();
         el = el.child(
           div()
             .id("global-problems")
@@ -145,20 +145,13 @@ impl Workspace {
             .text_color(theme.yellow)
             .child(other_sessions_with_problems.to_string())
             .tooltip(move |window, cx| {
-              let other = other.clone();
+              let names = names.clone();
               Tooltip::element(move |_window, cx| {
                 let theme = cx.theme();
                 let fg = theme.foreground;
-                let dim = theme.muted_foreground;
                 let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
-                for (i, (header, descs)) in other.iter().enumerate() {
-                  if i > 0 {
-                    col = col.child(div().text_color(dim).child("—"));
-                  }
-                  col = col.child(div().text_color(dim).child(header.clone()));
-                  for desc in descs {
-                    col = col.child(div().text_color(fg).pl_2().child(desc.clone()));
-                  }
+                for name in &names {
+                  col = col.child(div().text_color(fg).child(name.clone()));
                 }
                 col
               })
