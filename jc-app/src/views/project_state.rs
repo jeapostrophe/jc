@@ -21,6 +21,12 @@ pub struct SavedPaneLayout {
   pub layout: PaneLayout,
 }
 
+/// A pending rekey from a `/clear` event: waiting for the new JSONL to get a slug.
+pub struct PendingRekey {
+  pub old_slug: String,
+  pub new_session_id: String,
+}
+
 pub struct ProjectState {
   pub path: PathBuf,
   pub name: String,
@@ -33,6 +39,8 @@ pub struct ProjectState {
   pub script_problems: Vec<ScriptProblem>,
   pub last_script_run: Option<Instant>,
   pub saved_layout: Option<SavedPaneLayout>,
+  /// Pending session rekeys from `/clear` events, awaiting slug resolution.
+  pub pending_rekeys: Vec<PendingRekey>,
 }
 
 impl ProjectState {
@@ -106,6 +114,7 @@ impl ProjectState {
       script_problems: Vec::new(),
       last_script_run: None,
       saved_layout: None,
+      pending_rekeys: Vec::new(),
     }
   }
 

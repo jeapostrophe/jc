@@ -57,6 +57,41 @@ pub fn install_hooks(project_path: &Path, port: u16) -> Result<()> {
     .expect("PermissionRequest should be an array")
     .push(permission_entry);
 
+  // SessionEnd hook (detect /clear) — only "command" type is supported.
+  // The hook receives JSON on stdin with session_id, reason, cwd, etc.
+  let session_end_entry = serde_json::json!({
+      "hooks": [{
+        "type": "command",
+        "command": format!(
+          "curl -sf -X POST {base}session-end -H 'Content-Type: application/json' -d @-"
+        ),
+        "timeout": 5
+      }]
+  });
+  hooks_obj
+    .entry("SessionEnd")
+    .or_insert_with(|| Value::Array(Vec::new()))
+    .as_array_mut()
+    .expect("SessionEnd should be an array")
+    .push(session_end_entry);
+
+  // SessionStart hook (detect new session after /clear) — only "command" type is supported.
+  let session_start_entry = serde_json::json!({
+      "hooks": [{
+        "type": "command",
+        "command": format!(
+          "curl -sf -X POST {base}session-start -H 'Content-Type: application/json' -d @-"
+        ),
+        "timeout": 5
+      }]
+  });
+  hooks_obj
+    .entry("SessionStart")
+    .or_insert_with(|| Value::Array(Vec::new()))
+    .as_array_mut()
+    .expect("SessionStart should be an array")
+    .push(session_start_entry);
+
   write_settings(&settings_path, &settings)
 }
 

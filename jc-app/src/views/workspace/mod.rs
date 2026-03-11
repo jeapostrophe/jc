@@ -13,11 +13,12 @@ use gpui_component::theme::Theme;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
 use jc_core::problem::ProblemTarget;
+use jc_core::session;
 use jc_core::snippets::{self, SnippetDocument};
 use jc_core::theme::Appearance;
 use jc_terminal::{Palette, TerminalView, TerminalViewEvent};
 use std::ops::DerefMut;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 actions!(
@@ -187,15 +188,11 @@ impl Workspace {
         }
         // Spawn async task to consume hook events.
         let rx = server.rx.clone();
-        let task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        let task = cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
           while let Ok(event) = rx.recv_async().await {
-            let Ok(should_continue) = cx.update(|cx: &mut App| {
-              if let Some(entity) = this.upgrade() {
-                entity.update(cx, |view, cx| view.handle_hook_event(event, cx));
-                true
-              } else {
-                false
-              }
+            let Ok(should_continue) = this.update_in(cx, |view, window, cx| {
+              view.handle_hook_event(event, window, cx);
+              true
             }) else {
               break;
             };
@@ -1151,13 +1148,35 @@ impl Workspace {
   // Hook events
   // ---------------------------------------------------------------------------
 
-  fn handle_hook_event(&mut self, event: HookEvent, cx: &mut Context<Self>) {
+  fn handle_hook_event(
+    &mut self,
+    event: HookEvent,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
     eprintln!("hook: {:?} session={} slug={:?}", event.kind, event.session_id, event.slug);
+
+    // On every hook event, try to resolve any pending rekeys.
+    self.drain_pending_rekeys(window, cx);
+
+    // Handle session clear: re-key the session from old slug to new slug.
+    if let HookEventKind::SessionClear { ref old_session_id, ref new_session_id } = event.kind {
+      self.handle_session_clear(
+        event.project_path.as_deref(),
+        old_session_id,
+        new_session_id,
+        window,
+        cx,
+      );
+      cx.notify();
+      return;
+    }
 
     let pending = match event.kind {
       HookEventKind::Stop => PendingEvent::ClaudeStop,
       HookEventKind::PermissionPrompt => PendingEvent::ClaudePermission,
       HookEventKind::IdlePrompt => PendingEvent::ClaudeIdle,
+      HookEventKind::SessionClear { .. } => unreachable!(),
     };
 
     // Match the slug to a session across all projects.
@@ -1186,11 +1205,135 @@ impl Workspace {
         HookEventKind::Stop => "Claude finished",
         HookEventKind::PermissionPrompt => "Permission needed",
         HookEventKind::IdlePrompt => "Claude is idle",
+        HookEventKind::SessionClear { .. } => unreachable!(),
       };
       crate::notify::notify(&title, message, critical, event.slug.as_deref());
     }
 
     cx.notify();
+  }
+
+  /// Handle a `/clear` event: the old session ended and a new one started in
+  /// the same Claude process. Mark the old TODO heading deleted, then poll for
+  /// the new slug to appear (it's written on the first assistant response).
+  fn handle_session_clear(
+    &mut self,
+    project_path: Option<&Path>,
+    old_session_id: &str,
+    new_session_id: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(project_path) = project_path else {
+      eprintln!("hook: session-clear with no project path");
+      return;
+    };
+
+    // Find the project.
+    let Some(project_idx) = self.projects.iter().position(|p| p.path == project_path) else {
+      eprintln!("hook: session-clear for unknown project {}", project_path.display());
+      return;
+    };
+
+    // Resolve old slug from old_session_id.
+    let old_slug =
+      session::session_id_to_slug(project_path, old_session_id).unwrap_or_default();
+
+    if old_slug.is_empty() || !self.projects[project_idx].sessions.contains_key(&old_slug) {
+      eprintln!("hook: session-clear for unknown slug (old_session_id={old_session_id})");
+      return;
+    }
+
+    eprintln!("hook: session cleared, old slug={old_slug}, polling for new slug...");
+
+    // Mark old heading deleted immediately so the stale slug doesn't persist.
+    let todo_view = self.projects[project_idx].todo_view.clone();
+    todo_view.update(cx, |tv, cx| {
+      tv.mark_session_deleted(&old_slug, window, cx);
+      tv.save(cx);
+    });
+
+    // The new slug won't be written until Claude streams a real response.
+    // Store a pending rekey; it will be resolved on the next Stop event
+    // (or any hook event) when the slug becomes available.
+    self.projects[project_idx].pending_rekeys.push(
+      crate::views::project_state::PendingRekey {
+        old_slug: old_slug.to_string(),
+        new_session_id: new_session_id.to_string(),
+      },
+    );
+    eprintln!("hook: queued pending rekey old_slug={old_slug} new_session_id={new_session_id}");
+  }
+
+  /// Re-key a session from `old_slug` to `new_slug`: update the sessions map,
+  /// TODO.md headings, reply view, and bell subscriptions.
+  fn rekey_session(
+    &mut self,
+    project_idx: usize,
+    old_slug: &str,
+    new_slug: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let project = &mut self.projects[project_idx];
+
+    let Some(mut session) = project.sessions.remove(old_slug) else {
+      return;
+    };
+
+    eprintln!("hook: rekeying session {old_slug} → {new_slug}");
+
+    session.slug = new_slug.to_string();
+    session.label = new_slug.to_string();
+
+    // Point reply view at new slug's JSONL files.
+    session.reply_view.update(cx, |rv, cx| {
+      rv.set_session_slug(Some(new_slug.to_string()), window, cx);
+    });
+
+    project.sessions.insert(new_slug.to_string(), session);
+
+    // Update active slug if it pointed at the old one.
+    if project.active_session_slug.as_deref() == Some(old_slug) {
+      project.active_session_slug = Some(new_slug.to_string());
+    }
+
+    // Update TODO.md: insert new heading (old heading was already marked
+    // deleted by handle_session_clear).
+    let todo_view = project.todo_view.clone();
+    todo_view.update(cx, |tv, cx| {
+      tv.insert_session_heading(new_slug, new_slug, window, cx);
+      tv.save(cx);
+    });
+
+    // Rebuild bell subscriptions since the key changed.
+    self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
+
+    cx.notify();
+  }
+
+  /// Try to resolve pending rekeys across all projects.
+  /// Called on every hook event — slugs appear in JSONL only after Claude
+  /// streams a real response, which triggers a Stop hook.
+  fn drain_pending_rekeys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    for project_idx in 0..self.projects.len() {
+      let project = &self.projects[project_idx];
+      let pp = project.path.clone();
+
+      // Collect resolved rekeys.
+      let mut resolved: Vec<(usize, String)> = Vec::new();
+      for (i, pending) in project.pending_rekeys.iter().enumerate() {
+        if let Some(new_slug) = session::session_id_to_slug(&pp, &pending.new_session_id) {
+          resolved.push((i, new_slug));
+        }
+      }
+
+      // Apply resolved rekeys in reverse order (to preserve indices).
+      for (i, new_slug) in resolved.into_iter().rev() {
+        let old_slug = self.projects[project_idx].pending_rekeys.remove(i).old_slug;
+        self.rekey_session(project_idx, &old_slug, &new_slug, window, cx);
+      }
+    }
   }
 }
 

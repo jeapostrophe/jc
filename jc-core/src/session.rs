@@ -191,15 +191,17 @@ pub fn session_id_to_slug(project_path: &Path, session_id: &str) -> Option<Strin
   if target.exists() { extract_slug(&target) } else { None }
 }
 
-/// Extract the slug from a JSONL file by reading until we find one.
-/// Only reads the first few KB — slugs appear in early entries.
+/// Extract the slug from a JSONL file.
+/// Checks the first 50 lines, then falls back to scanning the last 8 KB
+/// (slugs may not appear until Claude starts streaming a response).
 fn extract_slug(path: &Path) -> Option<String> {
-  use std::io::{BufRead, BufReader};
+  use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
   let file = std::fs::File::open(path).ok()?;
-  let reader = BufReader::new(file);
-  for line in reader.lines().take(20) {
+  let mut reader = BufReader::new(file);
+
+  // Forward scan: first 50 lines.
+  for line in (&mut reader).lines().take(50) {
     let line = line.ok()?;
-    // Fast path: skip lines without "slug" to avoid full JSON parse.
     if !line.contains("\"slug\"") {
       continue;
     }
@@ -209,6 +211,24 @@ fn extract_slug(path: &Path) -> Option<String> {
       return Some(slug);
     }
   }
+
+  // Tail scan: last 8 KB for files where the slug appears later.
+  let file_len = reader.seek(SeekFrom::End(0)).ok()?;
+  let tail_start = file_len.saturating_sub(8192);
+  reader.seek(SeekFrom::Start(tail_start)).ok()?;
+  let mut tail = String::new();
+  reader.read_to_string(&mut tail).ok()?;
+  for line in tail.lines() {
+    if !line.contains("\"slug\"") {
+      continue;
+    }
+    if let Ok(entry) = serde_json::from_str::<RawEntry>(line)
+      && let Some(slug) = entry.slug
+    {
+      return Some(slug);
+    }
+  }
+
   None
 }
 

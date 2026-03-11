@@ -1,5 +1,7 @@
 use crate::session;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
 
 pub const HOOK_PATH_PREFIX: &str = "/jc-hook/";
 
@@ -16,6 +18,8 @@ pub enum HookEventKind {
   Stop,
   IdlePrompt,
   PermissionPrompt,
+  /// A `/clear` was detected: the old session ended and a new one started.
+  SessionClear { old_session_id: String, new_session_id: String },
 }
 
 /// Lightweight HTTP server that receives Claude Code hook POSTs.
@@ -33,6 +37,17 @@ struct HookPayload {
   session_id: Option<String>,
   cwd: Option<String>,
   notification_type: Option<String>,
+  /// SessionEnd reason: "clear", "logout", "prompt_input_exit", etc.
+  reason: Option<String>,
+  /// SessionStart source: "clear", "startup", "resume", "compact".
+  source: Option<String>,
+}
+
+/// Stashed SessionEnd(reason=clear) waiting for matching SessionStart.
+struct ClearStash {
+  old_session_id: String,
+  project_path: Option<PathBuf>,
+  timestamp: Instant,
 }
 
 impl HookServer {
@@ -67,6 +82,10 @@ fn accept_loop(
   tx: flume::Sender<HookEvent>,
   project_paths: &[PathBuf],
 ) {
+  // Stash for correlating SessionEnd(clear) → SessionStart(clear) pairs.
+  // Keyed by project path; entries expire after 10 seconds.
+  let clear_stash: Mutex<Vec<ClearStash>> = Mutex::new(Vec::new());
+
   for mut request in server.incoming_requests() {
     let path = request.url().to_string();
 
@@ -101,6 +120,44 @@ fn accept_loop(
       "stop" => Some(HookEventKind::Stop),
       "notification" => parse_notification_kind(&payload.notification_type),
       "permission" => Some(HookEventKind::PermissionPrompt),
+
+      // SessionEnd with reason=clear: stash the old session_id for pairing.
+      "session-end" if payload.reason.as_deref() == Some("clear") => {
+        let mut stash = clear_stash.lock().unwrap();
+        // Expire stale entries.
+        stash.retain(|s| s.timestamp.elapsed().as_secs() < 10);
+        stash.push(ClearStash {
+          old_session_id: session_id.clone(),
+          project_path: project_path.clone(),
+          timestamp: Instant::now(),
+        });
+        eprintln!("hook: session-end clear, stashed old_session_id={session_id}");
+        None
+      }
+
+      // SessionStart with source=clear: pair with stashed SessionEnd.
+      "session-start" if payload.source.as_deref() == Some("clear") => {
+        let mut stash = clear_stash.lock().unwrap();
+        stash.retain(|s| s.timestamp.elapsed().as_secs() < 10);
+        // Find a stash entry matching this project path.
+        let idx = stash.iter().position(|s| s.project_path == project_path);
+        if let Some(idx) = idx {
+          let stashed = stash.remove(idx);
+          Some(HookEventKind::SessionClear {
+            old_session_id: stashed.old_session_id,
+            new_session_id: session_id.clone(),
+          })
+        } else {
+          eprintln!(
+            "hook: session-start clear with no matching stash, session_id={session_id}"
+          );
+          None
+        }
+      }
+
+      // Ignore other session-start/session-end events.
+      "session-end" | "session-start" => None,
+
       _ => None,
     };
 
