@@ -51,8 +51,8 @@ actions!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneLayout {
   One,
-  #[default]
   Two,
+  #[default]
   Three,
 }
 
@@ -140,8 +140,19 @@ impl Workspace {
       projects.push(ProjectState::create(path, name, &palette, window, cx));
     }
 
+    // Create global TODO view (~/.claude/TODO.md) as a read-only CodeView.
+    let global_todo_path =
+      PathBuf::from(std::env::var("HOME").expect("HOME not set")).join(".claude/TODO.md");
+    let global_todo_view = cx.new(|cx| {
+      let mut cv = crate::views::code_view::CodeView::new(window, cx);
+      if global_todo_path.exists() {
+        cv.open_file(global_todo_path, window, cx);
+      }
+      cv
+    });
+
     // Determine initial pane content from first project's first session.
-    let initial_contents = Self::initial_pane_contents(&projects[0], cx);
+    let initial_contents = Self::initial_pane_contents(&projects[0], &global_todo_view, cx);
     let panes: Vec<Entity<Pane>> = initial_contents
       .into_iter()
       .map(|content| cx.new(|cx| Pane::with_content(content, cx)))
@@ -284,17 +295,6 @@ impl Workspace {
         }
       });
 
-    // Create global TODO view (~/.claude/TODO.md) as a read-only CodeView.
-    let global_todo_path =
-      PathBuf::from(std::env::var("HOME").expect("HOME not set")).join(".claude/TODO.md");
-    let global_todo_view = cx.new(|cx| {
-      let mut cv = crate::views::code_view::CodeView::new(window, cx);
-      if global_todo_path.exists() {
-        cv.open_file(global_todo_path, window, cx);
-      }
-      cv
-    });
-
     // Load snippets and set up file watcher.
     snippets::ensure_file_exists();
     let snippets = snippets::load();
@@ -340,7 +340,11 @@ impl Workspace {
   }
 
   /// Build initial PaneContent for all 3 panes from a project.
-  fn initial_pane_contents(project: &ProjectState, cx: &App) -> Vec<PaneContent> {
+  fn initial_pane_contents(
+    project: &ProjectState,
+    global_todo_view: &Entity<crate::views::code_view::CodeView>,
+    cx: &App,
+  ) -> Vec<PaneContent> {
     let first = if let Some(session) = project.active_session() {
       let focus = session.claude_terminal.read(cx).focus_handle(cx);
       PaneContent {
@@ -357,21 +361,22 @@ impl Workspace {
       }
     };
 
-    let second = if let Some(session) = project.active_session() {
-      let focus = session.general_terminal.read(cx).focus_handle(cx);
+    let second = {
+      let focus = project.todo_view.read(cx).focus_handle(cx);
       PaneContent {
-        kind: PaneContentKind::GeneralTerminal,
-        view: session.general_terminal.clone().into(),
+        kind: PaneContentKind::TodoEditor,
+        view: project.todo_view.clone().into(),
         focus,
       }
-    } else {
-      let focus = project.diff_view.read(cx).focus_handle(cx);
-      PaneContent { kind: PaneContentKind::GitDiff, view: project.diff_view.clone().into(), focus }
     };
 
     let third = {
-      let focus = project.diff_view.read(cx).focus_handle(cx);
-      PaneContent { kind: PaneContentKind::GitDiff, view: project.diff_view.clone().into(), focus }
+      let focus = global_todo_view.read(cx).focus_handle(cx);
+      PaneContent {
+        kind: PaneContentKind::GlobalTodo,
+        view: global_todo_view.clone().into(),
+        focus,
+      }
     };
 
     vec![first, second, third]
@@ -807,6 +812,7 @@ impl Workspace {
       // First visit: default layout.
       self.set_pane_view(0, PaneContentKind::ClaudeTerminal, cx);
       self.set_pane_view(1, PaneContentKind::TodoEditor, cx);
+      self.set_pane_view(2, PaneContentKind::GlobalTodo, cx);
       self.panes[0].read(cx).focus_content(window);
       self.active_pane_index = 0;
     }
