@@ -240,10 +240,10 @@ impl Workspace {
               let mut changed = false;
               // Refresh stale diff views so problem counts reflect git state.
               for project in &mut view.projects {
-                let stale = project.diff_view.read(cx).is_stale();
-                if stale {
-                  project.diff_view.update(cx, |dv, _cx| dv.refresh_data());
-                  changed = true;
+                if project.diff_view.read(cx).is_stale() {
+                  let data_changed =
+                    project.diff_view.update(cx, |dv, _cx| dv.refresh_data());
+                  changed |= data_changed;
                 }
               }
               for project in &mut view.projects {
@@ -672,22 +672,28 @@ impl Workspace {
       self.projects[self.active_project_index].diff_view.update(cx, |v, cx| v.refresh(window, cx));
     }
     self.set_pane_view(pane_idx, kind, cx);
+    self.active_pane_index = pane_idx;
 
-    self.panes[pane_idx].read(cx).focus_content(window);
-
-    // When switching to the TODO editor, auto-scroll to the end of the active session's WAIT body.
+    // When switching to the TODO editor, ensure a WAIT section exists and scroll to it.
     if kind == PaneContentKind::TodoEditor {
       let project = &self.projects[self.active_project_index];
-      let tv = project.todo_view.read(cx);
       if let Some(label) = project.active_label() {
+        let todo_view = project.todo_view.clone();
+        todo_view.update(cx, |tv, cx| tv.ensure_wait(&label, window, cx));
+        let project = &self.projects[self.active_project_index];
+        let tv = project.todo_view.read(cx);
         let text = tv.editor_text(cx);
-        if let Some(wait_line) = tv.document().wait_body_end_line(label, &text) {
+        if let Some(wait_line) = tv.document().wait_body_end_line(&label, &text) {
           let wait_line_0 = wait_line.saturating_sub(1);
           let _ = tv;
           project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
         }
       }
     }
+
+    // Focus last so nothing after can clobber it.
+    self.panes[pane_idx].read(cx).focus_content(window);
+    cx.notify();
   }
 
   fn show_claude_terminal(

@@ -7,6 +7,9 @@ actions!(comment_panel, [ConfirmComment, DismissComment]);
 pub fn init(cx: &mut App) {
   cx.bind_keys([
     KeyBinding::new("cmd-enter", ConfirmComment, Some("CommentPanel")),
+    // Also bind in "Input" context so Cmd-Enter works when the input has
+    // focus — the action bubbles up to the CommentPanel handler.
+    KeyBinding::new("cmd-enter", ConfirmComment, Some("Input")),
     KeyBinding::new("escape", DismissComment, Some("CommentPanel")),
     KeyBinding::new("cmd-w", DismissComment, Some("CommentPanel")),
   ]);

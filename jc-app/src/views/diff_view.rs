@@ -107,20 +107,33 @@ impl DiffView {
     self.show_current_file(window, cx);
   }
 
-  /// Returns true if the git index has changed since the last refresh.
+  /// Returns true if the diff data may have changed since the last refresh.
+  /// For WorkingTree diffs this always returns true because `.git/index`
+  /// mtime only tracks staged changes, not working-tree edits.
   pub fn is_stale(&self) -> bool {
-    git_index_mtime(&self.project_path) != self.git_index_mtime
+    match self.source {
+      DiffSource::WorkingTree => true,
+      DiffSource::Commit { .. } => git_index_mtime(&self.project_path) != self.git_index_mtime,
+    }
   }
 
   /// Refresh diff data without updating the editor display.
   /// Used by the background problem poll to keep file lists current.
-  pub fn refresh_data(&mut self) {
+  /// Returns true if the diff content actually changed.
+  pub fn refresh_data(&mut self) -> bool {
     let diff_text = match &self.source {
       DiffSource::WorkingTree => generate_diff(&self.project_path),
       DiffSource::Commit { oid, .. } => generate_commit_diff(&self.project_path, *oid),
     };
-    self.file_diffs = parse_file_diffs(&diff_text);
+    let new_diffs = parse_file_diffs(&diff_text);
     self.git_index_mtime = git_index_mtime(&self.project_path);
+
+    let changed = new_diffs.len() != self.file_diffs.len()
+      || new_diffs
+        .iter()
+        .zip(self.file_diffs.iter())
+        .any(|(a, b)| a.name != b.name || a.checksum != b.checksum);
+    self.file_diffs = new_diffs;
 
     self.reviewed.retain(|name, checksum| {
       self.file_diffs.iter().any(|fd| fd.name == *name && fd.checksum == *checksum)
@@ -128,6 +141,8 @@ impl DiffView {
 
     self.current_file_index =
       self.file_diffs.iter().position(|fd| !self.is_reviewed(&fd.name)).unwrap_or(0);
+
+    changed
   }
 
   fn show_current_file(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -307,14 +322,15 @@ fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
         diffs.push(FileDiff { name, content: std::mem::take(&mut current_content), checksum });
       }
       let name = rest.split(" b/").next().unwrap_or(rest).to_string();
-      if name == "TODO.md" {
+      if name == "TODO.md" || name == ".claude/settings.local.json" {
         current_name = None;
+        current_content.clear();
         continue;
       }
       current_name = Some(name);
       current_content.push_str(line);
       current_content.push('\n');
-    } else {
+    } else if current_name.is_some() {
       current_content.push_str(line);
       current_content.push('\n');
     }
