@@ -95,7 +95,7 @@ impl CodeView {
       self.language_override.clone().unwrap_or_else(|| Language::from_path(path).name().into());
     self.editor.update(cx, |state, cx| {
       state.set_highlighter(lang, cx);
-      state.set_value(content, window, cx);
+      state.set_value_preserving_position(content, window, cx);
     });
     self.dirty = false;
     self.externally_modified = false;
