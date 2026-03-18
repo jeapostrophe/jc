@@ -8,6 +8,7 @@ use git2::DiffFormat;
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputState};
+use std::ops::Range;
 
 actions!(diff_view, [MarkReviewed]);
 
@@ -55,6 +56,12 @@ pub struct DiffView {
   file_diffs: Vec<FileDiff>,
   current_file_index: usize,
   reviewed: HashMap<String, u64>,
+  /// Mtime of `.git/index` at last refresh, used for staleness detection.
+  git_index_mtime: Option<std::time::SystemTime>,
+}
+
+fn git_index_mtime(project_path: &Path) -> Option<std::time::SystemTime> {
+  std::fs::metadata(project_path.join(".git/index")).ok().and_then(|m| m.modified().ok())
 }
 
 impl DiffView {
@@ -68,6 +75,7 @@ impl DiffView {
       file_diffs: Vec::new(),
       current_file_index: 0,
       reviewed: HashMap::default(),
+      git_index_mtime: None,
     };
     view.refresh(window, cx);
     view
@@ -85,6 +93,7 @@ impl DiffView {
       DiffSource::Commit { oid, .. } => generate_commit_diff(&self.project_path, *oid),
     };
     self.file_diffs = parse_file_diffs(&diff_text);
+    self.git_index_mtime = git_index_mtime(&self.project_path);
 
     // Prune reviewed entries: remove if file is gone or checksum changed.
     self.reviewed.retain(|name, checksum| {
@@ -98,6 +107,29 @@ impl DiffView {
     self.show_current_file(window, cx);
   }
 
+  /// Returns true if the git index has changed since the last refresh.
+  pub fn is_stale(&self) -> bool {
+    git_index_mtime(&self.project_path) != self.git_index_mtime
+  }
+
+  /// Refresh diff data without updating the editor display.
+  /// Used by the background problem poll to keep file lists current.
+  pub fn refresh_data(&mut self) {
+    let diff_text = match &self.source {
+      DiffSource::WorkingTree => generate_diff(&self.project_path),
+      DiffSource::Commit { oid, .. } => generate_commit_diff(&self.project_path, *oid),
+    };
+    self.file_diffs = parse_file_diffs(&diff_text);
+    self.git_index_mtime = git_index_mtime(&self.project_path);
+
+    self.reviewed.retain(|name, checksum| {
+      self.file_diffs.iter().any(|fd| fd.name == *name && fd.checksum == *checksum)
+    });
+
+    self.current_file_index =
+      self.file_diffs.iter().position(|fd| !self.is_reviewed(&fd.name)).unwrap_or(0);
+  }
+
   fn show_current_file(&self, window: &mut Window, cx: &mut Context<Self>) {
     let (content, language) = if self.file_diffs.is_empty() {
       (String::default(), Language::default())
@@ -105,9 +137,12 @@ impl DiffView {
       let fd = &self.file_diffs[self.current_file_index];
       (fd.content.clone(), Language::from_path(Path::new(&fd.name)))
     };
+    let is_dark = cx.theme().is_dark();
+    let backgrounds = diff_line_backgrounds(&content, is_dark);
     self.editor.update(cx, |state, cx| {
       state.set_highlighter(language.name(), cx);
       state.set_value(content, window, cx);
+      state.set_line_backgrounds(backgrounds, cx);
     });
   }
 
@@ -272,6 +307,10 @@ fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
         diffs.push(FileDiff { name, content: std::mem::take(&mut current_content), checksum });
       }
       let name = rest.split(" b/").next().unwrap_or(rest).to_string();
+      if name == "TODO.md" {
+        current_name = None;
+        continue;
+      }
       current_name = Some(name);
       current_content.push_str(line);
       current_content.push('\n');
@@ -320,6 +359,33 @@ fn diff_to_string(diff: &git2::Diff) -> Result<String, git2::Error> {
     true
   })?;
   Ok(output)
+}
+
+/// Build per-line background segments for diff added/deleted lines.
+fn diff_line_backgrounds(content: &str, is_dark: bool) -> Vec<(Range<usize>, Hsla)> {
+  let (added_bg, deleted_bg) = if is_dark {
+    (hsla(0.33, 0.35, 0.18, 0.6), hsla(0.0, 0.35, 0.18, 0.6))
+  } else {
+    (hsla(0.33, 0.40, 0.85, 0.4), hsla(0.0, 0.40, 0.85, 0.4))
+  };
+
+  let mut segments = Vec::new();
+  let mut offset = 0;
+
+  for line in content.split('\n') {
+    let line_end = offset + line.len();
+    let bg = match line.as_bytes().first() {
+      Some(b'+') => Some(added_bg),
+      Some(b'-') => Some(deleted_bg),
+      _ => None,
+    };
+    if let Some(color) = bg {
+      segments.push((offset..line_end, color));
+    }
+    offset = line_end + 1;
+  }
+
+  segments
 }
 
 const MAX_LOG_ENTRIES: usize = 500;

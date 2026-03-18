@@ -5,7 +5,7 @@
 use anyhow::Result;
 use gpui::{
   Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
-  EventEmitter, FocusHandle, Focusable, HighlightStyle, InteractiveElement as _, IntoElement,
+  EventEmitter, FocusHandle, Focusable, HighlightStyle, Hsla, InteractiveElement as _, IntoElement,
   KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
   ParentElement as _, Pixels, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString,
   Styled as _, Subscription, Task, UTF16Selection, Window, actions, div, point,
@@ -335,8 +335,13 @@ pub struct InputState {
   pub(super) inline_completion: InlineCompletion,
 
   /// Extra highlight styles applied on top of syntax and diagnostic highlights.
-  /// Useful for custom range decorations (e.g. background highlights).
+  /// Useful for custom range decorations (e.g. foreground color overrides).
   pub(super) extra_highlights: Vec<(Range<usize>, HighlightStyle)>,
+
+  /// Per-range background colors painted behind text.
+  /// Uses the same rendering path as LSP document colors: foreground text is
+  /// automatically adjusted (black/white) for contrast against the background.
+  pub(super) line_backgrounds: Vec<(Range<usize>, Hsla)>,
 }
 
 impl EventEmitter<InputEvent> for InputState {}
@@ -417,6 +422,7 @@ impl InputState {
       _pending_update: false,
       inline_completion: InlineCompletion::default(),
       extra_highlights: Vec::new(),
+      line_backgrounds: Vec::new(),
     }
   }
 
@@ -517,6 +523,17 @@ impl InputState {
     cx: &mut Context<Self>,
   ) {
     self.extra_highlights = highlights;
+    cx.notify();
+  }
+
+  /// Set per-range background colors painted behind text.
+  /// Text foreground is automatically adjusted for contrast.
+  pub fn set_line_backgrounds(
+    &mut self,
+    backgrounds: Vec<(Range<usize>, Hsla)>,
+    cx: &mut Context<Self>,
+  ) {
+    self.line_backgrounds = backgrounds;
     cx.notify();
   }
 

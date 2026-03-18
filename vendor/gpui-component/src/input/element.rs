@@ -722,24 +722,25 @@ impl TextElement {
       InputMode::CodeEditor { highlighter, diagnostics, .. } => (highlighter.borrow(), diagnostics),
       _ => return None,
     };
-    let highlighter = highlighter.as_ref()?;
 
     let mut offset = visible_byte_range.start;
     let mut styles = vec![];
 
-    for line in text.iter_lines().skip(visible_range.start).take(visible_range.len()) {
-      let line_len = if is_multi_line {
-        // +1 for `\n`
-        line.len() + 1
-      } else {
-        line.len()
-      };
+    if let Some(highlighter) = highlighter.as_ref() {
+      for line in text.iter_lines().skip(visible_range.start).take(visible_range.len()) {
+        let line_len = if is_multi_line {
+          // +1 for `\n`
+          line.len() + 1
+        } else {
+          line.len()
+        };
 
-      let range = offset..offset + line_len;
-      let line_styles = highlighter.styles(&range, &cx.theme().highlight_theme);
-      styles = gpui::combine_highlights(styles, line_styles).collect();
+        let range = offset..offset + line_len;
+        let line_styles = highlighter.styles(&range, &cx.theme().highlight_theme);
+        styles = gpui::combine_highlights(styles, line_styles).collect();
 
-      offset = range.end;
+        offset = range.end;
+      }
     }
 
     let diagnostic_styles = diagnostics.styles_for_range(&visible_byte_range, cx);
@@ -1308,6 +1309,37 @@ impl Element for TextElement {
           }
         }
         offset_y += height;
+      }
+    }
+
+    // Paint line backgrounds (e.g. diff added/deleted)
+    {
+      let state = self.state.read(cx);
+      if !state.line_backgrounds.is_empty() {
+        let text = &state.text;
+        let mut offset_y = invisible_top_padding;
+        let mut byte_offset = text.line_start_offset(visible_range.start);
+        for ix in 0..prepaint.last_layout.lines.len() {
+          let row = visible_range.start + ix;
+          let line_byte_len = text.line_len(row);
+          let line_byte_range = byte_offset..byte_offset + line_byte_len;
+          let height = prepaint.last_layout.lines[ix].size(line_height).height;
+
+          for (bg_range, bg_color) in &state.line_backgrounds {
+            if bg_range.start < line_byte_range.end && bg_range.end > line_byte_range.start {
+              let p = point(input_bounds.origin.x, origin.y + offset_y);
+              window.paint_quad(fill(
+                Bounds::new(p, size(bounds.size.width, height)),
+                *bg_color,
+              ));
+              break;
+            }
+          }
+
+          offset_y += height;
+          // +1 for the newline separator.
+          byte_offset += line_byte_len + 1;
+        }
       }
     }
 
