@@ -1096,26 +1096,24 @@ impl ProjectActionsPickerDelegate {
       }
 
       let mut candidates: Vec<ProblemCandidate> = Vec::new();
+      let pi = active_project_index;
+      let project = &projects[pi];
 
-      for (pi, project) in projects.iter().enumerate() {
-        // Empty projects with problems.
-        if project.sessions.is_empty()
-          && todo_documents.get(pi).map_or(true, |d| d.sessions.is_empty())
-        {
-          if !project.problems.is_empty() {
-            let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);
-            candidates.push(ProblemCandidate {
-              pi,
-              kind: SessionPickerEntryKind::EmptyProject,
-              project_name: project.name.clone(),
-              label: String::new(),
-              problems: project.problems.len(),
-              min_rank,
-            });
-          }
-          continue;
+      if project.sessions.is_empty()
+        && todo_documents.get(pi).map_or(true, |d| d.sessions.is_empty())
+      {
+        if !project.problems.is_empty() {
+          let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);
+          candidates.push(ProblemCandidate {
+            pi,
+            kind: SessionPickerEntryKind::EmptyProject,
+            project_name: project.name.clone(),
+            label: String::new(),
+            problems: project.problems.len(),
+            min_rank,
+          });
         }
-
+      } else {
         // Adopted sessions with problems.
         for (&id, session) in &project.sessions {
           let total_problems = session.problems.len() + project.problems.len();
@@ -1137,8 +1135,6 @@ impl ProjectActionsPickerDelegate {
             });
           }
         }
-
-        // Unadopted TODO.md sessions (they have 0 problems, skip them).
       }
 
       // Sort by urgency: min_rank ASC.
@@ -1147,7 +1143,7 @@ impl ProjectActionsPickerDelegate {
       for c in candidates {
         let label_text = match &c.kind {
           SessionPickerEntryKind::EmptyProject => format!("! {}", c.project_name),
-          _ => format!("! {} / {}", c.project_name, c.label),
+          _ => format!("! {}", c.label),
         };
         labels.push(label_text);
         entries.push(ProjectActionsEntry::Problem {
@@ -1249,7 +1245,7 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
         let marker = picker_marker_base().text_color(marker_color).child("!");
         let main_text = match kind {
           SessionPickerEntryKind::EmptyProject => project_name.clone(),
-          _ => format!("{project_name} / {label}"),
+          _ => label.clone(),
         };
         let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
         let right_el = div().ml_auto().text_xs().text_color(muted_color).child(format!("{problems}"));
