@@ -947,16 +947,41 @@ impl SessionPickerDelegate {
       }
     }
 
-    // Move the active session to the end so other projects' entries are more
-    // prominent (you already know which session you're on).
-    if let Some(ai) = active_entry {
-      let entry = entries.remove(ai);
-      entries.push(entry);
-      active_entry = Some(entries.len() - 1);
-    }
+    // Sort into groups:
+    //   0: this project, attached with problems
+    //   1: this project, attached without problems (non-active)
+    //   2: other projects, attached (grouped by project)
+    //   3: other projects, empty (no sessions)
+    //   4: this project, detached (unadopted)
+    //   5: other projects, detached
+    //   6: current active session
+    let sort_group = |e: &SessionPickerEntry, idx: usize| -> (u8, usize) {
+      let is_this = e.project_index == active_project_index;
+      let is_active = active_entry == Some(idx);
+      match &e.kind {
+        _ if is_active => (6, e.project_index),
+        SessionPickerEntryKind::Session(_) if is_this && e.problems > 0 => (0, 0),
+        SessionPickerEntryKind::Session(_) if is_this => (1, 0),
+        SessionPickerEntryKind::Session(_) => (2, e.project_index),
+        SessionPickerEntryKind::EmptyProject => (3, e.project_index),
+        SessionPickerEntryKind::Unadopted { .. } if is_this => (4, 0),
+        SessionPickerEntryKind::Unadopted { .. } => (5, e.project_index),
+      }
+    };
+
+    let mut indices: Vec<usize> = (0..entries.len()).collect();
+    indices.sort_by(|&a, &b| {
+      let ga = sort_group(&entries[a], a);
+      let gb = sort_group(&entries[b], b);
+      ga.cmp(&gb)
+    });
+
+    let sorted_entries: Vec<_> = indices.iter().map(|&i| entries[i].clone()).collect();
+    // Recompute active_entry position after sort.
+    let active_entry = active_entry.and_then(|old| indices.iter().position(|&i| i == old));
 
     // Build fuzzy-filterable labels.
-    let labels: Vec<String> = entries
+    let labels: Vec<String> = sorted_entries
       .iter()
       .map(|e| match &e.kind {
         SessionPickerEntryKind::Session(_) | SessionPickerEntryKind::Unadopted { .. } => {
@@ -966,7 +991,7 @@ impl SessionPickerDelegate {
       })
       .collect();
 
-    Self { labels, entries, active_entry, result: None }
+    Self { labels, entries: sorted_entries, active_entry, result: None }
   }
 
   /// Like `new()` but sorted by urgency: sessions with problems first (lowest rank = most urgent).
