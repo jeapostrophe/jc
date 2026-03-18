@@ -629,6 +629,41 @@ impl InputState {
     cx.notify();
   }
 
+  /// Replace text while preserving scroll position and clamping the cursor.
+  ///
+  /// Use this when programmatically updating content (e.g. after a save-and-reload
+  /// or structural edit) where the user's viewport should not jump.
+  pub fn set_value_preserving_position(
+    &mut self,
+    value: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let old_offset = self.scroll_handle.offset();
+    let old_cursor = self.cursor();
+
+    self.history.ignore = true;
+    let was_disabled = self.disabled;
+    self.disabled = false;
+    self.replace_text(value, window, cx);
+    self.disabled = was_disabled;
+    self.history.ignore = false;
+
+    // Clamp cursor to new text length.
+    let clamped = old_cursor.min(self.text.len());
+    self.selected_range = (clamped..clamped).into();
+
+    if self.mode.is_code_editor() {
+      self._pending_update = true;
+      self.lsp.reset();
+    }
+
+    // Restore scroll position.
+    self.scroll_handle.set_offset(old_offset);
+
+    cx.notify();
+  }
+
   /// Insert text at the current cursor position.
   ///
   /// And the cursor will be moved to the end of inserted text.

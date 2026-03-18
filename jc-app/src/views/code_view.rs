@@ -126,10 +126,8 @@ impl CodeView {
     let ours = self.editor.read(cx).value().to_string();
     match diffy::merge(&self.base_content, &ours, &theirs) {
       Ok(merged) => {
-        let (cursor_pos, _) = self.editor.read(cx).selection_positions();
         self.editor.update(cx, |state, cx| {
-          state.set_value(merged, window, cx);
-          state.set_cursor_position(cursor_pos, window, cx);
+          state.set_value_preserving_position(merged, window, cx);
         });
         self.base_content = theirs;
         cx.notify();

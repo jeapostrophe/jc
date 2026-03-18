@@ -125,7 +125,7 @@ impl TodoView {
     let new_text = todo::insert_session_heading(&text, &self.document, uuid, label);
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {
-        state.set_value(new_text, window, cx);
+        state.set_value_preserving_position(new_text, window, cx);
       });
     });
     self.revalidate(cx);
@@ -155,7 +155,7 @@ impl TodoView {
       let mut text = cv.editor_text(cx);
       text.insert_str(offset, comment);
       cv.editor().update(cx, |state, cx| {
-        state.set_value(text, window, cx);
+        state.set_value_preserving_position(text, window, cx);
       });
     });
   }
@@ -171,7 +171,7 @@ impl TodoView {
     if let Some(new_text) = todo::mark_session_deleted(&text, &self.document, label) {
       self.code_view.update(cx, |cv, cx| {
         cv.editor().update(cx, |state, cx| {
-          state.set_value(new_text, window, cx);
+          state.set_value_preserving_position(new_text, window, cx);
         });
       });
       self.revalidate(cx);
@@ -194,7 +194,7 @@ impl TodoView {
     let result = todo::send_from_wait(&text, session, selection)?;
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {
-        state.set_value(result.new_text, window, cx);
+        state.set_value_preserving_position(result.new_text, window, cx);
       });
     });
     self.revalidate(cx);
@@ -214,7 +214,7 @@ impl TodoView {
     if let Some(new_text) = todo::update_session_uuid(&text, &self.document, label, new_uuid) {
       self.code_view.update(cx, |cv, cx| {
         cv.editor().update(cx, |state, cx| {
-          state.set_value(new_text, window, cx);
+          state.set_value_preserving_position(new_text, window, cx);
         });
       });
       self.revalidate(cx);
