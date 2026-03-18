@@ -7,13 +7,14 @@ fn rgb_to_hsla(r: u8, g: u8, b: u8) -> Hsla {
   gpui::rgba(((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xFF).into()
 }
 
-/// Parse a hex color string (e.g. "#C5C8C6") to GPUI Hsla.
+/// Parse a hex color string (`#RRGGBB` or `#RRGGBBAA`) to GPUI Hsla.
 pub fn hex_to_hsla(hex: &str) -> Hsla {
   let hex = hex.trim_start_matches('#');
   let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
   let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
   let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
-  rgb_to_hsla(r, g, b)
+  let a = if hex.len() >= 8 { u8::from_str_radix(&hex[6..8], 16).unwrap_or(0xFF) } else { 0xFF };
+  gpui::rgba(((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | (a as u32)).into()
 }
 
 /// Standard dark terminal palette.

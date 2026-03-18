@@ -26,12 +26,12 @@ bright_white  = "#FFFFFF"
 border    = "#373B41"
 muted     = "#282A2E"
 accent    = "#282A2E"
-selection = "#3A4A5C"
+selection = "#373B41C0"
 
 [editor]
 background         = "#1D1F21"
 foreground         = "#C5C8C6"
-active_line        = "#282A2E"
+active_line        = "#373B4180"
 line_number        = "#969896"
 active_line_number = "#C5C8C6"
 
