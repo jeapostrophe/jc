@@ -206,6 +206,29 @@ impl TodoView {
     Some((result.message_text, result.message_index))
   }
 
+  /// Ensure the session has a WAIT section, inserting one if missing.
+  /// Returns true if a WAIT section was added.
+  pub fn ensure_wait(
+    &mut self,
+    label: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> bool {
+    let text = self.editor_text(cx);
+    if let Some(new_text) = todo::insert_wait_section(&text, &self.document, label) {
+      self.code_view.update(cx, |cv, cx| {
+        cv.editor().update(cx, |state, cx| {
+          state.set_value_preserving_position(new_text, window, cx);
+        });
+      });
+      self.revalidate(cx);
+      self.save(cx);
+      true
+    } else {
+      false
+    }
+  }
+
   /// Update a session's UUID in the TODO document text.
   pub fn update_session_uuid(
     &mut self,

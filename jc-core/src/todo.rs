@@ -89,6 +89,17 @@ impl TodoDocument {
     let wait = session.wait.as_ref()?;
     Some(wait.body_byte_range.end)
   }
+
+  /// Returns the byte offset where a session's content ends (the start of the
+  /// next session heading, or end of document).
+  pub fn session_end_offset(&self, label: &str, text_len: usize) -> Option<usize> {
+    let idx = self.sessions.iter().position(|s| s.label == label)?;
+    if idx + 1 < self.sessions.len() {
+      Some(self.sessions[idx + 1].heading_byte_range.start)
+    } else {
+      Some(text_len)
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,9 +235,34 @@ fn finalize_wait_body(session: &mut TodoSession, boundary: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Session heading insertion
+// Insert WAIT section
 // ---------------------------------------------------------------------------
 
+/// Insert a `### WAIT\n` heading at the end of a session that lacks one.
+/// Returns the new document text, or `None` if the session already has a WAIT.
+pub fn insert_wait_section(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
+  let session = doc.session_by_label(label)?;
+  if session.wait.is_some() {
+    return None;
+  }
+  let end = doc.session_end_offset(label, text.len())?;
+  let mut new_text = String::with_capacity(text.len() + 16);
+  new_text.push_str(&text[..end]);
+  // Ensure a blank line before the heading.
+  if !new_text.ends_with("\n\n") {
+    if !new_text.ends_with('\n') {
+      new_text.push('\n');
+    }
+    new_text.push('\n');
+  }
+  new_text.push_str("### WAIT\n");
+  new_text.push_str(&text[end..]);
+  Some(new_text)
+}
+
+// ---------------------------------------------------------------------------
+// Session heading insertion
+// ---------------------------------------------------------------------------
 
 /// Build new text with a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading inserted.
 /// If a `# Claude` section exists, the heading goes right after it. Otherwise
