@@ -242,8 +242,30 @@ fn finalize_wait_body(session: &mut TodoSession, boundary: usize) {
 /// Returns the new document text, or `None` if the session already has a WAIT.
 pub fn insert_wait_section(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
   let session = doc.session_by_label(label)?;
-  if session.wait.is_some() {
-    return None;
+  if let Some(wait) = &session.wait {
+    // WAIT exists — ensure there is a blank line after the heading so the
+    // cursor has somewhere to land.  If the body is empty and the next
+    // character after the heading newline is not another newline, insert one.
+    let after_heading = wait.heading_byte_range.end;
+    // Skip past the newline that terminates the heading line itself.
+    let body_start = if text.as_bytes().get(after_heading) == Some(&b'\n') {
+      after_heading + 1
+    } else {
+      after_heading
+    };
+    // If the body is empty (or whitespace-only) and the very next byte is
+    // not a newline, we need to insert a blank line.
+    let body = &text[wait.body_byte_range.clone()];
+    let needs_blank = body.trim().is_empty()
+      && text.as_bytes().get(body_start) != Some(&b'\n');
+    if !needs_blank {
+      return None;
+    }
+    let mut new_text = String::with_capacity(text.len() + 1);
+    new_text.push_str(&text[..body_start]);
+    new_text.push('\n');
+    new_text.push_str(&text[body_start..]);
+    return Some(new_text);
   }
   let end = doc.session_end_offset(label, text.len())?;
   let mut new_text = String::with_capacity(text.len() + 16);
