@@ -23,7 +23,7 @@ impl Workspace {
     if ranked.is_empty() {
       // No problems — go straight to TODO/WAIT.
       self.last_jumped_target = None;
-      self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
+      self.set_rightmost_pane_view(PaneContentKind::TodoEditor, window, cx);
       return;
     }
 
@@ -38,7 +38,7 @@ impl Workspace {
     if next_idx >= ranked.len() {
       // End-of-cycle: jump to TODO/WAIT, reset so next press restarts.
       self.last_jumped_target = None;
-      self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
+      self.set_rightmost_pane_view(PaneContentKind::TodoEditor, window, cx);
     } else {
       let target = ranked.swap_remove(next_idx).1;
       self.jump_to_problem_target(target, window, cx);
@@ -62,7 +62,7 @@ impl Workspace {
     };
 
     // set_active_pane_view handles view resolution, refresh, focus, and TODO scroll.
-    self.set_active_pane_view(kind, window, cx);
+    self.set_rightmost_pane_view(kind, window, cx);
 
     // Post-navigation: open specific file or navigate to diff entry.
     match target {

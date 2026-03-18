@@ -11,12 +11,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::pane::PaneContentKind;
-use super::workspace::PaneLayout;
 
 pub struct SavedPaneLayout {
   pub pane_kinds: [Option<PaneContentKind>; 3],
   pub active_pane_index: usize,
-  pub layout: PaneLayout,
 }
 
 pub struct ProjectState {
@@ -57,11 +55,12 @@ impl ProjectState {
     let best = document
       .sessions
       .iter()
+      .filter(|s| !s.disabled)
       .find(|s| {
         !s.uuid.is_empty()
           && session_dir.join(format!("{}.jsonl", s.uuid)).exists()
       })
-      .or_else(|| document.sessions.first());
+      .or_else(|| document.sessions.iter().find(|s| !s.disabled));
 
     if let Some(todo_session) = best {
       let uuid = if todo_session.uuid.is_empty() {

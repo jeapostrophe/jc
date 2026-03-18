@@ -13,6 +13,8 @@ pub struct HookEvent {
 
 #[derive(Debug, Clone)]
 pub enum HookEventKind {
+  /// User submitted a prompt — Claude is about to start working.
+  PromptSubmit,
   Stop,
   IdlePrompt,
   PermissionPrompt,
@@ -112,6 +114,7 @@ fn accept_loop(
     });
 
     let kind = match route {
+      "prompt-submit" => Some(HookEventKind::PromptSubmit),
       "stop" => Some(HookEventKind::Stop),
       "notification" => parse_notification_kind(&payload.notification_type),
       "permission" => Some(HookEventKind::PermissionPrompt),

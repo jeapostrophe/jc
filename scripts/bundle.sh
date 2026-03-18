@@ -10,7 +10,7 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
 echo "Building jc-app (release)..."
-cargo build --release -p jc-app
+(cd "$PROJECT_ROOT" && cargo build --release -p jc-app)
 
 rm -rf "$APP_BUNDLE"
 
@@ -23,26 +23,33 @@ cp "$PROJECT_ROOT/jc-app/Info.plist" "$CONTENTS_DIR/Info.plist"
 # Copy binary
 cp "$PROJECT_ROOT/target/release/jc-app" "$MACOS_DIR/jc-app"
 
-# Convert icon.png to AppIcon.icns
+# Generate AppIcon.icns with proper HIG-compliant transparent padding
+# (824x824 content centered on 1024x1024 canvas).
 ICON_SRC="$PROJECT_ROOT/icon.png"
-ICONSET_DIR=$(mktemp -d)/AppIcon.iconset
-mkdir -p "$ICONSET_DIR"
+ICON_TMP=$(mktemp -d)
+COMMON_ICONS="$PROJECT_ROOT/../common/icons/gen-icons.sh"
 
-sips -z 16 16     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16.png"      > /dev/null 2>&1
-sips -z 32 32     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16@2x.png"   > /dev/null 2>&1
-sips -z 32 32     "$ICON_SRC" --out "$ICONSET_DIR/icon_32x32.png"      > /dev/null 2>&1
-sips -z 64 64     "$ICON_SRC" --out "$ICONSET_DIR/icon_32x32@2x.png"   > /dev/null 2>&1
-sips -z 128 128   "$ICON_SRC" --out "$ICONSET_DIR/icon_128x128.png"    > /dev/null 2>&1
-sips -z 256 256   "$ICON_SRC" --out "$ICONSET_DIR/icon_128x128@2x.png" > /dev/null 2>&1
-sips -z 256 256   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256.png"    > /dev/null 2>&1
-sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256@2x.png" > /dev/null 2>&1
-sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_512x512.png"    > /dev/null 2>&1
-sips -z 1024 1024 "$ICON_SRC" --out "$ICONSET_DIR/icon_512x512@2x.png" > /dev/null 2>&1
+if [ -x "$COMMON_ICONS" ]; then
+  "$COMMON_ICONS" "$ICON_SRC" "$ICON_TMP"
+else
+  # Inline fallback: same logic as gen-icons.sh
+  MASTER="$ICON_TMP/master.png"
+  ICONSET="$ICON_TMP/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  magick "$ICON_SRC" -resize 824x824 -gravity center -background none -extent 1024x1024 "$MASTER"
+  for spec in \
+    "1024 icon_512x512@2x" "512 icon_512x512" "512 icon_256x256@2x" \
+    "256 icon_256x256" "256 icon_128x128@2x" "128 icon_128x128" \
+    "64 icon_32x32@2x" "32 icon_32x32" "32 icon_16x16@2x" "16 icon_16x16"; do
+    size="${spec%% *}"; name="${spec##* }"
+    magick "$MASTER" -resize "${size}x${size}" "PNG32:$ICONSET/${name}.png"
+  done
+  iconutil -c icns "$ICONSET" --output "$ICON_TMP/icon.icns"
+  rm "$MASTER"
+fi
 
-iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/AppIcon.icns"
-
-# Clean up temp iconset
-rm -rf "$(dirname "$ICONSET_DIR")"
+cp "$ICON_TMP/icon.icns" "$RESOURCES_DIR/AppIcon.icns"
+rm -rf "$ICON_TMP"
 
 # Ad-hoc codesign
 codesign --force --sign - "$APP_BUNDLE"

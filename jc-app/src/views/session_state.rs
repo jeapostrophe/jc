@@ -23,6 +23,9 @@ pub struct SessionState {
   pub general_terminal: Entity<TerminalView>,
   pub pending_events: HashSet<PendingEvent>,
   pub problems: Vec<SessionProblem>,
+  /// True while Claude is actively working. Set by `UserPromptSubmit` hook and
+  /// `send_to_terminal`; cleared by `Stop`/`IdlePrompt` hooks.
+  pub busy: bool,
 }
 
 impl SessionState {
@@ -62,6 +65,7 @@ impl SessionState {
       general_terminal,
       pending_events: HashSet::default(),
       problems: Vec::new(),
+      busy: false,
     }
   }
 

@@ -144,8 +144,8 @@ impl Workspace {
               SessionPickerResult::InitProject(pi) => {
                 this.init_empty_project(pi, window, cx);
               }
-              SessionPickerResult::Removed(pi, id) => {
-                this.remove_session(pi, id, window, cx);
+              SessionPickerResult::ToggleDisabled(pi, label) => {
+                this.toggle_session_disabled(pi, &label, window, cx);
               }
             }
             cx.notify();

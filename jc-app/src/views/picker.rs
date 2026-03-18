@@ -65,6 +65,14 @@ fn picker_marker_base() -> Div {
   div().text_xs().font_weight(FontWeight::BOLD).w(px(22.0)).flex_shrink_0().flex().justify_end()
 }
 
+/// A small `marker label` pair for footer legends.
+fn legend_item(marker: &str, marker_color: Hsla, label: &str, label_color: Hsla) -> Div {
+  div().flex().items_center().gap_0p5().children([
+    div().text_color(marker_color).font_weight(FontWeight::BOLD).child(marker.to_string()),
+    div().text_color(label_color).child(label.to_string()),
+  ])
+}
+
 pub fn fuzzy_match(query_lower: &[char], candidate: &str) -> Option<i64> {
   if query_lower.is_empty() {
     return Some(0);
@@ -133,6 +141,11 @@ pub trait PickerDelegate: 'static {
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex");
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
     row.child(label.clone())
+  }
+
+  /// Optional footer shown below the results list (e.g. a legend).
+  fn render_footer(&self, _cx: &App) -> Option<Div> {
+    None
   }
 }
 
@@ -325,6 +338,9 @@ impl<D: PickerDelegate> Render for PickerState<D> {
           list
         }
       })
+      .children(self.delegate.render_footer(cx).map(|footer| {
+        footer.border_t_1().border_color(theme.border)
+      }))
   }
 }
 
@@ -802,7 +818,7 @@ enum SessionPickerEntryKind {
   /// An adopted session — stores its SessionId.
   Session(SessionId),
   /// A TODO.md session not yet adopted (has uuid + label but no running terminal).
-  Unadopted { uuid: String },
+  Unadopted { uuid: String, disabled: bool },
   /// A project with no sessions — selecting it will discover-or-create a session.
   EmptyProject,
 }
@@ -815,8 +831,8 @@ pub enum SessionPickerResult {
   Adopt(usize, String, String),
   /// Initialize a project that has no sessions yet: project_index.
   InitProject(usize),
-  /// Remove a session: (project_index, session_id).
-  Removed(usize, SessionId),
+  /// Toggle disabled state on a session: (project_index, label).
+  ToggleDisabled(usize, String),
 }
 
 pub struct SessionPickerDelegate {
@@ -847,7 +863,10 @@ impl SessionPickerDelegate {
         .filter_map(|s| s.uuid.as_deref())
         .collect();
 
-      if project.sessions.is_empty() && todo_documents.get(pi).map_or(true, |d| d.sessions.is_empty()) {
+      let has_adoptable = todo_documents
+        .get(pi)
+        .map_or(false, |d| d.sessions.iter().any(|s| !s.uuid.is_empty()));
+      if project.sessions.is_empty() && !has_adoptable {
         let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);
         entries.push(SessionPickerEntry {
           kind: SessionPickerEntryKind::EmptyProject,
@@ -893,9 +912,16 @@ impl SessionPickerDelegate {
           let uuid_adopted = !todo_session.uuid.is_empty()
             && adopted_uuids.contains(todo_session.uuid.as_str());
           let label_adopted = adopted_labels.contains(todo_session.label.as_str());
+          // Skip sessions with no UUID — nothing to adopt/resume.
+          if todo_session.uuid.is_empty() {
+            continue;
+          }
           if !uuid_adopted && !label_adopted {
             entries.push(SessionPickerEntry {
-              kind: SessionPickerEntryKind::Unadopted { uuid: todo_session.uuid.clone() },
+              kind: SessionPickerEntryKind::Unadopted {
+                uuid: todo_session.uuid.clone(),
+                disabled: todo_session.disabled,
+              },
               project_index: pi,
               project_name: project.name.clone(),
               label: todo_session.label.clone(),
@@ -919,6 +945,14 @@ impl SessionPickerDelegate {
       if !matches!(e.kind, SessionPickerEntryKind::EmptyProject) {
         e.ambiguous_label = label_counts.get(&e.label).copied().unwrap_or(0) > 1;
       }
+    }
+
+    // Move the active session to the end so other projects' entries are more
+    // prominent (you already know which session you're on).
+    if let Some(ai) = active_entry {
+      let entry = entries.remove(ai);
+      entries.push(entry);
+      active_entry = Some(entries.len() - 1);
     }
 
     // Build fuzzy-filterable labels.
@@ -984,7 +1018,7 @@ impl PickerDelegate for SessionPickerDelegate {
       SessionPickerEntryKind::Session(id) => {
         SessionPickerResult::Session(e.project_index, *id)
       }
-      SessionPickerEntryKind::Unadopted { uuid } => {
+      SessionPickerEntryKind::Unadopted { uuid, .. } => {
         SessionPickerResult::Adopt(e.project_index, uuid.clone(), e.label.clone())
       }
       SessionPickerEntryKind::EmptyProject => SessionPickerResult::InitProject(e.project_index),
@@ -993,9 +1027,15 @@ impl PickerDelegate for SessionPickerDelegate {
 
   fn delete(&mut self, index: usize, _window: &mut Window, cx: &mut Context<PickerState<Self>>) {
     let e = &self.entries[index];
-    if let SessionPickerEntryKind::Session(id) = e.kind {
-      self.result = Some(SessionPickerResult::Removed(e.project_index, id));
-      cx.emit(PickerEvent::Confirmed);
+    match &e.kind {
+      SessionPickerEntryKind::Session(_) | SessionPickerEntryKind::Unadopted { .. } => {
+        self.result = Some(SessionPickerResult::ToggleDisabled(
+          e.project_index,
+          e.label.clone(),
+        ));
+        cx.emit(PickerEvent::Confirmed);
+      }
+      _ => {}
     }
   }
 
@@ -1013,7 +1053,11 @@ impl PickerDelegate for SessionPickerDelegate {
         let color = if selected { theme.accent_foreground } else { theme.blue };
         picker_marker_base().text_color(color).child("+")
       }
-      SessionPickerEntryKind::Unadopted { .. } => {
+      SessionPickerEntryKind::Unadopted { disabled: true, .. } => {
+        let color = if selected { theme.accent_foreground } else { theme.muted_foreground };
+        picker_marker_base().text_color(color).child("~")
+      }
+      SessionPickerEntryKind::Unadopted { disabled: false, .. } => {
         let color = if selected { theme.accent_foreground } else { theme.yellow };
         picker_marker_base().text_color(color).child("~")
       }
@@ -1038,12 +1082,27 @@ impl PickerDelegate for SessionPickerDelegate {
     let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
     let right = match &entry.kind {
       SessionPickerEntryKind::EmptyProject => "(no sessions)".to_string(),
-      SessionPickerEntryKind::Unadopted { .. } => "(adopt)".to_string(),
+      SessionPickerEntryKind::Unadopted { disabled: true, .. } => "(disabled)".to_string(),
+      SessionPickerEntryKind::Unadopted { disabled: false, .. } => "(adopt)".to_string(),
       _ => String::new(),
     };
     let right_el = div().ml_auto().text_xs().text_color(muted_color).child(right);
 
     row.child(marker).child(main_text).child(right_el)
+  }
+
+  fn render_footer(&self, cx: &App) -> Option<Div> {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    Some(
+      div().px_2().py_1().flex().flex_wrap().gap_x_3().gap_y_0p5().text_xs().text_color(muted).children([
+        legend_item(">", theme.green, "active", muted),
+        legend_item("~", theme.yellow, "adopt", muted),
+        legend_item("~", theme.muted_foreground, "disabled", muted),
+        legend_item("+", theme.blue, "new", muted),
+        div().child("Cmd-Shift-Bksp: toggle disable"),
+      ])
+    )
   }
 }
 
@@ -1176,8 +1235,10 @@ impl ProjectActionsPickerDelegate {
 
       if let Some(doc) = todo_documents.get(active_project_index) {
         for ts in &doc.sessions {
-          let uuid_adopted =
-            !ts.uuid.is_empty() && adopted_uuids.contains(ts.uuid.as_str());
+          if ts.uuid.is_empty() {
+            continue;
+          }
+          let uuid_adopted = adopted_uuids.contains(ts.uuid.as_str());
           let label_adopted = adopted_labels.contains(ts.label.as_str());
           if !uuid_adopted && !label_adopted {
             labels.push(format!("* {}", ts.label));
@@ -1255,7 +1316,7 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
     self.result = Some(match entry {
       ProjectActionsEntry::Problem { pi, kind, label, .. } => match kind {
         SessionPickerEntryKind::Session(id) => ProjectActionsResult::SwitchToSession(*pi, *id),
-        SessionPickerEntryKind::Unadopted { uuid } => {
+        SessionPickerEntryKind::Unadopted { uuid, .. } => {
           ProjectActionsResult::AdoptTodoSession(*pi, uuid.clone(), label.clone())
         }
         SessionPickerEntryKind::EmptyProject => ProjectActionsResult::InitProject(*pi),
@@ -1303,6 +1364,19 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
         row.child(marker).child(summary.clone())
       }
     }
+  }
+
+  fn render_footer(&self, cx: &App) -> Option<Div> {
+    let theme = cx.theme();
+    let muted = theme.muted_foreground;
+    Some(
+      div().px_2().py_1().flex().flex_wrap().gap_x_3().gap_y_0p5().text_xs().text_color(muted).children([
+        legend_item("!", theme.red, "problem", muted),
+        legend_item("*", theme.cyan, "dormant", muted),
+        legend_item("+", theme.green, "new", muted),
+        legend_item("~", theme.yellow, "unattached", muted),
+      ])
+    )
   }
 }
 

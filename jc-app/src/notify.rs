@@ -11,10 +11,7 @@ use objc2_foundation::NSString;
 static ACTION_TX: OnceLock<flume::Sender<String>> = OnceLock::new();
 static AUTHORIZED: AtomicBool = AtomicBool::new(false);
 
-const SWITCH_ACTION_ID: &str = "SWITCH_SESSION";
-const CATEGORY_ID: &str = "CLAUDE_EVENT";
-
-/// Returns a receiver for notification action slugs (session the user wants to switch to).
+/// Returns a receiver for session IDs from notification clicks.
 /// Call once at startup before `init()`.
 pub fn action_receiver() -> flume::Receiver<String> {
   let (tx, rx) = flume::unbounded();
@@ -22,7 +19,7 @@ pub fn action_receiver() -> flume::Receiver<String> {
   rx
 }
 
-/// Initialize the notification system: request authorization, register categories, set delegate.
+/// Initialize the notification system: request authorization and set delegate.
 /// Must be called on the main thread.
 pub fn init() {
   if MainThreadMarker::new().is_none() {
@@ -35,32 +32,6 @@ pub fn init() {
   unsafe {
     let center: Retained<AnyObject> =
       msg_send![AnyClass::get(c"UNUserNotificationCenter").unwrap(), currentNotificationCenter];
-
-    // Create "Switch to Session" action (foreground activation).
-    let action_id = NSString::from_str(SWITCH_ACTION_ID);
-    let action_title = NSString::from_str("Switch to Session");
-    let action: Retained<AnyObject> = msg_send![
-      AnyClass::get(c"UNNotificationAction").unwrap(),
-      actionWithIdentifier: &*action_id,
-      title: &*action_title,
-      options: 1usize // UNNotificationActionOptionForeground
-    ];
-
-    // Create category containing the action.
-    let category_id = NSString::from_str(CATEGORY_ID);
-    let actions: Retained<AnyObject> =
-      msg_send![AnyClass::get(c"NSArray").unwrap(), arrayWithObject: &*action];
-    let empty: Retained<AnyObject> = msg_send![AnyClass::get(c"NSArray").unwrap(), array];
-    let category: Retained<AnyObject> = msg_send![
-      AnyClass::get(c"UNNotificationCategory").unwrap(),
-      categoryWithIdentifier: &*category_id,
-      actions: &*actions,
-      intentIdentifiers: &*empty,
-      options: 0usize
-    ];
-    let categories: Retained<AnyObject> =
-      msg_send![AnyClass::get(c"NSSet").unwrap(), setWithObject: &*category];
-    let () = msg_send![&*center, setNotificationCategories: &*categories];
 
     // Build and set the delegate. Leak it to keep it alive for the app lifetime.
     let delegate = build_delegate();
@@ -79,11 +50,14 @@ pub fn init() {
       requestAuthorizationWithOptions: 7usize,
       completionHandler: &*handler
     ];
+
+    // Observe app activation (dock click, Cmd-Tab, etc.) to bring the window forward.
+    observe_app_activation();
   }
 }
 
 /// Post a notification. Falls back to dock bounce if banners aren't authorized.
-pub fn notify(title: &str, message: &str, critical: bool, slug: Option<&str>) {
+pub fn notify(title: &str, message: &str, critical: bool, session_id: Option<&str>) {
   eprintln!("notify: {title} — {message}");
   bounce_dock_icon(critical);
 
@@ -93,16 +67,16 @@ pub fn notify(title: &str, message: &str, critical: bool, slug: Option<&str>) {
 
   let title = title.to_string();
   let message = message.to_string();
-  let slug = slug.map(str::to_string);
+  let session_id = session_id.map(str::to_string);
 
   // Post from a background thread to avoid blocking the UI.
   std::thread::spawn(move || {
     // SAFETY: All ObjC calls here create new objects; no shared mutable state.
-    unsafe { post_notification(&title, &message, slug.as_deref()) };
+    unsafe { post_notification(&title, &message, session_id.as_deref()) };
   });
 }
 
-unsafe fn post_notification(title: &str, message: &str, slug: Option<&str>) {
+unsafe fn post_notification(title: &str, message: &str, session_id: Option<&str>) {
   let content: Retained<AnyObject> =
     msg_send![AnyClass::get(c"UNMutableNotificationContent").unwrap(), new];
 
@@ -116,22 +90,18 @@ unsafe fn post_notification(title: &str, message: &str, slug: Option<&str>) {
     msg_send![AnyClass::get(c"UNNotificationSound").unwrap(), defaultSound];
   let () = msg_send![&*content, setSound: &*sound];
 
-  // Category enables the "Switch to Session" action button.
-  let cat_id = NSString::from_str(CATEGORY_ID);
-  let () = msg_send![&*content, setCategoryIdentifier: &*cat_id];
-
-  // Thread identifier groups notifications by slug.
-  if let Some(slug) = slug {
-    let thread_id = NSString::from_str(slug);
+  // Thread identifier groups notifications by session.
+  if let Some(session_id) = session_id {
+    let thread_id = NSString::from_str(session_id);
     let () = msg_send![&*content, setThreadIdentifier: &*thread_id];
 
-    // Store slug in userInfo so the action handler can route to the session.
-    let slug_key = NSString::from_str("slug");
-    let slug_val = NSString::from_str(slug);
+    // Store session_id in userInfo so the click handler can route to the session.
+    let key = NSString::from_str("session_id");
+    let val = NSString::from_str(session_id);
     let user_info: Retained<AnyObject> = msg_send![
       AnyClass::get(c"NSDictionary").unwrap(),
-      dictionaryWithObject: &*slug_val,
-      forKey: &*slug_key
+      dictionaryWithObject: &*val,
+      forKey: &*key
     ];
     let () = msg_send![&*content, setUserInfo: &*user_info];
   }
@@ -176,8 +146,8 @@ fn bounce_dock_icon(critical: bool) {
 
 /// Delegate method: userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:
 ///
-/// Extracts the slug from the notification's userInfo and sends it through
-/// the action channel so the workspace can switch sessions.
+/// Extracts the session_id from the notification's userInfo and sends it through
+/// the action channel so the workspace can switch to the session.
 unsafe extern "C" fn did_receive_response(
   _this: *mut AnyObject,
   _sel: Sel,
@@ -190,12 +160,15 @@ unsafe extern "C" fn did_receive_response(
     let request: Retained<AnyObject> = msg_send![&*notification, request];
     let content: Retained<AnyObject> = msg_send![&*request, content];
     let user_info: Retained<AnyObject> = msg_send![&*content, userInfo];
-    let slug_key = NSString::from_str("slug");
-    let slug_val: Option<Retained<NSString>> = msg_send![&*user_info, objectForKey: &*slug_key];
+    let key = NSString::from_str("session_id");
+    let val: Option<Retained<NSString>> = msg_send![&*user_info, objectForKey: &*key];
 
-    if let (Some(slug), Some(tx)) = (slug_val, ACTION_TX.get()) {
-      let _ = tx.send(slug.to_string());
+    if let (Some(session_id), Some(tx)) = (val, ACTION_TX.get()) {
+      let _ = tx.send(session_id.to_string());
     }
+
+    // Move the key window to the active Space and bring it forward.
+    bring_window_to_front();
 
     // Call the completion handler block: ((void)(^)(void))
     if !handler.is_null() {
@@ -203,6 +176,57 @@ unsafe extern "C" fn did_receive_response(
         std::mem::transmute((*handler.cast::<BlockLayout>()).invoke);
       invoke(handler);
     }
+  }
+}
+
+/// Register an observer for NSApplicationDidBecomeActiveNotification so that
+/// any activation (dock click, Cmd-Tab, etc.) switches to the window's Space.
+unsafe fn observe_app_activation() {
+  unsafe {
+    let nc: Retained<AnyObject> =
+      msg_send![AnyClass::get(c"NSNotificationCenter").unwrap(), defaultCenter];
+    let name = NSString::from_str("NSApplicationDidBecomeActiveNotification");
+    let block = RcBlock::new(|_notif: *mut AnyObject| {
+      unsafe { bring_window_to_front() };
+    });
+    let () = msg_send![
+      &*nc,
+      addObserverForName: &*name,
+      object: std::ptr::null::<AnyObject>(),
+      queue: std::ptr::null::<AnyObject>(),
+      usingBlock: &*block
+    ];
+    // Leak the block so it lives for the app's lifetime.
+    std::mem::forget(block);
+  }
+}
+
+/// Switch to the Space containing the app's window and bring it forward.
+/// Must be called on the main thread.
+unsafe fn bring_window_to_front() {
+  unsafe {
+    let app: Retained<AnyObject> =
+      msg_send![AnyClass::get(c"NSApplication").unwrap(), sharedApplication];
+
+    // Find the window to focus.
+    let mut window: *mut AnyObject = msg_send![&*app, keyWindow];
+    if window.is_null() {
+      let windows: Retained<AnyObject> = msg_send![&*app, windows];
+      let count: usize = msg_send![&*windows, count];
+      if count == 0 {
+        return;
+      }
+      window = msg_send![&*windows, objectAtIndex: 0usize];
+      if window.is_null() {
+        return;
+      }
+    }
+
+    // orderFrontRegardless makes macOS switch to the Space the window lives on
+    // (when "When switching to an application, switch to a Space with open
+    // windows" is enabled in System Settings, which is the default).
+    let () = msg_send![window, orderFrontRegardless];
+    let () = msg_send![&*app, activateIgnoringOtherApps: true];
   }
 }
 

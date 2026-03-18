@@ -81,12 +81,12 @@ Each session has:
 **Session lifecycle:**
 - **Project init:** When a project is first added to jc, the app reads TODO.md for existing session headings with UUIDs. Each is resumed via `claude --resume <uuid>`. If no sessions exist, a plain `claude` instance is launched.
 - **New session:** From the session picker (Cmd-P), the user can create a new session. The app launches a fresh Claude Code instance; the UUID is auto-detected from the first hook event.
-- **Remove session:** From the session picker (Cmd-P) or problem picker (Cmd-:), press Cmd-Shift-Backspace to remove the selected session. This drops the session's terminals and marks its TODO.md heading as deleted, which the parser skips on future launches.
+- **Disable session:** From the session picker (Cmd-P), press Cmd-Shift-Backspace to toggle the `[D]` (disabled/dormant) prefix on a session. Disabled sessions are not auto-attached on startup but remain in the picker's adopt list (shown as "(disabled)"). If adopted, they detach and return to the disabled list. To permanently delete a session, manually change `[D]` to `[DELETED]` in the TODO.md heading.
 - **`/clear` handling:** When the user runs `/clear` in a Claude terminal, the hook system detects the session clear event and automatically updates the session's UUID to the new session ID.
 
 ### Session Architecture
 
-The app uses an `App -> Projects -> Sessions` hierarchy. Each `ProjectState` owns a TODO file, diff view, code view, and a `HashMap<SessionId, SessionState>` keyed by numeric ID. Each `SessionState` owns a Claude terminal (resumed via `--resume <uuid>`), a general terminal, and an optional UUID. The workspace has an active project with an active session; the active session drives which terminals are shown in the panes. Switching sessions swaps the pane contents without disconnecting terminals. Sessions can be removed at runtime via the session picker (Cmd-Shift-Backspace), which drops the `SessionState` and marks the TODO heading as deleted.
+The app uses an `App -> Projects -> Sessions` hierarchy. Each `ProjectState` owns a TODO file, diff view, code view, and a `HashMap<SessionId, SessionState>` keyed by numeric ID. Each `SessionState` owns a Claude terminal (resumed via `--resume <uuid>`), a general terminal, and an optional UUID. The workspace has an active project with an active session; the active session drives which terminals are shown in the panes. Switching sessions swaps the pane contents without disconnecting terminals. Sessions can be disabled at runtime via the session picker (Cmd-Shift-Backspace), which toggles the `[D]` prefix on the TODO heading. Disabled sessions are skipped during auto-attach but remain visible in the adopt list. To permanently delete, manually change `[D]` to `[DELETED]` in TODO.md.
 
 Key design points:
 - Separate terminal instances per session (switching sessions does not disconnect terminals)
@@ -120,6 +120,10 @@ These become the basis for the next message.
 The `### WAIT` marker separates what has been sent from what is being drafted. When the user selects text above `### WAIT` and presses the send key, that text is wrapped in a new `### Message N` heading and sent to the Claude terminal. The `### WAIT` marker moves below it. Unselected text remains as future notes.
 
 The `## Label` heading followed by `> uuid=...` is parsed by the app. The label is a freeform description. The UUID links the session to a Claude Code session for `--resume`.
+
+Session headings support two special prefixes:
+- `## [D] Label` — **disabled/dormant**. The session is parsed and appears in the adopt list but is not auto-attached on startup. Toggle via Cmd-Shift-Backspace in the session picker.
+- `## [DELETED] Label` — **deleted**. The session is completely skipped by the parser and does not appear anywhere. This is a manual edit; the app never writes this prefix directly.
 
 ### Comment Format
 
@@ -466,3 +470,19 @@ Hooks are the one extension point that works well today. Claude Code fires event
 
 ### Automation
 - [ ] [D] Manage automations; i.e. creating sessions and running them automatically
+
+---
+
+## Claude Code Hook Opportunities
+
+Currently used hooks: `UserPromptSubmit`, `Stop`, `Notification` (idle/permission), `PermissionRequest`, `SessionStart`, `SessionEnd`.
+
+Hooks worth exploring:
+
+- **`PreToolUse`** — Show real-time tool activity in the session status (e.g., "Reading src/main.rs", "Running tests"). Could also enforce project-specific tool policies.
+- **`PostToolUse`** — Auto-refresh the code view when Claude writes/edits a file in the current project. Auto-refresh diff view after git operations.
+- **`SubagentStart`/`SubagentStop`** — Track concurrent subagent work. Show a count of active subagents in the session status bar. Could detect when a subagent modifies files in the project.
+- **`PostCompact`** — Display a notification or marker when context was compacted, so the user knows Claude's memory was trimmed. Could log the compact summary to the TODO.
+- **`TaskCompleted`** — Surface completed tasks in the TODO view or as notifications. Could auto-check items in PLAN.md.
+- **`PreCompact`** — Inject custom instructions before compaction to preserve project-specific context.
+- **`InstructionsLoaded`** — Track which CLAUDE.md files are active, useful for debugging instruction precedence.

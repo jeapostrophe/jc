@@ -1,3 +1,4 @@
+pub mod close_confirm;
 pub mod code_view;
 pub mod comment_panel;
 pub mod diff_view;

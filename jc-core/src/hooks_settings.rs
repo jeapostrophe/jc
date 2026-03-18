@@ -23,6 +23,17 @@ pub fn install_hooks(project_path: &Path, port: u16) -> Result<()> {
 
   let base = format!("http://127.0.0.1:{port}{HOOK_PATH_PREFIX}");
 
+  // UserPromptSubmit hook (fires when user submits a prompt — Claude about to start)
+  let prompt_submit_entry = serde_json::json!({
+      "hooks": [{ "type": "http", "url": format!("{base}prompt-submit") }]
+  });
+  hooks_obj
+    .entry("UserPromptSubmit")
+    .or_insert_with(|| Value::Array(Vec::new()))
+    .as_array_mut()
+    .expect("UserPromptSubmit should be an array")
+    .push(prompt_submit_entry);
+
   // Stop hook
   let stop_entry = serde_json::json!({
       "hooks": [{ "type": "http", "url": format!("{base}stop") }]

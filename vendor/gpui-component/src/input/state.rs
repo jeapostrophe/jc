@@ -103,7 +103,9 @@ pub(super) const CONTEXT: &str = "Input";
 pub(crate) fn init(cx: &mut App) {
   cx.bind_keys([
     KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
+    KeyBinding::new("shift-backspace", Backspace, Some(CONTEXT)),
     KeyBinding::new("delete", Delete, Some(CONTEXT)),
+    KeyBinding::new("shift-delete", Delete, Some(CONTEXT)),
     #[cfg(target_os = "macos")]
     KeyBinding::new("cmd-backspace", DeleteToBeginningOfLine, Some(CONTEXT)),
     #[cfg(target_os = "macos")]

@@ -295,15 +295,15 @@ impl Workspace {
         }
       });
 
-    // Initialize notification system and poll for notification action responses.
+    // Initialize notification system and poll for notification click responses.
     let notification_action_rx = crate::notify::action_receiver();
     crate::notify::init();
     let notification_poll_task =
       cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
-        while let Ok(slug) = notification_action_rx.recv_async().await {
+        while let Ok(session_id) = notification_action_rx.recv_async().await {
           let Ok(should_continue) = cx.update(|window, cx| {
             if let Some(entity) = this.upgrade() {
-              entity.update(cx, |ws, cx| ws.switch_to_slug(&slug, window, cx));
+              entity.update(cx, |ws, cx| ws.switch_to_session_id(&session_id, window, cx));
               window.activate_window();
               true
             } else {
@@ -639,6 +639,27 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    self.show_in_pane(self.active_pane_index, kind, window, cx);
+  }
+
+  /// Show `kind` in the rightmost visible pane and focus it.
+  pub(super) fn set_rightmost_pane_view(
+    &mut self,
+    kind: PaneContentKind,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let pane_idx = self.visible_pane_count() - 1;
+    self.show_in_pane(pane_idx, kind, window, cx);
+  }
+
+  fn show_in_pane(
+    &mut self,
+    pane_idx: usize,
+    kind: PaneContentKind,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
     // Clear bell when user switches to the claude terminal.
     if kind == PaneContentKind::ClaudeTerminal
       && let Some(session) = self.projects[self.active_project_index].active_session_mut()
@@ -650,7 +671,6 @@ impl Workspace {
     if kind == PaneContentKind::GitDiff {
       self.projects[self.active_project_index].diff_view.update(cx, |v, cx| v.refresh(window, cx));
     }
-    let pane_idx = self.active_pane_index;
     self.set_pane_view(pane_idx, kind, cx);
 
     self.panes[pane_idx].read(cx).focus_content(window);
@@ -817,7 +837,6 @@ impl Workspace {
       let saved = SavedPaneLayout {
         pane_kinds: std::array::from_fn(|i| self.panes[i].read(cx).content_kind()),
         active_pane_index: self.active_pane_index,
-        layout: self.layout,
       };
       self.projects[self.active_project_index].saved_layout = Some(saved);
     }
@@ -882,33 +901,32 @@ impl Workspace {
     self.switch_to_session(next_pi, next_sid, window, cx);
   }
 
-  /// Find a session by slug/label across all projects and switch to it.
-  /// This is used by notification actions which still pass slug strings.
-  fn switch_to_slug(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+  /// Find a session by ID across all projects and switch to it.
+  /// Used by notification click handler which passes session UUIDs.
+  fn switch_to_session_id(&mut self, session_id: &str, window: &mut Window, cx: &mut Context<Self>) {
     for (pi, project) in self.projects.iter().enumerate() {
-      // Try to match by label.
-      if let Some((id, _)) = project.session_by_label(slug) {
+      if let Some((id, _)) = project.session_by_uuid(session_id) {
         self.switch_to_session(pi, Some(id), window, cx);
         return;
       }
-      // Try to match by UUID.
-      if let Some((id, _)) = project.session_by_uuid(slug) {
+      // Fall back to label match for older notifications.
+      if let Some((id, _)) = project.session_by_label(session_id) {
         self.switch_to_session(pi, Some(id), window, cx);
         return;
       }
     }
   }
 
-  /// Restore saved pane layout for the active project, or use defaults.
+  /// Restore saved pane contents for the active project, or use defaults.
+  /// The pane layout (1/2/3) is window-level and not restored here.
   fn restore_or_default_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     // Copy saved layout data to avoid borrow conflict with set_pane_view.
     let saved = self.projects[self.active_project_index]
       .saved_layout
       .as_ref()
-      .map(|s| (s.pane_kinds, s.active_pane_index, s.layout));
+      .map(|s| (s.pane_kinds, s.active_pane_index));
 
-    if let Some((kinds, active, layout)) = saved {
-      self.layout = layout;
+    if let Some((kinds, active)) = saved {
       for (i, kind) in kinds.iter().enumerate() {
         if let Some(kind) = kind {
           self.set_pane_view(i, *kind, cx);
@@ -1091,45 +1109,45 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
-  // Session removal
+  // Session disable toggle
   // ---------------------------------------------------------------------------
 
-  fn remove_session(
+  fn toggle_session_disabled(
     &mut self,
     project_idx: usize,
-    session_id: SessionId,
+    label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let project = &mut self.projects[project_idx];
+    let todo_view = project.todo_view.clone();
 
-    // Get label before removing, for marking deleted in TODO.
-    let label = project.sessions.get(&session_id).map(|s| s.label.clone());
+    // Check if the session is currently adopted (running).
+    let adopted_id = project.session_by_label(label).map(|(id, _)| id);
 
-    // Remove the session state (drops terminals).
-    project.sessions.remove(&session_id);
+    todo_view.update(cx, |tv, cx| {
+      tv.toggle_session_disabled(label, window, cx);
+      tv.save(cx);
+    });
 
-    // Mark the session as deleted in TODO.md so it won't reappear on restart.
-    if let Some(label) = &label {
-      let todo_view = project.todo_view.clone();
-      todo_view.update(cx, |tv, cx| {
-        tv.mark_session_deleted(label, window, cx);
-        tv.save(cx);
-      });
+    // If the session was adopted and is now being disabled, detach it.
+    let is_now_disabled = todo_view.read(cx).document().session_by_label(label)
+      .map_or(false, |s| s.disabled);
+    if is_now_disabled {
+      if let Some(id) = adopted_id {
+        let project = &mut self.projects[project_idx];
+        project.sessions.remove(&id);
+
+        if project.active_session == Some(id) {
+          let next_id = project.sessions.keys().next().copied();
+          project.active_session = next_id;
+        }
+
+        self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
+        let active = self.projects[project_idx].active_session;
+        self.switch_to_session(project_idx, active, window, cx);
+      }
     }
-
-    // If the removed session was active, pick another one.
-    if project.active_session == Some(session_id) {
-      let next_id = project.sessions.keys().next().copied();
-      project.active_session = next_id;
-    }
-
-    // Rebuild bell subscriptions since a session was removed.
-    self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
-
-    // Switch to the new active session (or clear panes if none).
-    let active = self.projects[project_idx].active_session;
-    self.switch_to_session(project_idx, active, window, cx);
   }
 
   // ---------------------------------------------------------------------------
@@ -1337,11 +1355,28 @@ impl Workspace {
       return;
     }
 
+    // PromptSubmit just sets busy — it's not a problem/notification.
+    if matches!(event.kind, HookEventKind::PromptSubmit) {
+      let session_uuid = &event.session_id;
+      if !session_uuid.is_empty() {
+        for project in &mut self.projects {
+          if let Some(session) =
+            project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(session_uuid))
+          {
+            session.busy = true;
+            break;
+          }
+        }
+      }
+      cx.notify();
+      return;
+    }
+
     let pending = match event.kind {
       HookEventKind::Stop => PendingEvent::ClaudeStop,
       HookEventKind::PermissionPrompt => PendingEvent::ClaudePermission,
       HookEventKind::IdlePrompt => PendingEvent::ClaudeIdle,
-      HookEventKind::SessionClear { .. } => unreachable!(),
+      HookEventKind::PromptSubmit | HookEventKind::SessionClear { .. } => unreachable!(),
     };
 
     // Match by UUID (session_id from hook) across all projects.
@@ -1356,7 +1391,6 @@ impl Workspace {
           .values_mut()
           .find(|s| s.uuid.as_deref() == Some(session_uuid));
         if let Some(session) = found {
-          session.ever_active = true;
           session.busy = !matches!(pending, PendingEvent::ClaudeIdle | PendingEvent::ClaudeStop);
           let is_new = session.pending_events.insert(pending.clone());
           if is_new {
@@ -1368,7 +1402,6 @@ impl Workspace {
         // If no UUID match, try to assign to a pending (uuid=None) session.
         if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
           session.uuid = Some(session_uuid.clone());
-          session.ever_active = true;
           session.busy = !matches!(pending, PendingEvent::ClaudeIdle | PendingEvent::ClaudeStop);
           let is_new = session.pending_events.insert(pending.clone());
           // Update TODO.md with the new UUID.
@@ -1396,9 +1429,8 @@ impl Workspace {
         HookEventKind::Stop => "Claude finished",
         HookEventKind::PermissionPrompt => "Permission needed",
         HookEventKind::IdlePrompt => "Claude is idle",
-        HookEventKind::SessionClear { .. } => unreachable!(),
+        HookEventKind::PromptSubmit | HookEventKind::SessionClear { .. } => unreachable!(),
       };
-      // Pass session_uuid as notification identifier (replaces old slug).
       let notify_id = if event.session_id.is_empty() { None } else { Some(event.session_id.as_str()) };
       crate::notify::notify(&title, message, critical, notify_id);
     }

@@ -15,6 +15,8 @@ pub struct TodoDocument {
 pub struct TodoSession {
   pub uuid: String,
   pub label: String,
+  /// Session is present in the document but should not be auto-attached on startup.
+  pub disabled: bool,
   pub line: u32,
   pub heading_byte_range: Range<usize>,
   /// 1-based line number of the `> uuid=...` line.
@@ -112,6 +114,8 @@ pub fn parse(text: &str) -> TodoDocument {
   let mut byte_offset: usize = 0;
   // State: we just saw an `## Label` heading and are looking for `> uuid=...` next.
   let mut expecting_uuid_for: Option<TodoSession> = None;
+  // Only create sessions for `##` headings inside a `# Claude` section.
+  let mut in_claude_section = false;
 
   for (line_idx, line) in text.lines().enumerate() {
     let line_num = line_idx as u32 + 1;
@@ -139,24 +143,32 @@ pub fn parse(text: &str) -> TodoDocument {
     if expecting_uuid_for.is_some() {
       // Already handled above, skip normal parsing for this line.
     } else if line.starts_with("# ") {
-      // Any top-level heading ends the current session.
+      // Any top-level heading ends the current session and leaves the Claude section.
       finalize_session(&mut doc, &mut current_session, line_start);
+      in_claude_section = line == "# Claude";
 
-      if line == "# Claude" {
+      if in_claude_section {
         doc.claude_section_line = Some(line_num);
       }
     } else if let Some(after_h2) = line.strip_prefix("## ") {
       // Any second-level heading ends the current session.
       finalize_session(&mut doc, &mut current_session, line_start);
 
-      // Skip sessions marked as DELETED.
-      if after_h2.starts_with("DELETED ") {
-        // Don't create a session for deleted headings.
+      // Only treat `##` headings as sessions inside `# Claude`.
+      if !in_claude_section {
+        // Ignore — this heading is outside the Claude section.
+      } else if after_h2.starts_with("[DELETED] ") {
+        // Skip sessions marked as [DELETED].
       } else if !after_h2.is_empty() {
-        // New format: `## Label` (the label is everything after "## ")
-        let label = after_h2.to_string();
+        // Check for [D] prefix indicating a disabled (dormant) session.
+        let (label, disabled) = if let Some(rest) = after_h2.strip_prefix("[D] ") {
+          (rest.to_string(), true)
+        } else {
+          (after_h2.to_string(), false)
+        };
         expecting_uuid_for = Some(TodoSession {
           label,
+          disabled,
           line: line_num,
           heading_byte_range: line_start..line_end,
           ..Default::default()
@@ -338,34 +350,26 @@ pub fn insert_session_heading(
 // Session deletion marking
 // ---------------------------------------------------------------------------
 
-/// Mark a session heading as deleted by changing `## <label>` to
-/// `## DELETED <label>`. Returns the modified text, or `None` if the
-/// label was not found in the document.
-pub fn mark_session_deleted(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
+/// Toggle the `[D]` (disabled/dormant) prefix on a session heading.
+/// Returns the modified text, or `None` if the label was not found.
+pub fn toggle_session_disabled(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
   let session = doc.session_by_label(label)?;
-  let heading = &text[session.heading_byte_range.clone()];
-  let new_heading = heading.replacen(&format!("## {label}"), &format!("## DELETED {label}"), 1);
-  let mut new_text = String::with_capacity(text.len() + "DELETED ".len());
-  new_text.push_str(&text[..session.heading_byte_range.start]);
+  let range = session.heading_byte_range.clone();
+  let heading = &text[range.clone()];
+  let new_heading = if session.disabled {
+    // Remove [D] prefix: `## [D] Label` → `## Label`
+    heading.replacen(&format!("## [D] {label}"), &format!("## {label}"), 1)
+  } else {
+    // Add [D] prefix: `## Label` → `## [D] Label`
+    heading.replacen(&format!("## {label}"), &format!("## [D] {label}"), 1)
+  };
+  let mut new_text = String::with_capacity(text.len() + 4);
+  new_text.push_str(&text[..range.start]);
   new_text.push_str(&new_heading);
-  new_text.push_str(&text[session.heading_byte_range.end..]);
+  new_text.push_str(&text[range.end..]);
   Some(new_text)
 }
 
-/// Unmark a deleted session heading by removing the `DELETED ` prefix from
-/// `## DELETED <label>`. Scans the raw text since deleted sessions
-/// are not in the parsed document. Returns the modified text, or `None` if
-/// no matching deleted heading was found.
-pub fn unmark_session_deleted(text: &str, label: &str) -> Option<String> {
-  let needle = format!("## DELETED {label}");
-  let pos = text.find(&needle)?;
-  let replacement = format!("## {label}");
-  let mut new_text = String::with_capacity(text.len());
-  new_text.push_str(&text[..pos]);
-  new_text.push_str(&replacement);
-  new_text.push_str(&text[pos + needle.len()..]);
-  Some(new_text)
-}
 
 // ---------------------------------------------------------------------------
 // UUID update
@@ -490,6 +494,27 @@ mod tests {
     assert!(doc.sessions.is_empty());
     assert!(doc.first_session().is_none());
     assert!(doc.session_uuids().is_empty());
+  }
+
+  #[test]
+  fn h2_outside_claude_section_ignored() {
+    let text = "\
+# APU
+## Voices
+some notes
+## performance
+more notes
+
+# Claude
+## Real Session
+> uuid=abc
+
+### WAIT
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions.len(), 1);
+    assert_eq!(doc.sessions[0].label, "Real Session");
+    assert_eq!(doc.sessions[0].uuid, "abc");
   }
 
   #[test]
@@ -677,7 +702,7 @@ body
 
   #[test]
   fn uuid_byte_range_covers_uuid_text() {
-    let text = "## My Label\n> uuid=my-uuid\n";
+    let text = "# Claude\n## My Label\n> uuid=my-uuid\n";
     let doc = parse(text);
     let session = &doc.sessions[0];
     assert_eq!(&text[session.uuid_byte_range.clone()], "my-uuid");
@@ -685,7 +710,7 @@ body
 
   #[test]
   fn heading_byte_range_covers_full_line() {
-    let text = "## Test Label\n> uuid=test\nsome body\n";
+    let text = "# Claude\n## Test Label\n> uuid=test\nsome body\n";
     let doc = parse(text);
     let session = &doc.sessions[0];
     assert_eq!(&text[session.heading_byte_range.clone()], "## Test Label");
@@ -694,6 +719,7 @@ body
   #[test]
   fn top_level_heading_ends_session() {
     let text = "\
+# Claude
 ## Inside
 > uuid=inside
 
@@ -704,15 +730,16 @@ body
 
 ";
     let doc = parse(text);
-    assert_eq!(doc.sessions.len(), 2);
+    // `## Inside` is under `# Claude`, but `## Outside` is under `# Other Section`.
+    assert_eq!(doc.sessions.len(), 1);
     assert_eq!(doc.sessions[0].uuid, "inside");
     assert_eq!(doc.sessions[0].messages.len(), 1);
-    assert_eq!(doc.sessions[1].uuid, "outside");
   }
 
   #[test]
   fn wait_body_range_bounded_by_next_heading() {
     let text = "\
+# Claude
 ## A
 > uuid=a
 
@@ -939,10 +966,77 @@ third
   }
 
   #[test]
+  fn disabled_sessions_are_parsed_with_flag() {
+    let text = "\
+# Claude
+## [D] Dormant Session
+> uuid=dormant
+
+### WAIT
+## Active Session
+> uuid=active
+
+### WAIT
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions.len(), 2);
+    assert_eq!(doc.sessions[0].label, "Dormant Session");
+    assert!(doc.sessions[0].disabled);
+    assert_eq!(doc.sessions[0].uuid, "dormant");
+    assert_eq!(doc.sessions[1].label, "Active Session");
+    assert!(!doc.sessions[1].disabled);
+  }
+
+  #[test]
+  fn toggle_session_disabled_roundtrip() {
+    let text = "\
+# Claude
+## My Session
+> uuid=my-uuid
+
+### WAIT
+";
+    let doc = parse(text);
+    assert!(!doc.sessions[0].disabled);
+
+    // Disable it.
+    let disabled_text = toggle_session_disabled(text, &doc, "My Session").unwrap();
+    assert!(disabled_text.contains("## [D] My Session"));
+    let doc2 = parse(&disabled_text);
+    assert_eq!(doc2.sessions[0].label, "My Session");
+    assert!(doc2.sessions[0].disabled);
+
+    // Re-enable it.
+    let enabled_text = toggle_session_disabled(&disabled_text, &doc2, "My Session").unwrap();
+    assert!(enabled_text.contains("## My Session"));
+    assert!(!enabled_text.contains("[D]"));
+    let doc3 = parse(&enabled_text);
+    assert!(!doc3.sessions[0].disabled);
+  }
+
+  #[test]
+  fn bracket_deleted_sessions_are_skipped() {
+    let text = "\
+# Claude
+## [DELETED] Old Label
+> uuid=old
+
+### WAIT
+## Active Session
+> uuid=active
+
+### WAIT
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions.len(), 1);
+    assert_eq!(doc.sessions[0].label, "Active Session");
+  }
+
+  #[test]
   fn deleted_sessions_are_skipped() {
     let text = "\
 # Claude
-## DELETED Old Label
+## [DELETED] Old Label
 > uuid=old
 
 ### WAIT
@@ -955,38 +1049,6 @@ stale draft
     let doc = parse(text);
     assert_eq!(doc.sessions.len(), 1);
     assert_eq!(doc.sessions[0].label, "Active Session");
-  }
-
-  #[test]
-  fn mark_session_deleted_roundtrip() {
-    let text = "\
-# Claude
-## My Label
-> uuid=my-uuid
-
-### WAIT
-draft
-";
-    let doc = parse(text);
-    let marked = mark_session_deleted(text, &doc, "My Label").unwrap();
-    assert!(marked.contains("## DELETED My Label"));
-
-    // Marked session should be skipped when parsed.
-    let doc2 = parse(&marked);
-    assert!(doc2.sessions.is_empty());
-
-    // Unmark should restore it.
-    let restored = unmark_session_deleted(&marked, "My Label").unwrap();
-    assert!(restored.contains("## My Label"));
-    let doc3 = parse(&restored);
-    assert_eq!(doc3.sessions.len(), 1);
-    assert_eq!(doc3.sessions[0].label, "My Label");
-  }
-
-  #[test]
-  fn unmark_nonexistent_returns_none() {
-    let text = "## Active\n> uuid=x\n";
-    assert!(unmark_session_deleted(text, "Active").is_none());
   }
 
   #[test]

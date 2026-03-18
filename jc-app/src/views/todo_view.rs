@@ -164,15 +164,15 @@ impl TodoView {
     });
   }
 
-  /// Mark a session heading as deleted in the TODO text.
-  pub fn mark_session_deleted(
+  /// Toggle the `[D]` (disabled/dormant) prefix on a session heading.
+  pub fn toggle_session_disabled(
     &mut self,
     label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let text = self.editor_text(cx);
-    if let Some(new_text) = todo::mark_session_deleted(&text, &self.document, label) {
+    if let Some(new_text) = todo::toggle_session_disabled(&text, &self.document, label) {
       self.code_view.update(cx, |cv, cx| {
         cv.editor().update(cx, |state, cx| {
           state.set_value_preserving_position(new_text, window, cx);

@@ -235,6 +235,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::copy_reply))
       .on_action(cx.listener(Self::jump_to_wait))
       .on_action(cx.listener(Self::next_problem))
+      .on_action(cx.listener(Self::rotate_next_project))
       .on_action(cx.listener(Self::toggle_keybinding_help))
       .on_action(cx.listener(Self::show_snippet_picker))
       .child(self.render_title_bar(cx))
@@ -242,6 +243,7 @@ impl Render for Workspace {
       .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
       .when_some(self.active_comment_panel.as_ref(), |el, v| el.child(modal_overlay(v)))
       .when_some(self.keybinding_help.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))
+      .when_some(self.close_confirm.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))
   }
 }
 

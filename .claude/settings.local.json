@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "curl -sf -X POST http://127.0.0.1:53194/jc-hook/session-start -H 'Content-Type: application/json' -d @-",
+            "command": "curl -sf -X POST http://127.0.0.1:64555/jc-hook/session-start -H 'Content-Type: application/json' -d @-",
             "timeout": 5
           }
         ]
@@ -56,8 +56,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "curl -sf -X POST http://127.0.0.1:53194/jc-hook/session-end -H 'Content-Type: application/json' -d @-",
+            "command": "curl -sf -X POST http://127.0.0.1:64555/jc-hook/session-end -H 'Content-Type: application/json' -d @-",
             "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:64555/jc-hook/prompt-submit"
           }
         ]
       }
@@ -67,7 +77,7 @@
         "hooks": [
           {
             "type": "http",
-            "url": "http://127.0.0.1:53194/jc-hook/stop"
+            "url": "http://127.0.0.1:64555/jc-hook/stop"
           }
         ]
       }
@@ -78,7 +88,7 @@
         "hooks": [
           {
             "type": "http",
-            "url": "http://127.0.0.1:53194/jc-hook/notification"
+            "url": "http://127.0.0.1:64555/jc-hook/notification"
           }
         ]
       }
@@ -88,7 +98,7 @@
         "hooks": [
           {
             "type": "http",
-            "url": "http://127.0.0.1:53194/jc-hook/permission"
+            "url": "http://127.0.0.1:64555/jc-hook/permission"
           }
         ]
       }
