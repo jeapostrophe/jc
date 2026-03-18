@@ -63,6 +63,10 @@ impl TodoView {
     &self.file_path
   }
 
+  pub fn code_view(&self) -> &Entity<super::code_view::CodeView> {
+    &self.code_view
+  }
+
   pub fn is_dirty(&self, cx: &App) -> bool {
     self.code_view.read(cx).is_dirty(cx)
   }
