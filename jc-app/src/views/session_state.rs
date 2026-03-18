@@ -1,11 +1,11 @@
-use crate::views::reply_view::ReplyView;
 use gpui::*;
 use jc_core::problem::{AppTodoProblem, ClaudeProblem, SessionProblem, TerminalProblem};
-use jc_core::session::discover_session_group;
 use jc_core::todo::TodoProblem;
 use jc_terminal::{Palette, TerminalConfig, TerminalView};
 use std::collections::HashSet;
 use std::path::Path;
+
+pub type SessionId = usize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PendingEvent {
@@ -16,29 +16,30 @@ pub enum PendingEvent {
 }
 
 pub struct SessionState {
-  pub slug: String,
+  pub id: SessionId,
+  pub uuid: Option<String>,
   pub label: String,
   pub claude_terminal: Entity<TerminalView>,
   pub general_terminal: Entity<TerminalView>,
-  pub reply_view: Entity<ReplyView>,
   pub pending_events: HashSet<PendingEvent>,
   pub problems: Vec<SessionProblem>,
 }
 
 impl SessionState {
   pub fn create(
-    slug: String,
+    id: SessionId,
+    uuid: Option<String>,
     label: String,
     project_path: &Path,
     palette: &Palette,
     window: &mut Window,
     cx: &mut App,
   ) -> Self {
-    // Find the most recent JSONL session UUID for this slug so we can
-    // resume the Claude session. Falls back to plain `claude` if none found.
-    let command = discover_session_group(project_path, &slug)
-      .and_then(|g| g.latest_session_id())
-      .map(|uuid| format!("claude --resume {uuid}"))
+    // If we have a UUID, resume that session. Otherwise launch plain `claude`.
+    let command = uuid
+      .as_ref()
+      .filter(|u| !u.is_empty())
+      .map(|u| format!("claude --resume {u}"))
       .unwrap_or_else(|| "claude".to_string());
 
     let claude_config = TerminalConfig {
@@ -53,20 +54,12 @@ impl SessionState {
     let general_terminal =
       cx.new(|cx| TerminalView::new(general_config, Some(&project), window, cx));
 
-    let slug_for_reply = slug.clone();
-    let reply_project = project_path.to_path_buf();
-    let reply_view = cx.new(|cx| {
-      let mut rv = ReplyView::new(reply_project, window, cx);
-      rv.set_session_slug(Some(slug_for_reply), window, cx);
-      rv
-    });
-
     Self {
-      slug,
+      id,
+      uuid,
       label,
       claude_terminal,
       general_terminal,
-      reply_view,
       pending_events: HashSet::default(),
       problems: Vec::new(),
     }
@@ -89,14 +82,8 @@ impl SessionState {
 
     for tp in todo_problems {
       match tp {
-        TodoProblem::InvalidSessionSlug { slug, line, .. } if slug == &self.slug => {
-          problems.push(SessionProblem::Todo(AppTodoProblem::InvalidSlug {
-            slug: slug.clone(),
-            line: *line,
-          }));
-        }
-        TodoProblem::UnsentWait { slug } if slug == &self.slug => {
-          problems.push(SessionProblem::Todo(AppTodoProblem::UnsentWait { slug: slug.clone() }));
+        TodoProblem::UnsentWait { label } if label == &self.label => {
+          problems.push(SessionProblem::Todo(AppTodoProblem::UnsentWait { label: label.clone() }));
         }
         _ => {}
       }

@@ -1,15 +1,13 @@
 use crate::views::code_view::CodeView;
 use crate::views::diff_view::DiffView;
-use crate::views::session_state::SessionState;
+use crate::views::session_state::{SessionId, SessionState};
 use crate::views::todo_view::TodoView;
 use gpui::*;
 use jc_core::problem::{DiffProblem, ProjectProblem, ScriptProblem};
-use jc_core::session::discover_latest_session_group;
 use jc_core::status_script;
-use jc_core::todo;
 use jc_terminal::Palette;
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::pane::PaneContentKind;
@@ -21,17 +19,12 @@ pub struct SavedPaneLayout {
   pub layout: PaneLayout,
 }
 
-/// A pending rekey from a `/clear` event: waiting for the new JSONL to get a slug.
-pub struct PendingRekey {
-  pub old_slug: String,
-  pub new_session_id: String,
-}
-
 pub struct ProjectState {
   pub path: PathBuf,
   pub name: String,
-  pub sessions: HashMap<String, SessionState>,
-  pub active_session_slug: Option<String>,
+  pub sessions: HashMap<SessionId, SessionState>,
+  pub active_session: Option<SessionId>,
+  pub next_session_id: SessionId,
   pub todo_view: Entity<TodoView>,
   pub diff_view: Entity<DiffView>,
   pub code_view: Entity<CodeView>,
@@ -39,8 +32,6 @@ pub struct ProjectState {
   pub script_problems: Vec<ScriptProblem>,
   pub last_script_run: Option<Instant>,
   pub saved_layout: Option<SavedPaneLayout>,
-  /// Pending session rekeys from `/clear` events, awaiting slug resolution.
-  pub pending_rekeys: Vec<PendingRekey>,
 }
 
 impl ProjectState {
@@ -55,58 +46,58 @@ impl ProjectState {
     let code_view = cx.new(|cx| CodeView::new(window, cx));
     let todo_view = cx.new(|cx| TodoView::new(path.clone(), window, cx));
 
-    // If TODO.md has no valid sessions, try to discover the most recent
-    // JSONL session group and insert a heading automatically.
-    if !todo::has_valid_sessions(todo_view.read(cx).document(), &path)
-      && let Some(group) = discover_latest_session_group(&path)
-    {
-      todo_view.update(cx, |tv, cx| {
-        tv.insert_session_heading(&group.slug, &group.slug, window, cx);
-      });
-    }
-
-    // Build sessions, skipping any with invalid slugs to avoid creating
-    // broken SessionState entries (terminals that can't resume).
+    // Lazy adoption: only launch a terminal for the first TODO session whose
+    // UUID still has a JSONL file on disk (i.e. the session is resumable).
+    // Fall back to the first session if none have a live UUID.
     let document = todo_view.read(cx).document().clone();
-    let invalid_slugs: HashSet<String> = todo_view
-      .read(cx)
-      .problems()
-      .iter()
-      .filter_map(|p| match p {
-        todo::TodoProblem::InvalidSessionSlug { slug, .. } => Some(slug.clone()),
-        todo::TodoProblem::UnsentWait { .. } => None,
-      })
-      .collect();
-
     let mut sessions = HashMap::new();
-    for todo_session in &document.sessions {
-      if invalid_slugs.contains(&todo_session.slug) {
-        continue;
-      }
+    let mut next_session_id: SessionId = 0;
+
+    let session_dir = Self::session_dir(&path);
+    let best = document
+      .sessions
+      .iter()
+      .find(|s| {
+        !s.uuid.is_empty()
+          && session_dir.join(format!("{}.jsonl", s.uuid)).exists()
+      })
+      .or_else(|| document.sessions.first());
+
+    if let Some(todo_session) = best {
+      let uuid = if todo_session.uuid.is_empty() {
+        None
+      } else {
+        Some(todo_session.uuid.clone())
+      };
+      let id = next_session_id;
+      next_session_id += 1;
       let state = SessionState::create(
-        todo_session.slug.clone(),
+        id,
+        uuid,
         todo_session.label.clone(),
         &path,
         palette,
         window,
         cx,
       );
-      sessions.insert(todo_session.slug.clone(), state);
+      sessions.insert(id, state);
     }
 
-    let active_session_slug =
-      document.sessions.iter().find(|s| sessions.contains_key(&s.slug)).map(|s| s.slug.clone());
+    let active_session = sessions.keys().next().copied();
 
     // Highlight the initial active session in the TODO view.
-    if let Some(slug) = &active_session_slug {
-      todo_view.update(cx, |tv, cx| tv.set_active_slug(Some(slug), cx));
+    if let Some(id) = active_session {
+      if let Some(session) = sessions.get(&id) {
+        todo_view.update(cx, |tv, cx| tv.set_active_label(Some(&session.label), cx));
+      }
     }
 
     Self {
       path,
       name,
       sessions,
-      active_session_slug,
+      active_session,
+      next_session_id,
       todo_view,
       diff_view,
       code_view,
@@ -114,20 +105,26 @@ impl ProjectState {
       script_problems: Vec::new(),
       last_script_run: None,
       saved_layout: None,
-      pending_rekeys: Vec::new(),
     }
   }
 
+  /// Path to Claude's JSONL session directory for this project.
+  fn session_dir(project_path: &Path) -> PathBuf {
+    let encoded = project_path.to_string_lossy().replace('/', "-");
+    let home = std::env::var("HOME").expect("HOME not set");
+    PathBuf::from(home).join(".claude/projects").join(encoded)
+  }
+
   pub fn active_session(&self) -> Option<&SessionState> {
-    self.active_session_slug.as_ref().and_then(|slug| self.sessions.get(slug))
+    self.active_session.and_then(|id| self.sessions.get(&id))
   }
 
   pub fn active_session_mut(&mut self) -> Option<&mut SessionState> {
-    self.active_session_slug.as_ref().and_then(|slug| self.sessions.get_mut(slug))
+    self.active_session.and_then(|id| self.sessions.get_mut(&id))
   }
 
-  pub fn active_slug(&self) -> Option<&str> {
-    self.active_session_slug.as_deref()
+  pub fn active_label(&self) -> Option<&str> {
+    self.active_session().map(|s| s.label.as_str())
   }
 
   /// Refresh problems for all sessions and the project itself.
@@ -141,10 +138,19 @@ impl ProjectState {
     // Sync session labels from the TODO document.
     let document = todo_view.document();
     for todo_session in &document.sessions {
-      if let Some(session) = self.sessions.get_mut(&todo_session.slug) {
-        if session.label != todo_session.label {
-          session.label = todo_session.label.clone();
-          changed = true;
+      // Find session by label match (since labels are the stable identifier in TODO.md).
+      for session in self.sessions.values_mut() {
+        if session.label == todo_session.label {
+          // Update UUID if it changed in the document.
+          let new_uuid = if todo_session.uuid.is_empty() {
+            None
+          } else {
+            Some(todo_session.uuid.clone())
+          };
+          if session.uuid != new_uuid {
+            session.uuid = new_uuid;
+            changed = true;
+          }
         }
       }
     }
@@ -174,5 +180,19 @@ impl ProjectState {
     changed |= self.problems != problems;
     self.problems = problems;
     changed
+  }
+
+  /// Find a session by its label.
+  pub fn session_by_label(&self, label: &str) -> Option<(SessionId, &SessionState)> {
+    self.sessions.iter().find(|(_, s)| s.label == label).map(|(&id, s)| (id, s))
+  }
+
+  /// Find a session by UUID.
+  pub fn session_by_uuid(&self, uuid: &str) -> Option<(SessionId, &SessionState)> {
+    self
+      .sessions
+      .iter()
+      .find(|(_, s)| s.uuid.as_deref() == Some(uuid))
+      .map(|(&id, s)| (id, s))
   }
 }

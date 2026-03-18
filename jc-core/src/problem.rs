@@ -46,8 +46,7 @@ pub struct ScriptProblem {
 /// App-level view of todo problems (distinct from the parser-level `TodoProblem`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AppTodoProblem {
-  UnsentWait { slug: String },
-  InvalidSlug { slug: String, line: u32 },
+  UnsentWait { label: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +86,6 @@ impl SessionProblem {
       Self::Claude(ClaudeProblem::Idle) => 4,
       Self::Terminal(TerminalProblem::Bell) => 5,
       Self::Todo(AppTodoProblem::UnsentWait { .. }) => 6,
-      Self::Todo(AppTodoProblem::InvalidSlug { .. }) => 7,
     }
   }
 
@@ -97,8 +95,7 @@ impl SessionProblem {
       Self::Claude(ClaudeProblem::Stop) => "Stopped".into(),
       Self::Claude(ClaudeProblem::Idle) => "Idle prompt".into(),
       Self::Terminal(TerminalProblem::Bell) => "Bell".into(),
-      Self::Todo(AppTodoProblem::UnsentWait { slug }) => format!("Unsent wait: {slug}"),
-      Self::Todo(AppTodoProblem::InvalidSlug { slug, .. }) => format!("Invalid slug: {slug}"),
+      Self::Todo(AppTodoProblem::UnsentWait { label }) => format!("Unsent wait: {label}"),
     }
   }
 }

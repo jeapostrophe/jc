@@ -36,12 +36,12 @@ data/
   light_theme.toml                  # unified light theme: terminal palette, UI chrome, syntax (Tomorrow)
   fonts/                            # bundled Lilex font (Regular, Bold, Italic, BoldItalic)
 jc-core/                            # data model + config persistence
-  src/lib.rs, config.rs, model.rs, problem.rs, session.rs, theme.rs
+  src/lib.rs, config.rs, model.rs, problem.rs, theme.rs
 jc-terminal/                        # embedded terminal emulator
   src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
   examples/terminal_window.rs
 jc-app/                             # binary: CLI + GPUI app
-  src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_state,session_state,project_view,diff_view,code_view,todo_view,reply_view}.rs
+  src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_state,session_state,diff_view,code_view,todo_view}.rs
   src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
   examples/basic_window.rs
 ```
@@ -51,7 +51,7 @@ jc-app/                             # binary: CLI + GPUI app
 - **macOS only.** No cross-platform concerns.
 - **Rust.** Follow Zed's GUI practices (GPUI) where possible.
 - **Keyboard-first.** Single key, Emacs-style bindings with modal ideas. Not a full vim emulator, just efficient keyboard-driven navigation.
-- **Claude Code directly.** Run the real Claude Code CLI in an embedded terminal so we get upstream improvements for free. Use Claude Code's hooks system (HTTP hooks) and session JSONL files for structured status events and reply capture alongside the raw terminal.
+- **Claude Code directly.** Run the real Claude Code CLI in an embedded terminal so we get upstream improvements for free. Use Claude Code's hooks system (HTTP hooks) for structured status events alongside the raw terminal. Reply capture uses Claude's built-in `/copy` command with clipboard polling.
 - **Minimal but functional.** Not a full IDE. Opens files in Zed (or another editor) for serious editing.
 
 ## Core Concepts
@@ -62,50 +62,52 @@ A project corresponds to a code repository. The app tracks active projects in `~
 
 ### Sessions
 
-Each project has one or more sessions. A session represents an ongoing Claude Code conversation, identified by a **slug** --- a human-readable identifier assigned by Claude Code (e.g., `"encapsulated-swimming-firefly"`). Sessions are defined in the project's TODO.md file via `## Session <slug>: <label>` headings. Each session has:
-- A Claude Code terminal, resumed via `--resume` using the most recent JSONL file UUID from the slug group
+Each project has one or more sessions. A session represents an ongoing Claude Code conversation, identified by a **UUID** --- the session ID assigned by Claude Code. Sessions are defined in the project's TODO.md file via headings with a UUID metadata line:
+
+```markdown
+## Refactor auth module
+> uuid=abc123-def456-...
+```
+
+Each session has:
+- A Claude Code terminal, resumed via `--resume <uuid>`
 - A general-purpose terminal
 - Its own message history and notes within TODO.md
 
-The slug links a session to a group of Claude Code JSONL files in `~/.claude/projects/<encoded-path>/`. When Claude forks a session (e.g., transitioning from planning to execution, or after `/clear` + resume), the new JSONL file shares the same slug as the original. This makes the slug a stable identifier across forks, unlike `session_id` which changes on each fork.
+**State model:** `state.toml` holds only a project registry (list of project paths). All session state is derived from TODO.md files. The session picker reads session headings from each project's TODO.md.
 
-**Session forking mechanism:** When Claude forks, it creates a new JSONL file. The first `user` entry has `sessionId` set to the **parent** session's ID and `parentUuid` pointing to a message UUID in the parent file (the fork point). Subsequent entries use the new file's own `sessionId`. All entries share the same `slug`.
+**UUID assignment:** When a new session is created, it starts without a UUID. The UUID is assigned automatically when Claude Code's first hook event arrives (which reports the session ID). The hook system updates both the in-memory session state and the TODO.md file.
 
-**State model:** `state.toml` holds only a project registry (list of project paths). All session state is derived from TODO.md files. When the user picks between projects and sessions, the picker reads `## Session` headings from each project's TODO.md.
-
-**Creating sessions:** Slugs are assigned by Claude Code, not invented by the user. The app creates sessions programmatically:
-- **Project init:** When a project is first added to jc, the app scans for existing JSONL files. If any exist, the most recent session's slug is adopted and a `## Session <slug>: <slug>` heading is written into TODO.md (using the slug as the initial label). If none exist, the app launches Claude Code fresh, waits for the JSONL file to appear, extracts the slug, and writes the heading.
-- **New session:** From the slug picker (Cmd-Shift-P), the user selects "NEW." The app launches a fresh Claude Code instance, polls for the new JSONL file, discovers the resulting slug, and inserts a `## Session <slug>: <slug>` heading into TODO.md.
-- **Adopt existing:** The slug picker lists discovered slugs from the JSONL directory that aren't yet in TODO.md as "Attach" entries. Selecting one adopts the session, inserting a `## Session <slug>: <slug>` heading.
-- **Remove session:** From the session picker (Cmd-P) or problem picker (Cmd-:), press Cmd-Shift-Backspace to remove the selected session. This drops the session's terminals and marks its TODO.md heading as `## Session DELETED <slug>: <label>`, which the parser skips on future launches. The JSONL files on disk are not deleted.
-- **Re-attach deleted session:** The slug picker shows deleted sessions as "Attach" entries (since their heading is skipped by the parser). Selecting one restores the `DELETED` marker back to a normal heading and re-creates the session state.
-
-To find all JSONL files for a slug, scan the session directory and match on the `slug` field. The most recently modified file in the group is the "active" one.
+**Session lifecycle:**
+- **Project init:** When a project is first added to jc, the app reads TODO.md for existing session headings with UUIDs. Each is resumed via `claude --resume <uuid>`. If no sessions exist, a plain `claude` instance is launched.
+- **New session:** From the session picker (Cmd-P), the user can create a new session. The app launches a fresh Claude Code instance; the UUID is auto-detected from the first hook event.
+- **Remove session:** From the session picker (Cmd-P) or problem picker (Cmd-:), press Cmd-Shift-Backspace to remove the selected session. This drops the session's terminals and marks its TODO.md heading as deleted, which the parser skips on future launches.
+- **`/clear` handling:** When the user runs `/clear` in a Claude terminal, the hook system detects the session clear event and automatically updates the session's UUID to the new session ID.
 
 ### Session Architecture
 
-The app uses an `App -> Projects -> Sessions` hierarchy. Each `ProjectState` owns a TODO file, diff view, code view, and a `HashMap<String, SessionState>` keyed by slug. Each `SessionState` owns a Claude terminal (resumed via `--resume <uuid>`), a general terminal, and a reply view pre-bound to the slug. The workspace has an active project with an active session slug; the active session drives which terminals and reply view are shown in the panes. Switching sessions swaps the pane contents without disconnecting terminals. Sessions can be removed at runtime via the session picker (Cmd-Shift-Backspace), which drops the `SessionState` and marks the TODO heading as deleted.
+The app uses an `App -> Projects -> Sessions` hierarchy. Each `ProjectState` owns a TODO file, diff view, code view, and a `HashMap<SessionId, SessionState>` keyed by numeric ID. Each `SessionState` owns a Claude terminal (resumed via `--resume <uuid>`), a general terminal, and an optional UUID. The workspace has an active project with an active session; the active session drives which terminals are shown in the panes. Switching sessions swaps the pane contents without disconnecting terminals. Sessions can be removed at runtime via the session picker (Cmd-Shift-Backspace), which drops the `SessionState` and marks the TODO heading as deleted.
 
 Key design points:
 - Separate terminal instances per session (switching sessions does not disconnect terminals)
-- Session state derived from TODO.md `## Session` headings, not persisted separately
+- Session state derived from TODO.md headings with `> uuid=...` metadata, not persisted separately
 - Per-view typed problem enums (`SessionProblem`, `ProjectProblem`) track actionable conditions; see [Problems & Status](#problems--status)
-- **Session picker (Cmd-P):** Shows all adopted sessions across all projects. Format: `project / label    (slug) recency`. The `(slug)` is only shown when the label is ambiguous (appears on more than one session). Markers: red problem count for sessions with problems, green `>` for active session, blank otherwise. Problem counts include both session-level and project-level problems.
-- **Slug picker (Cmd-Shift-P):** Shows all discovered sessions for the current project plus a "NEW" entry. Format: `project / label    (slug) recency`. Adopted sessions show their TODO label; orphaned sessions show "Attach". Markers: red problem count or green `✓` for adopted sessions, blue `+` for attach, yellow `*` for new. Selecting "NEW" launches a fresh Claude instance and auto-detects the slug.
+- **Session picker (Cmd-P):** Shows all sessions across all projects. Format: `project / label`. Markers: red problem count for sessions with problems, green `>` for active session, blue `+` for empty projects. Problem counts include both session-level and project-level problems.
 - Title bar shows `project > session` with `!` dirty marker and problem count when the active session has problems
 
 ### TODO.md
 
 Each project has a single TODO.md file. The app is the sole writer; if the file changes on disk, the app detects it and shows a visual indicator (with optional git-style merge).
 
-The file serves dual purposes: freeform project notes and session state. Sessions are defined by `## Session` headings under `# Claude`:
+The file serves dual purposes: freeform project notes and session state. Sessions are defined by `##` headings with a `> uuid=...` metadata line under `# Claude`:
 
 ```markdown
 # TODO
 (freeform notes, project-level planning)
 
 # Claude
-## Session encapsulated-swimming-firefly: Refactor auth module
+## Refactor auth module
+> uuid=abc123-def456-...
 ### Message 0
 first instruction sent to claude
 ### Message 1
@@ -117,15 +119,14 @@ These become the basis for the next message.
 
 The `### WAIT` marker separates what has been sent from what is being drafted. When the user selects text above `### WAIT` and presses the send key, that text is wrapped in a new `### Message N` heading and sent to the Claude terminal. The `### WAIT` marker moves below it. Unselected text remains as future notes.
 
-The `## Session <slug>: <label>` heading format is parsed by the app. The slug portion must match a valid Claude Code session slug; the app highlights invalid slugs as errors. The label is a freeform description.
+The `## Label` heading followed by `> uuid=...` is parsed by the app. The label is a freeform description. The UUID links the session to a Claude Code session for `--resume`.
 
 ### Comment Format
 
-From any view (diff, terminal, code, reply), the user can press a comment keybinding to annotate a region. Comments are appended to the current session's future notes (below `### WAIT`) in these formats:
+From any view (diff, terminal, code), the user can press a comment keybinding to annotate a region. Comments are appended to the current session's future notes (below `### WAIT`) in these formats:
 
 - **From diff or code view:** `* <file>:<start_line>-<end_line> --- Comment text`
 - **From terminal:** `* TERMINAL\n\`\`\`\n[selected content]\n\`\`\`\nComment text`
-- **From a Claude reply:** `* .jc/replies/<turn_file>.md:<line> --- Comment text`
 
 ## Research
 
@@ -165,31 +166,11 @@ Syntax-highlighted source viewer with light editing capability (not a full edito
 - Comment keybinding works here too
 - Keybinding to open the file in an external editor (Zed)
 
-### Claude Reply Viewer
+### Claude Reply Capture
 
-Reads the session's Claude Code JSONL files (`~/.claude/projects/<encoded-path>/<session-id>.jsonl`) and presents the conversation as a sequence of **turns**. A turn groups a user request with all subsequent messages (assistant responses, tool use, thinking) until the next user request.
+Replies are captured via Claude Code's built-in `/copy` command. Pressing **Cmd-Shift-C** sends `/copy` to the active Claude terminal, polls the clipboard for a change, and writes the result to `.jc/replies/<uuid>.md` (or `.jc/replies/<label>.md` if no UUID is assigned yet). The file is then opened in the code viewer pane for review and annotation.
 
-Each turn is rendered as a Markdown document with headings for each message type. Initially only `text` content blocks are rendered:
-
-```markdown
-# Request
-<user message text>
-
-# Reply
-<assistant text content>
-```
-
-Full conversation rendering (tool use summaries, thinking blocks as additional headings) is planned as future work.
-
-This rendering approach means Cmd-T (context picker) works automatically via tree-sitter markdown heading queries, and the existing comment keybinding can annotate any region.
-
-When a turn is viewed, its rendered Markdown is written to `.jc/replies/<turn_file>.md` in the project directory (gitignored). Comments reference this file path so Claude can read the file to understand the context. These files are written automatically --- no manual extraction step.
-
-Navigation:
-- **Cmd-Shift-O** opens a turn picker (newest first) showing the user's request text as a preview
-- **Cmd-T** picks headings within the current turn
-
-The view monitors the JSONL file for changes and reloads when updated (e.g., while Claude is working). JSONL files are append-only so even large sessions (multi-MB) reload quickly.
+This approach avoids parsing JSONL files entirely --- Claude Code handles the extraction, and the app just captures the clipboard result. The saved reply files can be referenced by Claude in future instructions (via file path comments).
 
 ## Problems & Status
 
@@ -209,7 +190,6 @@ Each view defines its own problem types. Problems are scoped to the level that o
 | Claude terminal | `ClaudeProblem::ApiError` | Hook event: API error | User interacts with the session |
 | General terminal | `TerminalProblem::Bell` | BEL character detected | User focuses the terminal |
 | TODO view | `TodoProblem::UnsentWait` | Content exists below `### WAIT` | Content is sent or removed |
-| TODO view | `TodoProblem::InvalidSlug` | `## Session` slug has no JSONL | Slug is corrected or JSONL appears |
 
 **Project-level problems** (owned by `ProjectState`):
 
@@ -227,7 +207,7 @@ Each view defines its own enum. Aggregation uses wrapper enums at the session an
 enum ClaudeProblem { Stop, Permission, Idle, ApiError }
 enum TerminalProblem { Bell }
 enum DiffProblem { UnreviewedFile(PathBuf) }
-enum AppTodoProblem { UnsentWait { slug }, InvalidSlug { slug, line } }
+enum AppTodoProblem { UnsentWait { label } }
 
 // Script problems (scaffolded, not yet wired) use the format: {rank:}?file{:line}? - message
 struct ScriptProblem { rank: Option<i8>, file: PathBuf, line: Option<usize>, message: String }
@@ -239,9 +219,9 @@ enum SessionProblem { Claude(ClaudeProblem), Terminal(TerminalProblem), Todo(App
 enum ProjectProblem { Diff(DiffProblem), Script(ScriptProblem) }
 ```
 
-Note: `AppTodoProblem` is distinct from the parser-level `TodoProblem` in `jc-core/src/todo.rs`. The parser detects raw conditions (invalid slug, unsent wait); `SessionState::refresh_problems()` converts them into `AppTodoProblem` variants filtered to the session's slug.
+Note: `AppTodoProblem` is distinct from the parser-level `TodoProblem` in `jc-core/src/todo.rs`. The parser detects raw conditions (unsent wait); `SessionState::refresh_problems()` converts them into `AppTodoProblem` variants filtered to the session's label.
 
-Each problem type has a `rank()` and `description()` method. Built-in ranks: permission (1) > API error (2) > stop (3) > idle (4) > BEL (5) > unsent wait (6) > invalid slug (7) > unreviewed file (10). Script problems use an explicit optional rank; unranked ones default to 20.
+Each problem type has a `rank()` and `description()` method. Built-in ranks: permission (1) > API error (2) > stop (3) > idle (4) > BEL (5) > unsent wait (6) > unreviewed file (10). Script problems use an explicit optional rank; unranked ones default to 20.
 
 ### Refresh Model
 
@@ -262,7 +242,6 @@ Problems surface in multiple locations:
 
 - **Title bar**: `"! Project > Session N"` — a `!` dirty marker on the left and a problem count on the right when the active session + project has problems. The count is session problems + project problems.
 - **Session picker** (Cmd-P): Red problem count replaces the green `>` marker for sessions with problems. Count is session + project combined.
-- **Slug picker** (Cmd-Shift-P): Red problem count replaces the green `✓` for adopted sessions with problems.
 - **Global indicator** (upper right, left of usage): Count of *other* sessions (not the active one) that have problems.
 
 All marker columns use a fixed-width right-aligned layout (`picker_marker_base()`) so single-character markers and multi-digit counts align cleanly.
@@ -356,7 +335,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 | Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff` for word-level highlighting |
 | Git worktrees | `git2` worktree API (create/list/prune) |
 | Problem tracking | Per-view typed enums (`ClaudeProblem`, `TerminalProblem`, `DiffProblem`, `AppTodoProblem`) + wrapper enums (`SessionProblem`, `ProjectProblem`); push via hooks + BEL into `pending_events`; poll via diff/TODO every 2s; `refresh_problems()` merges both and skips re-render when unchanged |
-| Claude reply viewer | Parse session JSONL from `~/.claude/projects/`, group into turns, render as Markdown in read-only editor |
+| Claude reply capture | `/copy` command + clipboard polling, writes to `.jc/replies/<uuid>.md` |
 | Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
 | Persistent state | `~/.config/jc/` --- project registry, window layout; session state in TODO.md |
 | Desktop notifications | Dock bounce via `objc2-app-kit` (`NSApplication::requestUserAttention`); no bundling required. Banners need `.app` bundle. |
@@ -374,7 +353,6 @@ Hooks are the one extension point that works well today. Claude Code fires event
 | Cmd-[ | Focus previous pane | |
 | Cmd-] | Focus next pane | |
 | Cmd-P | Session picker | |
-| Cmd-Shift-P | Slug picker (current project) | |
 | Cmd-O | File picker | |
 | Cmd-T | Context picker (symbols / headings / modified files) | |
 | Cmd-Shift-O | Git log picker | |
@@ -383,6 +361,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 | Cmd-Shift-K | Snippet picker (`~/.claude/jc.md`) | |
 | Cmd-S | Save file | |
 | Cmd-Enter | Send to terminal | |
+| Cmd-Shift-C | Copy reply (/copy → clipboard → .jc/replies/) | |
 | Cmd-; | Next problem (current project) / jump to WAIT if none | |
 | Cmd-: | Urgency-sorted session picker | |
 | Cmd-? | Keybinding help overlay | |
@@ -431,7 +410,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 4. Highlight a region (with mouse or keybindings) in the diff, press the comment key, type a note. It appears in TODO.md under `### WAIT`.
 5. Mark reviewed files as done (they collapse).
 6. Switch to the general terminal to run tests or inspect behavior. Highlight output, press comment key.
-7. Switch to the reply viewer (Cmd-. → Reply). Use Cmd-Shift-O to pick a turn. Scroll through the rendered conversation and annotate.
+7. Press Cmd-Shift-C to capture Claude's reply via `/copy`. The reply is saved to `.jc/replies/` and opened in the code viewer for annotation.
 
 ### Navigating Code
 
@@ -450,9 +429,9 @@ Hooks are the one extension point that works well today. Claude Code fires event
 
 ### Managing Projects and Sessions
 
-1. Add a project: run `jc .` from a repo, or use an in-app command. The app discovers or creates a Claude Code session and writes the `## Session` heading into TODO.md.
-2. Use the session picker (Cmd-P) to switch between adopted sessions across all projects.
-3. Use the slug picker (Cmd-Shift-P) to manage the current project's sessions: switch to an adopted session, attach an orphaned one, or select "NEW" to launch a fresh Claude instance.
+1. Add a project: run `jc .` from a repo, or use an in-app command. The app reads TODO.md for existing sessions or launches a fresh Claude instance.
+2. Use the session picker (Cmd-P) to switch between sessions across all projects. Sessions with problems are highlighted with a red count.
+3. Create new sessions from the session picker. UUIDs are assigned automatically via hooks.
 
 ## Task Checklist
 
@@ -464,9 +443,6 @@ Hooks are the one extension point that works well today. Claude Code fires event
 > - **[?]** Unclassified — Needs triage. When you encounter a `[?]` task, read the task description, examine the relevant code, and replace `[?]` with the correct label (`[T]`/`[E]`/`[H]`/`[D]`). Do this before starting any other work.
 >
 > *When adding new checklist items, always include a `[T]`/`[E]`/`[H]`/`[D]`/`[?]` label after the checkbox. If the item doesn't fit under an existing section, create a new `###` section for it.*
-
-### Claude Reply Viewer
-- [ ] [H] Full conversation rendering: tool use summaries, thinking blocks as additional headings
 
 ### Git Diff View
 - [ ] [H] Add word-level inline highlighting via `similar` with background highlights NOT diagnostics

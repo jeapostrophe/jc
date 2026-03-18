@@ -8,18 +8,16 @@ pub enum PaneContentKind {
   GitDiff,
   CodeViewer,
   TodoEditor,
-  ReplyViewer,
   GlobalTodo,
 }
 
 impl PaneContentKind {
-  pub const ALL: [PaneContentKind; 7] = [
+  pub const ALL: [PaneContentKind; 6] = [
     Self::ClaudeTerminal,
     Self::GeneralTerminal,
     Self::GitDiff,
     Self::CodeViewer,
     Self::TodoEditor,
-    Self::ReplyViewer,
     Self::GlobalTodo,
   ];
 
@@ -30,7 +28,6 @@ impl PaneContentKind {
       Self::GitDiff => "Diff",
       Self::CodeViewer => "Code",
       Self::TodoEditor => "TODO",
-      Self::ReplyViewer => "Reply",
       Self::GlobalTodo => "Global TODO",
     }
   }

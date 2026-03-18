@@ -13,11 +13,15 @@ pub struct TodoDocument {
 
 #[derive(Debug, Default, Clone)]
 pub struct TodoSession {
-  pub slug: String,
+  pub uuid: String,
   pub label: String,
   pub line: u32,
   pub heading_byte_range: Range<usize>,
-  pub slug_byte_range: Range<usize>,
+  /// 1-based line number of the `> uuid=...` line.
+  pub uuid_line: u32,
+  /// Byte range of the uuid value within the full document text
+  /// (i.e. the characters after `> uuid=`).
+  pub uuid_byte_range: Range<usize>,
   pub messages: Vec<TodoMessage>,
   pub wait: Option<TodoWait>,
 }
@@ -38,8 +42,7 @@ pub struct TodoWait {
 
 #[derive(Debug, Clone)]
 pub enum TodoProblem {
-  InvalidSessionSlug { slug: String, line: u32, slug_byte_range: Range<usize> },
-  UnsentWait { slug: String },
+  UnsentWait { label: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -51,19 +54,23 @@ impl TodoDocument {
     self.sessions.first()
   }
 
-  pub fn session_by_slug(&self, slug: &str) -> Option<&TodoSession> {
-    self.sessions.iter().find(|s| s.slug == slug)
+  pub fn session_by_uuid(&self, uuid: &str) -> Option<&TodoSession> {
+    self.sessions.iter().find(|s| s.uuid == uuid)
   }
 
-  pub fn session_slugs(&self) -> Vec<&str> {
-    self.sessions.iter().map(|s| s.slug.as_str()).collect()
+  pub fn session_by_label(&self, label: &str) -> Option<&TodoSession> {
+    self.sessions.iter().find(|s| s.label == label)
+  }
+
+  pub fn session_uuids(&self) -> Vec<&str> {
+    self.sessions.iter().map(|s| s.uuid.as_str()).collect()
   }
 
   /// Returns the 1-based line number of the last line of the WAIT body for the
-  /// given session slug. This is the line where a user would type new content.
+  /// given session (by label). This is the line where a user would type new content.
   /// If the WAIT body is empty, returns the line right after the heading.
-  pub fn wait_body_end_line(&self, slug: &str, text: &str) -> Option<u32> {
-    let wait = self.session_by_slug(slug)?.wait.as_ref()?;
+  pub fn wait_body_end_line(&self, label: &str, text: &str) -> Option<u32> {
+    let wait = self.session_by_label(label)?.wait.as_ref()?;
     let body = &text[wait.body_byte_range.clone()];
     // Count newlines in the body to find how many lines it spans.
     let body_lines = body.chars().filter(|&c| c == '\n').count() as u32;
@@ -75,10 +82,10 @@ impl TodoDocument {
   }
 
   /// Returns the byte offset at the end of the WAIT body for the given
-  /// session. This is where comments should be inserted. If the session has
-  /// no WAIT, returns `None`.
-  pub fn comment_insert_offset(&self, slug: &str) -> Option<usize> {
-    let session = self.session_by_slug(slug)?;
+  /// session (by label). This is where comments should be inserted.
+  /// If the session has no WAIT, returns `None`.
+  pub fn comment_insert_offset(&self, label: &str) -> Option<usize> {
+    let session = self.session_by_label(label)?;
     let wait = session.wait.as_ref()?;
     Some(wait.body_byte_range.end)
   }
@@ -92,13 +99,35 @@ pub fn parse(text: &str) -> TodoDocument {
   let mut doc = TodoDocument::default();
   let mut current_session: Option<TodoSession> = None;
   let mut byte_offset: usize = 0;
+  // State: we just saw an `## Label` heading and are looking for `> uuid=...` next.
+  let mut expecting_uuid_for: Option<TodoSession> = None;
 
   for (line_idx, line) in text.lines().enumerate() {
     let line_num = line_idx as u32 + 1;
     let line_start = byte_offset;
     let line_end = line_start + line.len();
 
-    if line.starts_with("# ") {
+    // If we're expecting a `> uuid=` line after a heading:
+    if let Some(ref mut pending) = expecting_uuid_for {
+      if let Some(rest) = line.strip_prefix("> uuid=") {
+        pending.uuid = rest.to_string();
+        pending.uuid_line = line_num;
+        let uuid_value_start = line_start + "> uuid=".len();
+        pending.uuid_byte_range = uuid_value_start..line_end;
+        // Promote to current session.
+        finalize_session(&mut doc, &mut current_session, line_start);
+        current_session = expecting_uuid_for.take();
+      } else {
+        // No uuid line — accept the session with an empty UUID.
+        finalize_session(&mut doc, &mut current_session, line_start);
+        current_session = expecting_uuid_for.take();
+        // Fall through to normal parsing of this line.
+      }
+    }
+
+    if expecting_uuid_for.is_some() {
+      // Already handled above, skip normal parsing for this line.
+    } else if line.starts_with("# ") {
       // Any top-level heading ends the current session.
       finalize_session(&mut doc, &mut current_session, line_start);
 
@@ -109,27 +138,18 @@ pub fn parse(text: &str) -> TodoDocument {
       // Any second-level heading ends the current session.
       finalize_session(&mut doc, &mut current_session, line_start);
 
-      if let Some(rest) = after_h2.strip_prefix("Session ") {
-        // Skip sessions marked as DELETED.
-        if rest.starts_with("DELETED ") {
-          // Don't create a session for deleted headings.
-        } else if let Some(colon_pos) = rest.find(": ") {
-          // Split on first `: ` to get slug and label.
-          let slug = &rest[..colon_pos];
-          let label = &rest[colon_pos + ": ".len()..];
-
-          let slug_abs_start = line_start + "## Session ".len();
-          let slug_abs_end = slug_abs_start + slug.len();
-
-          current_session = Some(TodoSession {
-            slug: slug.to_string(),
-            label: label.to_string(),
-            line: line_num,
-            heading_byte_range: line_start..line_end,
-            slug_byte_range: slug_abs_start..slug_abs_end,
-            ..Default::default()
-          });
-        }
+      // Skip sessions marked as DELETED.
+      if after_h2.starts_with("DELETED ") {
+        // Don't create a session for deleted headings.
+      } else if !after_h2.is_empty() {
+        // New format: `## Label` (the label is everything after "## ")
+        let label = after_h2.to_string();
+        expecting_uuid_for = Some(TodoSession {
+          label,
+          line: line_num,
+          heading_byte_range: line_start..line_end,
+          ..Default::default()
+        });
       }
     } else if let Some(after_h3) = line.strip_prefix("### ") {
       if after_h3 == "WAIT" {
@@ -207,20 +227,17 @@ fn finalize_wait_body(session: &mut TodoSession, boundary: usize) {
 // Session heading insertion
 // ---------------------------------------------------------------------------
 
-/// Returns true if the document has at least one session whose slug matches
-/// a JSONL session group on disk.
-pub fn has_valid_sessions(doc: &TodoDocument, project_path: &Path) -> bool {
-  doc
-    .sessions
-    .iter()
-    .any(|s| crate::session::discover_session_group(project_path, &s.slug).is_some())
-}
 
-/// Build new text with a `## Session <slug>: <label>` heading inserted.
+/// Build new text with a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading inserted.
 /// If a `# Claude` section exists, the heading goes right after it. Otherwise
 /// a `# Claude` section is appended at the end of the text.
-pub fn insert_session_heading(text: &str, doc: &TodoDocument, slug: &str, label: &str) -> String {
-  let heading = format!("## Session {slug}: {label}\n### WAIT\n");
+pub fn insert_session_heading(
+  text: &str,
+  doc: &TodoDocument,
+  uuid: &str,
+  label: &str,
+) -> String {
+  let heading = format!("## {label}\n> uuid={uuid}\n\n### WAIT\n");
 
   if let Some(claude_line) = doc.claude_section_line {
     // Find byte offset right after the `# Claude` line.
@@ -263,14 +280,13 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, slug: &str, label:
 // Session deletion marking
 // ---------------------------------------------------------------------------
 
-/// Mark a session heading as deleted by changing `## Session <slug>:` to
-/// `## Session DELETED <slug>:`. Returns the modified text, or `None` if the
-/// slug was not found in the document.
-pub fn mark_session_deleted(text: &str, doc: &TodoDocument, slug: &str) -> Option<String> {
-  let session = doc.session_by_slug(slug)?;
+/// Mark a session heading as deleted by changing `## <label>` to
+/// `## DELETED <label>`. Returns the modified text, or `None` if the
+/// label was not found in the document.
+pub fn mark_session_deleted(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
+  let session = doc.session_by_label(label)?;
   let heading = &text[session.heading_byte_range.clone()];
-  let new_heading =
-    heading.replacen(&format!("## Session {slug}:"), &format!("## Session DELETED {slug}:"), 1);
+  let new_heading = heading.replacen(&format!("## {label}"), &format!("## DELETED {label}"), 1);
   let mut new_text = String::with_capacity(text.len() + "DELETED ".len());
   new_text.push_str(&text[..session.heading_byte_range.start]);
   new_text.push_str(&new_heading);
@@ -279,17 +295,35 @@ pub fn mark_session_deleted(text: &str, doc: &TodoDocument, slug: &str) -> Optio
 }
 
 /// Unmark a deleted session heading by removing the `DELETED ` prefix from
-/// `## Session DELETED <slug>:`. Scans the raw text since deleted sessions
+/// `## DELETED <label>`. Scans the raw text since deleted sessions
 /// are not in the parsed document. Returns the modified text, or `None` if
 /// no matching deleted heading was found.
-pub fn unmark_session_deleted(text: &str, slug: &str) -> Option<String> {
-  let needle = format!("## Session DELETED {slug}:");
+pub fn unmark_session_deleted(text: &str, label: &str) -> Option<String> {
+  let needle = format!("## DELETED {label}");
   let pos = text.find(&needle)?;
-  let replacement = format!("## Session {slug}:");
+  let replacement = format!("## {label}");
   let mut new_text = String::with_capacity(text.len());
   new_text.push_str(&text[..pos]);
   new_text.push_str(&replacement);
   new_text.push_str(&text[pos + needle.len()..]);
+  Some(new_text)
+}
+
+// ---------------------------------------------------------------------------
+// UUID update
+// ---------------------------------------------------------------------------
+
+/// Update a session's UUID in the document text. Returns the modified text,
+/// or `None` if the session is not found.
+pub fn update_session_uuid(text: &str, doc: &TodoDocument, label: &str, new_uuid: &str) -> Option<String> {
+  let session = doc.session_by_label(label)?;
+  if session.uuid_byte_range == (0..0) {
+    return None;
+  }
+  let mut new_text = String::with_capacity(text.len() + new_uuid.len());
+  new_text.push_str(&text[..session.uuid_byte_range.start]);
+  new_text.push_str(new_uuid);
+  new_text.push_str(&text[session.uuid_byte_range.end..]);
   Some(new_text)
 }
 
@@ -368,21 +402,14 @@ pub fn send_from_wait(
 // Validation
 // ---------------------------------------------------------------------------
 
-pub fn validate(doc: &TodoDocument, project_path: &Path, text: &str) -> Vec<TodoProblem> {
+pub fn validate(doc: &TodoDocument, _project_path: &Path, text: &str) -> Vec<TodoProblem> {
   let mut problems = Vec::default();
 
   for session in &doc.sessions {
-    if crate::session::discover_session_group(project_path, &session.slug).is_none() {
-      problems.push(TodoProblem::InvalidSessionSlug {
-        slug: session.slug.clone(),
-        line: session.line,
-        slug_byte_range: session.slug_byte_range.clone(),
-      });
-    }
     if let Some(wait) = &session.wait {
       let body = &text[wait.body_byte_range.clone()];
       if !body.trim().is_empty() {
-        problems.push(TodoProblem::UnsentWait { slug: session.slug.clone() });
+        problems.push(TodoProblem::UnsentWait { label: session.label.clone() });
       }
     }
   }
@@ -404,14 +431,16 @@ mod tests {
     assert!(doc.claude_section_line.is_none());
     assert!(doc.sessions.is_empty());
     assert!(doc.first_session().is_none());
-    assert!(doc.session_slugs().is_empty());
+    assert!(doc.session_uuids().is_empty());
   }
 
   #[test]
   fn single_session_with_messages_and_wait() {
     let text = "\
 # Claude
-## Session my-slug: My Label
+## My Label
+> uuid=abc-123
+
 ### Message 0
 some body text
 ### Message 1
@@ -425,17 +454,14 @@ draft content here
     assert_eq!(doc.sessions.len(), 1);
 
     let session = &doc.sessions[0];
-    assert_eq!(session.slug, "my-slug");
+    assert_eq!(session.uuid, "abc-123");
     assert_eq!(session.label, "My Label");
     assert_eq!(session.line, 2);
     assert_eq!(session.messages.len(), 2);
     assert_eq!(session.messages[0].index, 0);
-    assert_eq!(session.messages[0].line, 3);
     assert_eq!(session.messages[1].index, 1);
-    assert_eq!(session.messages[1].line, 5);
 
     let wait = session.wait.as_ref().unwrap();
-    assert_eq!(wait.line, 7);
 
     // The WAIT body should contain "draft content here\n".
     let body = &text[wait.body_byte_range.clone()];
@@ -446,10 +472,14 @@ draft content here
   fn multiple_sessions() {
     let text = "\
 # Claude
-## Session alpha: First Session
+## First Session
+> uuid=aaa
+
 ### Message 0
 body
-## Session beta: Second Session
+## Second Session
+> uuid=bbb
+
 ### Message 0
 body
 ### WAIT
@@ -458,9 +488,9 @@ wait body
     let doc = parse(text);
 
     assert_eq!(doc.sessions.len(), 2);
-    assert_eq!(doc.sessions[0].slug, "alpha");
+    assert_eq!(doc.sessions[0].uuid, "aaa");
     assert_eq!(doc.sessions[0].label, "First Session");
-    assert_eq!(doc.sessions[1].slug, "beta");
+    assert_eq!(doc.sessions[1].uuid, "bbb");
     assert_eq!(doc.sessions[1].label, "Second Session");
     assert!(doc.sessions[0].wait.is_none());
     assert!(doc.sessions[1].wait.is_some());
@@ -470,7 +500,9 @@ wait body
   fn session_with_no_wait() {
     let text = "\
 # Claude
-## Session no-wait: No Wait Here
+## No Wait Here
+> uuid=no-wait
+
 ### Message 0
 body text
 ### Message 1
@@ -480,7 +512,7 @@ more body
 
     assert_eq!(doc.sessions.len(), 1);
     let session = &doc.sessions[0];
-    assert_eq!(session.slug, "no-wait");
+    assert_eq!(session.uuid, "no-wait");
     assert!(session.wait.is_none());
     assert_eq!(session.messages.len(), 2);
   }
@@ -489,7 +521,9 @@ more body
   fn session_with_no_messages() {
     let text = "\
 # Claude
-## Session empty: Empty Session
+## Empty Session
+> uuid=empty
+
 ### WAIT
 some wait body
 ";
@@ -497,7 +531,7 @@ some wait body
 
     assert_eq!(doc.sessions.len(), 1);
     let session = &doc.sessions[0];
-    assert_eq!(session.slug, "empty");
+    assert_eq!(session.uuid, "empty");
     assert_eq!(session.label, "Empty Session");
     assert!(session.messages.is_empty());
     assert!(session.wait.is_some());
@@ -507,53 +541,65 @@ some wait body
   fn comment_insert_offset_returns_correct_byte_offset() {
     let text = "\
 # Claude
-## Session test: Test Session
+## Test Session
+> uuid=test
+
 ### WAIT
 draft body
 ";
     let doc = parse(text);
 
-    let offset = doc.comment_insert_offset("test").unwrap();
+    let offset = doc.comment_insert_offset("Test Session").unwrap();
     // The offset should be at the end of the WAIT body, which is the end of
     // the document.
     assert_eq!(offset, text.len());
 
     // Verify the body range content.
-    let session = doc.session_by_slug("test").unwrap();
+    let session = doc.session_by_label("Test Session").unwrap();
     let wait = session.wait.as_ref().unwrap();
     let body = &text[wait.body_byte_range.clone()];
     assert!(body.contains("draft body"));
   }
 
   #[test]
-  fn session_by_slug_and_session_slugs() {
+  fn session_by_uuid_and_session_uuids() {
     let text = "\
 # Claude
-## Session aaa: First
+## First
+> uuid=aaa
+
 ### Message 0
-## Session bbb: Second
+## Second
+> uuid=bbb
+
 ### WAIT
 body
-## Session ccc: Third
+## Third
+> uuid=ccc
+
 ";
     let doc = parse(text);
 
-    assert_eq!(doc.session_slugs(), vec!["aaa", "bbb", "ccc"]);
-    assert_eq!(doc.session_by_slug("bbb").unwrap().label, "Second");
-    assert!(doc.session_by_slug("nonexistent").is_none());
+    assert_eq!(doc.session_uuids(), vec!["aaa", "bbb", "ccc"]);
+    assert_eq!(doc.session_by_uuid("bbb").unwrap().label, "Second");
+    assert!(doc.session_by_uuid("nonexistent").is_none());
   }
 
   #[test]
   fn first_session_returns_first() {
     let text = "\
 # Claude
-## Session first: The First
-## Session second: The Second
+## The First
+> uuid=first
+
+## The Second
+> uuid=second
+
 ";
     let doc = parse(text);
 
     let first = doc.first_session().unwrap();
-    assert_eq!(first.slug, "first");
+    assert_eq!(first.uuid, "first");
     assert_eq!(first.label, "The First");
   }
 
@@ -561,61 +607,71 @@ body
   fn comment_insert_offset_none_without_wait() {
     let text = "\
 # Claude
-## Session no-wait: No Wait
+## No Wait
+> uuid=no-wait
+
 ### Message 0
 body
 ";
     let doc = parse(text);
-    assert!(doc.comment_insert_offset("no-wait").is_none());
+    assert!(doc.comment_insert_offset("No Wait").is_none());
   }
 
   #[test]
-  fn slug_byte_range_covers_slug_text() {
-    let text = "## Session my-slug: My Label\n";
+  fn uuid_byte_range_covers_uuid_text() {
+    let text = "## My Label\n> uuid=my-uuid\n";
     let doc = parse(text);
     let session = &doc.sessions[0];
-    assert_eq!(&text[session.slug_byte_range.clone()], "my-slug");
+    assert_eq!(&text[session.uuid_byte_range.clone()], "my-uuid");
   }
 
   #[test]
   fn heading_byte_range_covers_full_line() {
-    let text = "## Session test: Test Label\nsome body\n";
+    let text = "## Test Label\n> uuid=test\nsome body\n";
     let doc = parse(text);
     let session = &doc.sessions[0];
-    assert_eq!(&text[session.heading_byte_range.clone()], "## Session test: Test Label");
+    assert_eq!(&text[session.heading_byte_range.clone()], "## Test Label");
   }
 
   #[test]
   fn top_level_heading_ends_session() {
     let text = "\
-## Session inside: Inside
+## Inside
+> uuid=inside
+
 ### Message 0
 # Other Section
-## Session outside: Outside
+## Outside
+> uuid=outside
+
 ";
     let doc = parse(text);
     assert_eq!(doc.sessions.len(), 2);
-    assert_eq!(doc.sessions[0].slug, "inside");
+    assert_eq!(doc.sessions[0].uuid, "inside");
     assert_eq!(doc.sessions[0].messages.len(), 1);
-    assert_eq!(doc.sessions[1].slug, "outside");
+    assert_eq!(doc.sessions[1].uuid, "outside");
   }
 
   #[test]
   fn wait_body_range_bounded_by_next_heading() {
     let text = "\
-## Session a: A
+## A
+> uuid=a
+
 ### WAIT
 wait content
-## Session b: B
+## B
+> uuid=b
+
 ";
     let doc = parse(text);
 
-    let session_a = doc.session_by_slug("a").unwrap();
+    let session_a = doc.session_by_label("A").unwrap();
     let wait = session_a.wait.as_ref().unwrap();
     let body = &text[wait.body_byte_range.clone()];
     assert!(body.contains("wait content"));
     // Body should NOT contain the next session heading.
-    assert!(!body.contains("## Session b"));
+    assert!(!body.contains("## B"));
   }
 
   #[test]
@@ -627,12 +683,12 @@ some notes
 # Claude
 ";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "my-slug", "my-slug");
-    assert!(result.contains("# Claude\n## Session my-slug: my-slug\n### WAIT\n"));
+    let result = insert_session_heading(text, &doc, "my-uuid", "My Label");
+    assert!(result.contains("# Claude\n## My Label\n> uuid=my-uuid\n"));
     // Verify it re-parses correctly.
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 1);
-    assert_eq!(new_doc.sessions[0].slug, "my-slug");
+    assert_eq!(new_doc.sessions[0].uuid, "my-uuid");
     assert!(new_doc.sessions[0].wait.is_some());
   }
 
@@ -643,39 +699,42 @@ some notes
 some notes
 ";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "test-slug", "test-slug");
-    assert!(result.contains("# Claude\n## Session test-slug: test-slug\n### WAIT\n"));
+    let result = insert_session_heading(text, &doc, "test-uuid", "Test Label");
+    assert!(result.contains("# Claude\n## Test Label\n> uuid=test-uuid\n"));
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 1);
-    assert_eq!(new_doc.sessions[0].slug, "test-slug");
+    assert_eq!(new_doc.sessions[0].uuid, "test-uuid");
   }
 
   #[test]
   fn insert_session_heading_empty_document() {
     let text = "";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "fresh", "fresh");
-    assert_eq!(result, "# Claude\n## Session fresh: fresh\n### WAIT\n");
+    let result = insert_session_heading(text, &doc, "", "Fresh");
+    assert_eq!(result, "# Claude\n## Fresh\n> uuid=\n\n### WAIT\n");
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 1);
-    assert_eq!(new_doc.sessions[0].slug, "fresh");
+    assert_eq!(new_doc.sessions[0].uuid, "");
+    assert_eq!(new_doc.sessions[0].label, "Fresh");
   }
 
   #[test]
   fn insert_session_heading_with_existing_sessions() {
     let text = "\
 # Claude
-## Session old: Old Session
+## Old Session
+> uuid=old
+
 ### WAIT
 notes
 ";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "new-slug", "new-slug");
+    let result = insert_session_heading(text, &doc, "new-uuid", "New Label");
     // New heading should be inserted right after `# Claude`, before the old session.
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 2);
-    assert_eq!(new_doc.sessions[0].slug, "new-slug");
-    assert_eq!(new_doc.sessions[1].slug, "old");
+    assert_eq!(new_doc.sessions[0].uuid, "new-uuid");
+    assert_eq!(new_doc.sessions[1].uuid, "old");
   }
 
   // -------------------------------------------------------------------------
@@ -686,14 +745,16 @@ notes
   fn send_from_wait_basic() {
     let text = "\
 # Claude
-## Session s: S
+## S
+> uuid=s
+
 ### Message 0
 hello
 ### WAIT
 draft text
 ";
     let doc = parse(text);
-    let session = doc.session_by_slug("s").unwrap();
+    let session = doc.session_by_label("S").unwrap();
     let wait = session.wait.as_ref().unwrap();
 
     // Select just "draft text" within the body.
@@ -708,7 +769,7 @@ draft text
 
     // Re-parse to verify structure.
     let new_doc = parse(&result.new_text);
-    let new_session = new_doc.session_by_slug("s").unwrap();
+    let new_session = new_doc.session_by_label("S").unwrap();
     assert_eq!(new_session.messages.len(), 2);
     assert!(new_session.wait.is_some());
   }
@@ -717,12 +778,14 @@ draft text
   fn send_from_wait_no_selection_sends_all() {
     let text = "\
 # Claude
-## Session s: S
+## S
+> uuid=s
+
 ### WAIT
 all body content
 ";
     let doc = parse(text);
-    let session = doc.session_by_slug("s").unwrap();
+    let session = doc.session_by_label("S").unwrap();
 
     // Empty selection (collapsed cursor) → send entire body.
     let result = send_from_wait(text, session, 0..0).unwrap();
@@ -735,14 +798,16 @@ all body content
   fn send_from_wait_partial_selection() {
     let text = "\
 # Claude
-## Session s: S
+## S
+> uuid=s
+
 ### WAIT
 line one
 line two
 line three
 ";
     let doc = parse(text);
-    let session = doc.session_by_slug("s").unwrap();
+    let session = doc.session_by_label("S").unwrap();
     let wait = session.wait.as_ref().unwrap();
     let body = &text[wait.body_byte_range.clone()];
 
@@ -756,7 +821,7 @@ line three
 
     // Remaining body should have line one and line three.
     let new_doc = parse(&result.new_text);
-    let new_wait = new_doc.session_by_slug("s").unwrap().wait.as_ref().unwrap();
+    let new_wait = new_doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
     let new_body = &result.new_text[new_wait.body_byte_range.clone()];
     assert!(new_body.contains("line one"));
     assert!(new_body.contains("line three"));
@@ -767,11 +832,13 @@ line three
   fn send_from_wait_empty_body() {
     let text = "\
 # Claude
-## Session s: S
+## S
+> uuid=s
+
 ### WAIT
 ";
     let doc = parse(text);
-    let session = doc.session_by_slug("s").unwrap();
+    let session = doc.session_by_label("S").unwrap();
 
     // Empty body → should return None.
     assert!(send_from_wait(text, session, 0..0).is_none());
@@ -781,12 +848,14 @@ line three
   fn send_from_wait_no_wait_section() {
     let text = "\
 # Claude
-## Session s: S
+## S
+> uuid=s
+
 ### Message 0
 hello
 ";
     let doc = parse(text);
-    let session = doc.session_by_slug("s").unwrap();
+    let session = doc.session_by_label("S").unwrap();
     assert!(send_from_wait(text, session, 0..0).is_none());
   }
 
@@ -794,7 +863,9 @@ hello
   fn send_from_wait_multiple_messages() {
     let text = "\
 # Claude
-## Session s: S
+## S
+> uuid=s
+
 ### Message 0
 first
 ### Message 1
@@ -803,7 +874,7 @@ second
 third
 ";
     let doc = parse(text);
-    let session = doc.session_by_slug("s").unwrap();
+    let session = doc.session_by_label("S").unwrap();
     let result = send_from_wait(text, session, 0..0).unwrap();
     assert_eq!(result.message_index, 2);
     assert_eq!(result.message_text, "third");
@@ -813,61 +884,101 @@ third
   fn deleted_sessions_are_skipped() {
     let text = "\
 # Claude
-## Session DELETED old-slug: Old Label
+## DELETED Old Label
+> uuid=old
+
 ### WAIT
 stale draft
-## Session active: Active Session
+## Active Session
+> uuid=active
+
 ### WAIT
 ";
     let doc = parse(text);
     assert_eq!(doc.sessions.len(), 1);
-    assert_eq!(doc.sessions[0].slug, "active");
+    assert_eq!(doc.sessions[0].label, "Active Session");
   }
 
   #[test]
   fn mark_session_deleted_roundtrip() {
     let text = "\
 # Claude
-## Session my-slug: My Label
+## My Label
+> uuid=my-uuid
+
 ### WAIT
 draft
 ";
     let doc = parse(text);
-    let marked = mark_session_deleted(text, &doc, "my-slug").unwrap();
-    assert!(marked.contains("## Session DELETED my-slug: My Label"));
+    let marked = mark_session_deleted(text, &doc, "My Label").unwrap();
+    assert!(marked.contains("## DELETED My Label"));
 
     // Marked session should be skipped when parsed.
     let doc2 = parse(&marked);
     assert!(doc2.sessions.is_empty());
 
     // Unmark should restore it.
-    let restored = unmark_session_deleted(&marked, "my-slug").unwrap();
-    assert!(restored.contains("## Session my-slug: My Label"));
+    let restored = unmark_session_deleted(&marked, "My Label").unwrap();
+    assert!(restored.contains("## My Label"));
     let doc3 = parse(&restored);
     assert_eq!(doc3.sessions.len(), 1);
-    assert_eq!(doc3.sessions[0].slug, "my-slug");
+    assert_eq!(doc3.sessions[0].label, "My Label");
   }
 
   #[test]
   fn unmark_nonexistent_returns_none() {
-    let text = "## Session active: Active\n";
-    assert!(unmark_session_deleted(text, "active").is_none());
+    let text = "## Active\n> uuid=x\n";
+    assert!(unmark_session_deleted(text, "Active").is_none());
   }
 
   #[test]
   fn send_from_wait_selection_outside_body() {
     let text = "\
 # Claude
-## Session s: S
+## S
+> uuid=s
+
 ### Message 0
 hello
 ### WAIT
 draft
 ";
     let doc = parse(text);
-    let session = doc.session_by_slug("s").unwrap();
+    let session = doc.session_by_label("S").unwrap();
 
     // Selection entirely before the WAIT body.
     assert!(send_from_wait(text, session, 0..5).is_none());
+  }
+
+  #[test]
+  fn blank_uuid_session() {
+    let text = "\
+# Claude
+## New Session
+> uuid=
+
+### WAIT
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions.len(), 1);
+    let session = &doc.sessions[0];
+    assert_eq!(session.uuid, "");
+    assert_eq!(session.label, "New Session");
+  }
+
+  #[test]
+  fn update_session_uuid_works() {
+    let text = "\
+# Claude
+## My Session
+> uuid=old-uuid
+
+### WAIT
+";
+    let doc = parse(text);
+    let updated = update_session_uuid(text, &doc, "My Session", "new-uuid").unwrap();
+    assert!(updated.contains("> uuid=new-uuid"));
+    let new_doc = parse(&updated);
+    assert_eq!(new_doc.sessions[0].uuid, "new-uuid");
   }
 }

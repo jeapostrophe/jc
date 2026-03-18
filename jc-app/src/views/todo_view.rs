@@ -1,8 +1,7 @@
 use crate::views::code_view::CodeView;
 use gpui::*;
 use gpui_component::ActiveTheme;
-use gpui_component::highlighter::{Diagnostic, DiagnosticSeverity};
-use gpui_component::input::{InputEvent, Position, Rope};
+use gpui_component::input::{InputEvent, Rope};
 use jc_core::todo::{self, TodoDocument, TodoProblem};
 use std::path::{Path, PathBuf};
 
@@ -14,7 +13,7 @@ pub struct TodoView {
   project_path: PathBuf,
   document: TodoDocument,
   problems: Vec<TodoProblem>,
-  active_slug: Option<String>,
+  active_label: Option<String>,
   _editor_subscription: Subscription,
 }
 
@@ -53,7 +52,7 @@ impl TodoView {
       project_path,
       document,
       problems,
-      active_slug: None,
+      active_label: None,
       _editor_subscription,
     };
     view.apply_diagnostics(cx);
@@ -102,28 +101,28 @@ impl TodoView {
     &self.problems
   }
 
-  /// Set the active session slug. The active session's headings get
+  /// Set the active session label. The active session's headings get
   /// highlighted with the `@type` / `@function` theme colors while
   /// other sessions use default markdown heading colors.
-  pub fn set_active_slug(&mut self, slug: Option<&str>, cx: &mut Context<Self>) {
-    let changed = self.active_slug.as_deref() != slug;
-    self.active_slug = slug.map(|s| s.to_string());
+  pub fn set_active_label(&mut self, label: Option<&str>, cx: &mut Context<Self>) {
+    let changed = self.active_label.as_deref() != label;
+    self.active_label = label.map(|s| s.to_string());
     if changed {
       self.apply_session_highlights(cx);
     }
   }
 
-  /// Insert a `## Session <slug>: <label>` heading into the TODO.md,
+  /// Insert a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading into the TODO.md,
   /// save, and revalidate.
   pub fn insert_session_heading(
     &mut self,
-    slug: &str,
+    uuid: &str,
     label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let text = self.code_view.read(cx).editor_text(cx);
-    let new_text = todo::insert_session_heading(&text, &self.document, slug, label);
+    let new_text = todo::insert_session_heading(&text, &self.document, uuid, label);
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {
         state.set_value(new_text, window, cx);
@@ -144,12 +143,12 @@ impl TodoView {
 
   pub fn insert_comment(
     &self,
-    session_slug: &str,
+    session_label: &str,
     comment: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let Some(offset) = self.document.comment_insert_offset(session_slug) else {
+    let Some(offset) = self.document.comment_insert_offset(session_label) else {
       return;
     };
     self.code_view.update(cx, |cv, cx| {
@@ -162,9 +161,14 @@ impl TodoView {
   }
 
   /// Mark a session heading as deleted in the TODO text.
-  pub fn mark_session_deleted(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+  pub fn mark_session_deleted(
+    &mut self,
+    label: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
     let text = self.editor_text(cx);
-    if let Some(new_text) = todo::mark_session_deleted(&text, &self.document, slug) {
+    if let Some(new_text) = todo::mark_session_deleted(&text, &self.document, label) {
       self.code_view.update(cx, |cv, cx| {
         cv.editor().update(cx, |state, cx| {
           state.set_value(new_text, window, cx);
@@ -174,36 +178,19 @@ impl TodoView {
     }
   }
 
-  /// Unmark a deleted session heading, restoring it to active.
-  pub fn unmark_session_deleted(
-    &mut self,
-    slug: &str,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    let text = self.editor_text(cx);
-    if let Some(new_text) = todo::unmark_session_deleted(&text, slug) {
-      self.code_view.update(cx, |cv, cx| {
-        cv.editor().update(cx, |state, cx| {
-          state.set_value(new_text, window, cx);
-        });
-      });
-      self.revalidate(cx);
-    }
-  }
 
   /// Extract the selected text (or entire WAIT body if no selection) from the
   /// active session's WAIT section, wrap it in a new `### Message N` heading,
   /// and update the editor. Returns `(message_text, message_index)` on success.
   pub fn send_selection(
     &mut self,
-    slug: &str,
+    label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> Option<(String, usize)> {
     let text = self.editor_text(cx);
     let selection = self.code_view.read(cx).editor().read(cx).selection_byte_range();
-    let session = self.document.session_by_slug(slug)?;
+    let session = self.document.session_by_label(label)?;
     let result = todo::send_from_wait(&text, session, selection)?;
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {
@@ -213,6 +200,25 @@ impl TodoView {
     self.revalidate(cx);
     self.save(cx);
     Some((result.message_text, result.message_index))
+  }
+
+  /// Update a session's UUID in the TODO document text.
+  pub fn update_session_uuid(
+    &mut self,
+    label: &str,
+    new_uuid: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let text = self.editor_text(cx);
+    if let Some(new_text) = todo::update_session_uuid(&text, &self.document, label, new_uuid) {
+      self.code_view.update(cx, |cv, cx| {
+        cv.editor().update(cx, |state, cx| {
+          state.set_value(new_text, window, cx);
+        });
+      });
+      self.revalidate(cx);
+    }
   }
 
   /// Re-validate and refresh diagnostics. Call after loading or when the user
@@ -225,32 +231,14 @@ impl TodoView {
     self.apply_session_highlights(cx);
   }
 
-  /// Push current problems as editor diagnostics (wavy underlines on invalid slugs).
+  /// Push current problems as editor diagnostics.
   fn apply_diagnostics(&mut self, cx: &mut Context<Self>) {
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {
         let rope = Rope::from(state.value().as_ref());
         if let Some(diag_set) = state.diagnostics_mut() {
           diag_set.reset(&rope);
-          for problem in &self.problems {
-            match problem {
-              TodoProblem::UnsentWait { .. } => {}
-              TodoProblem::InvalidSessionSlug { slug, line, .. } => {
-                // Position is 0-based; our line numbers are 1-based.
-                // Slug starts at column 11 ("## Session ".len()).
-                let col_start = "## Session ".len() as u32;
-                let col_end = col_start + slug.len() as u32;
-                let line_0 = line.saturating_sub(1);
-                diag_set.push(
-                  Diagnostic::new(
-                    Position::new(line_0, col_start)..Position::new(line_0, col_end),
-                    format!("No JSONL session found for slug '{slug}'"),
-                  )
-                  .with_severity(DiagnosticSeverity::Error),
-                );
-              }
-            }
-          }
+          // No more InvalidSessionSlug diagnostics — validation only checks unsent waits.
           cx.notify();
         }
       });
@@ -258,9 +246,10 @@ impl TodoView {
   }
 
   /// Apply foreground highlights to the active session's headings.
-  /// h2 (`## Session`) → `@type` color, h3 (`### Message` / `### WAIT`) → `@function` color.
+  /// h2 (`## Label`) → `@type` color, h3 (`### Message` / `### WAIT`) → `@function` color.
   fn apply_session_highlights(&self, cx: &mut Context<Self>) {
-    let session = self.active_slug.as_deref().and_then(|slug| self.document.session_by_slug(slug));
+    let session =
+      self.active_label.as_deref().and_then(|label| self.document.session_by_label(label));
 
     let Some(session) = session else {
       self.code_view.update(cx, |cv, cx| {
@@ -277,7 +266,7 @@ impl TodoView {
 
     let mut highlights = Vec::new();
 
-    // Highlight the session heading (## Session slug: label).
+    // Highlight the session heading (## Label).
     highlights.push((session.heading_byte_range.clone(), h2_style));
 
     // Highlight all ### Message and ### WAIT headings within this session.

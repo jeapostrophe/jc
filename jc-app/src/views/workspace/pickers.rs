@@ -4,9 +4,9 @@ use crate::views::pane::PaneContentKind;
 use crate::views::picker::{
   CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
   LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
-  ReplyHeadingPickerDelegate, ReplyTurnPickerDelegate, SearchLines, SessionPickerDelegate,
-  SessionPickerResult, ShowSessionPicker, ShowSlugPicker, ShowSnippetPicker, ShowViewPicker,
-  SlugAction, SlugPickerDelegate, SnippetPickerDelegate, SnippetTarget, TodoHeaderPickerDelegate,
+  SearchLines, SessionPickerDelegate,
+  SessionPickerResult, ShowSessionPicker, ShowSnippetPicker, ShowViewPicker,
+  SnippetPickerDelegate, SnippetTarget, TodoHeaderPickerDelegate,
   ViewPickerDelegate,
 };
 use gpui::*;
@@ -88,7 +88,8 @@ impl Workspace {
       return;
     }
 
-    let delegate = SessionPickerDelegate::new(&self.projects, self.active_project_index);
+    let docs = self.todo_documents(cx);
+    let delegate = SessionPickerDelegate::new(&self.projects, self.active_project_index, &docs);
     self.show_session_picker(delegate, window, cx);
   }
 
@@ -112,77 +113,19 @@ impl Workspace {
             this.pre_picker_focus.take();
             this.dismiss_picker();
             match result {
-              SessionPickerResult::Session(pi, slug) => {
-                this.switch_to_session(pi, Some(slug), window, cx);
+              SessionPickerResult::Session(pi, id) => {
+                this.switch_to_session(pi, Some(id), window, cx);
+              }
+              SessionPickerResult::Adopt(pi, uuid, label) => {
+                this.adopt_session(pi, &uuid, &label, window, cx);
               }
               SessionPickerResult::InitProject(pi) => {
                 this.init_empty_project(pi, window, cx);
               }
-              SessionPickerResult::Removed(pi, slug) => {
-                this.remove_session(pi, &slug, window, cx);
+              SessionPickerResult::Removed(pi, id) => {
+                this.remove_session(pi, id, window, cx);
               }
             }
-            cx.notify();
-          }
-          PickerEvent::Dismissed => {
-            if let Some(focus) = this.pre_picker_focus.take() {
-              focus.focus(window);
-            }
-            this.dismiss_picker();
-            cx.notify();
-          }
-        }
-      });
-
-    self.active_picker = Some(picker.clone().into());
-    self._picker_subscription = Some(subscription);
-
-    picker.read(cx).input_focus_handle(cx).focus(window);
-    cx.notify();
-  }
-
-  pub(super) fn open_slug_picker(
-    &mut self,
-    _: &ShowSlugPicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let project = &self.projects[self.active_project_index];
-    let delegate = SlugPickerDelegate::new(project);
-    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
-    self.pre_picker_focus = window.focused(cx);
-
-    let project_idx = self.active_project_index;
-    let subscription =
-      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
-        match event {
-          PickerEvent::Confirmed => {
-            let action =
-              picker_entity.read(cx).delegate().confirmed_entry().map(|e| e.action.clone());
-            match action {
-              Some(SlugAction::Switch(slug)) => {
-                this.pre_picker_focus.take();
-                this.switch_to_session(project_idx, Some(slug), window, cx);
-              }
-              Some(SlugAction::Attach(slug, label)) => {
-                this.pre_picker_focus.take();
-                this.adopt_slug(project_idx, &slug, &label, window, cx);
-              }
-              Some(SlugAction::New) => {
-                this.pre_picker_focus.take();
-                this.create_new_session(project_idx, window, cx);
-              }
-              None => {
-                if let Some(focus) = this.pre_picker_focus.take() {
-                  focus.focus(window);
-                }
-              }
-            }
-            this.dismiss_picker();
             cx.notify();
           }
           PickerEvent::Dismissed => {
@@ -250,12 +193,6 @@ impl Workspace {
         let delegate = CodeSymbolPickerDelegate::new(project.code_view.clone(), cx);
         self.show_picker(delegate, window, cx);
       }
-      Some(PaneContentKind::ReplyViewer) => {
-        if let Some(session) = project.active_session() {
-          let delegate = ReplyHeadingPickerDelegate::new(session.reply_view.clone(), cx);
-          self.show_picker(delegate, window, cx);
-        }
-      }
       _ => {}
     }
   }
@@ -278,18 +215,8 @@ impl Workspace {
       return;
     }
 
-    let kind = self.active_pane_entity().read(cx).content_kind();
-    let project = self.active_project();
-
-    if kind == Some(PaneContentKind::ReplyViewer) {
-      if let Some(session) = project.active_session() {
-        let delegate = ReplyTurnPickerDelegate::new(session.reply_view.clone(), cx);
-        self.show_picker(delegate, window, cx);
-      }
-    } else {
-      let delegate = GitLogPickerDelegate::new(project.diff_view.clone(), cx);
-      self.show_picker_with_confirm(delegate, Some(PaneContentKind::GitDiff), window, cx);
-    }
+    let delegate = GitLogPickerDelegate::new(self.active_project().diff_view.clone(), cx);
+    self.show_picker_with_confirm(delegate, Some(PaneContentKind::GitDiff), window, cx);
   }
 
   pub(super) fn search_lines(
@@ -317,12 +244,6 @@ impl Workspace {
       Some(PaneContentKind::GitDiff) => {
         let delegate = LineSearchPickerDelegate::for_view(&project.diff_view, cx);
         self.show_picker(delegate, window, cx);
-      }
-      Some(PaneContentKind::ReplyViewer) => {
-        if let Some(session) = project.active_session() {
-          let delegate = LineSearchPickerDelegate::for_view(&session.reply_view, cx);
-          self.show_picker(delegate, window, cx);
-        }
       }
       _ => {}
     }
@@ -408,9 +329,6 @@ impl Workspace {
         project.code_view.read(cx).comment_context(&project.path, cx)
       }
       Some(PaneContentKind::GitDiff) => project.diff_view.read(cx).comment_context(cx),
-      Some(PaneContentKind::ReplyViewer) => {
-        project.active_session().and_then(|s| s.reply_view.read(cx).comment_context(cx))
-      }
       _ => None,
     };
 
@@ -427,8 +345,9 @@ impl Workspace {
         let project = &this.projects[this.active_project_index];
         if let Some(session) = project.active_session() {
           let comment = format!("{text}\n");
+          let label = session.label.clone();
           project.todo_view.update(cx, |tv, cx| {
-            tv.insert_comment(&session.slug, &comment, window, cx);
+            tv.insert_comment(&label, &comment, window, cx);
             tv.save(cx);
           });
         }
@@ -475,13 +394,13 @@ impl Workspace {
       _ => SnippetTarget::TodoWait,
     };
 
-    let active_slug = project.active_slug().map(str::to_string);
+    let active_label = project.active_label().map(str::to_string);
     let claude_terminal = project.active_session().map(|s| s.claude_terminal.clone());
 
     let delegate = SnippetPickerDelegate::new(
       self.snippets.items.clone(),
       project.todo_view.clone(),
-      active_slug,
+      active_label,
       claude_terminal,
       insert_target,
     );

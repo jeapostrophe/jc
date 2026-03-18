@@ -37,14 +37,6 @@ impl Workspace {
           format!("Diff [{source_label}] ({reviewed}/{total})")
         }
       }
-      Some(PaneContentKind::ReplyViewer) => {
-        if let Some(session) = project.active_session() {
-          let label = session.reply_view.read(cx).current_turn_label();
-          format!("Reply: {label}")
-        } else {
-          "Reply: No session".to_string()
-        }
-      }
       Some(kind) => kind.label().to_string(),
       None => "Empty".to_string(),
     }
@@ -78,9 +70,8 @@ impl Workspace {
       .enumerate()
       .filter(|(pi, p)| {
         let has_project_problems = !p.problems.is_empty();
-        let has_session_problems = p.sessions.iter().any(|(slug, s)| {
-          let is_active = *pi == self.active_project_index
-            && p.active_session_slug.as_deref() == Some(slug.as_str());
+        let has_session_problems = p.sessions.iter().any(|(&id, s)| {
+          let is_active = *pi == self.active_project_index && p.active_session == Some(id);
           !is_active && !s.problems.is_empty()
         });
         has_project_problems || has_session_problems
@@ -232,17 +223,16 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::show_git_diff))
       .on_action(cx.listener(Self::show_code_viewer))
       .on_action(cx.listener(Self::show_todo_editor))
-      .on_action(cx.listener(Self::show_reply_viewer))
       .on_action(cx.listener(Self::open_in_external_editor))
       .on_action(cx.listener(Self::open_file_picker))
       .on_action(cx.listener(Self::open_context_picker))
       .on_action(cx.listener(Self::open_git_log_picker))
       .on_action(cx.listener(Self::open_session_picker))
-      .on_action(cx.listener(Self::open_slug_picker))
       .on_action(cx.listener(Self::search_lines))
       .on_action(cx.listener(Self::open_comment_panel))
       .on_action(cx.listener(Self::save_file))
       .on_action(cx.listener(Self::send_to_terminal))
+      .on_action(cx.listener(Self::copy_reply))
       .on_action(cx.listener(Self::next_problem))
       .on_action(cx.listener(Self::toggle_keybinding_help))
       .on_action(cx.listener(Self::open_problem_picker))

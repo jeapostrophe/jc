@@ -5,7 +5,6 @@ pub mod keybinding_help;
 pub mod pane;
 pub mod picker;
 pub mod project_state;
-pub mod reply_view;
 pub mod session_state;
 pub mod todo_view;
 pub mod workspace;

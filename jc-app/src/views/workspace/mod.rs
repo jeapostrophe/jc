@@ -6,14 +6,12 @@ use crate::views::diff_view::DiffViewEvent;
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
-use crate::views::reply_view::gc_stale_replies;
-use crate::views::session_state::{PendingEvent, SessionState};
+use crate::views::session_state::{PendingEvent, SessionId, SessionState};
 use gpui::*;
 use gpui_component::theme::Theme;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
 use jc_core::problem::ProblemTarget;
-use jc_core::session;
 use jc_core::snippets::{self, SnippetDocument};
 use jc_core::theme::Appearance;
 use jc_terminal::{Palette, TerminalView, TerminalViewEvent};
@@ -39,10 +37,10 @@ actions!(
     ShowTodoEditor,
     OpenInExternalEditor,
     OpenGitLogPicker,
-    ShowReplyViewer,
     OpenCommentPanel,
     SaveFile,
     SendToTerminal,
+    CopyReply,
     NextProblem,
     ShowKeybindingHelp,
   ]
@@ -67,6 +65,14 @@ fn appearance_from_window(appearance: WindowAppearance) -> Appearance {
 /// Get the terminal palette matching the current window appearance.
 fn palette_from_window(window: &Window) -> Palette {
   Palette::for_appearance(appearance_from_window(window.appearance()))
+}
+
+/// Read the current macOS clipboard contents via `pbpaste`.
+fn clipboard_contents() -> Option<String> {
+  std::process::Command::new("pbpaste")
+    .output()
+    .ok()
+    .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
 }
 
 pub struct Workspace {
@@ -124,8 +130,6 @@ impl Workspace {
         window,
         cx,
       ));
-      let path = project.path.clone();
-      std::thread::spawn(move || gc_stale_replies(&path));
     }
 
     // If no projects registered, create a default one from cwd.
@@ -135,8 +139,6 @@ impl Workspace {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".into());
-      let gc_path = path.clone();
-      std::thread::spawn(move || gc_stale_replies(&gc_path));
       projects.push(ProjectState::create(path, name, &palette, window, cx));
     }
 
@@ -386,31 +388,33 @@ impl Workspace {
   fn subscribe_bells(projects: &[ProjectState], cx: &mut Context<Self>) -> Vec<Subscription> {
     let mut subs = Vec::new();
     for (pi, project) in projects.iter().enumerate() {
-      for (slug, session) in &project.sessions {
-        subs.push(Self::make_bell_subscription(&session.claude_terminal, pi, slug.clone(), cx));
+      for (&id, session) in &project.sessions {
+        subs.push(Self::make_bell_subscription(&session.claude_terminal, pi, id, cx));
       }
     }
     subs
   }
 
   /// Subscribe to bell events for a single newly-created session.
-  fn subscribe_session_bell(&mut self, pi: usize, slug: &str, cx: &mut Context<Self>) {
-    let terminal = &self.projects[pi].sessions[slug].claude_terminal;
-    let sub = Self::make_bell_subscription(terminal, pi, slug.to_string(), cx);
+  fn subscribe_session_bell(&mut self, pi: usize, id: SessionId, cx: &mut Context<Self>) {
+    let terminal = &self.projects[pi].sessions[&id].claude_terminal;
+    let sub = Self::make_bell_subscription(terminal, pi, id, cx);
     self._bell_subscriptions.push(sub);
   }
 
   fn make_bell_subscription(
     terminal: &Entity<TerminalView>,
     pi: usize,
-    slug: String,
+    session_id: SessionId,
     cx: &mut Context<Self>,
   ) -> Subscription {
     cx.subscribe(
       terminal,
       move |this: &mut Self, _, event: &TerminalViewEvent, cx: &mut Context<Self>| match event {
         TerminalViewEvent::Bell => {
-          if let Some(session) = this.projects.get_mut(pi).and_then(|p| p.sessions.get_mut(&slug)) {
+          if let Some(session) =
+            this.projects.get_mut(pi).and_then(|p| p.sessions.get_mut(&session_id))
+          {
             session.pending_events.insert(PendingEvent::TerminalBell);
           }
           cx.notify();
@@ -566,12 +570,6 @@ impl Workspace {
     if kind == PaneContentKind::GitDiff {
       self.projects[self.active_project_index].diff_view.update(cx, |v, cx| v.refresh(window, cx));
     }
-    if kind == PaneContentKind::ReplyViewer
-      && let Some(s) = self.projects[self.active_project_index].active_session()
-    {
-      s.reply_view.update(cx, |v, cx| v.refresh(window, cx));
-    }
-
     let pane_idx = self.active_pane_index;
     self.set_pane_view(pane_idx, kind, cx);
 
@@ -581,9 +579,9 @@ impl Workspace {
     if kind == PaneContentKind::TodoEditor {
       let project = &self.projects[self.active_project_index];
       let tv = project.todo_view.read(cx);
-      if let Some(slug) = project.active_slug() {
+      if let Some(label) = project.active_label() {
         let text = tv.editor_text(cx);
-        if let Some(wait_line) = tv.document().wait_body_end_line(slug, &text) {
+        if let Some(wait_line) = tv.document().wait_body_end_line(label, &text) {
           let wait_line_0 = wait_line.saturating_sub(1);
           let _ = tv;
           project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
@@ -620,15 +618,6 @@ impl Workspace {
 
   fn show_todo_editor(&mut self, _: &ShowTodoEditor, window: &mut Window, cx: &mut Context<Self>) {
     self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
-  }
-
-  fn show_reply_viewer(
-    &mut self,
-    _: &ShowReplyViewer,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    self.set_active_pane_view(PaneContentKind::ReplyViewer, window, cx);
   }
 
   fn toggle_keybinding_help(
@@ -698,8 +687,8 @@ impl Workspace {
 
     // If the project is already loaded, just switch to it.
     if let Some(idx) = self.projects.iter().position(|p| p.path == canonical) {
-      let slug = self.projects[idx].active_session_slug.clone();
-      self.switch_to_session(idx, slug, window, cx);
+      let active = self.projects[idx].active_session;
+      self.switch_to_session(idx, active, window, cx);
       return;
     }
 
@@ -710,15 +699,12 @@ impl Workspace {
       .map(|n| n.to_string_lossy().into_owned())
       .unwrap_or_else(|| "unknown".into());
 
-    let gc_path = canonical.clone();
-    std::thread::spawn(move || gc_stale_replies(&gc_path));
-
     let project = ProjectState::create(canonical.clone(), name, &palette, window, cx);
     self.projects.push(project);
 
     let project_idx = self.projects.len() - 1;
-    let slug = self.projects[project_idx].active_session_slug.clone();
-    self.switch_to_session(project_idx, slug, window, cx);
+    let active = self.projects[project_idx].active_session;
+    self.switch_to_session(project_idx, active, window, cx);
 
     // Persist to state.toml.
     if let Ok(mut state) = jc_core::config::load_state() {
@@ -734,7 +720,7 @@ impl Workspace {
   fn switch_to_session(
     &mut self,
     project_idx: usize,
-    slug: Option<String>,
+    session_id: Option<SessionId>,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -751,7 +737,7 @@ impl Workspace {
     }
 
     self.active_project_index = project_idx;
-    self.projects[project_idx].active_session_slug = slug.clone();
+    self.projects[project_idx].active_session = session_id;
 
     // Acknowledge pending events for this session (user is switching to it).
     if let Some(session) = self.projects[project_idx].active_session_mut() {
@@ -760,8 +746,9 @@ impl Workspace {
 
     // Update the TODO view's active session highlight.
     {
+      let label = self.projects[project_idx].active_label().map(|s| s.to_string());
       let todo_view = self.projects[project_idx].todo_view.clone();
-      todo_view.update(cx, |tv, cx| tv.set_active_slug(slug.as_deref(), cx));
+      todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
     }
 
     if project_changed {
@@ -780,11 +767,18 @@ impl Workspace {
     cx.notify();
   }
 
-  /// Find a session by slug across all projects and switch to it.
+  /// Find a session by slug/label across all projects and switch to it.
+  /// This is used by notification actions which still pass slug strings.
   fn switch_to_slug(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
     for (pi, project) in self.projects.iter().enumerate() {
-      if project.sessions.contains_key(slug) {
-        self.switch_to_session(pi, Some(slug.to_string()), window, cx);
+      // Try to match by label.
+      if let Some((id, _)) = project.session_by_label(slug) {
+        self.switch_to_session(pi, Some(id), window, cx);
+        return;
+      }
+      // Try to match by UUID.
+      if let Some((id, _)) = project.session_by_uuid(slug) {
+        self.switch_to_session(pi, Some(id), window, cx);
         return;
       }
     }
@@ -832,8 +826,7 @@ impl Workspace {
       if let Some(kind) = self.panes[i].read(cx).content_kind() {
         match kind {
           PaneContentKind::ClaudeTerminal
-          | PaneContentKind::GeneralTerminal
-          | PaneContentKind::ReplyViewer => to_rebind.push((i, kind)),
+          | PaneContentKind::GeneralTerminal => to_rebind.push((i, kind)),
           _ => {}
         }
       }
@@ -875,10 +868,6 @@ impl Workspace {
         let focus = project.todo_view.read(cx).focus_handle(cx);
         Some((project.todo_view.clone().into(), focus))
       }
-      PaneContentKind::ReplyViewer => project.active_session().map(|s| {
-        let focus = s.reply_view.read(cx).focus_handle(cx);
-        (s.reply_view.clone().into(), focus)
-      }),
       PaneContentKind::GlobalTodo => {
         let focus = self.global_todo_view.read(cx).focus_handle(cx);
         Some((self.global_todo_view.clone().into(), focus))
@@ -896,31 +885,79 @@ impl Workspace {
   // Session creation
   // ---------------------------------------------------------------------------
 
-  fn adopt_slug(
+  /// Launch a brand new Claude session (no --resume), with a blank UUID.
+  /// The UUID will be assigned when the first hook event arrives.
+  fn create_new_session(
     &mut self,
     project_idx: usize,
-    slug: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let project_path = self.projects[project_idx].path.clone();
+    let palette = palette_from_window(window);
+
+    let project = &mut self.projects[project_idx];
+    let id = project.next_session_id;
+    project.next_session_id += 1;
+
+    let label = "New Session".to_string();
+
+    let session = SessionState::create(
+      id,
+      None, // no UUID yet — will be assigned on first hook
+      label.clone(),
+      &project_path,
+      &palette,
+      window,
+      cx,
+    );
+
+    project.sessions.insert(id, session);
+
+    // Insert TODO heading with blank UUID.
+    let todo_view = project.todo_view.clone();
+    todo_view.update(cx, |tv, cx| {
+      tv.insert_session_heading("", &label, window, cx);
+      tv.save(cx);
+    });
+
+    self.subscribe_session_bell(project_idx, id, cx);
+    self.switch_to_session(project_idx, Some(id), window, cx);
+  }
+
+  /// Activate an empty project by creating a brand new Claude session.
+  fn init_empty_project(
+    &mut self,
+    project_idx: usize,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.create_new_session(project_idx, window, cx);
+  }
+
+  /// Adopt a TODO.md session that isn't running yet.
+  /// If it has a UUID, launches `claude --resume <uuid>` (invalid UUIDs just
+  /// show an error in the terminal — jc won't crash). If the UUID is empty,
+  /// launches a fresh `claude` and the first hook event will assign the UUID.
+  fn adopt_session(
+    &mut self,
+    project_idx: usize,
+    uuid: &str,
     label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let todo_view = self.projects[project_idx].todo_view.clone();
     let project_path = self.projects[project_idx].path.clone();
-
-    // Try to unmark a previously deleted heading first; if not found, insert new.
-    todo_view.update(cx, |tv, cx| {
-      tv.unmark_session_deleted(slug, window, cx);
-      // If unmark didn't find a deleted heading, insert a new one.
-      if tv.document().session_by_slug(slug).is_none() {
-        tv.insert_session_heading(slug, label, window, cx);
-      }
-      tv.save(cx);
-    });
-
-    // Build palette and create session state.
     let palette = palette_from_window(window);
+
+    let project = &mut self.projects[project_idx];
+    let id = project.next_session_id;
+    project.next_session_id += 1;
+
+    let uuid_opt = if uuid.is_empty() { None } else { Some(uuid.to_string()) };
     let session = SessionState::create(
-      slug.to_string(),
+      id,
+      uuid_opt,
       label.to_string(),
       &project_path,
       &palette,
@@ -928,131 +965,14 @@ impl Workspace {
       cx,
     );
 
-    let slug_owned = slug.to_string();
-    let project = &mut self.projects[project_idx];
-    project.sessions.insert(slug_owned.clone(), session);
-    self.subscribe_session_bell(project_idx, &slug_owned, cx);
-    self.switch_to_session(project_idx, Some(slug_owned), window, cx);
+    project.sessions.insert(id, session);
+    self.subscribe_session_bell(project_idx, id, cx);
+    self.switch_to_session(project_idx, Some(id), window, cx);
   }
 
-  /// Launch a brand new Claude session (no --resume), detect the slug once
-  /// the JSONL file appears, and adopt it into TODO.md.
-  fn create_new_session(
-    &mut self,
-    project_idx: usize,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    use jc_core::session::discover_session_groups;
-    use std::collections::HashSet;
-
-    let project_path = self.projects[project_idx].path.clone();
-
-    // Snapshot existing slugs so we can detect the new one.
-    let existing_slugs: HashSet<String> =
-      discover_session_groups(&project_path).into_iter().map(|g| g.slug).collect();
-
-    // Create a session that runs plain `claude` (no resume).
-    // Use a unique pending key until the real slug is discovered.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static PENDING_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let pending_slug = format!("__pending_{}__", PENDING_COUNTER.fetch_add(1, Ordering::Relaxed));
-    let palette = palette_from_window(window);
-    let session = SessionState::create(
-      String::new(), // empty slug -> falls back to plain `claude`
-      String::new(),
-      &project_path,
-      &palette,
-      window,
-      cx,
-    );
-
-    let project = &mut self.projects[project_idx];
-    project.sessions.insert(pending_slug.clone(), session);
-    self.subscribe_session_bell(project_idx, &pending_slug, cx);
-    self.switch_to_session(project_idx, Some(pending_slug.clone()), window, cx);
-
-    // Poll for the new JSONL file in the background. Once a new slug appears,
-    // update the session and insert a TODO heading.
-    cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
-      for _ in 0..120 {
-        Timer::after(StdDuration::from_millis(500)).await;
-
-        let path = project_path.clone();
-        let slugs = existing_slugs.clone();
-        let new_slug = std::thread::spawn(move || {
-          discover_session_groups(&path)
-            .into_iter()
-            .find(|g| !slugs.contains(&g.slug))
-            .map(|g| g.slug)
-        })
-        .join()
-        .ok()
-        .flatten();
-
-        if let Some(slug) = new_slug {
-          let pending = pending_slug.clone();
-          let _ = this.update_in(cx, |workspace, window, cx| {
-            let project = &mut workspace.projects[project_idx];
-
-            // Re-key the session from the pending key to the real slug.
-            if let Some(mut session) = project.sessions.remove(&pending) {
-              session.slug = slug.clone();
-              session.label = slug.clone();
-
-              // Update the reply view to track the new slug.
-              session.reply_view.update(cx, |rv, cx| {
-                rv.set_session_slug(Some(slug.clone()), window, cx);
-              });
-
-              project.sessions.insert(slug.clone(), session);
-
-              // Update active slug if it was pointing at the pending key.
-              if project.active_session_slug.as_ref() == Some(&pending) {
-                project.active_session_slug = Some(slug.clone());
-              }
-            }
-
-            // Insert TODO heading.
-            let todo_view = project.todo_view.clone();
-            todo_view.update(cx, |tv, cx| {
-              tv.insert_session_heading(&slug, &slug, window, cx);
-              tv.save(cx);
-            });
-
-            // Rebuild bell subscriptions since the key changed.
-            workspace._bell_subscriptions = Self::subscribe_bells(&workspace.projects, cx);
-
-            cx.notify();
-          });
-          return;
-        }
-      }
-    })
-    .detach();
-  }
-
-  /// Activate an empty project: discover existing JSONL sessions and adopt the
-  /// most recent one, or create a brand new Claude session if none exist.
-  fn init_empty_project(
-    &mut self,
-    project_idx: usize,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    use jc_core::session::discover_latest_session_group;
-
-    let project_path = self.projects[project_idx].path.clone();
-
-    if let Some(group) = discover_latest_session_group(&project_path) {
-      // Existing JSONL files found — adopt the most recent slug.
-      let slug = group.slug.clone();
-      let label = group.summary().unwrap_or_else(|| slug.clone());
-      self.adopt_slug(project_idx, &slug, &label, window, cx);
-    } else {
-      // No JSONL files — launch a fresh Claude session.
-      self.create_new_session(project_idx, window, cx);
-    }
+  /// Collect TodoDocument references from each project's todo_view.
+  fn todo_documents<'a>(&'a self, cx: &'a App) -> Vec<&'a jc_core::todo::TodoDocument> {
+    self.projects.iter().map(|p| p.todo_view.read(cx).document()).collect()
   }
 
   // ---------------------------------------------------------------------------
@@ -1062,35 +982,39 @@ impl Workspace {
   fn remove_session(
     &mut self,
     project_idx: usize,
-    slug: &str,
+    session_id: SessionId,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let project = &mut self.projects[project_idx];
 
+    // Get label before removing, for marking deleted in TODO.
+    let label = project.sessions.get(&session_id).map(|s| s.label.clone());
+
     // Remove the session state (drops terminals).
-    project.sessions.remove(slug);
+    project.sessions.remove(&session_id);
 
     // Mark the session as deleted in TODO.md so it won't reappear on restart.
-    let todo_view = project.todo_view.clone();
-    todo_view.update(cx, |tv, cx| {
-      tv.mark_session_deleted(slug, window, cx);
-      tv.save(cx);
-    });
+    if let Some(label) = &label {
+      let todo_view = project.todo_view.clone();
+      todo_view.update(cx, |tv, cx| {
+        tv.mark_session_deleted(label, window, cx);
+        tv.save(cx);
+      });
+    }
 
     // If the removed session was active, pick another one.
-    if project.active_session_slug.as_deref() == Some(slug) {
-      // Pick the first remaining session, if any.
-      let next_slug = project.sessions.keys().next().cloned();
-      project.active_session_slug = next_slug;
+    if project.active_session == Some(session_id) {
+      let next_id = project.sessions.keys().next().copied();
+      project.active_session = next_id;
     }
 
     // Rebuild bell subscriptions since a session was removed.
     self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
 
     // Switch to the new active session (or clear panes if none).
-    let active_slug = self.projects[project_idx].active_session_slug.clone();
-    self.switch_to_session(project_idx, active_slug, window, cx);
+    let active = self.projects[project_idx].active_session;
+    self.switch_to_session(project_idx, active, window, cx);
   }
 
   // ---------------------------------------------------------------------------
@@ -1119,7 +1043,7 @@ impl Workspace {
 
   fn send_to_terminal(&mut self, _: &SendToTerminal, window: &mut Window, cx: &mut Context<Self>) {
     let project = &self.projects[self.active_project_index];
-    let Some(slug) = project.active_slug().map(str::to_string) else {
+    let Some(label) = project.active_label().map(str::to_string) else {
       return;
     };
     let Some(session) = project.active_session() else {
@@ -1128,7 +1052,7 @@ impl Workspace {
     let claude_terminal = session.claude_terminal.clone();
 
     let Some((message_text, _)) =
-      project.todo_view.update(cx, |tv, cx| tv.send_selection(&slug, window, cx))
+      project.todo_view.update(cx, |tv, cx| tv.send_selection(&label, window, cx))
     else {
       return;
     };
@@ -1151,6 +1075,75 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
+  // Copy reply (/copy)
+  // ---------------------------------------------------------------------------
+
+  fn copy_reply(&mut self, _: &CopyReply, window: &mut Window, cx: &mut Context<Self>) {
+    let project = &self.projects[self.active_project_index];
+    let Some(session) = project.active_session() else {
+      return;
+    };
+
+    // Determine file name: use UUID if available, otherwise the label.
+    let filename = session
+      .uuid
+      .as_deref()
+      .filter(|u| !u.is_empty())
+      .unwrap_or(&session.label);
+    let reply_dir = project.path.join(".jc/replies");
+    let reply_path = reply_dir.join(format!("{filename}.md"));
+
+    // Send `/copy\n` to the Claude terminal.
+    let claude_terminal = session.claude_terminal.clone();
+    claude_terminal.read(cx).write_text("/copy");
+    let pty = claude_terminal.read(cx).pty_handle();
+    std::thread::spawn(move || {
+      std::thread::sleep(StdDuration::from_millis(200));
+      let _ = pty.write_all(b"\r");
+    });
+
+    // Read clipboard now, then poll for change.
+    let code_view = project.code_view.clone();
+    cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+      // Read initial clipboard.
+      let initial = clipboard_contents().unwrap_or_default();
+
+      // Poll for clipboard change (up to 3s, every 200ms).
+      let mut new_content = None;
+      for _ in 0..15 {
+        Timer::after(StdDuration::from_millis(200)).await;
+        if let Some(current) = clipboard_contents() {
+          if current != initial && !current.is_empty() {
+            new_content = Some(current);
+            break;
+          }
+        }
+      }
+
+      let Some(content) = new_content else {
+        return;
+      };
+
+      // Create directory and write file.
+      let _ = std::fs::create_dir_all(&reply_dir);
+      if let Err(e) = std::fs::write(&reply_path, &content) {
+        eprintln!("failed to write reply file: {e}");
+        return;
+      }
+
+      // Open the file in the code view and switch to it.
+      let _ = this.update_in(cx, |ws, window, cx| {
+        code_view.update(cx, |v, cx| {
+          v.set_language_override("markdown", cx);
+          v.open_file(reply_path, window, cx);
+        });
+        ws.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
+      });
+    })
+    .detach();
+  }
+
+  // ---------------------------------------------------------------------------
   // Hook events
   // ---------------------------------------------------------------------------
 
@@ -1160,12 +1153,9 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    eprintln!("hook: {:?} session={} slug={:?}", event.kind, event.session_id, event.slug);
+    eprintln!("hook: {:?} session={}", event.kind, event.session_id);
 
-    // On every hook event, try to resolve any pending rekeys.
-    self.drain_pending_rekeys(window, cx);
-
-    // Handle session clear: re-key the session from old slug to new slug.
+    // Handle session clear: update the session's UUID.
     if let HookEventKind::SessionClear { ref old_session_id, ref new_session_id } = event.kind {
       self.handle_session_clear(
         event.project_path.as_deref(),
@@ -1185,16 +1175,38 @@ impl Workspace {
       HookEventKind::SessionClear { .. } => unreachable!(),
     };
 
-    // Match the slug to a session across all projects.
+    // Match by UUID (session_id from hook) across all projects.
     let mut matched_project: Option<String> = None;
     let mut matched_label: Option<String> = None;
-    if let Some(slug) = &event.slug {
+
+    let session_uuid = &event.session_id;
+    if !session_uuid.is_empty() {
       for project in &mut self.projects {
-        if let Some(session) = project.sessions.get_mut(slug) {
+        let found = project
+          .sessions
+          .values_mut()
+          .find(|s| s.uuid.as_deref() == Some(session_uuid));
+        if let Some(session) = found {
           let is_new = session.pending_events.insert(pending.clone());
           if is_new {
             matched_project = Some(project.name.clone());
             matched_label = Some(session.label.clone());
+          }
+          break;
+        }
+        // If no UUID match, try to assign to a pending (uuid=None) session.
+        if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
+          session.uuid = Some(session_uuid.clone());
+          let is_new = session.pending_events.insert(pending.clone());
+          // Update TODO.md with the new UUID.
+          let label = session.label.clone();
+          project.todo_view.update(cx, |tv, cx| {
+            tv.update_session_uuid(&label, session_uuid, &mut *window, cx);
+            tv.save(cx);
+          });
+          if is_new {
+            matched_project = Some(project.name.clone());
+            matched_label = Some(label);
           }
           break;
         }
@@ -1213,15 +1225,18 @@ impl Workspace {
         HookEventKind::IdlePrompt => "Claude is idle",
         HookEventKind::SessionClear { .. } => unreachable!(),
       };
-      crate::notify::notify(&title, message, critical, event.slug.as_deref());
+      // Pass session_uuid as notification identifier (replaces old slug).
+      let notify_id = if event.session_id.is_empty() { None } else { Some(event.session_id.as_str()) };
+      crate::notify::notify(&title, message, critical, notify_id);
     }
 
     cx.notify();
   }
 
   /// Handle a `/clear` event: the old session ended and a new one started in
-  /// the same Claude process. Mark the old TODO heading deleted, then poll for
-  /// the new slug to appear (it's written on the first assistant response).
+  /// the same Claude process. Update the session's UUID to the new one.
+  /// No terminal relaunch needed — `/clear` resets the conversation but the
+  /// Claude process keeps running in the same terminal.
   fn handle_session_clear(
     &mut self,
     project_path: Option<&Path>,
@@ -1230,116 +1245,24 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let Some(project_path) = project_path else {
-      eprintln!("hook: session-clear with no project path");
+    let Some(project_path) = project_path else { return };
+    let Some(project) = self.projects.iter_mut().find(|p| p.path == *project_path) else { return };
+    let Some(session) = project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(old_session_id)) else {
+      eprintln!("hook: session-clear for unknown uuid {old_session_id}");
       return;
     };
 
-    // Find the project.
-    let Some(project_idx) = self.projects.iter().position(|p| p.path == project_path) else {
-      eprintln!("hook: session-clear for unknown project {}", project_path.display());
-      return;
-    };
+    eprintln!("hook: session cleared, uuid {old_session_id} -> {new_session_id}");
+    let label = session.label.clone();
+    session.uuid = Some(new_session_id.to_string());
 
-    // Resolve old slug from old_session_id.
-    let old_slug =
-      session::session_id_to_slug(project_path, old_session_id).unwrap_or_default();
-
-    if old_slug.is_empty() || !self.projects[project_idx].sessions.contains_key(&old_slug) {
-      eprintln!("hook: session-clear for unknown slug (old_session_id={old_session_id})");
-      return;
-    }
-
-    eprintln!("hook: session cleared, old slug={old_slug}, polling for new slug...");
-
-    // Mark old heading deleted immediately so the stale slug doesn't persist.
-    let todo_view = self.projects[project_idx].todo_view.clone();
-    todo_view.update(cx, |tv, cx| {
-      tv.mark_session_deleted(&old_slug, window, cx);
-      tv.save(cx);
-    });
-
-    // The new slug won't be written until Claude streams a real response.
-    // Store a pending rekey; it will be resolved on the next Stop event
-    // (or any hook event) when the slug becomes available.
-    self.projects[project_idx].pending_rekeys.push(
-      crate::views::project_state::PendingRekey {
-        old_slug: old_slug.to_string(),
-        new_session_id: new_session_id.to_string(),
-      },
-    );
-    eprintln!("hook: queued pending rekey old_slug={old_slug} new_session_id={new_session_id}");
-  }
-
-  /// Re-key a session from `old_slug` to `new_slug`: update the sessions map,
-  /// TODO.md headings, reply view, and bell subscriptions.
-  fn rekey_session(
-    &mut self,
-    project_idx: usize,
-    old_slug: &str,
-    new_slug: &str,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    let project = &mut self.projects[project_idx];
-
-    let Some(mut session) = project.sessions.remove(old_slug) else {
-      return;
-    };
-
-    eprintln!("hook: rekeying session {old_slug} → {new_slug}");
-
-    session.slug = new_slug.to_string();
-    session.label = new_slug.to_string();
-
-    // Point reply view at new slug's JSONL files.
-    session.reply_view.update(cx, |rv, cx| {
-      rv.set_session_slug(Some(new_slug.to_string()), window, cx);
-    });
-
-    project.sessions.insert(new_slug.to_string(), session);
-
-    // Update active slug if it pointed at the old one.
-    if project.active_session_slug.as_deref() == Some(old_slug) {
-      project.active_session_slug = Some(new_slug.to_string());
-    }
-
-    // Update TODO.md: insert new heading (old heading was already marked
-    // deleted by handle_session_clear).
+    // Update TODO.md: change `> uuid=OLD` to `> uuid=NEW`.
     let todo_view = project.todo_view.clone();
     todo_view.update(cx, |tv, cx| {
-      tv.insert_session_heading(new_slug, new_slug, window, cx);
+      tv.update_session_uuid(&label, new_session_id, window, cx);
       tv.save(cx);
     });
-
-    // Rebuild bell subscriptions since the key changed.
-    self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
-
     cx.notify();
-  }
-
-  /// Try to resolve pending rekeys across all projects.
-  /// Called on every hook event — slugs appear in JSONL only after Claude
-  /// streams a real response, which triggers a Stop hook.
-  fn drain_pending_rekeys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    for project_idx in 0..self.projects.len() {
-      let project = &self.projects[project_idx];
-      let pp = project.path.clone();
-
-      // Collect resolved rekeys.
-      let mut resolved: Vec<(usize, String)> = Vec::new();
-      for (i, pending) in project.pending_rekeys.iter().enumerate() {
-        if let Some(new_slug) = session::session_id_to_slug(&pp, &pending.new_session_id) {
-          resolved.push((i, new_slug));
-        }
-      }
-
-      // Apply resolved rekeys in reverse order (to preserve indices).
-      for (i, new_slug) in resolved.into_iter().rev() {
-        let old_slug = self.projects[project_idx].pending_rekeys.remove(i).old_slug;
-        self.rekey_session(project_idx, &old_slug, &new_slug, window, cx);
-      }
-    }
   }
 }
 
@@ -1374,13 +1297,13 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
     KeyBinding::new("cmd-shift-o", OpenGitLogPicker, Some("Workspace")),
     KeyBinding::new("cmd-p", crate::views::picker::ShowSessionPicker, Some("Workspace")),
-    KeyBinding::new("cmd-shift-p", crate::views::picker::ShowSlugPicker, Some("Workspace")),
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Workspace")),
     KeyBinding::new("cmd-s", SaveFile, Some("Workspace")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Workspace")),
     KeyBinding::new("cmd-;", NextProblem, Some("Workspace")),
     KeyBinding::new("cmd-:", crate::views::picker::ShowProblemPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Workspace")),
+    KeyBinding::new("cmd-shift-c", CopyReply, Some("Workspace")),
     KeyBinding::new("cmd-?", ShowKeybindingHelp, Some("Workspace")),
   ]);
 

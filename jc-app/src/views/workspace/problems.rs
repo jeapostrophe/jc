@@ -103,8 +103,9 @@ impl Workspace {
       return;
     }
 
+    let docs = self.todo_documents(cx);
     let delegate =
-      SessionPickerDelegate::new_urgency_sorted(&self.projects, self.active_project_index);
+      SessionPickerDelegate::new_urgency_sorted(&self.projects, self.active_project_index, &docs);
     self.show_session_picker(delegate, window, cx);
   }
 }

@@ -1,4 +1,3 @@
-use crate::session;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -8,7 +7,6 @@ pub const HOOK_PATH_PREFIX: &str = "/jc-hook/";
 #[derive(Debug, Clone)]
 pub struct HookEvent {
   pub session_id: String,
-  pub slug: Option<String>,
   pub project_path: Option<PathBuf>,
   pub kind: HookEventKind,
 }
@@ -113,9 +111,6 @@ fn accept_loop(
       project_paths.iter().find(|p| cwd.starts_with(p)).cloned()
     });
 
-    // Resolve slug
-    let slug = project_path.as_ref().and_then(|pp| session::session_id_to_slug(pp, &session_id));
-
     let kind = match route {
       "stop" => Some(HookEventKind::Stop),
       "notification" => parse_notification_kind(&payload.notification_type),
@@ -164,7 +159,7 @@ fn accept_loop(
     let _ = request.respond(json_response(200, "{}"));
 
     if let Some(kind) = kind {
-      let event = HookEvent { session_id, slug, project_path, kind };
+      let event = HookEvent { session_id, project_path, kind };
       if tx.send(event).is_err() {
         break; // receiver dropped
       }

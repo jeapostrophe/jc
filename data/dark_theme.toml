@@ -26,7 +26,7 @@ bright_white  = "#FFFFFF"
 border    = "#373B41"
 muted     = "#282A2E"
 accent    = "#282A2E"
-selection = "#373B41"
+selection = "#3A4A5C"
 
 [editor]
 background         = "#1D1F21"

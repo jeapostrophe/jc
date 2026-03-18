@@ -16,7 +16,82 @@
       "mcp__drawthings__generate_image",
       "Bash(/usr/bin/date:*)",
       "Bash(./scripts/claude-usage.sh:*)",
-      "Bash(cargo search:*)"
+      "Bash(cargo search:*)",
+      "Bash(echo parse failed:*)",
+      "Bash(lsof:*)",
+      "Bash(pgrep:*)",
+      "Bash(grep:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat > /tmp/jc-hook-sessionstart-test.json"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sf -X POST http://127.0.0.1:53194/jc-hook/session-start -H 'Content-Type: application/json' -d @-",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat > /tmp/jc-hook-sessionend-test.json"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sf -X POST http://127.0.0.1:53194/jc-hook/session-end -H 'Content-Type: application/json' -d @-",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:53194/jc-hook/stop"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:53194/jc-hook/notification"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:53194/jc-hook/permission"
+          }
+        ]
+      }
     ]
   }
 }
