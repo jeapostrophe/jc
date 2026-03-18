@@ -1048,6 +1048,12 @@ impl Workspace {
   // ---------------------------------------------------------------------------
 
   fn send_to_terminal(&mut self, _: &SendToTerminal, window: &mut Window, cx: &mut Context<Self>) {
+    // Only send when the TODO editor is focused.
+    let active_kind = self.panes[self.active_pane_index].read(cx).content_kind();
+    if active_kind != Some(PaneContentKind::TodoEditor) {
+      return;
+    }
+
     let project = &self.projects[self.active_project_index];
     let Some(label) = project.active_label().map(str::to_string) else {
       return;
