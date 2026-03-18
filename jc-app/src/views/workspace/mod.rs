@@ -2,6 +2,7 @@ mod pickers;
 mod problems;
 mod render;
 
+use crate::views::close_confirm::{CloseConfirm, CloseConfirmEvent};
 use crate::views::diff_view::DiffViewEvent;
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
@@ -42,6 +43,7 @@ actions!(
     CopyReply,
     NextProblem,
     JumpToWait,
+    RotateNextProject,
     ShowKeybindingHelp,
   ]
 );
@@ -108,6 +110,10 @@ pub struct Workspace {
   window_active: bool,
   _window_activation_subscription: Subscription,
   _notification_poll_task: Option<Task<()>>,
+  close_confirm: Option<(AnyView, Subscription)>,
+  pre_close_confirm_focus: Option<FocusHandle>,
+  /// Whether the pending close is a quit (vs window close).
+  close_confirm_is_quit: bool,
 }
 
 impl Workspace {
@@ -232,6 +238,14 @@ impl Workspace {
           if let Some(entity) = this.upgrade() {
             entity.update(cx, |view, cx| {
               let mut changed = false;
+              // Refresh stale diff views so problem counts reflect git state.
+              for project in &mut view.projects {
+                let stale = project.diff_view.read(cx).is_stale();
+                if stale {
+                  project.diff_view.update(cx, |dv, _cx| dv.refresh_data());
+                  changed = true;
+                }
+              }
               for project in &mut view.projects {
                 changed |= project.refresh_problems(cx);
               }
@@ -342,6 +356,9 @@ impl Workspace {
       window_active: true,
       _window_activation_subscription: window_activation_subscription,
       _notification_poll_task: Some(notification_poll_task),
+      close_confirm: None,
+      pre_close_confirm_focus: None,
+      close_confirm_is_quit: false,
     };
 
     ws.subscribe_active_project(window, cx);
@@ -489,16 +506,83 @@ impl Workspace {
   // Window actions
   // ---------------------------------------------------------------------------
 
-  fn close_window(&mut self, _: &CloseWindow, window: &mut Window, _cx: &mut Context<Self>) {
-    window.remove_window();
+  fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+    if self.close_confirm.is_some() {
+      return;
+    }
+    let active = self.active_session_count();
+    if active > 0 {
+      self.show_close_confirm(active, false, window, cx);
+    } else {
+      window.remove_window();
+    }
   }
 
   fn minimize_window(&mut self, _: &MinimizeWindow, window: &mut Window, _cx: &mut Context<Self>) {
     window.minimize_window();
   }
 
-  fn quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
-    cx.quit();
+  fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
+    if self.close_confirm.is_some() {
+      return;
+    }
+    let active = self.active_session_count();
+    if active > 0 {
+      self.show_close_confirm(active, true, window, cx);
+    } else {
+      cx.quit();
+    }
+  }
+
+  /// Count sessions that are actively working (not idle/stopped).
+  fn active_session_count(&self) -> usize {
+    self
+      .projects
+      .iter()
+      .flat_map(|p| p.sessions.values())
+      .filter(|s| {
+        // A session is "active" if it has received at least one hook event
+        // (meaning Claude started working) and hasn't since reported idle or stop.
+        s.ever_active
+          && !s.pending_events.contains(&PendingEvent::ClaudeIdle)
+          && !s.pending_events.contains(&PendingEvent::ClaudeStop)
+      })
+      .count()
+  }
+
+  fn show_close_confirm(
+    &mut self,
+    session_count: usize,
+    is_quit: bool,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.close_confirm_is_quit = is_quit;
+    self.pre_close_confirm_focus = window.focused(cx);
+    let view = cx.new(|cx| CloseConfirm::new(session_count, is_quit, cx));
+    let sub = cx.subscribe_in(&view, window, |this: &mut Self, _, event, window, cx| {
+      match event {
+        CloseConfirmEvent::Confirmed => {
+          this.close_confirm = None;
+          this.pre_close_confirm_focus = None;
+          if this.close_confirm_is_quit {
+            cx.quit();
+          } else {
+            window.remove_window();
+          }
+        }
+        CloseConfirmEvent::Cancelled => {
+          this.close_confirm = None;
+          if let Some(focus) = this.pre_close_confirm_focus.take() {
+            focus.focus(window);
+          }
+          cx.notify();
+        }
+      }
+    });
+    view.read(cx).focus_handle(cx).focus(window);
+    self.close_confirm = Some((view.into(), sub));
+    cx.notify();
   }
 
   // ---------------------------------------------------------------------------
@@ -514,17 +598,20 @@ impl Workspace {
   }
 
   fn focus_prev_pane(&mut self, _: &FocusPrevPane, window: &mut Window, cx: &mut Context<Self>) {
-    let count = self.visible_pane_count();
-    self.active_pane_index = (self.active_pane_index + count - 1) % count;
-    self.panes[self.active_pane_index].read(cx).focus_content(window);
-    cx.notify();
+    if self.active_pane_index > 0 {
+      self.active_pane_index -= 1;
+      self.panes[self.active_pane_index].read(cx).focus_content(window);
+      cx.notify();
+    }
   }
 
   fn focus_next_pane(&mut self, _: &FocusNextPane, window: &mut Window, cx: &mut Context<Self>) {
     let count = self.visible_pane_count();
-    self.active_pane_index = (self.active_pane_index + 1) % count;
-    self.panes[self.active_pane_index].read(cx).focus_content(window);
-    cx.notify();
+    if self.active_pane_index + 1 < count {
+      self.active_pane_index += 1;
+      self.panes[self.active_pane_index].read(cx).focus_content(window);
+      cx.notify();
+    }
   }
 
   fn set_layout(&mut self, layout: PaneLayout, window: &mut Window, cx: &mut Context<Self>) {
@@ -778,6 +865,35 @@ impl Workspace {
     }
 
     cx.notify();
+  }
+
+  fn rotate_next_project(
+    &mut self,
+    _: &RotateNextProject,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    // Build a flat list of (project_index, session_id) in deterministic order.
+    let mut slots: Vec<(usize, Option<SessionId>)> = Vec::new();
+    for (pi, project) in self.projects.iter().enumerate() {
+      if project.sessions.is_empty() {
+        slots.push((pi, None));
+      } else {
+        let mut ids: Vec<SessionId> = project.sessions.keys().copied().collect();
+        ids.sort();
+        for id in ids {
+          slots.push((pi, Some(id)));
+        }
+      }
+    }
+    if slots.len() <= 1 {
+      return;
+    }
+
+    let current = (self.active_project_index, self.projects[self.active_project_index].active_session);
+    let pos = slots.iter().position(|s| *s == current).unwrap_or(0);
+    let (next_pi, next_sid) = slots[(pos + 1) % slots.len()];
+    self.switch_to_session(next_pi, next_sid, window, cx);
   }
 
   /// Find a session by slug/label across all projects and switch to it.
@@ -1112,9 +1228,20 @@ impl Workspace {
     };
     let wait_line = wait.line;
 
-    // Switch to the TODO pane and scroll to the WAIT heading.
-    self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
+    // If a visible pane already shows the TODO editor, focus it instead of
+    // replacing the current pane.
+    let visible = self.visible_pane_count();
+    let existing = (0..visible).find(|&i| {
+      self.panes[i].read(cx).content_kind() == Some(PaneContentKind::TodoEditor)
+    });
+    if let Some(idx) = existing {
+      self.active_pane_index = idx;
+      self.panes[idx].read(cx).focus_content(window);
+    } else {
+      self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
+    }
     todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line, window, cx));
+    cx.notify();
   }
 
   // ---------------------------------------------------------------------------
@@ -1230,6 +1357,7 @@ impl Workspace {
           .values_mut()
           .find(|s| s.uuid.as_deref() == Some(session_uuid));
         if let Some(session) = found {
+          session.ever_active = true;
           let is_new = session.pending_events.insert(pending.clone());
           if is_new {
             matched_project = Some(project.name.clone());
@@ -1240,6 +1368,7 @@ impl Workspace {
         // If no UUID match, try to assign to a pending (uuid=None) session.
         if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
           session.uuid = Some(session_uuid.clone());
+          session.ever_active = true;
           let is_new = session.pending_events.insert(pending.clone());
           // Update TODO.md with the new UUID.
           let label = session.label.clone();
@@ -1346,6 +1475,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-p", crate::views::picker::ProjectActionsPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-c", CopyReply, Some("Workspace")),
+    KeyBinding::new("cmd-`", RotateNextProject, Some("Workspace")),
     KeyBinding::new("cmd-?", ShowKeybindingHelp, Some("Workspace")),
   ]);
 
@@ -1356,5 +1486,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-s", SaveFile, Some("Input")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Input")),
     KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Input")),
+    KeyBinding::new("cmd-.", JumpToWait, Some("Input")),
+    KeyBinding::new("cmd-`", RotateNextProject, Some("Input")),
   ]);
 }

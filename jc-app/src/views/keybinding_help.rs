@@ -23,6 +23,7 @@ const SECTIONS: &[Section] = &[
       ("Cmd-]", "Focus next pane"),
       ("Cmd-O", "Open pane / file"),
       ("Cmd-Shift-O", "Pane drill-down"),
+      ("Cmd-`", "Next session"),
       ("Cmd-P", "Session picker"),
       ("Cmd-Shift-P", "Project actions"),
       ("Cmd-F", "Search lines"),
