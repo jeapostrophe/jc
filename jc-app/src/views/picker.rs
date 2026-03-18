@@ -26,13 +26,12 @@ actions!(
     SelectPageDown,
     SelectPageUp,
     DeletePickerItem,
-    OpenFilePicker,
-    OpenContextPicker,
+    OpenPicker,
+    DrillDownPicker,
+    ProjectActionsPicker,
     ShowSessionPicker,
     SearchLines,
-    ShowProblemPicker,
     ShowSnippetPicker,
-    ShowViewPicker,
   ]
 );
 
@@ -48,8 +47,8 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("pagedown", SelectPageDown, Some("Picker")),
     KeyBinding::new("pageup", SelectPageUp, Some("Picker")),
     KeyBinding::new("cmd-shift-backspace", DeletePickerItem, Some("Picker")),
-    KeyBinding::new("cmd-o", OpenFilePicker, Some("Workspace")),
-    KeyBinding::new("cmd-t", OpenContextPicker, Some("Workspace")),
+    KeyBinding::new("cmd-o", OpenPicker, Some("Workspace")),
+    KeyBinding::new("cmd-shift-o", DrillDownPicker, Some("Workspace")),
     KeyBinding::new("cmd-f", SearchLines, Some("Workspace")),
     // Also bind in "Input" context so our SearchLines takes precedence over
     // gpui-component's built-in Search action (which opens the editor's find
@@ -330,132 +329,96 @@ impl<D: PickerDelegate> Render for PickerState<D> {
 }
 
 // ---------------------------------------------------------------------------
-// FilePickerDelegate
+// OpenPickerDelegate (replaces FilePickerDelegate + ViewPickerDelegate)
 // ---------------------------------------------------------------------------
 
-pub struct FilePickerDelegate {
-  files: Vec<String>,
-  code_view: Entity<CodeView>,
-  project_path: PathBuf,
-  /// Set of relative paths that have been modified in the git working tree.
-  modified_files: HashSet<String>,
-  /// Indices of recently opened files (in recency order, most recent first).
-  recent_indices: Vec<usize>,
+use crate::views::pane::PaneContentKind;
+
+pub enum OpenPickerResult {
+  SwitchPane(PaneContentKind),
+  OpenFile, // file already opened in code_view by confirm()
 }
 
-impl FilePickerDelegate {
+pub struct OpenPickerDelegate {
+  labels: Vec<String>,
+  /// First N items are panes (N = PaneContentKind::ALL.len()), rest are files.
+  pane_count: usize,
+  kinds: Vec<PaneContentKind>,
+  code_view: Entity<CodeView>,
+  project_path: PathBuf,
+  modified_files: HashSet<String>,
+  recent_indices: Vec<usize>,
+  result: Option<OpenPickerResult>,
+}
+
+impl OpenPickerDelegate {
   pub fn new(
     project_path: PathBuf,
     code_view: Entity<CodeView>,
     recent_files: Vec<PathBuf>,
   ) -> Self {
+    let kinds: Vec<PaneContentKind> = PaneContentKind::ALL.to_vec();
+    let pane_count = kinds.len();
+
+    let mut labels: Vec<String> = kinds.iter().map(|k| k.label().to_string()).collect();
+
     let (files, modified_files) = list_project_files_and_modified(&project_path);
 
-    // Map recent_files (absolute paths) to indices in the files list.
+    // Map recent_files (absolute paths) to indices in the files list (offset by pane_count).
     let recent_indices: Vec<usize> = recent_files
       .iter()
       .filter_map(|abs_path| {
         let rel = abs_path.strip_prefix(&project_path).ok()?;
         let rel_str = rel.to_str()?;
-        files.iter().position(|f| f == rel_str)
+        files.iter().position(|f| f == rel_str).map(|i| i + pane_count)
       })
       .collect();
 
-    Self { files, code_view, project_path, modified_files, recent_indices }
+    // File labels: prefix each file with `/`.
+    labels.extend(files.iter().map(|f| format!("/{f}")));
+
+    Self { labels, pane_count, kinds, code_view, project_path, modified_files, recent_indices, result: None }
+  }
+
+  pub fn result(&self) -> Option<&OpenPickerResult> {
+    self.result.as_ref()
   }
 }
 
-impl PickerDelegate for FilePickerDelegate {
-  fn items(&self) -> &[String] {
-    &self.files
-  }
-
-  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
-    let full_path = self.project_path.join(&self.files[index]);
-    self.code_view.update(cx, |v, cx| v.open_file(full_path, window, cx));
-  }
-
-  fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
-    let mut result = Vec::new();
-    for (index, item) in self.files.iter().enumerate() {
-      if let Some(score) = fuzzy_match(query_lower, item) {
-        // Boost score for recently opened files so they sort to the top.
-        let recency_boost = self
-          .recent_indices
-          .iter()
-          .position(|&ri| ri == index)
-          .map(|pos| 1000_i64 - pos as i64)
-          .unwrap_or(0);
-        result.push(FilteredItem { index, score: score + recency_boost });
-      }
-    }
-    result
-  }
-
-  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
-    let theme = cx.theme();
-    let label = &self.files[index];
-    let is_modified = self.modified_files.contains(label);
-    let is_recent = self.recent_indices.contains(&index);
-
-    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
-    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
-
-    let marker = if is_modified {
-      let color = if selected { theme.accent_foreground } else { theme.yellow };
-      Some(("M", color))
-    } else if is_recent {
-      let color = if selected { theme.accent_foreground } else { theme.blue };
-      Some(("R", color))
-    } else {
-      None
-    };
-
-    if let Some((text, color)) = marker {
-      row
-        .child(div().text_xs().text_color(color).font_weight(FontWeight::BOLD).child(text))
-        .child(label.clone())
-    } else {
-      row.child(div().text_xs().w(px(10.0))).child(label.clone())
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// DiffFilePickerDelegate
-// ---------------------------------------------------------------------------
-
-pub struct DiffFilePickerDelegate {
-  labels: Vec<String>,
-  reviewed: Vec<bool>,
-  diff_view: Entity<DiffView>,
-}
-
-impl DiffFilePickerDelegate {
-  pub fn new(diff_view: Entity<DiffView>, cx: &App) -> Self {
-    let dv = diff_view.read(cx);
-    let labels: Vec<String> = dv.file_diffs().iter().map(|fd| fd.name.clone()).collect();
-    let reviewed: Vec<bool> = dv.file_diffs().iter().map(|fd| dv.is_reviewed(&fd.name)).collect();
-    Self { labels, reviewed, diff_view }
-  }
-}
-
-impl PickerDelegate for DiffFilePickerDelegate {
+impl PickerDelegate for OpenPickerDelegate {
   fn items(&self) -> &[String] {
     &self.labels
   }
 
   fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
-    self.diff_view.update(cx, |v, cx| v.set_file_index(index, window, cx));
+    if index < self.pane_count {
+      self.result = Some(OpenPickerResult::SwitchPane(self.kinds[index]));
+    } else {
+      // File path: strip the leading `/` prefix from the label.
+      let rel_path = &self.labels[index][1..];
+      let full_path = self.project_path.join(rel_path);
+      self.code_view.update(cx, |v, cx| v.open_file(full_path, window, cx));
+      self.result = Some(OpenPickerResult::OpenFile);
+    }
   }
 
   fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
     let mut result = Vec::new();
     for (index, item) in self.labels.iter().enumerate() {
       if let Some(score) = fuzzy_match(query_lower, item) {
-        // Push reviewed files to the bottom by subtracting a large bias.
-        let bias = if self.reviewed[index] { -10000 } else { 0 };
-        result.push(FilteredItem { index, score: score + bias });
+        let boost = if index < self.pane_count {
+          // Pane items get a boost so they rank above files on short queries.
+          500
+        } else {
+          // Recency boost for files.
+          self
+            .recent_indices
+            .iter()
+            .position(|&ri| ri == index)
+            .map(|pos| 1000_i64 - pos as i64)
+            .unwrap_or(0)
+        };
+        result.push(FilteredItem { index, score: score + boost });
       }
     }
     result
@@ -464,57 +427,126 @@ impl PickerDelegate for DiffFilePickerDelegate {
   fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
     let theme = cx.theme();
     let label = &self.labels[index];
-    let is_reviewed = self.reviewed[index];
 
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    if is_reviewed {
-      let marker_color = if selected { theme.accent_foreground } else { theme.green };
-      row
-        .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("✓"))
-        .child(label.clone())
-    } else {
+    if index < self.pane_count {
+      // Pane item: just the label text.
       row.child(div().text_xs().w(px(10.0))).child(label.clone())
+    } else {
+      // File item: show M/R markers.
+      let rel_path = &label[1..]; // strip leading `/`
+      let is_modified = self.modified_files.contains(rel_path);
+      let is_recent = self.recent_indices.contains(&index);
+
+      let marker = if is_modified {
+        let color = if selected { theme.accent_foreground } else { theme.yellow };
+        Some(("M", color))
+      } else if is_recent {
+        let color = if selected { theme.accent_foreground } else { theme.blue };
+        Some(("R", color))
+      } else {
+        None
+      };
+
+      if let Some((text, color)) = marker {
+        row
+          .child(div().text_xs().text_color(color).font_weight(FontWeight::BOLD).child(text))
+          .child(label.clone())
+      } else {
+        row.child(div().text_xs().w(px(10.0))).child(label.clone())
+      }
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// GitLogPickerDelegate
+// DiffDrillDownPickerDelegate (replaces DiffFilePickerDelegate + GitLogPickerDelegate)
 // ---------------------------------------------------------------------------
 
-pub struct GitLogPickerDelegate {
+enum DiffDrillDownEntry {
+  File { name: String, reviewed: bool },
+  Commit { entry: GitLogEntry },
+  WorkingTree,
+}
+
+pub struct DiffDrillDownPickerDelegate {
   labels: Vec<String>,
-  entries: Vec<GitLogEntry>,
+  entries: Vec<DiffDrillDownEntry>,
   diff_view: Entity<DiffView>,
 }
 
-impl GitLogPickerDelegate {
+impl DiffDrillDownPickerDelegate {
   pub fn new(diff_view: Entity<DiffView>, cx: &App) -> Self {
-    let path = diff_view.read(cx).project_path().to_path_buf();
-    let entries = git_log(&path);
+    let dv = diff_view.read(cx);
+    let mut labels = Vec::new();
+    let mut entries = Vec::new();
 
-    let mut labels = vec!["Working tree".to_string()];
-    labels.extend(entries.iter().map(|e| format!("{} {}", e.short_hash, e.summary)));
+    // 1. Diff files.
+    for fd in dv.file_diffs() {
+      let reviewed = dv.is_reviewed(&fd.name);
+      labels.push(fd.name.clone());
+      entries.push(DiffDrillDownEntry::File { name: fd.name.clone(), reviewed });
+    }
+
+    // 2. Git log entries prefixed with `@`.
+    // Working tree first.
+    labels.push("@* Working tree".to_string());
+    entries.push(DiffDrillDownEntry::WorkingTree);
+
+    // Then commits.
+    let path = dv.project_path().to_path_buf();
+    let log_entries = git_log(&path);
+    for e in log_entries {
+      labels.push(format!("@{} {}", e.short_hash, e.summary));
+      entries.push(DiffDrillDownEntry::Commit { entry: e });
+    }
 
     Self { labels, entries, diff_view }
   }
 }
 
-impl PickerDelegate for GitLogPickerDelegate {
+impl PickerDelegate for DiffDrillDownPickerDelegate {
   fn items(&self) -> &[String] {
     &self.labels
   }
 
   fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
-    let source = if index == 0 {
-      DiffSource::WorkingTree
-    } else {
-      let entry = &self.entries[index - 1];
-      DiffSource::Commit { oid: entry.oid, summary: entry.summary.clone() }
-    };
-    self.diff_view.update(cx, |v, cx| v.set_source(source, window, cx));
+    match &self.entries[index] {
+      DiffDrillDownEntry::File { name, .. } => {
+        // Find the file index in the diff view's file list.
+        let file_idx = {
+          let dv = self.diff_view.read(cx);
+          dv.file_diffs().iter().position(|fd| fd.name == *name)
+        };
+        if let Some(idx) = file_idx {
+          self.diff_view.update(cx, |v, cx| v.set_file_index(idx, window, cx));
+        }
+      }
+      DiffDrillDownEntry::WorkingTree => {
+        self.diff_view.update(cx, |v, cx| v.set_source(DiffSource::WorkingTree, window, cx));
+      }
+      DiffDrillDownEntry::Commit { entry, .. } => {
+        let source = DiffSource::Commit { oid: entry.oid, summary: entry.summary.clone() };
+        self.diff_view.update(cx, |v, cx| v.set_source(source, window, cx));
+      }
+    }
+  }
+
+  fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
+    let mut result = Vec::new();
+    for (index, item) in self.labels.iter().enumerate() {
+      if let Some(score) = fuzzy_match(query_lower, item) {
+        let bias = match &self.entries[index] {
+          DiffDrillDownEntry::File { reviewed: true, .. } => -10000,
+          DiffDrillDownEntry::WorkingTree | DiffDrillDownEntry::Commit { .. } => -5000,
+          DiffDrillDownEntry::File { reviewed: false, .. } => 0,
+        };
+        result.push(FilteredItem { index, score: score + bias });
+      }
+    }
+    result
   }
 
   fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
@@ -522,17 +554,29 @@ impl PickerDelegate for GitLogPickerDelegate {
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    if index == 0 {
-      let marker_color = if selected { theme.accent_foreground } else { theme.yellow };
-      row
-        .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("*"))
-        .child("Working tree".to_string())
-    } else {
-      let entry = &self.entries[index - 1];
-      let hash_color = if selected { theme.accent_foreground } else { theme.blue };
-      row
-        .child(div().text_xs().text_color(hash_color).child(entry.short_hash.clone()))
-        .child(entry.summary.clone())
+    match &self.entries[index] {
+      DiffDrillDownEntry::File { name, reviewed } => {
+        if *reviewed {
+          let marker_color = if selected { theme.accent_foreground } else { theme.green };
+          row
+            .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("✓"))
+            .child(name.clone())
+        } else {
+          row.child(div().text_xs().w(px(10.0))).child(name.clone())
+        }
+      }
+      DiffDrillDownEntry::WorkingTree => {
+        let marker_color = if selected { theme.accent_foreground } else { theme.yellow };
+        row
+          .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("*"))
+          .child("Working tree".to_string())
+      }
+      DiffDrillDownEntry::Commit { entry, .. } => {
+        let hash_color = if selected { theme.accent_foreground } else { theme.blue };
+        row
+          .child(div().text_xs().text_color(hash_color).child(entry.short_hash.clone()))
+          .child(entry.summary.clone())
+      }
     }
   }
 }
@@ -1004,6 +1048,228 @@ impl PickerDelegate for SessionPickerDelegate {
 }
 
 // ---------------------------------------------------------------------------
+// ProjectActionsPickerDelegate
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub enum ProjectActionsResult {
+  SwitchToSession(usize, SessionId),
+  AdoptTodoSession(usize, String, String), // pi, uuid, label
+  InitProject(usize),
+  CreateNew,
+  AdoptJsonlSession(String, String), // uuid, label
+}
+
+enum ProjectActionsEntry {
+  Problem { pi: usize, kind: SessionPickerEntryKind, project_name: String, label: String, problems: usize, min_rank: i8 },
+  NewSession,
+  Unattached { uuid: String, summary: String },
+}
+
+pub struct ProjectActionsPickerDelegate {
+  labels: Vec<String>,
+  entries: Vec<ProjectActionsEntry>,
+  result: Option<ProjectActionsResult>,
+}
+
+impl ProjectActionsPickerDelegate {
+  pub fn new(
+    projects: &[ProjectState],
+    active_project_index: usize,
+    todo_documents: &[&jc_core::todo::TodoDocument],
+    project_path: &Path,
+  ) -> Self {
+    use std::collections::HashSet;
+
+    let mut labels = Vec::new();
+    let mut entries = Vec::new();
+
+    // 1. Problem entries: sessions with problems, sorted by urgency.
+    {
+      struct ProblemCandidate {
+        pi: usize,
+        kind: SessionPickerEntryKind,
+        project_name: String,
+        label: String,
+        problems: usize,
+        min_rank: i8,
+      }
+
+      let mut candidates: Vec<ProblemCandidate> = Vec::new();
+
+      for (pi, project) in projects.iter().enumerate() {
+        // Empty projects with problems.
+        if project.sessions.is_empty()
+          && todo_documents.get(pi).map_or(true, |d| d.sessions.is_empty())
+        {
+          if !project.problems.is_empty() {
+            let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);
+            candidates.push(ProblemCandidate {
+              pi,
+              kind: SessionPickerEntryKind::EmptyProject,
+              project_name: project.name.clone(),
+              label: String::new(),
+              problems: project.problems.len(),
+              min_rank,
+            });
+          }
+          continue;
+        }
+
+        // Adopted sessions with problems.
+        for (&id, session) in &project.sessions {
+          let total_problems = session.problems.len() + project.problems.len();
+          if total_problems > 0 {
+            let min_rank = session
+              .problems
+              .iter()
+              .map(|p| p.rank())
+              .chain(project.problems.iter().map(|p| p.rank()))
+              .min()
+              .unwrap_or(i8::MAX);
+            candidates.push(ProblemCandidate {
+              pi,
+              kind: SessionPickerEntryKind::Session(id),
+              project_name: project.name.clone(),
+              label: session.label.clone(),
+              problems: total_problems,
+              min_rank,
+            });
+          }
+        }
+
+        // Unadopted TODO.md sessions (they have 0 problems, skip them).
+      }
+
+      // Sort by urgency: min_rank ASC.
+      candidates.sort_by(|a, b| a.min_rank.cmp(&b.min_rank).then(a.pi.cmp(&b.pi)));
+
+      for c in candidates {
+        let label_text = match &c.kind {
+          SessionPickerEntryKind::EmptyProject => format!("! {}", c.project_name),
+          _ => format!("! {} / {}", c.project_name, c.label),
+        };
+        labels.push(label_text);
+        entries.push(ProjectActionsEntry::Problem {
+          pi: c.pi,
+          kind: c.kind,
+          project_name: c.project_name,
+          label: c.label,
+          problems: c.problems,
+          min_rank: c.min_rank,
+        });
+      }
+    }
+
+    // 2. New session.
+    labels.push("+ New session".to_string());
+    entries.push(ProjectActionsEntry::NewSession);
+
+    // 3. Unattached JSONL sessions for current project.
+    {
+      let existing_uuids: HashSet<&str> = todo_documents
+        .get(active_project_index)
+        .map(|doc| doc.sessions.iter().map(|s| s.uuid.as_str()).collect())
+        .unwrap_or_default();
+
+      let encoded = project_path.to_string_lossy().replace('/', "-");
+      let home = std::env::var("HOME").unwrap_or_default();
+      let session_dir = PathBuf::from(home).join(".claude/projects").join(encoded);
+
+      if let Ok(read_dir) = std::fs::read_dir(&session_dir) {
+        let mut discovered: Vec<(String, String, std::time::SystemTime)> = Vec::new();
+
+        for entry in read_dir.flatten() {
+          let path = entry.path();
+          if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+          }
+          let uuid = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+          };
+          if existing_uuids.contains(uuid.as_str()) {
+            continue;
+          }
+          let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
+          let summary = extract_first_user_summary(&path).unwrap_or_else(|| uuid[..8].to_string());
+          discovered.push((uuid, summary, mtime.unwrap_or(std::time::UNIX_EPOCH)));
+        }
+
+        // Sort newest first.
+        discovered.sort_by(|a, b| b.2.cmp(&a.2));
+
+        for (uuid, summary, mtime) in discovered {
+          let age = format_relative_time(mtime);
+          let label_text = format!("~ {summary} ({age})");
+          labels.push(label_text);
+          entries.push(ProjectActionsEntry::Unattached { uuid, summary });
+        }
+      }
+    }
+
+    Self { labels, entries, result: None }
+  }
+
+  pub fn result(&self) -> Option<ProjectActionsResult> {
+    self.result.clone()
+  }
+}
+
+impl PickerDelegate for ProjectActionsPickerDelegate {
+  fn items(&self) -> &[String] {
+    &self.labels
+  }
+
+  fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
+    let entry = &self.entries[index];
+    self.result = Some(match entry {
+      ProjectActionsEntry::Problem { pi, kind, label, .. } => match kind {
+        SessionPickerEntryKind::Session(id) => ProjectActionsResult::SwitchToSession(*pi, *id),
+        SessionPickerEntryKind::Unadopted { uuid } => {
+          ProjectActionsResult::AdoptTodoSession(*pi, uuid.clone(), label.clone())
+        }
+        SessionPickerEntryKind::EmptyProject => ProjectActionsResult::InitProject(*pi),
+      },
+      ProjectActionsEntry::NewSession => ProjectActionsResult::CreateNew,
+      ProjectActionsEntry::Unattached { uuid, summary } => {
+        ProjectActionsResult::AdoptJsonlSession(uuid.clone(), summary.clone())
+      }
+    });
+  }
+
+  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
+    let theme = cx.theme();
+    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
+    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
+
+    match &self.entries[index] {
+      ProjectActionsEntry::Problem { project_name, label, problems, kind, .. } => {
+        let marker_color = if selected { theme.accent_foreground } else { theme.red };
+        let marker = picker_marker_base().text_color(marker_color).child("!");
+        let main_text = match kind {
+          SessionPickerEntryKind::EmptyProject => project_name.clone(),
+          _ => format!("{project_name} / {label}"),
+        };
+        let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
+        let right_el = div().ml_auto().text_xs().text_color(muted_color).child(format!("{problems}"));
+        row.child(marker).child(main_text).child(right_el)
+      }
+      ProjectActionsEntry::NewSession => {
+        let marker_color = if selected { theme.accent_foreground } else { theme.green };
+        let marker = picker_marker_base().text_color(marker_color).child("+");
+        row.child(marker).child("New session".to_string())
+      }
+      ProjectActionsEntry::Unattached { summary, .. } => {
+        let marker_color = if selected { theme.accent_foreground } else { theme.yellow };
+        let marker = picker_marker_base().text_color(marker_color).child("~");
+        row.child(marker).child(summary.clone())
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // LineSearchPickerDelegate
 // ---------------------------------------------------------------------------
 
@@ -1124,40 +1390,6 @@ impl PickerDelegate for LineSearchPickerDelegate {
 }
 
 // ---------------------------------------------------------------------------
-// ViewPickerDelegate
-// ---------------------------------------------------------------------------
-
-use crate::views::pane::PaneContentKind;
-
-pub struct ViewPickerDelegate {
-  labels: Vec<String>,
-  kinds: Vec<PaneContentKind>,
-  confirmed_kind: Option<PaneContentKind>,
-}
-
-impl ViewPickerDelegate {
-  pub fn new() -> Self {
-    let kinds: Vec<PaneContentKind> = PaneContentKind::ALL.to_vec();
-    let labels: Vec<String> = kinds.iter().map(|k| k.label().to_string()).collect();
-    Self { labels, kinds, confirmed_kind: None }
-  }
-
-  pub fn confirmed_kind(&self) -> Option<PaneContentKind> {
-    self.confirmed_kind
-  }
-}
-
-impl PickerDelegate for ViewPickerDelegate {
-  fn items(&self) -> &[String] {
-    &self.labels
-  }
-
-  fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
-    self.confirmed_kind = Some(self.kinds[index]);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // SnippetPickerDelegate
 // ---------------------------------------------------------------------------
 
@@ -1222,5 +1454,75 @@ impl PickerDelegate for SnippetPickerDelegate {
         }
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Extract a short summary from a JSONL file (first informative user message).
+fn extract_first_user_summary(path: &Path) -> Option<String> {
+  use std::io::{BufRead, BufReader};
+
+  let file = std::fs::File::open(path).ok()?;
+  let reader = BufReader::new(file);
+
+  for line in reader.lines().take(200) {
+    let line = line.ok()?;
+    if !line.contains("\"user\"") {
+      continue;
+    }
+    let entry: serde_json::Value = serde_json::from_str(&line).ok()?;
+    if entry.get("type").and_then(|t| t.as_str()) != Some("user") {
+      continue;
+    }
+    let msg = entry.get("message")?;
+    if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+      continue;
+    }
+    let text = match msg.get("content")? {
+      serde_json::Value::String(s) => s.clone(),
+      serde_json::Value::Array(arr) => arr
+        .iter()
+        .filter_map(|item| {
+          let obj = item.as_object()?;
+          if obj.get("type")?.as_str()? == "text" {
+            obj.get("text")?.as_str().map(String::from)
+          } else {
+            None
+          }
+        })
+        .collect::<Vec<_>>()
+        .join("\n"),
+      _ => continue,
+    };
+    for l in text.lines() {
+      let l = l.trim();
+      if l.is_empty() || l.starts_with('<') || l.contains("Implement the following plan") {
+        continue;
+      }
+      let l = l.trim_start_matches('#').trim_start();
+      if l.is_empty() {
+        continue;
+      }
+      let truncated = if l.len() > 80 {
+        format!("{}...", &l[..l.floor_char_boundary(80)])
+      } else {
+        l.to_string()
+      };
+      return Some(truncated);
+    }
+  }
+  None
+}
+
+fn format_relative_time(time: std::time::SystemTime) -> String {
+  let secs = time.elapsed().unwrap_or_default().as_secs();
+  match secs {
+    0..60 => "just now".to_string(),
+    60..3600 => format!("{}m ago", secs / 60),
+    3600..86400 => format!("{}h ago", secs / 3600),
+    _ => format!("{}d ago", secs / 86400),
   }
 }

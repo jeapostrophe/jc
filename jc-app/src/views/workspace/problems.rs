@@ -1,5 +1,4 @@
 use crate::views::pane::PaneContentKind;
-use crate::views::picker::{SessionPickerDelegate, ShowProblemPicker};
 use gpui::*;
 use jc_core::problem::ProblemTarget;
 
@@ -93,19 +92,4 @@ impl Workspace {
     }
   }
 
-  pub(super) fn open_problem_picker(
-    &mut self,
-    _: &ShowProblemPicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let docs = self.todo_documents(cx);
-    let delegate =
-      SessionPickerDelegate::new_urgency_sorted(&self.projects, self.active_project_index, &docs);
-    self.show_session_picker(delegate, window, cx);
-  }
 }

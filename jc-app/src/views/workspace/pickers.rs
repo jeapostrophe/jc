@@ -2,17 +2,18 @@ use crate::file_watcher::watch_dir;
 use crate::views::comment_panel::{CommentPanel, CommentPanelEvent};
 use crate::views::pane::PaneContentKind;
 use crate::views::picker::{
-  CodeSymbolPickerDelegate, DiffFilePickerDelegate, FilePickerDelegate, GitLogPickerDelegate,
-  LineSearchPickerDelegate, OpenContextPicker, OpenFilePicker, PickerEvent, PickerState,
+  CodeSymbolPickerDelegate, DiffDrillDownPickerDelegate,
+  DrillDownPicker, LineSearchPickerDelegate, OpenPicker, OpenPickerDelegate,
+  OpenPickerResult, PickerEvent, PickerState,
+  ProjectActionsPickerDelegate, ProjectActionsPicker, ProjectActionsResult,
   SearchLines, SessionPickerDelegate,
-  SessionPickerResult, ShowSessionPicker, ShowSnippetPicker, ShowViewPicker,
+  SessionPickerResult, ShowSessionPicker, ShowSnippetPicker,
   SnippetPickerDelegate, SnippetTarget, TodoHeaderPickerDelegate,
-  ViewPickerDelegate,
 };
 use gpui::*;
 use jc_core::snippets;
 
-use super::{OpenCommentPanel, OpenGitLogPicker, Workspace};
+use super::{OpenCommentPanel, Workspace};
 
 impl Workspace {
   pub(super) fn setup_snippet_watcher(
@@ -35,9 +36,9 @@ impl Workspace {
     )
   }
 
-  pub(super) fn show_view_picker(
+  pub(super) fn open_picker(
     &mut self,
-    _: &ShowViewPicker,
+    _: &OpenPicker,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -45,7 +46,12 @@ impl Workspace {
       return;
     }
 
-    let delegate = ViewPickerDelegate::new();
+    let project = self.active_project();
+    let delegate = OpenPickerDelegate::new(
+      project.path.clone(),
+      project.code_view.clone(),
+      self.recent_files.clone(),
+    );
     let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
     self.pre_picker_focus = window.focused(cx);
 
@@ -53,11 +59,28 @@ impl Workspace {
       cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
         match event {
           PickerEvent::Confirmed => {
-            let kind = picker_entity.read(cx).delegate().confirmed_kind();
-            this.pre_picker_focus.take();
-            this.dismiss_picker();
-            if let Some(kind) = kind {
-              this.set_active_pane_view(kind, window, cx);
+            let result = picker_entity.read(cx).delegate().result();
+            match result {
+              Some(OpenPickerResult::SwitchPane(kind)) => {
+                this.pre_picker_focus.take();
+                this.dismiss_picker();
+                this.set_active_pane_view(*kind, window, cx);
+              }
+              Some(OpenPickerResult::OpenFile) => {
+                // Track the opened file in recent_files
+                if let Some(path) = this.active_project().code_view.read(cx).file_path() {
+                  let path = path.to_path_buf();
+                  this.recent_files.retain(|p| p != &path);
+                  this.recent_files.insert(0, path);
+                  this.recent_files.truncate(50);
+                }
+                this.pre_picker_focus.take();
+                this.dismiss_picker();
+                this.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
+              }
+              None => {
+                this.dismiss_picker();
+              }
             }
             cx.notify();
           }
@@ -73,7 +96,6 @@ impl Workspace {
 
     self.active_picker = Some(picker.clone().into());
     self._picker_subscription = Some(subscription);
-
     picker.read(cx).input_focus_handle(cx).focus(window);
     cx.notify();
   }
@@ -149,28 +171,9 @@ impl Workspace {
   // Pickers
   // ---------------------------------------------------------------------------
 
-  pub(super) fn open_file_picker(
+  pub(super) fn open_drill_down_picker(
     &mut self,
-    _: &OpenFilePicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_picker.is_some() {
-      return;
-    }
-
-    let project = self.active_project();
-    let delegate = FilePickerDelegate::new(
-      project.path.clone(),
-      project.code_view.clone(),
-      self.recent_files.clone(),
-    );
-    self.show_picker_with_confirm(delegate, Some(PaneContentKind::CodeViewer), window, cx);
-  }
-
-  pub(super) fn open_context_picker(
-    &mut self,
-    _: &OpenContextPicker,
+    _: &DrillDownPicker,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -183,7 +186,8 @@ impl Workspace {
 
     match kind {
       Some(PaneContentKind::GitDiff) => {
-        self.open_diff_picker(window, cx);
+        let delegate = DiffDrillDownPickerDelegate::new(project.diff_view.clone(), cx);
+        self.show_picker(delegate, window, cx);
       }
       Some(PaneContentKind::TodoEditor) => {
         let delegate = TodoHeaderPickerDelegate::new(project.todo_view.clone(), cx);
@@ -193,21 +197,18 @@ impl Workspace {
         let delegate = CodeSymbolPickerDelegate::new(project.code_view.clone(), cx);
         self.show_picker(delegate, window, cx);
       }
-      _ => {}
+      Some(PaneContentKind::GlobalTodo) => {
+        // GlobalTodo is a CodeView; use CodeSymbolPickerDelegate for markdown headers
+        let delegate = CodeSymbolPickerDelegate::new(self.global_todo_view.clone(), cx);
+        self.show_picker(delegate, window, cx);
+      }
+      _ => {} // Claude/Terminal: no-op
     }
   }
 
-  pub(super) fn open_diff_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    if self.active_picker.is_some() {
-      return;
-    }
-    let delegate = DiffFilePickerDelegate::new(self.active_project().diff_view.clone(), cx);
-    self.show_picker(delegate, window, cx);
-  }
-
-  pub(super) fn open_git_log_picker(
+  pub(super) fn open_project_actions_picker(
     &mut self,
-    _: &OpenGitLogPicker,
+    _: &ProjectActionsPicker,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -215,8 +216,66 @@ impl Workspace {
       return;
     }
 
-    let delegate = GitLogPickerDelegate::new(self.active_project().diff_view.clone(), cx);
-    self.show_picker_with_confirm(delegate, Some(PaneContentKind::GitDiff), window, cx);
+    let docs = self.todo_documents(cx);
+    let project_path = self.projects[self.active_project_index].path.clone();
+    let delegate = ProjectActionsPickerDelegate::new(
+      &self.projects,
+      self.active_project_index,
+      &docs,
+      &project_path,
+    );
+
+    let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
+    self.pre_picker_focus = window.focused(cx);
+
+    let pi = self.active_project_index;
+    let subscription =
+      cx.subscribe_in(&picker, window, move |this: &mut Self, picker_entity, event, window, cx| {
+        match event {
+          PickerEvent::Confirmed => {
+            let Some(result) = picker_entity.read(cx).delegate().result() else {
+              return;
+            };
+            this.pre_picker_focus.take();
+            this.dismiss_picker();
+            match result {
+              ProjectActionsResult::SwitchToSession(pi, id) => {
+                this.switch_to_session(pi, Some(id), window, cx);
+              }
+              ProjectActionsResult::AdoptTodoSession(pi, uuid, label) => {
+                this.adopt_session(pi, &uuid, &label, window, cx);
+              }
+              ProjectActionsResult::InitProject(pi) => {
+                this.init_empty_project(pi, window, cx);
+              }
+              ProjectActionsResult::CreateNew => {
+                this.create_new_session(pi, window, cx);
+              }
+              ProjectActionsResult::AdoptJsonlSession(uuid, label) => {
+                let todo_view = this.projects[pi].todo_view.clone();
+                todo_view.update(cx, |tv, cx| {
+                  tv.insert_session_heading(&uuid, &label, window, cx);
+                  tv.save(cx);
+                });
+                this.adopt_session(pi, &uuid, &label, window, cx);
+              }
+            }
+            cx.notify();
+          }
+          PickerEvent::Dismissed => {
+            if let Some(focus) = this.pre_picker_focus.take() {
+              focus.focus(window);
+            }
+            this.dismiss_picker();
+            cx.notify();
+          }
+        }
+      });
+
+    self.active_picker = Some(picker.clone().into());
+    self._picker_subscription = Some(subscription);
+    picker.read(cx).input_focus_handle(cx).focus(window);
+    cx.notify();
   }
 
   pub(super) fn search_lines(

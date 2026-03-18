@@ -36,7 +36,6 @@ actions!(
     ShowCodeViewer,
     ShowTodoEditor,
     OpenInExternalEditor,
-    OpenGitLogPicker,
     OpenCommentPanel,
     SaveFile,
     SendToTerminal,
@@ -435,7 +434,7 @@ impl Workspace {
       move |this: &mut Self, _, event: &DiffViewEvent, window, cx| match event {
         DiffViewEvent::Reviewed => {
           this.projects[active_pi].refresh_problems(cx);
-          this.open_diff_picker(window, cx);
+          this.open_drill_down_picker(&crate::views::picker::DrillDownPicker, window, cx);
         }
       },
     ));
@@ -1293,22 +1292,19 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-1", SetLayoutOne, Some("Workspace")),
     KeyBinding::new("cmd-2", SetLayoutTwo, Some("Workspace")),
     KeyBinding::new("cmd-3", SetLayoutThree, Some("Workspace")),
-    KeyBinding::new("cmd-.", crate::views::picker::ShowViewPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
-    KeyBinding::new("cmd-shift-o", OpenGitLogPicker, Some("Workspace")),
     KeyBinding::new("cmd-p", crate::views::picker::ShowSessionPicker, Some("Workspace")),
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Workspace")),
     KeyBinding::new("cmd-s", SaveFile, Some("Workspace")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Workspace")),
     KeyBinding::new("cmd-;", NextProblem, Some("Workspace")),
-    KeyBinding::new("cmd-:", crate::views::picker::ShowProblemPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Workspace")),
+    KeyBinding::new("cmd-shift-p", crate::views::picker::ProjectActionsPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-c", CopyReply, Some("Workspace")),
     KeyBinding::new("cmd-?", ShowKeybindingHelp, Some("Workspace")),
   ]);
 
   cx.bind_keys([
-    KeyBinding::new("cmd-.", crate::views::picker::ShowViewPicker, Some("Input")),
     KeyBinding::new("cmd-[", FocusPrevPane, Some("Input")),
     KeyBinding::new("cmd-]", FocusNextPane, Some("Input")),
     KeyBinding::new("cmd-k", OpenCommentPanel, Some("Input")),
