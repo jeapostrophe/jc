@@ -653,7 +653,7 @@ impl Workspace {
     self.show_in_pane(pane_idx, kind, window, cx);
   }
 
-  fn show_in_pane(
+  pub(super) fn show_in_pane(
     &mut self,
     pane_idx: usize,
     kind: PaneContentKind,

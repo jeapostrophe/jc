@@ -61,8 +61,16 @@ impl Workspace {
       ProblemTarget::CodeView { .. } => PaneContentKind::CodeViewer,
     };
 
-    // set_active_pane_view handles view resolution, refresh, focus, and TODO scroll.
-    self.set_rightmost_pane_view(kind, window, cx);
+    // Claude targets the leftmost pane; everything else targets the rightmost.
+    if kind == PaneContentKind::ClaudeTerminal {
+      // If Claude is already showing in another pane, replace it there to avoid duplicates.
+      let visible = self.visible_pane_count();
+      let existing = (0..visible).find(|&i| self.panes[i].read(cx).content_kind() == Some(kind));
+      let pane_idx = existing.unwrap_or(0);
+      self.show_in_pane(pane_idx, kind, window, cx);
+    } else {
+      self.set_rightmost_pane_view(kind, window, cx);
+    }
 
     // Post-navigation: open specific file or navigate to diff entry.
     match target {
