@@ -511,11 +511,7 @@ impl Workspace {
       return;
     }
     let active = self.active_session_count();
-    if active > 0 {
-      self.show_close_confirm(active, false, window, cx);
-    } else {
-      window.remove_window();
-    }
+    self.show_close_confirm(active, false, window, cx);
   }
 
   fn minimize_window(&mut self, _: &MinimizeWindow, window: &mut Window, _cx: &mut Context<Self>) {
@@ -527,11 +523,7 @@ impl Workspace {
       return;
     }
     let active = self.active_session_count();
-    if active > 0 {
-      self.show_close_confirm(active, true, window, cx);
-    } else {
-      cx.quit();
-    }
+    self.show_close_confirm(active, true, window, cx);
   }
 
   /// Count sessions that are actively working (not idle/stopped).
@@ -540,13 +532,7 @@ impl Workspace {
       .projects
       .iter()
       .flat_map(|p| p.sessions.values())
-      .filter(|s| {
-        // A session is "active" if it has received at least one hook event
-        // (meaning Claude started working) and hasn't since reported idle or stop.
-        s.ever_active
-          && !s.pending_events.contains(&PendingEvent::ClaudeIdle)
-          && !s.pending_events.contains(&PendingEvent::ClaudeStop)
-      })
+      .filter(|s| s.busy)
       .count()
   }
 
@@ -1185,12 +1171,21 @@ impl Workspace {
       return;
     };
     let claude_terminal = session.claude_terminal.clone();
+    let todo_view = project.todo_view.clone();
+
+    // Insert a WAIT section if the session doesn't have one.
+    todo_view.update(cx, |tv, cx| { tv.ensure_wait(&label, window, cx); });
 
     let Some((message_text, _)) =
-      project.todo_view.update(cx, |tv, cx| tv.send_selection(&label, window, cx))
+      todo_view.update(cx, |tv, cx| tv.send_selection(&label, window, cx))
     else {
       return;
     };
+
+    // Mark session as busy — we're about to submit work to Claude.
+    if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
+      session.busy = true;
+    }
 
     // Paste the message into the Claude terminal, then send Enter to submit.
     claude_terminal.read(cx).write_text(&message_text);
@@ -1215,12 +1210,16 @@ impl Workspace {
 
   fn jump_to_wait(&mut self, _: &JumpToWait, window: &mut Window, cx: &mut Context<Self>) {
     let project = &self.projects[self.active_project_index];
-    let Some(label) = project.active_label() else {
+    let Some(label) = project.active_label().map(str::to_string) else {
       return;
     };
     let todo_view = project.todo_view.clone();
+
+    // Insert a WAIT section if the session doesn't have one.
+    todo_view.update(cx, |tv, cx| { tv.ensure_wait(&label, window, cx); });
+
     let document = todo_view.read(cx).document().clone();
-    let Some(session) = document.session_by_label(label) else {
+    let Some(session) = document.session_by_label(&label) else {
       return;
     };
     let Some(wait) = &session.wait else {
@@ -1358,6 +1357,7 @@ impl Workspace {
           .find(|s| s.uuid.as_deref() == Some(session_uuid));
         if let Some(session) = found {
           session.ever_active = true;
+          session.busy = !matches!(pending, PendingEvent::ClaudeIdle | PendingEvent::ClaudeStop);
           let is_new = session.pending_events.insert(pending.clone());
           if is_new {
             matched_project = Some(project.name.clone());
@@ -1369,6 +1369,7 @@ impl Workspace {
         if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
           session.uuid = Some(session_uuid.clone());
           session.ever_active = true;
+          session.busy = !matches!(pending, PendingEvent::ClaudeIdle | PendingEvent::ClaudeStop);
           let is_new = session.pending_events.insert(pending.clone());
           // Update TODO.md with the new UUID.
           let label = session.label.clone();
