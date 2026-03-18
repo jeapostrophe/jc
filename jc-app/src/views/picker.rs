@@ -1062,13 +1062,17 @@ pub enum ProjectActionsResult {
 
 enum ProjectActionsEntry {
   Problem { pi: usize, kind: SessionPickerEntryKind, project_name: String, label: String, problems: usize, min_rank: i8 },
+  /// A TODO.md session that isn't currently running.
+  Dormant { uuid: String, label: String },
   NewSession,
+  /// A JSONL session not referenced in TODO.md.
   Unattached { uuid: String, summary: String },
 }
 
 pub struct ProjectActionsPickerDelegate {
   labels: Vec<String>,
   entries: Vec<ProjectActionsEntry>,
+  active_project_index: usize,
   result: Option<ProjectActionsResult>,
 }
 
@@ -1157,11 +1161,40 @@ impl ProjectActionsPickerDelegate {
       }
     }
 
-    // 2. New session.
+    // 2. Dormant sessions: in TODO.md but not currently running.
+    {
+      let adopted_uuids: HashSet<&str> = projects[active_project_index]
+        .sessions
+        .values()
+        .filter_map(|s| s.uuid.as_deref())
+        .collect();
+      let adopted_labels: HashSet<&str> = projects[active_project_index]
+        .sessions
+        .values()
+        .map(|s| s.label.as_str())
+        .collect();
+
+      if let Some(doc) = todo_documents.get(active_project_index) {
+        for ts in &doc.sessions {
+          let uuid_adopted =
+            !ts.uuid.is_empty() && adopted_uuids.contains(ts.uuid.as_str());
+          let label_adopted = adopted_labels.contains(ts.label.as_str());
+          if !uuid_adopted && !label_adopted {
+            labels.push(format!("* {}", ts.label));
+            entries.push(ProjectActionsEntry::Dormant {
+              uuid: ts.uuid.clone(),
+              label: ts.label.clone(),
+            });
+          }
+        }
+      }
+    }
+
+    // 3. New session.
     labels.push("+ New session".to_string());
     entries.push(ProjectActionsEntry::NewSession);
 
-    // 3. Unattached JSONL sessions for current project.
+    // 4. Unattached JSONL sessions for current project (not in TODO.md).
     {
       let existing_uuids: HashSet<&str> = todo_documents
         .get(active_project_index)
@@ -1204,7 +1237,7 @@ impl ProjectActionsPickerDelegate {
       }
     }
 
-    Self { labels, entries, result: None }
+    Self { labels, entries, active_project_index, result: None }
   }
 
   pub fn result(&self) -> Option<ProjectActionsResult> {
@@ -1227,6 +1260,9 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
         }
         SessionPickerEntryKind::EmptyProject => ProjectActionsResult::InitProject(*pi),
       },
+      ProjectActionsEntry::Dormant { uuid, label } => {
+        ProjectActionsResult::AdoptTodoSession(self.active_project_index, uuid.clone(), label.clone())
+      }
       ProjectActionsEntry::NewSession => ProjectActionsResult::CreateNew,
       ProjectActionsEntry::Unattached { uuid, summary } => {
         ProjectActionsResult::AdoptJsonlSession(uuid.clone(), summary.clone())
@@ -1250,6 +1286,11 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
         let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
         let right_el = div().ml_auto().text_xs().text_color(muted_color).child(format!("{problems}"));
         row.child(marker).child(main_text).child(right_el)
+      }
+      ProjectActionsEntry::Dormant { label, .. } => {
+        let marker_color = if selected { theme.accent_foreground } else { theme.cyan };
+        let marker = picker_marker_base().text_color(marker_color).child("*");
+        row.child(marker).child(label.clone())
       }
       ProjectActionsEntry::NewSession => {
         let marker_color = if selected { theme.accent_foreground } else { theme.green };
