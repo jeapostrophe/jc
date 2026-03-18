@@ -235,6 +235,13 @@ impl Workspace {
                 changed |= project.refresh_problems(cx);
               }
               if changed {
+                // Keep TodoView active label in sync (e.g. after a heading rename).
+                {
+                  let pi = view.active_project_index;
+                  let label = view.projects[pi].active_label().map(|s| s.to_string());
+                  let todo_view = view.projects[pi].todo_view.clone();
+                  todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
+                }
                 cx.notify();
               }
             });

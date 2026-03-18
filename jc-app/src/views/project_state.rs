@@ -135,22 +135,36 @@ impl ProjectState {
 
     let mut changed = false;
 
-    // Sync session labels from the TODO document.
+    // Sync session state from the TODO document.
+    // Match by UUID (stable) first, then fall back to label for sessions without a UUID.
     let document = todo_view.document();
     for todo_session in &document.sessions {
-      // Find session by label match (since labels are the stable identifier in TODO.md).
-      for session in self.sessions.values_mut() {
-        if session.label == todo_session.label {
-          // Update UUID if it changed in the document.
-          let new_uuid = if todo_session.uuid.is_empty() {
-            None
-          } else {
-            Some(todo_session.uuid.clone())
-          };
-          if session.uuid != new_uuid {
-            session.uuid = new_uuid;
-            changed = true;
-          }
+      let new_uuid = if todo_session.uuid.is_empty() {
+        None
+      } else {
+        Some(todo_session.uuid.as_str())
+      };
+
+      let matched = self.sessions.values_mut().find(|session| {
+        // Primary match: both have UUIDs and they match.
+        if let (Some(s_uuid), Some(t_uuid)) = (session.uuid.as_deref(), new_uuid) {
+          return s_uuid == t_uuid;
+        }
+        // Fallback: session has no UUID yet, match by label.
+        session.uuid.is_none() && session.label == todo_session.label
+      });
+
+      if let Some(session) = matched {
+        // Update UUID if it was assigned or changed.
+        let owned_uuid = new_uuid.map(str::to_string);
+        if session.uuid != owned_uuid {
+          session.uuid = owned_uuid;
+          changed = true;
+        }
+        // Keep label in sync with the TODO heading.
+        if session.label != todo_session.label {
+          session.label = todo_session.label.clone();
+          changed = true;
         }
       }
     }
