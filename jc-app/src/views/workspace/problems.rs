@@ -58,23 +58,26 @@ impl Workspace {
       ProblemTarget::GeneralTerminal => PaneContentKind::GeneralTerminal,
       ProblemTarget::TodoEditor => PaneContentKind::TodoEditor,
       ProblemTarget::DiffView { .. } => PaneContentKind::GitDiff,
+      ProblemTarget::CodeView { file, .. }
+        if file.file_name().and_then(|f| f.to_str()) == Some("TODO.md") =>
+      {
+        PaneContentKind::TodoEditor
+      }
       ProblemTarget::CodeView { .. } => PaneContentKind::CodeViewer,
     };
 
-    // Claude targets the leftmost pane; everything else targets the rightmost.
-    if kind == PaneContentKind::ClaudeTerminal {
-      // If Claude is already showing in another pane, replace it there to avoid duplicates.
-      let visible = self.visible_pane_count();
-      let existing = (0..visible).find(|&i| self.panes[i].read(cx).content_kind() == Some(kind));
-      let pane_idx = existing.unwrap_or(0);
-      self.show_in_pane(pane_idx, kind, window, cx);
-    } else {
-      self.set_rightmost_pane_view(kind, window, cx);
-    }
+    // If the target is already visible in a pane, navigate there in place.
+    // Otherwise: Claude → leftmost pane, everything else → rightmost pane.
+    let visible = self.visible_pane_count();
+    let pane_idx = (0..visible)
+      .find(|&i| self.panes[i].read(cx).content_kind() == Some(kind))
+      .unwrap_or(if kind == PaneContentKind::ClaudeTerminal { 0 } else { visible - 1 });
+    self.show_in_pane(pane_idx, kind, window, cx);
 
     // Post-navigation: open specific file or navigate to diff entry.
+    // Skip CodeView actions when the target was remapped to TodoEditor.
     match target {
-      ProblemTarget::CodeView { file, line } => {
+      ProblemTarget::CodeView { file, line } if kind == PaneContentKind::CodeViewer => {
         let project_path = self.projects[self.active_project_index].path.clone();
         let full_path = project_path.join(&file);
         let code_view = self.projects[self.active_project_index].code_view.clone();
