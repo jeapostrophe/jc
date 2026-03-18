@@ -363,6 +363,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 | Cmd-Enter | Send to terminal | |
 | Cmd-Shift-C | Copy reply (/copy → clipboard → .jc/replies/) | |
 | Cmd-; | Next problem (current project) / jump to WAIT if none | |
+| Cmd-. | Jump to WAIT section of active session | |
 | Cmd-: | Urgency-sorted session picker | |
 | Cmd-? | Keybinding help overlay | |
 | Cmd-Shift-E | Open in external editor | |

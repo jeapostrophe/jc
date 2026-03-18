@@ -233,6 +233,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::save_file))
       .on_action(cx.listener(Self::send_to_terminal))
       .on_action(cx.listener(Self::copy_reply))
+      .on_action(cx.listener(Self::jump_to_wait))
       .on_action(cx.listener(Self::next_problem))
       .on_action(cx.listener(Self::toggle_keybinding_help))
       .on_action(cx.listener(Self::show_snippet_picker))

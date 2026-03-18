@@ -41,6 +41,7 @@ actions!(
     SendToTerminal,
     CopyReply,
     NextProblem,
+    JumpToWait,
     ShowKeybindingHelp,
   ]
 );
@@ -668,19 +669,25 @@ impl Workspace {
     let pane = self.active_pane_entity().clone();
     let kind = pane.read(cx).content_kind();
     let project = self.active_project();
-    let file_path = match kind {
+    let (file_path, line) = match kind {
       Some(PaneContentKind::CodeViewer) => {
-        project.code_view.read(cx).file_path().map(|p| p.to_path_buf())
+        let cv = project.code_view.read(cx);
+        let path = cv.file_path().map(|p| p.to_path_buf());
+        let line = cv.editor().read(cx).cursor_position().line;
+        (path, line)
       }
       Some(PaneContentKind::TodoEditor) => {
-        Some(project.todo_view.read(cx).file_path().to_path_buf())
+        let tv = project.todo_view.read(cx);
+        let path = tv.file_path().to_path_buf();
+        let line = tv.code_view().read(cx).editor().read(cx).cursor_position().line;
+        (Some(path), line)
       }
-      _ => None,
+      _ => (None, 0),
     };
     if let Some(path) = file_path {
-      let editor =
-        if self.config.editor.is_empty() { "open".to_string() } else { self.config.editor.clone() };
-      let _ = std::process::Command::new(&editor).arg(path).spawn();
+      // Use `zed path:line` to open at the cursor position within the project.
+      let arg = format!("{}:{}", path.display(), line + 1);
+      let _ = std::process::Command::new("zed").arg(arg).spawn();
     }
   }
 
@@ -1087,6 +1094,30 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
+  // Jump to WAIT
+  // ---------------------------------------------------------------------------
+
+  fn jump_to_wait(&mut self, _: &JumpToWait, window: &mut Window, cx: &mut Context<Self>) {
+    let project = &self.projects[self.active_project_index];
+    let Some(label) = project.active_label() else {
+      return;
+    };
+    let todo_view = project.todo_view.clone();
+    let document = todo_view.read(cx).document().clone();
+    let Some(session) = document.session_by_label(label) else {
+      return;
+    };
+    let Some(wait) = &session.wait else {
+      return;
+    };
+    let wait_line = wait.line;
+
+    // Switch to the TODO pane and scroll to the WAIT heading.
+    self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
+    todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line, window, cx));
+  }
+
+  // ---------------------------------------------------------------------------
   // Copy reply (/copy)
   // ---------------------------------------------------------------------------
 
@@ -1311,6 +1342,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-s", SaveFile, Some("Workspace")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Workspace")),
     KeyBinding::new("cmd-;", NextProblem, Some("Workspace")),
+    KeyBinding::new("cmd-.", JumpToWait, Some("Workspace")),
     KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-p", crate::views::picker::ProjectActionsPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-c", CopyReply, Some("Workspace")),
