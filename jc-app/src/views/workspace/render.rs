@@ -13,13 +13,17 @@ impl Workspace {
     let project = self.active_project();
     match pane.read(cx).content_kind() {
       Some(PaneContentKind::CodeViewer) => {
-        let cv = project.code_view.read(cx);
-        let dirty = if cv.is_dirty(cx) { " [+]" } else { "" };
-        if let Some(path) = cv.file_path() {
-          let relative = path.strip_prefix(&project.path).ok().unwrap_or(path);
-          format!("Code: {}{dirty}", relative.display())
+        if let Some(cv) = project.code_view() {
+          let cv = cv.read(cx);
+          let dirty = if cv.is_dirty(cx) { " [+]" } else { "" };
+          if let Some(path) = cv.file_path() {
+            let relative = path.strip_prefix(&project.path).ok().unwrap_or(path);
+            format!("Code: {}{dirty}", relative.display())
+          } else {
+            format!("Code{dirty}")
+          }
         } else {
-          format!("Code{dirty}")
+          "Code".to_string()
         }
       }
       Some(PaneContentKind::TodoEditor) => {

@@ -1,5 +1,6 @@
 use crate::views::code_view::CodeView;
 use crate::views::diff_view::DiffView;
+use crate::views::pane::PaneContentKind;
 use crate::views::session_state::{SessionId, SessionState};
 use crate::views::todo_view::TodoView;
 use gpui::*;
@@ -9,8 +10,6 @@ use jc_terminal::Palette;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-use super::pane::PaneContentKind;
 
 pub struct SavedPaneLayout {
   pub pane_kinds: [Option<PaneContentKind>; 3],
@@ -25,11 +24,9 @@ pub struct ProjectState {
   pub next_session_id: SessionId,
   pub todo_view: Entity<TodoView>,
   pub diff_view: Entity<DiffView>,
-  pub code_view: Entity<CodeView>,
   pub problems: Vec<ProjectProblem>,
   pub script_problems: Vec<ScriptProblem>,
   pub last_script_run: Option<Instant>,
-  pub saved_layout: Option<SavedPaneLayout>,
 }
 
 impl ProjectState {
@@ -41,7 +38,6 @@ impl ProjectState {
     cx: &mut App,
   ) -> Self {
     let diff_view = cx.new(|cx| DiffView::new(path.clone(), window, cx));
-    let code_view = cx.new(|cx| CodeView::new(window, cx));
     let todo_view = cx.new(|cx| TodoView::new(path.clone(), window, cx));
 
     // Lazy adoption: only launch a terminal for the first TODO session whose
@@ -99,11 +95,9 @@ impl ProjectState {
       next_session_id,
       todo_view,
       diff_view,
-      code_view,
       problems: Vec::new(),
       script_problems: Vec::new(),
       last_script_run: None,
-      saved_layout: None,
     }
   }
 
@@ -124,6 +118,11 @@ impl ProjectState {
 
   pub fn active_label(&self) -> Option<&str> {
     self.active_session().map(|s| s.label.as_str())
+  }
+
+  /// Convenience: the active session's code view.
+  pub fn code_view(&self) -> Option<&Entity<CodeView>> {
+    self.active_session().map(|s| &s.code_view)
   }
 
   /// Refresh problems for all sessions and the project itself.

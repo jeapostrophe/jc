@@ -627,7 +627,7 @@ impl Workspace {
     let project = self.active_project();
     match kind {
       PaneContentKind::CodeViewer => {
-        Some(OtherPaneScrollable::Editor(project.code_view.read(cx).editor().clone()))
+        project.code_view().map(|cv| OtherPaneScrollable::Editor(cv.read(cx).editor().clone()))
       }
       PaneContentKind::GitDiff => {
         Some(OtherPaneScrollable::Editor(project.diff_view.read(cx).editor().clone()))
@@ -873,10 +873,14 @@ impl Workspace {
     let project = self.active_project();
     let (file_path, line) = match kind {
       Some(PaneContentKind::CodeViewer) => {
-        let cv = project.code_view.read(cx);
-        let path = cv.file_path().map(|p| p.to_path_buf());
-        let line = cv.editor().read(cx).cursor_position().line;
-        (path, line)
+        if let Some(cv) = project.code_view() {
+          let cv = cv.read(cx);
+          let path = cv.file_path().map(|p| p.to_path_buf());
+          let line = cv.editor().read(cx).cursor_position().line;
+          (path, line)
+        } else {
+          (None, 0)
+        }
       }
       Some(PaneContentKind::TodoEditor) => {
         let tv = project.todo_view.read(cx);
@@ -1066,10 +1070,10 @@ impl Workspace {
         let focus = project.diff_view.read(cx).focus_handle(cx);
         Some((project.diff_view.clone().into(), focus))
       }
-      PaneContentKind::CodeViewer => {
-        let focus = project.code_view.read(cx).focus_handle(cx);
-        Some((project.code_view.clone().into(), focus))
-      }
+      PaneContentKind::CodeViewer => project.active_session().map(|s| {
+        let focus = s.code_view.read(cx).focus_handle(cx);
+        (s.code_view.clone().into(), focus)
+      }),
       PaneContentKind::TodoEditor => {
         let focus = project.todo_view.read(cx).focus_handle(cx);
         Some((project.todo_view.clone().into(), focus))
@@ -1234,7 +1238,9 @@ impl Workspace {
 
     match kind {
       Some(PaneContentKind::CodeViewer) => {
-        project.code_view.update(cx, |v, cx| v.save(cx));
+        if let Some(cv) = project.code_view() {
+          cv.update(cx, |v, cx| v.save(cx));
+        }
       }
       Some(PaneContentKind::TodoEditor) => {
         project.todo_view.update(cx, |v, cx| v.save(cx));
@@ -1363,7 +1369,7 @@ impl Workspace {
     });
 
     // Read clipboard now, then poll for change.
-    let code_view = project.code_view.clone();
+    let code_view = session.code_view.clone();
     cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
       // Read initial clipboard.
       let initial = clipboard_contents().unwrap_or_default();

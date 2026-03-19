@@ -47,9 +47,10 @@ impl Workspace {
     }
 
     let project = self.active_project();
+    let Some(code_view) = project.code_view().cloned() else { return };
     let delegate = OpenPickerDelegate::new(
       project.path.clone(),
-      project.code_view.clone(),
+      code_view,
       self.recent_files.clone(),
     );
     let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
@@ -68,8 +69,7 @@ impl Workspace {
               }
               Some(OpenPickerResult::OpenFile) => {
                 // Track the opened file in recent_files
-                if let Some(path) = this.active_project().code_view.read(cx).file_path() {
-                  let path = path.to_path_buf();
+                if let Some(path) = this.active_project().code_view().and_then(|cv| cv.read(cx).file_path().map(|p| p.to_path_buf())) {
                   this.recent_files.retain(|p| p != &path);
                   this.recent_files.insert(0, path);
                   this.recent_files.truncate(50);
@@ -194,8 +194,10 @@ impl Workspace {
         self.show_picker(delegate, window, cx);
       }
       Some(PaneContentKind::CodeViewer) => {
-        let delegate = CodeSymbolPickerDelegate::new(project.code_view.clone(), cx);
-        self.show_picker(delegate, window, cx);
+        if let Some(cv) = project.code_view() {
+          let delegate = CodeSymbolPickerDelegate::new(cv.clone(), cx);
+          self.show_picker(delegate, window, cx);
+        }
       }
       Some(PaneContentKind::GlobalTodo) => {
         // GlobalTodo is a CodeView; use CodeSymbolPickerDelegate for markdown headers
@@ -293,8 +295,10 @@ impl Workspace {
 
     match kind {
       Some(PaneContentKind::CodeViewer) => {
-        let delegate = LineSearchPickerDelegate::for_view(&project.code_view, cx);
-        self.show_picker(delegate, window, cx);
+        if let Some(cv) = project.code_view() {
+          let delegate = LineSearchPickerDelegate::for_view(cv, cx);
+          self.show_picker(delegate, window, cx);
+        }
       }
       Some(PaneContentKind::TodoEditor) => {
         let delegate = LineSearchPickerDelegate::for_view(&project.todo_view, cx);
@@ -321,8 +325,7 @@ impl Workspace {
     let subscription =
       cx.subscribe_in(&picker, window, move |this: &mut Self, _, event, window, cx| match event {
         PickerEvent::Confirmed => {
-          if let Some(path) = this.active_project().code_view.read(cx).file_path() {
-            let path = path.to_path_buf();
+          if let Some(path) = this.active_project().code_view().and_then(|cv| cv.read(cx).file_path().map(|p| p.to_path_buf())) {
             this.recent_files.retain(|p| p != &path);
             this.recent_files.insert(0, path);
             this.recent_files.truncate(50);
@@ -385,7 +388,7 @@ impl Workspace {
 
     let context = match kind {
       Some(PaneContentKind::CodeViewer) => {
-        project.code_view.read(cx).comment_context(&project.path, cx)
+        project.code_view().and_then(|cv| cv.read(cx).comment_context(&project.path, cx))
       }
       Some(PaneContentKind::GitDiff) => project.diff_view.read(cx).comment_context(cx),
       _ => None,

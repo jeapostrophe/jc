@@ -80,7 +80,7 @@ impl Workspace {
       ProblemTarget::CodeView { file, line } if kind == PaneContentKind::CodeViewer => {
         let project_path = self.projects[self.active_project_index].path.clone();
         let full_path = project_path.join(&file);
-        let code_view = self.projects[self.active_project_index].code_view.clone();
+        let Some(code_view) = self.projects[self.active_project_index].code_view().cloned() else { return };
         code_view.update(cx, |v, cx| {
           v.open_file(full_path, window, cx);
           if let Some(line) = line {

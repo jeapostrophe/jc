@@ -1,3 +1,5 @@
+use crate::views::code_view::CodeView;
+use crate::views::project_state::SavedPaneLayout;
 use gpui::*;
 use jc_core::problem::{AppTodoProblem, ClaudeProblem, SessionProblem, TerminalProblem};
 use jc_core::todo::TodoProblem;
@@ -21,11 +23,14 @@ pub struct SessionState {
   pub label: String,
   pub claude_terminal: Entity<TerminalView>,
   pub general_terminal: Entity<TerminalView>,
+  pub code_view: Entity<CodeView>,
   pub pending_events: HashSet<PendingEvent>,
   pub problems: Vec<SessionProblem>,
   /// True while Claude is actively working. Set by `UserPromptSubmit` hook and
   /// `send_to_terminal`; cleared by `Stop`/`IdlePrompt` hooks.
   pub busy: bool,
+  /// Saved pane layout for this session, restored when switching back.
+  pub saved_layout: Option<SavedPaneLayout>,
 }
 
 impl SessionState {
@@ -56,6 +61,7 @@ impl SessionState {
     let claude_terminal = cx.new(|cx| TerminalView::new(claude_config, Some(&project), window, cx));
     let general_terminal =
       cx.new(|cx| TerminalView::new(general_config, Some(&project), window, cx));
+    let code_view = cx.new(|cx| CodeView::new(window, cx));
 
     Self {
       id,
@@ -63,9 +69,11 @@ impl SessionState {
       label,
       claude_terminal,
       general_terminal,
+      code_view,
       pending_events: HashSet::default(),
       problems: Vec::new(),
       busy: false,
+      saved_layout: None,
     }
   }
 
