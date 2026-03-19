@@ -50,6 +50,7 @@ actions!(
     ScrollOtherDown,
     ScrollOtherPageUp,
     ScrollOtherPageDown,
+    ToggleCodeDiff,
   ]
 );
 
@@ -829,6 +830,46 @@ impl Workspace {
     self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
   }
 
+  /// Toggle between Code and Diff views for the current file.
+  fn toggle_code_diff(&mut self, _: &ToggleCodeDiff, window: &mut Window, cx: &mut Context<Self>) {
+    let kind = self.active_pane_entity().read(cx).content_kind();
+    let pi = self.active_project_index;
+
+    match kind {
+      Some(PaneContentKind::CodeViewer) => {
+        // Grab relative path before mutating.
+        let relative = {
+          let project = &self.projects[pi];
+          project.code_view().and_then(|cv| {
+            let cv = cv.read(cx);
+            cv.file_path().and_then(|p| {
+              p.strip_prefix(&project.path).ok().map(|r| r.to_string_lossy().into_owned())
+            })
+          })
+        };
+        self.set_active_pane_view(PaneContentKind::GitDiff, window, cx);
+        if let Some(name) = relative {
+          let diff_view = self.projects[pi].diff_view.clone();
+          let idx = diff_view.read(cx).file_diffs().iter().position(|fd| fd.name == name);
+          if let Some(idx) = idx {
+            diff_view.update(cx, |v, cx| v.set_file_index(idx, window, cx));
+          }
+        }
+      }
+      Some(PaneContentKind::GitDiff) => {
+        let file_name = self.projects[pi].diff_view.read(cx).current_file_name().map(str::to_string);
+        if let Some(name) = file_name {
+          let full_path = self.projects[pi].path.join(&name);
+          if let Some(cv) = self.projects[pi].code_view().cloned() {
+            cv.update(cx, |v, cx| v.open_file(full_path, window, cx));
+          }
+          self.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
+        }
+      }
+      _ => {}
+    }
+  }
+
   fn toggle_keybinding_help(
     &mut self,
     _: &ShowKeybindingHelp,
@@ -1262,6 +1303,9 @@ impl Workspace {
       Some(PaneContentKind::TodoEditor) => {
         project.todo_view.update(cx, |v, cx| v.save(cx));
       }
+      Some(PaneContentKind::GlobalTodo) => {
+        self.global_todo_view.update(cx, |v, cx| v.save(cx));
+      }
       _ => {}
     }
   }
@@ -1610,6 +1654,7 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-alt-down", ScrollOtherDown, Some("Workspace")),
     KeyBinding::new("cmd-alt-pageup", ScrollOtherPageUp, Some("Workspace")),
     KeyBinding::new("cmd-alt-pagedown", ScrollOtherPageDown, Some("Workspace")),
+    KeyBinding::new("cmd-d", ToggleCodeDiff, Some("Workspace")),
   ]);
 
   cx.bind_keys([
@@ -1625,5 +1670,6 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-alt-down", ScrollOtherDown, Some("Input")),
     KeyBinding::new("cmd-alt-pageup", ScrollOtherPageUp, Some("Input")),
     KeyBinding::new("cmd-alt-pagedown", ScrollOtherPageDown, Some("Input")),
+    KeyBinding::new("cmd-d", ToggleCodeDiff, Some("Input")),
   ]);
 }

@@ -41,6 +41,10 @@ impl Workspace {
           format!("Diff [{source_label}] ({reviewed}/{total})")
         }
       }
+      Some(PaneContentKind::GlobalTodo) => {
+        let dirty = if self.global_todo_view.read(cx).is_dirty(cx) { " [+]" } else { "" };
+        format!("Global TODO{dirty}")
+      }
       Some(kind) => kind.label().to_string(),
       None => "Empty".to_string(),
     }
@@ -227,6 +231,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::show_git_diff))
       .on_action(cx.listener(Self::show_code_viewer))
       .on_action(cx.listener(Self::show_todo_editor))
+      .on_action(cx.listener(Self::toggle_code_diff))
       .on_action(cx.listener(Self::open_in_external_editor))
       .on_action(cx.listener(Self::open_picker))
       .on_action(cx.listener(Self::open_drill_down_picker))
