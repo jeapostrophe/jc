@@ -16,6 +16,7 @@ pub enum HookEventKind {
   /// User submitted a prompt — Claude is about to start working.
   PromptSubmit,
   Stop,
+  StopFailure,
   IdlePrompt,
   PermissionPrompt,
   /// A `/clear` was detected: the old session ended and a new one started.
@@ -116,6 +117,7 @@ fn accept_loop(
     let kind = match route {
       "prompt-submit" => Some(HookEventKind::PromptSubmit),
       "stop" => Some(HookEventKind::Stop),
+      "stop-failure" => Some(HookEventKind::StopFailure),
       "notification" => parse_notification_kind(&payload.notification_type),
       "permission" => Some(HookEventKind::PermissionPrompt),
 

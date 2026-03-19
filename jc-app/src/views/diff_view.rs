@@ -51,6 +51,8 @@ pub struct FileDiff {
 
 pub struct DiffView {
   editor: Entity<InputState>,
+  /// Focus handle for when there are no files to show (editor not rendered).
+  empty_focus: FocusHandle,
   project_path: PathBuf,
   source: DiffSource,
   file_diffs: Vec<FileDiff>,
@@ -68,8 +70,10 @@ impl DiffView {
   pub fn new(project_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
     let editor = cx
       .new(|cx| InputState::new(window, cx).code_editor("diff").soft_wrap(true).line_number(false));
+    let empty_focus = cx.focus_handle();
     let mut view = Self {
       editor,
+      empty_focus,
       project_path,
       source: DiffSource::WorkingTree,
       file_diffs: Vec::new(),
@@ -271,7 +275,11 @@ impl super::LineSearchable for DiffView {
 
 impl Focusable for DiffView {
   fn focus_handle(&self, cx: &App) -> FocusHandle {
-    self.editor.read(cx).focus_handle(cx)
+    if self.file_diffs.is_empty() {
+      self.empty_focus.clone()
+    } else {
+      self.editor.read(cx).focus_handle(cx)
+    }
   }
 }
 
@@ -283,6 +291,7 @@ impl Render for DiffView {
       return div()
         .size_full()
         .key_context("DiffView")
+        .track_focus(&self.empty_focus)
         .flex()
         .items_center()
         .justify_center()
@@ -309,7 +318,14 @@ fn generate_diff_inner(path: &Path) -> Result<String, git2::Error> {
   let repo = git2::Repository::open(path)?;
   let head = repo.head()?;
   let tree = head.peel_to_tree()?;
-  let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None)?;
+
+  // Include untracked files in the diff so new files show up for review.
+  let mut opts = git2::DiffOptions::new();
+  opts.include_untracked(true);
+  opts.recurse_untracked_dirs(true);
+  opts.show_untracked_content(true);
+
+  let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?;
   diff_to_string(&diff)
 }
 

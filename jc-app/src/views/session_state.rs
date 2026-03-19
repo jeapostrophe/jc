@@ -11,9 +11,8 @@ pub type SessionId = usize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PendingEvent {
-  ClaudeStop,
   ClaudePermission,
-  ClaudeIdle,
+  ClaudeStopFailure,
   TerminalBell,
 }
 
@@ -27,8 +26,10 @@ pub struct SessionState {
   pub pending_events: HashSet<PendingEvent>,
   pub problems: Vec<SessionProblem>,
   /// True while Claude is actively working. Set by `UserPromptSubmit` hook and
-  /// `send_to_terminal`; cleared by `Stop`/`IdlePrompt` hooks.
+  /// `send_to_terminal`; cleared by `Stop`/`StopFailure`/`IdlePrompt` hooks.
   pub busy: bool,
+  /// True once Claude has been busy at least once in this jc run.
+  pub has_ever_been_busy: bool,
   /// Saved pane layout for this session, restored when switching back.
   pub saved_layout: Option<SavedPaneLayout>,
 }
@@ -73,6 +74,7 @@ impl SessionState {
       pending_events: HashSet::default(),
       problems: Vec::new(),
       busy: false,
+      has_ever_been_busy: false,
       saved_layout: None,
     }
   }
@@ -84,9 +86,8 @@ impl SessionState {
 
     for event in &self.pending_events {
       let sp = match event {
-        PendingEvent::ClaudeStop => SessionProblem::Claude(ClaudeProblem::Stop),
         PendingEvent::ClaudePermission => SessionProblem::Claude(ClaudeProblem::Permission),
-        PendingEvent::ClaudeIdle => SessionProblem::Claude(ClaudeProblem::Idle),
+        PendingEvent::ClaudeStopFailure => SessionProblem::Claude(ClaudeProblem::StopFailure),
         PendingEvent::TerminalBell => SessionProblem::Terminal(TerminalProblem::Bell),
       };
       problems.push(sp);

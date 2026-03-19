@@ -1,6 +1,24 @@
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
+// Problem layers
+// ---------------------------------------------------------------------------
+
+/// Priority layers for the Cmd-; problem rotation system.
+/// Lower layer = higher priority. L0 problems are handled cross-session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProblemLayer {
+  /// Permission prompt, API error (StopFailure) — cross-session, always first.
+  L0,
+  /// Terminal bell, unreviewed diffs, script problems — review before sending.
+  L1,
+  /// Unsent WAIT — ready to send new work (suppressed if busy or L1 exists).
+  L2,
+  /// Session idle + has_ever_been_busy — needs new work started.
+  L3,
+}
+
+// ---------------------------------------------------------------------------
 // Navigation target
 // ---------------------------------------------------------------------------
 
@@ -20,9 +38,8 @@ pub enum ProblemTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClaudeProblem {
-  Stop,
   Permission,
-  Idle,
+  StopFailure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -67,10 +84,18 @@ pub enum ProjectProblem {
 }
 
 // ---------------------------------------------------------------------------
-// Rank and description
+// Layer, rank, target, and description
 // ---------------------------------------------------------------------------
 
 impl SessionProblem {
+  pub fn layer(&self) -> ProblemLayer {
+    match self {
+      Self::Claude(ClaudeProblem::Permission | ClaudeProblem::StopFailure) => ProblemLayer::L0,
+      Self::Terminal(TerminalProblem::Bell) => ProblemLayer::L1,
+      Self::Todo(AppTodoProblem::UnsentWait { .. }) => ProblemLayer::L2,
+    }
+  }
+
   pub fn target(&self) -> ProblemTarget {
     match self {
       Self::Claude(_) => ProblemTarget::ClaudeTerminal,
@@ -82,8 +107,7 @@ impl SessionProblem {
   pub fn rank(&self) -> i8 {
     match self {
       Self::Claude(ClaudeProblem::Permission) => 1,
-      Self::Claude(ClaudeProblem::Stop) => 3,
-      Self::Claude(ClaudeProblem::Idle) => 4,
+      Self::Claude(ClaudeProblem::StopFailure) => 2,
       Self::Terminal(TerminalProblem::Bell) => 5,
       Self::Todo(AppTodoProblem::UnsentWait { .. }) => 6,
     }
@@ -92,8 +116,7 @@ impl SessionProblem {
   pub fn description(&self) -> String {
     match self {
       Self::Claude(ClaudeProblem::Permission) => "Permission prompt".into(),
-      Self::Claude(ClaudeProblem::Stop) => "Stopped".into(),
-      Self::Claude(ClaudeProblem::Idle) => "Idle prompt".into(),
+      Self::Claude(ClaudeProblem::StopFailure) => "API error".into(),
       Self::Terminal(TerminalProblem::Bell) => "Bell".into(),
       Self::Todo(AppTodoProblem::UnsentWait { label }) => format!("Unsent wait: {label}"),
     }
@@ -101,6 +124,13 @@ impl SessionProblem {
 }
 
 impl ProjectProblem {
+  pub fn layer(&self) -> ProblemLayer {
+    match self {
+      Self::Diff(_) => ProblemLayer::L1,
+      Self::Script(_) => ProblemLayer::L1,
+    }
+  }
+
   pub fn target(&self) -> ProblemTarget {
     match self {
       Self::Diff(DiffProblem::UnreviewedFile(f)) => ProblemTarget::DiffView { file: f.clone() },

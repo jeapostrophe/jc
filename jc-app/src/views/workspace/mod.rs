@@ -13,7 +13,6 @@ use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
-use jc_core::problem::ProblemTarget;
 use jc_core::snippets::{self, SnippetDocument};
 use jc_core::theme::Appearance;
 use jc_terminal::{Palette, TerminalView, TerminalViewEvent};
@@ -112,7 +111,10 @@ pub struct Workspace {
   _ipc_poll_task: Option<Task<()>>,
   _bell_subscriptions: Vec<Subscription>,
   _problems_poll_task: Option<Task<()>>,
-  last_jumped_target: Option<ProblemTarget>,
+  /// Home session before first L0 cross-session jump (project_index, session_id).
+  pre_layer0_home: Option<(usize, SessionId)>,
+  /// Current cycling state within the layered problem rotation.
+  problem_cycle: Option<super::workspace::problems::ProblemCycleState>,
   snippets: SnippetDocument,
   _snippet_watcher: Option<notify::RecommendedWatcher>,
   global_todo_view: Entity<crate::views::code_view::CodeView>,
@@ -358,7 +360,8 @@ impl Workspace {
       _ipc_poll_task: Some(ipc_poll_task),
       _bell_subscriptions: bell_subscriptions,
       _problems_poll_task: Some(problems_poll_task),
-      last_jumped_target: None,
+      pre_layer0_home: None,
+      problem_cycle: None,
       snippets,
       _snippet_watcher: snippet_watcher,
       global_todo_view,
@@ -746,17 +749,6 @@ impl Workspace {
     self.show_in_pane(self.active_pane_index, kind, window, cx);
   }
 
-  /// Show `kind` in the rightmost visible pane and focus it.
-  pub(super) fn set_rightmost_pane_view(
-    &mut self,
-    kind: PaneContentKind,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    let pane_idx = self.visible_pane_count() - 1;
-    self.show_in_pane(pane_idx, kind, window, cx);
-  }
-
   pub(super) fn show_in_pane(
     &mut self,
     pane_idx: usize,
@@ -984,6 +976,17 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    self.switch_to_session_inner(project_idx, session_id, false, window, cx);
+  }
+
+  fn switch_to_session_inner(
+    &mut self,
+    project_idx: usize,
+    session_id: Option<SessionId>,
+    skip_acknowledge: bool,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
     // Save the current session's pane layout before switching away.
     let saved = SavedPaneLayout {
       pane_kinds: std::array::from_fn(|i| self.panes[i].read(cx).content_kind()),
@@ -998,10 +1001,15 @@ impl Workspace {
     self.active_project_index = project_idx;
     self.projects[project_idx].active_session = session_id;
 
-    // Acknowledge pending events for this session (user is switching to it).
-    if let Some(session) = self.projects[project_idx].active_session_mut() {
-      session.acknowledge();
+    // Acknowledge pending events unless skipped (e.g. L0 problem jump).
+    if !skip_acknowledge {
+      if let Some(session) = self.projects[project_idx].active_session_mut() {
+        session.acknowledge();
+      }
     }
+
+    // Reset problem cycle on manual session switches.
+    self.problem_cycle = None;
 
     // Update the TODO view's active session highlight.
     {
@@ -1343,6 +1351,7 @@ impl Workspace {
     // Mark session as busy — we're about to submit work to Claude.
     if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
       session.busy = true;
+      session.has_ever_been_busy = true;
     }
 
     // Paste the message into the Claude terminal, then send Enter to submit.
@@ -1504,6 +1513,7 @@ impl Workspace {
             project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(session_uuid))
           {
             session.busy = true;
+            session.has_ever_been_busy = true;
             break;
           }
         }
@@ -1512,10 +1522,12 @@ impl Workspace {
       return;
     }
 
-    let pending = match event.kind {
-      HookEventKind::Stop => PendingEvent::ClaudeStop,
-      HookEventKind::PermissionPrompt => PendingEvent::ClaudePermission,
-      HookEventKind::IdlePrompt => PendingEvent::ClaudeIdle,
+    // Determine the pending event (if any) and whether this clears busy.
+    let (pending, clears_busy) = match event.kind {
+      HookEventKind::Stop => (None, true),
+      HookEventKind::StopFailure => (Some(PendingEvent::ClaudeStopFailure), true),
+      HookEventKind::PermissionPrompt => (Some(PendingEvent::ClaudePermission), true),
+      HookEventKind::IdlePrompt => (None, true),
       HookEventKind::PromptSubmit | HookEventKind::SessionClear { .. } => unreachable!(),
     };
 
@@ -1531,28 +1543,36 @@ impl Workspace {
           .values_mut()
           .find(|s| s.uuid.as_deref() == Some(session_uuid));
         if let Some(session) = found {
-          session.busy = !matches!(pending, PendingEvent::ClaudeIdle | PendingEvent::ClaudeStop);
-          let is_new = session.pending_events.insert(pending.clone());
-          if is_new {
-            matched_project = Some(project.name.clone());
-            matched_label = Some(session.label.clone());
+          if clears_busy {
+            session.busy = false;
+          }
+          if let Some(ref pe) = pending {
+            let is_new = session.pending_events.insert(pe.clone());
+            if is_new {
+              matched_project = Some(project.name.clone());
+              matched_label = Some(session.label.clone());
+            }
           }
           break;
         }
         // If no UUID match, try to assign to a pending (uuid=None) session.
         if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
           session.uuid = Some(session_uuid.clone());
-          session.busy = !matches!(pending, PendingEvent::ClaudeIdle | PendingEvent::ClaudeStop);
-          let is_new = session.pending_events.insert(pending.clone());
-          // Update TODO.md with the new UUID.
-          let label = session.label.clone();
-          project.todo_view.update(cx, |tv, cx| {
-            tv.update_session_uuid(&label, session_uuid, &mut *window, cx);
-            tv.save(cx);
-          });
-          if is_new {
-            matched_project = Some(project.name.clone());
-            matched_label = Some(label);
+          if clears_busy {
+            session.busy = false;
+          }
+          if let Some(ref pe) = pending {
+            let is_new = session.pending_events.insert(pe.clone());
+            // Update TODO.md with the new UUID.
+            let label = session.label.clone();
+            project.todo_view.update(cx, |tv, cx| {
+              tv.update_session_uuid(&label, session_uuid, &mut *window, cx);
+              tv.save(cx);
+            });
+            if is_new {
+              matched_project = Some(project.name.clone());
+              matched_label = Some(label);
+            }
           }
           break;
         }
@@ -1563,10 +1583,11 @@ impl Workspace {
     if let (Some(project_name), Some(session_label)) = (matched_project, matched_label)
       && !self.window_active
     {
-      let critical = matches!(event.kind, HookEventKind::PermissionPrompt);
+      let critical = matches!(event.kind, HookEventKind::PermissionPrompt | HookEventKind::StopFailure);
       let title = format!("{project_name} > {session_label}");
       let message = match event.kind {
         HookEventKind::Stop => "Claude finished",
+        HookEventKind::StopFailure => "API error",
         HookEventKind::PermissionPrompt => "Permission needed",
         HookEventKind::IdlePrompt => "Claude is idle",
         HookEventKind::PromptSubmit | HookEventKind::SessionClear { .. } => unreachable!(),

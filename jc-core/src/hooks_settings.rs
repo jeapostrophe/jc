@@ -45,6 +45,17 @@ pub fn install_hooks(project_path: &Path, port: u16) -> Result<()> {
     .expect("Stop should be an array")
     .push(stop_entry);
 
+  // StopFailure hook (fires when turn ends due to API error)
+  let stop_failure_entry = serde_json::json!({
+      "hooks": [{ "type": "http", "url": format!("{base}stop-failure") }]
+  });
+  hooks_obj
+    .entry("StopFailure")
+    .or_insert_with(|| Value::Array(Vec::new()))
+    .as_array_mut()
+    .expect("StopFailure should be an array")
+    .push(stop_failure_entry);
+
   // Notification hooks (idle_prompt = Claude finished & waiting, permission_prompt = needs approval)
   let notification_entry = serde_json::json!({
       "matcher": ".*",

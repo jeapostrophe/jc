@@ -71,22 +71,8 @@ impl Workspace {
     let active_project_problems: Vec<String> =
       project.problems.iter().map(|p| p.description()).collect();
 
-    // Collect project names that have problems (excluding active session).
-    let other_project_names: Vec<String> = self
-      .projects
-      .iter()
-      .enumerate()
-      .filter(|(pi, p)| {
-        let has_project_problems = !p.problems.is_empty();
-        let has_session_problems = p.sessions.iter().any(|(&id, s)| {
-          let is_active = *pi == self.active_project_index && p.active_session == Some(id);
-          !is_active && !s.problems.is_empty()
-        });
-        has_project_problems || has_session_problems
-      })
-      .map(|(_, p)| p.name.clone())
-      .collect();
-    let other_sessions_with_problems = other_project_names.len();
+    // Per-layer session labels for corner indicator.
+    let layer_sessions = self.layer_problem_sessions(cx);
 
     let title_el = {
       let el =
@@ -135,28 +121,64 @@ impl Workspace {
 
     let right_el = {
       let mut el = div().flex().items_center().ml_auto().gap_2();
-      if other_sessions_with_problems > 0 {
-        let names = other_project_names.clone();
-        el = el.child(
-          div()
-            .id("global-problems")
-            .text_xs()
-            .text_color(theme.yellow)
-            .child(other_sessions_with_problems.to_string())
-            .tooltip(move |window, cx| {
-              let names = names.clone();
-              Tooltip::element(move |_window, cx| {
-                let theme = cx.theme();
-                let fg = theme.foreground;
-                let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
-                for name in &names {
-                  col = col.child(div().text_color(fg).child(name.clone()));
-                }
-                col
-              })
-              .build(window, cx)
-            }),
-        );
+      let has_any = layer_sessions.iter().any(|s| !s.is_empty());
+      if has_any {
+        let layer_colors = [theme.red, theme.yellow, theme.blue, theme.muted_foreground];
+        let mut segments = div()
+          .id("global-problems")
+          .flex()
+          .items_center()
+          .gap_0p5()
+          .text_xs();
+        let mut first = true;
+        for (i, sessions) in layer_sessions.iter().enumerate() {
+          if sessions.is_empty() {
+            continue;
+          }
+          if !first {
+            segments = segments.child(
+              div().text_color(theme.muted_foreground).child(" / "),
+            );
+          }
+          first = false;
+          segments = segments.child(
+            div().text_color(layer_colors[i]).child(sessions.len().to_string()),
+          );
+        }
+
+        let sessions_for_tooltip = layer_sessions.clone();
+        segments = segments.tooltip(move |window, cx| {
+          let sessions = sessions_for_tooltip.clone();
+          Tooltip::element(move |_window, cx| {
+            let theme = cx.theme();
+            let layer_colors = [theme.red, theme.yellow, theme.blue, theme.muted_foreground];
+            let layer_labels = ["L0: blocked/error", "L1: review", "L2: send", "L3: idle"];
+            let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
+            for (i, layer) in sessions.iter().enumerate() {
+              if layer.is_empty() {
+                continue;
+              }
+              col = col.child(
+                div()
+                  .text_color(layer_colors[i])
+                  .font_weight(FontWeight::SEMIBOLD)
+                  .child(format!("{}:", layer_labels[i])),
+              );
+              for name in layer {
+                col = col.child(
+                  div()
+                    .text_color(layer_colors[i])
+                    .pl_2()
+                    .child(name.clone()),
+                );
+              }
+            }
+            col
+          })
+          .build(window, cx)
+        });
+
+        el = el.child(segments);
       }
       el.mr_2()
     };

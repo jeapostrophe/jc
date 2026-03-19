@@ -186,21 +186,20 @@ Each view defines its own problem types. Problems are scoped to the level that o
 
 **Session-level problems** (owned by `SessionState`):
 
-| Source | Problem | Trigger | Resolution |
-|---|---|---|---|
-| Claude terminal | `ClaudeProblem::Stop` | Hook event: Claude finishes | User interacts with the session |
-| Claude terminal | `ClaudeProblem::Permission` | Hook event: permission prompt | User interacts with the session |
-| Claude terminal | `ClaudeProblem::Idle` | Hook event: idle prompt | User interacts with the session |
-| Claude terminal | `ClaudeProblem::ApiError` | Hook event: API error | User interacts with the session |
-| General terminal | `TerminalProblem::Bell` | BEL character detected | User focuses the terminal |
-| TODO view | `TodoProblem::UnsentWait` | Content exists below `### WAIT` | Content is sent or removed |
+| Source | Problem | Layer | Trigger | Resolution |
+|---|---|---|---|---|
+| Claude terminal | `ClaudeProblem::Permission` | L0 | Hook event: permission prompt | User interacts with the session |
+| Claude terminal | `ClaudeProblem::StopFailure` | L0 | Hook event: API error (StopFailure) | User interacts with the session |
+| General terminal | `TerminalProblem::Bell` | L1 | BEL character detected | User focuses the terminal |
+| TODO view | `AppTodoProblem::UnsentWait` | L2 | Content exists below `### WAIT` | Content is sent or removed |
+| Session state | *(synthetic L3)* | L3 | `!busy && has_ever_been_busy` | User starts new work |
 
 **Project-level problems** (owned by `ProjectState`):
 
-| Source | Problem | Trigger | Resolution |
-|---|---|---|---|
-| Diff view | `DiffProblem::UnreviewedFile(PathBuf)` | Dirty working tree files | File marked as reviewed |
-| Script | `ScriptProblem { rank, file, line, message }` | `./status.sh` output | Script stops reporting it |
+| Source | Problem | Layer | Trigger | Resolution |
+|---|---|---|---|---|
+| Diff view | `DiffProblem::UnreviewedFile(PathBuf)` | L1 | Dirty working tree files | File marked as reviewed |
+| Script | `ScriptProblem { rank, file, line, message }` | L1 | `./status.sh` output | Script stops reporting it |
 
 ### Problem Type Design
 
@@ -208,12 +207,12 @@ Each view defines its own enum. Aggregation uses wrapper enums at the session an
 
 ```rust
 // Per-view leaf enums (jc-core/src/problem.rs)
-enum ClaudeProblem { Stop, Permission, Idle, ApiError }
+enum ClaudeProblem { Permission, StopFailure }
 enum TerminalProblem { Bell }
 enum DiffProblem { UnreviewedFile(PathBuf) }
 enum AppTodoProblem { UnsentWait { label } }
 
-// Script problems (scaffolded, not yet wired) use the format: {rank:}?file{:line}? - message
+// Script problems use the format: {rank:}?file{:line}? - message
 struct ScriptProblem { rank: Option<i8>, file: PathBuf, line: Option<usize>, message: String }
 
 // Session-level wrapper
@@ -221,11 +220,33 @@ enum SessionProblem { Claude(ClaudeProblem), Terminal(TerminalProblem), Todo(App
 
 // Project-level wrapper
 enum ProjectProblem { Diff(DiffProblem), Script(ScriptProblem) }
+
+// Problem layers (lower = higher priority)
+enum ProblemLayer { L0, L1, L2, L3 }
 ```
 
 Note: `AppTodoProblem` is distinct from the parser-level `TodoProblem` in `jc-core/src/todo.rs`. The parser detects raw conditions (unsent wait); `SessionState::refresh_problems()` converts them into `AppTodoProblem` variants filtered to the session's label.
 
-Each problem type has a `rank()` and `description()` method. Built-in ranks: permission (1) > API error (2) > stop (3) > idle (4) > BEL (5) > unsent wait (6) > unreviewed file (10). Script problems use an explicit optional rank; unranked ones default to 20.
+### Problem Layers
+
+Problems are organized into 4 priority layers. Cmd-; (next problem) processes them in layer order:
+
+| Layer | Problems | Meaning | Scope |
+|---|---|---|---|
+| L0 | Permission, StopFailure | Claude blocked/failed | Cross-session — always handled first |
+| L1 | Terminal Bell, Unreviewed Diffs, Script | Review work | Current session/project |
+| L2 | UnsentWait (suppressed if busy or L1 exists) | Send new work | Current session |
+| L3 | Idle + has_ever_been_busy (synthetic) | Start new work | Current session |
+
+**Cmd-; behavior:**
+1. If any L0 problems exist anywhere, jump to them (cross-session, project-index order). Stores "home session" on first L0 jump.
+2. When all L0 cleared, return to home session and cycle L1/L2/L3.
+3. Within a layer, cycle through individual problems; when a layer is exhausted, advance to the next.
+4. L2 is suppressed when Claude is busy or L1 problems exist (review before sending).
+
+**Corner indicator:** Shows per-layer counts (e.g., `1 / 3 / 0 / 2`) with layer-specific colors: L0=red, L1=yellow, L2=blue, L3=muted. Zero-count layers are omitted. Future work: clickable segments.
+
+Each problem type has a `rank()`, `layer()`, and `description()` method. Ranks are used for intra-layer ordering: permission (1) > StopFailure (2) > BEL (5) > unsent wait (6) > unreviewed file (10). Script problems use an explicit optional rank; unranked ones default to 20.
 
 ### Refresh Model
 
@@ -251,9 +272,7 @@ Problems surface in multiple locations:
 All marker columns use a fixed-width right-aligned layout (`picker_marker_base()`) so single-character markers and multi-digit counts align cleanly.
 
 **Not yet implemented:**
-- Hover tooltips listing individual problems on title bar and global indicator
-- Problem navigation (jump to the view/file that can address each problem kind)
-- Jump to next problem keybinding (Cmd-;)
+- Clickable corner indicator segments (jump directly to a specific layer)
 
 ### Script Problems (`status.sh`)
 
@@ -272,14 +291,6 @@ Where:
 - Everything after ` - ` is the message
 
 The script runs with the project root as cwd. Non-zero exit is not an error — it just means no problems. The app ignores stderr.
-
-### Claude Usage Dashboard
-
-Always visible in a corner. Shows:
-- **5-hour window usage %** and time remaining
-- **Weekly usage %** and time remaining
-- **Par indicator:** compares usage % against elapsed working time %. "Under par" means you have budget to spare; "over par" means you're consuming faster than your pace.
-- Configurable working hours (e.g., exclude Sunday, reduce Saturday) so par calculations reflect actual work schedule, not raw calendar time.
 
 ## Remote Workflow
 
