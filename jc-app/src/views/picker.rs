@@ -762,7 +762,7 @@ fn list_project_files_and_modified(path: &Path) -> (Vec<String>, HashSet<String>
     return (Vec::new(), HashSet::new());
   };
 
-  let files = repo
+  let mut files: Vec<String> = repo
     .index()
     .ok()
     .map(|index| {
@@ -773,7 +773,7 @@ fn list_project_files_and_modified(path: &Path) -> (Vec<String>, HashSet<String>
   let mut opts = git2::StatusOptions::default();
   opts.include_untracked(true).recurse_untracked_dirs(true);
 
-  let modified = repo
+  let modified: HashSet<String> = repo
     .statuses(Some(&mut opts))
     .ok()
     .map(|statuses| {
@@ -791,6 +791,14 @@ fn list_project_files_and_modified(path: &Path) -> (Vec<String>, HashSet<String>
         .collect()
     })
     .unwrap_or_default();
+
+  // Add untracked (new) files to the file list so they appear in the picker.
+  let tracked: HashSet<String> = files.iter().cloned().collect();
+  for path in &modified {
+    if !tracked.contains(path) {
+      files.push(path.clone());
+    }
+  }
 
   (files, modified)
 }

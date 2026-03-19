@@ -1157,6 +1157,23 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    // If the session is disabled, remove the [D] label before adopting.
+    {
+      let project = &self.projects[project_idx];
+      let todo_view = project.todo_view.clone();
+      let is_disabled = todo_view
+        .read(cx)
+        .document()
+        .session_by_label(label)
+        .map_or(false, |s| s.disabled);
+      if is_disabled {
+        todo_view.update(cx, |tv, cx| {
+          tv.toggle_session_disabled(label, window, cx);
+          tv.save(cx);
+        });
+      }
+    }
+
     let project_path = self.projects[project_idx].path.clone();
     let palette = palette_from_window(window);
 
