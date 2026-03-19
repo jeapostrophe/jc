@@ -220,6 +220,10 @@ impl DiffView {
     self.file_diffs.len()
   }
 
+  pub fn editor(&self) -> &Entity<InputState> {
+    &self.editor
+  }
+
   pub fn project_path(&self) -> &Path {
     &self.project_path
   }

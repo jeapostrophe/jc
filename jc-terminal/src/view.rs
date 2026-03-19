@@ -293,6 +293,21 @@ impl TerminalView {
     }
   }
 
+  /// Scroll the terminal scrollback by the given number of lines (positive = down).
+  pub fn scroll_lines(&mut self, lines: i32, cx: &mut Context<Self>) {
+    // Scroll::Delta uses the opposite convention: positive scrolls *up* (toward history).
+    self.state.with_term_mut(|term| {
+      term.scroll_display(Scroll::Delta(-lines));
+    });
+    cx.notify();
+  }
+
+  /// Scroll the terminal scrollback by the given number of pages (positive = down).
+  pub fn scroll_pages(&mut self, pages: i32, cx: &mut Context<Self>) {
+    let rows = self.last_size.lock().1 as i32;
+    self.scroll_lines(pages * rows, cx);
+  }
+
   /// Get the selected text from the terminal, if any.
   pub fn selected_text(&self) -> Option<String> {
     self.state.with_term(|term| term.selection_to_string())

@@ -64,6 +64,9 @@ actions!(
     MoveEnd,
     MovePageUp,
     MovePageDown,
+    SelectPageUp,
+    SelectPageDown,
+    RecenterLine,
     SelectAll,
     SelectToStartOfLine,
     SelectToEndOfLine,
@@ -127,6 +130,9 @@ pub(crate) fn init(cx: &mut App) {
     KeyBinding::new("right", MoveRight, Some(CONTEXT)),
     KeyBinding::new("pageup", MovePageUp, Some(CONTEXT)),
     KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
+    KeyBinding::new("shift-pageup", SelectPageUp, Some(CONTEXT)),
+    KeyBinding::new("shift-pagedown", SelectPageDown, Some(CONTEXT)),
+    KeyBinding::new("ctrl-l", RecenterLine, Some(CONTEXT)),
     KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
     KeyBinding::new("shift-tab", OutdentInline, Some(CONTEXT)),
     #[cfg(target_os = "macos")]
@@ -918,6 +924,48 @@ impl InputState {
     self.select_vertical(1, window, cx);
   }
 
+  pub(super) fn select_page_up(
+    &mut self,
+    _: &SelectPageUp,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.mode.is_single_line() {
+      return;
+    }
+    let Some(last_layout) = &self.last_layout else {
+      return;
+    };
+    let display_lines = (self.input_bounds.size.height / last_layout.line_height) as isize;
+    self.select_vertical(-display_lines, window, cx);
+  }
+
+  pub(super) fn select_page_down(
+    &mut self,
+    _: &SelectPageDown,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.mode.is_single_line() {
+      return;
+    }
+    let Some(last_layout) = &self.last_layout else {
+      return;
+    };
+    let display_lines = (self.input_bounds.size.height / last_layout.line_height) as isize;
+    self.select_vertical(display_lines, window, cx);
+  }
+
+  pub(super) fn recenter_line(
+    &mut self,
+    _: &RecenterLine,
+    _window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let line = self.cursor_position().line;
+    self.scroll_to_center_line(line as u32, cx);
+  }
+
   pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
     self.selected_range = (0..self.text.len()).into();
     cx.notify();
@@ -1456,6 +1504,21 @@ impl InputState {
     scroll_offset.y = scroll_offset.y.min(px(0.));
     self.deferred_scroll_offset = Some(scroll_offset);
     cx.notify();
+  }
+
+  /// Scroll by the given number of lines (positive = down, negative = up).
+  pub fn scroll_by_lines(&mut self, lines: isize, cx: &mut Context<Self>) {
+    let Some(last_layout) = self.last_layout.as_ref() else { return };
+    let delta_y = -(lines as f32) * last_layout.line_height;
+    let old_offset = self.scroll_handle.offset();
+    self.update_scroll_offset(Some(point(old_offset.x, old_offset.y + delta_y)), cx);
+  }
+
+  /// Scroll by the given number of pages (positive = down, negative = up).
+  pub fn scroll_by_pages(&mut self, pages: isize, cx: &mut Context<Self>) {
+    let Some(last_layout) = self.last_layout.as_ref() else { return };
+    let display_lines = (self.input_bounds.size.height / last_layout.line_height) as isize;
+    self.scroll_by_lines(pages * display_lines, cx);
   }
 
   /// Scroll so the given 0-based line is approximately centered vertically.

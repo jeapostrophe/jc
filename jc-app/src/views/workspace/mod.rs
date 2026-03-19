@@ -9,6 +9,7 @@ use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
 use crate::views::session_state::{PendingEvent, SessionId, SessionState};
 use gpui::*;
+use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
@@ -45,8 +46,17 @@ actions!(
     JumpToWait,
     RotateNextProject,
     ShowKeybindingHelp,
+    ScrollOtherUp,
+    ScrollOtherDown,
+    ScrollOtherPageUp,
+    ScrollOtherPageDown,
   ]
 );
+
+enum OtherPaneScrollable {
+  Editor(Entity<InputState>),
+  Terminal(Entity<TerminalView>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneLayout {
@@ -600,6 +610,99 @@ impl Workspace {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Scroll other pane
+  // ---------------------------------------------------------------------------
+
+  /// Returns the index of the leftmost non-active visible pane, if any.
+  fn other_pane_index(&self) -> Option<usize> {
+    let visible = self.visible_pane_count();
+    (0..visible).find(|&i| i != self.active_pane_index)
+  }
+
+  /// Resolve the other pane's scrollable target into a concrete entity.
+  fn other_pane_scrollable(&self, cx: &App) -> Option<OtherPaneScrollable> {
+    let idx = self.other_pane_index()?;
+    let kind = self.panes[idx].read(cx).content_kind()?;
+    let project = self.active_project();
+    match kind {
+      PaneContentKind::CodeViewer => {
+        Some(OtherPaneScrollable::Editor(project.code_view.read(cx).editor().clone()))
+      }
+      PaneContentKind::GitDiff => {
+        Some(OtherPaneScrollable::Editor(project.diff_view.read(cx).editor().clone()))
+      }
+      PaneContentKind::TodoEditor => {
+        let editor = project.todo_view.read(cx).code_view().read(cx).editor().clone();
+        Some(OtherPaneScrollable::Editor(editor))
+      }
+      PaneContentKind::GlobalTodo => {
+        Some(OtherPaneScrollable::Editor(self.global_todo_view.read(cx).editor().clone()))
+      }
+      PaneContentKind::ClaudeTerminal => {
+        project.active_session().map(|s| OtherPaneScrollable::Terminal(s.claude_terminal.clone()))
+      }
+      PaneContentKind::GeneralTerminal => {
+        project.active_session().map(|s| OtherPaneScrollable::Terminal(s.general_terminal.clone()))
+      }
+    }
+  }
+
+  fn scroll_other_by(&mut self, lines: isize, cx: &mut Context<Self>) {
+    match self.other_pane_scrollable(cx) {
+      Some(OtherPaneScrollable::Editor(e)) => {
+        e.update(cx, |s, cx| s.scroll_by_lines(lines, cx));
+      }
+      Some(OtherPaneScrollable::Terminal(t)) => {
+        t.update(cx, |tv, cx| tv.scroll_lines(lines as i32, cx));
+      }
+      None => {}
+    }
+  }
+
+  fn scroll_other_by_pages(&mut self, pages: isize, cx: &mut Context<Self>) {
+    match self.other_pane_scrollable(cx) {
+      Some(OtherPaneScrollable::Editor(e)) => {
+        e.update(cx, |s, cx| s.scroll_by_pages(pages, cx));
+      }
+      Some(OtherPaneScrollable::Terminal(t)) => {
+        t.update(cx, |tv, cx| tv.scroll_pages(pages as i32, cx));
+      }
+      None => {}
+    }
+  }
+
+  fn scroll_other_up(&mut self, _: &ScrollOtherUp, _window: &mut Window, cx: &mut Context<Self>) {
+    self.scroll_other_by(-3, cx);
+  }
+
+  fn scroll_other_down(
+    &mut self,
+    _: &ScrollOtherDown,
+    _window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.scroll_other_by(3, cx);
+  }
+
+  fn scroll_other_page_up(
+    &mut self,
+    _: &ScrollOtherPageUp,
+    _window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.scroll_other_by_pages(-1, cx);
+  }
+
+  fn scroll_other_page_down(
+    &mut self,
+    _: &ScrollOtherPageDown,
+    _window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.scroll_other_by_pages(1, cx);
+  }
+
   fn set_layout(&mut self, layout: PaneLayout, window: &mut Window, cx: &mut Context<Self>) {
     self.layout = layout;
     let count = self.visible_pane_count();
@@ -836,16 +939,16 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let project_changed = project_idx != self.active_project_index;
-
-    // Save the current project's pane layout before switching away.
-    if project_changed {
-      let saved = SavedPaneLayout {
-        pane_kinds: std::array::from_fn(|i| self.panes[i].read(cx).content_kind()),
-        active_pane_index: self.active_pane_index,
-      };
-      self.projects[self.active_project_index].saved_layout = Some(saved);
+    // Save the current session's pane layout before switching away.
+    let saved = SavedPaneLayout {
+      pane_kinds: std::array::from_fn(|i| self.panes[i].read(cx).content_kind()),
+      active_pane_index: self.active_pane_index,
+    };
+    if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
+      session.saved_layout = Some(saved);
     }
+
+    let project_changed = project_idx != self.active_project_index;
 
     self.active_project_index = project_idx;
     self.projects[project_idx].active_session = session_id;
@@ -869,11 +972,7 @@ impl Workspace {
     // Refresh problems after acknowledge.
     self.projects[project_idx].refresh_problems(cx);
 
-    if project_changed {
-      self.restore_or_default_panes(window, cx);
-    } else {
-      self.rebind_session_panes(window, cx);
-    }
+    self.restore_or_default_panes(window, cx);
 
     cx.notify();
   }
@@ -923,13 +1022,13 @@ impl Workspace {
     }
   }
 
-  /// Restore saved pane contents for the active project, or use defaults.
+  /// Restore saved pane contents for the active session, or use defaults.
   /// The pane layout (1/2/3) is window-level and not restored here.
   fn restore_or_default_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     // Copy saved layout data to avoid borrow conflict with set_pane_view.
     let saved = self.projects[self.active_project_index]
-      .saved_layout
-      .as_ref()
+      .active_session()
+      .and_then(|s| s.saved_layout.as_ref())
       .map(|s| (s.pane_kinds, s.active_pane_index));
 
     if let Some((kinds, active)) = saved {
@@ -949,38 +1048,6 @@ impl Workspace {
       self.panes[0].read(cx).focus_content(window);
       self.active_pane_index = 0;
     }
-  }
-
-  /// When switching sessions within the same project, swap session-bound views
-  /// in-place (Claude terminal, general terminal, reply viewer) without
-  /// disturbing the pane layout or non-session views.
-  fn rebind_session_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    if self.projects[self.active_project_index].active_session().is_none() {
-      return;
-    }
-
-    // Collect which panes need rebinding (avoids borrow conflict with set_pane_view).
-    let mut to_rebind: Vec<(usize, PaneContentKind)> = Vec::new();
-    for i in 0..self.panes.len() {
-      if let Some(kind) = self.panes[i].read(cx).content_kind() {
-        match kind {
-          PaneContentKind::ClaudeTerminal
-          | PaneContentKind::GeneralTerminal => to_rebind.push((i, kind)),
-          _ => {}
-        }
-      }
-    }
-
-    if to_rebind.is_empty() {
-      // No pane shows a session view; put claude terminal in active pane.
-      self.set_pane_view(self.active_pane_index, PaneContentKind::ClaudeTerminal, cx);
-    } else {
-      for (i, kind) in to_rebind {
-        self.set_pane_view(i, kind, cx);
-      }
-    }
-
-    self.panes[self.active_pane_index].read(cx).focus_content(window);
   }
 
   /// Set a specific pane to show a view kind from the active project/session.
@@ -1516,6 +1583,10 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-shift-c", CopyReply, Some("Workspace")),
     KeyBinding::new("cmd-`", RotateNextProject, Some("Workspace")),
     KeyBinding::new("cmd-?", ShowKeybindingHelp, Some("Workspace")),
+    KeyBinding::new("cmd-alt-up", ScrollOtherUp, Some("Workspace")),
+    KeyBinding::new("cmd-alt-down", ScrollOtherDown, Some("Workspace")),
+    KeyBinding::new("cmd-alt-pageup", ScrollOtherPageUp, Some("Workspace")),
+    KeyBinding::new("cmd-alt-pagedown", ScrollOtherPageDown, Some("Workspace")),
   ]);
 
   cx.bind_keys([
@@ -1527,5 +1598,9 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Input")),
     KeyBinding::new("cmd-.", JumpToWait, Some("Input")),
     KeyBinding::new("cmd-`", RotateNextProject, Some("Input")),
+    KeyBinding::new("cmd-alt-up", ScrollOtherUp, Some("Input")),
+    KeyBinding::new("cmd-alt-down", ScrollOtherDown, Some("Input")),
+    KeyBinding::new("cmd-alt-pageup", ScrollOtherPageUp, Some("Input")),
+    KeyBinding::new("cmd-alt-pagedown", ScrollOtherPageDown, Some("Input")),
   ]);
 }
