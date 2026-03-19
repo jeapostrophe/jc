@@ -35,6 +35,7 @@ const SECTIONS: &[Section] = &[
       ("Cmd-.", "Jump to WAIT"),
       ("Cmd-Shift-C", "Copy reply (/copy)"),
       ("Cmd-?", "Keybinding help"),
+      ("Cmd-D", "Toggle Code/Diff for file"),
       ("Cmd-Shift-E", "Open in external editor"),
       ("Cmd-W", "Close window"),
       ("Cmd-M", "Minimize window"),
