@@ -1594,6 +1594,7 @@ impl Workspace {
           {
             session.busy = true;
             session.has_ever_been_busy = true;
+            session.pending_events.remove(&PendingEvent::ClaudePermission);
             found = true;
             break;
           }
@@ -1608,6 +1609,7 @@ impl Workspace {
               session.uuid = Some(session_uuid.clone());
               session.busy = true;
               session.has_ever_been_busy = true;
+              session.pending_events.remove(&PendingEvent::ClaudePermission);
               // Update TODO.md with the new UUID.
               let label = session.label.clone();
               project.todo_view.update(cx, |tv, cx| {
@@ -1648,6 +1650,8 @@ impl Workspace {
         {
           if clears_busy {
             session.busy = false;
+            // Claude has progressed past any permission prompt.
+            session.pending_events.remove(&PendingEvent::ClaudePermission);
           }
           if let Some(ref pe) = pending {
             session.pending_events.insert(pe.clone());
@@ -1668,6 +1672,7 @@ impl Workspace {
             session.uuid = Some(session_uuid.clone());
             if clears_busy {
               session.busy = false;
+              session.pending_events.remove(&PendingEvent::ClaudePermission);
             }
             if let Some(ref pe) = pending {
               session.pending_events.insert(pe.clone());
