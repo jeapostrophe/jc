@@ -956,6 +956,25 @@ impl Element for TextElement {
     self.state.update(cx, |state, cx| {
       state.text_wrapper.set_font(font, text_size, cx);
       state.text_wrapper.prepare_if_need(&state.text, cx);
+
+      // Resolve any deferred center-line request now that layout data is available.
+      if let Some(line) = state.deferred_center_line.take() {
+        let lh = window.line_height();
+        let viewport_height = state.input_bounds.size.height;
+        let mut row_offset_y = px(0.);
+        for (ix, wrap_line) in state.text_wrapper.lines.iter().enumerate() {
+          if ix == line as usize {
+            break;
+          }
+          row_offset_y += wrap_line.height(lh);
+        }
+        let centered_y = -(row_offset_y - viewport_height / 2.0 + lh / 2.0);
+        let scroll_offset = point(
+          state.deferred_scroll_offset.map(|o| o.x).unwrap_or(state.scroll_handle.offset().x),
+          centered_y.min(px(0.)),
+        );
+        state.deferred_scroll_offset = Some(scroll_offset);
+      }
     });
 
     let state = self.state.read(cx);

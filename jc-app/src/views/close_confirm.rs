@@ -18,12 +18,18 @@ pub enum CloseConfirmEvent {
 pub struct CloseConfirm {
   focus: FocusHandle,
   session_count: usize,
+  conflicts: Vec<String>,
   is_quit: bool,
 }
 
 impl CloseConfirm {
-  pub fn new(session_count: usize, is_quit: bool, cx: &mut Context<Self>) -> Self {
-    Self { focus: cx.focus_handle(), session_count, is_quit }
+  pub fn new(
+    session_count: usize,
+    conflicts: Vec<String>,
+    is_quit: bool,
+    cx: &mut Context<Self>,
+  ) -> Self {
+    Self { focus: cx.focus_handle(), session_count, conflicts, is_quit }
   }
 }
 
@@ -40,12 +46,25 @@ impl Render for CloseConfirm {
     let theme = cx.theme();
 
     let action = if self.is_quit { "Quit" } else { "Close" };
-    let message = if self.session_count == 0 {
-      "All sessions are idle. They will be terminated.".to_string()
-    } else {
+
+    let mut messages: Vec<String> = Vec::new();
+
+    if self.session_count > 0 {
       let sessions = if self.session_count == 1 { "session" } else { "sessions" };
-      format!("{} active Claude {} will be terminated.", self.session_count, sessions)
-    };
+      messages.push(format!(
+        "{} active Claude {} will be terminated.",
+        self.session_count, sessions
+      ));
+    }
+
+    if !self.conflicts.is_empty() {
+      let files = self.conflicts.join(", ");
+      messages.push(format!("Unsaved conflicts: {files}"));
+    }
+
+    if messages.is_empty() {
+      messages.push("All sessions are idle. They will be terminated.".to_string());
+    }
 
     div()
       .id("close-confirm")
@@ -78,7 +97,9 @@ impl Render for CloseConfirm {
               .text_color(theme.foreground)
               .child(format!("{action}?")),
           )
-          .child(div().text_color(theme.foreground).child(message))
+          .children(messages.into_iter().map(|msg| {
+            div().text_color(theme.foreground).child(msg)
+          }))
           .child(
             div()
               .flex()

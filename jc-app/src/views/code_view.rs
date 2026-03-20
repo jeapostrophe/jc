@@ -143,6 +143,10 @@ impl CodeView {
     self.editor.read(cx).value().as_ref() != self.base_content
   }
 
+  pub fn has_conflict(&self) -> bool {
+    self.externally_modified
+  }
+
   pub fn editor(&self) -> &Entity<InputState> {
     &self.editor
   }

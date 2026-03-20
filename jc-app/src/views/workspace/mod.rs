@@ -524,8 +524,7 @@ impl Workspace {
     if self.close_confirm.is_some() {
       return;
     }
-    let active = self.active_session_count();
-    self.show_close_confirm(active, false, window, cx);
+    self.try_close(false, window, cx);
   }
 
   fn minimize_window(&mut self, _: &MinimizeWindow, window: &mut Window, _cx: &mut Context<Self>) {
@@ -536,8 +535,65 @@ impl Workspace {
     if self.close_confirm.is_some() {
       return;
     }
+    self.try_close(true, window, cx);
+  }
+
+  /// Auto-save dirty buffers and close/quit. Shows confirm dialog if there
+  /// are active sessions or buffers with merge conflicts that can't be saved.
+  fn try_close(&mut self, is_quit: bool, window: &mut Window, cx: &mut Context<Self>) {
+    let conflicts = self.save_all_dirty(cx);
     let active = self.active_session_count();
-    self.show_close_confirm(active, true, window, cx);
+
+    if conflicts.is_empty() && active == 0 {
+      // Nothing to warn about — just close.
+      if is_quit {
+        cx.quit();
+      } else {
+        window.remove_window();
+      }
+    } else {
+      self.show_close_confirm(active, conflicts, is_quit, window, cx);
+    }
+  }
+
+  /// Save all dirty buffers (TODO views, code views, global TODO).
+  /// Returns a list of file names that had merge conflicts and couldn't be saved.
+  fn save_all_dirty(&mut self, cx: &mut Context<Self>) -> Vec<String> {
+    let mut conflicts = Vec::new();
+
+    for project in &self.projects {
+      // TODO view
+      if project.todo_view.read(cx).is_dirty(cx) {
+        project.todo_view.update(cx, |tv, cx| tv.save(cx));
+      }
+
+      // Per-session code views
+      for session in project.sessions.values() {
+        let cv = session.code_view.read(cx);
+        if cv.is_dirty(cx) {
+          if cv.has_conflict() {
+            if let Some(path) = cv.file_path() {
+              let relative = path.strip_prefix(&project.path).unwrap_or(path);
+              conflicts.push(relative.display().to_string());
+            }
+          } else {
+            drop(cv);
+            session.code_view.update(cx, |v, cx| v.save(cx));
+          }
+        }
+      }
+    }
+
+    // Global TODO
+    if self.global_todo_view.read(cx).is_dirty(cx) {
+      if self.global_todo_view.read(cx).has_conflict() {
+        conflicts.push("~/.claude/TODO.md".to_string());
+      } else {
+        self.global_todo_view.update(cx, |v, cx| v.save(cx));
+      }
+    }
+
+    conflicts
   }
 
   /// Count sessions that are actively working (not idle/stopped).
@@ -553,13 +609,14 @@ impl Workspace {
   fn show_close_confirm(
     &mut self,
     session_count: usize,
+    conflicts: Vec<String>,
     is_quit: bool,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     self.close_confirm_is_quit = is_quit;
     self.pre_close_confirm_focus = window.focused(cx);
-    let view = cx.new(|cx| CloseConfirm::new(session_count, is_quit, cx));
+    let view = cx.new(|cx| CloseConfirm::new(session_count, conflicts, is_quit, cx));
     let sub = cx.subscribe_in(&view, window, |this: &mut Self, _, event, window, cx| {
       match event {
         CloseConfirmEvent::Confirmed => {

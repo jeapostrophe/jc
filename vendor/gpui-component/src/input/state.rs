@@ -305,6 +305,9 @@ pub struct InputState {
   pub(crate) scroll_handle: ScrollHandle,
   /// The deferred scroll offset to apply on next layout.
   pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
+  /// Deferred center-line request — resolved into `deferred_scroll_offset` during prepaint
+  /// when layout data is available.
+  pub(crate) deferred_center_line: Option<u32>,
   /// The size of the scrollable content.
   pub(crate) scroll_size: gpui::Size<Pixels>,
 
@@ -413,6 +416,7 @@ impl InputState {
       scroll_handle: ScrollHandle::new(),
       scroll_size: gpui::size(px(0.), px(0.)),
       deferred_scroll_offset: None,
+      deferred_center_line: None,
       preferred_column: None,
       placeholder: SharedString::default(),
       mask_pattern: MaskPattern::default(),
@@ -1523,7 +1527,12 @@ impl InputState {
 
   /// Scroll so the given 0-based line is approximately centered vertically.
   pub fn scroll_to_center_line(&mut self, line: u32, cx: &mut Context<Self>) {
-    let Some(last_layout) = self.last_layout.as_ref() else { return };
+    let Some(last_layout) = self.last_layout.as_ref() else {
+      // Layout not yet available — defer until prepaint.
+      self.deferred_center_line = Some(line);
+      cx.notify();
+      return;
+    };
     let line_height = last_layout.line_height;
     let viewport_height = self.input_bounds.size.height;
 
