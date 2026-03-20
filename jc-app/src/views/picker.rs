@@ -307,7 +307,7 @@ impl<D: PickerDelegate> Render for PickerState<D> {
       .on_action(cx.listener(Self::delete_selected))
       .font_family("Lilex")
       .w(px(500.0))
-      .max_h(px(400.0))
+      .max_h_full()
       .bg(theme.background)
       .border_1()
       .border_color(theme.border)

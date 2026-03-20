@@ -316,7 +316,12 @@ impl TerminalView {
   fn grid_point_and_side(&self, pos: gpui::Point<Pixels>, layout: CellLayout) -> (Point, Side) {
     let origin = *self.canvas_origin.lock();
     let (cols, rows) = *self.last_size.lock();
-    pixel_to_grid(pos, origin, layout, cols, rows)
+    let (mut point, side) = pixel_to_grid(pos, origin, layout, cols, rows);
+    // Adjust for scroll position: when scrolled back into history,
+    // visible row 0 is at Line(-display_offset) in grid coordinates.
+    let display_offset = self.state.with_term(|t| t.grid().display_offset() as i32);
+    point.line = Line(point.line.0 - display_offset);
+    (point, side)
   }
 
   fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {
@@ -429,6 +434,33 @@ impl TerminalView {
     let _ = self.pty.write_all(b"\x1b[13;2u");
   }
 
+  /// Send a mouse event to the PTY in SGR or legacy format.
+  /// `button`: 0 = left click, 32 = motion with button held.
+  /// `pressed`: true for press/motion, false for release.
+  fn send_mouse_event(
+    &mut self,
+    button: u8,
+    pressed: bool,
+    position: gpui::Point<Pixels>,
+    layout: CellLayout,
+  ) {
+    let (point, _) = self.grid_point_and_side(position, layout);
+    let col = point.column.0 + 1;
+    let row = point.line.0 + 1;
+    let sgr = self.state.with_term(|t| t.mode().contains(TermMode::SGR_MOUSE));
+    if sgr {
+      let suffix = if pressed { 'M' } else { 'm' };
+      let seq = format!("\x1b[<{button};{col};{row}{suffix}");
+      let _ = self.pty.write_all(seq.as_bytes());
+    } else {
+      let cb = (button + 32) as u8;
+      let cx_byte = (col as u8).saturating_add(32);
+      let cy_byte = (row as u8).saturating_add(32);
+      let seq = [b'\x1b', b'[', b'M', cb, cx_byte, cy_byte];
+      let _ = self.pty.write_all(&seq);
+    }
+  }
+
   fn mouse_down(&mut self, position: gpui::Point<Pixels>, click_count: usize, layout: CellLayout) {
     let (point, side) = self.grid_point_and_side(position, layout);
     let selection_type = match click_count {
@@ -510,20 +542,35 @@ impl Render for TerminalView {
       .on_mouse_down(
         MouseButton::Left,
         cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-          this.mouse_down(event.position, event.click_count, layout);
+          let mouse_mode = this.state.with_term(|t| t.mode().intersects(TermMode::MOUSE_MODE));
+          if mouse_mode && !event.modifiers.shift {
+            this.send_mouse_event(0, true, event.position, layout);
+          } else {
+            this.mouse_down(event.position, event.click_count, layout);
+          }
           cx.notify();
         }),
       )
       .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
         if event.dragging() {
-          this.mouse_drag(event.position, layout);
+          let mouse_mode = this.state.with_term(|t| t.mode().intersects(TermMode::MOUSE_MODE));
+          if mouse_mode && !event.modifiers.shift {
+            this.send_mouse_event(32, true, event.position, layout);
+          } else {
+            this.mouse_drag(event.position, layout);
+          }
           cx.notify();
         }
       }))
       .on_mouse_up(
         MouseButton::Left,
         cx.listener(move |this, event: &MouseUpEvent, _window, cx| {
-          this.mouse_up(event.position, event.click_count, layout);
+          let mouse_mode = this.state.with_term(|t| t.mode().intersects(TermMode::MOUSE_MODE));
+          if mouse_mode && !event.modifiers.shift {
+            this.send_mouse_event(0, false, event.position, layout);
+          } else {
+            this.mouse_up(event.position, event.click_count, layout);
+          }
           cx.notify();
         }),
       )

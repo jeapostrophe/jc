@@ -824,36 +824,58 @@ impl Workspace {
 
   /// Toggle between Code and Diff views for the current file.
   fn toggle_code_diff(&mut self, _: &ToggleCodeDiff, window: &mut Window, cx: &mut Context<Self>) {
+    use crate::views::diff_view::source_line_to_diff_line;
+
     let kind = self.active_pane_entity().read(cx).content_kind();
     let pi = self.active_project_index;
 
     match kind {
       Some(PaneContentKind::CodeViewer) => {
-        // Grab relative path before mutating.
-        let relative = {
+        // Grab relative path and current source line before mutating.
+        let (relative, source_line) = {
           let project = &self.projects[pi];
-          project.code_view().and_then(|cv| {
+          let rel = project.code_view().and_then(|cv| {
             let cv = cv.read(cx);
             cv.file_path().and_then(|p| {
               p.strip_prefix(&project.path).ok().map(|r| r.to_string_lossy().into_owned())
             })
-          })
+          });
+          let line = project.code_view().map(|cv| cv.read(cx).editor().read(cx).cursor_position().line + 1);
+          (rel, line)
         };
         self.set_active_pane_view(PaneContentKind::GitDiff, window, cx);
         if let Some(name) = relative {
           let diff_view = self.projects[pi].diff_view.clone();
           let idx = diff_view.read(cx).file_diffs().iter().position(|fd| fd.name == name);
           if let Some(idx) = idx {
-            diff_view.update(cx, |v, cx| v.set_file_index(idx, window, cx));
+            diff_view.update(cx, |v, cx| {
+              v.set_file_index(idx, window, cx);
+              // Scroll diff to the source line.
+              if let Some(src_line) = source_line {
+                if let Some(content) = v.current_file_content() {
+                  if let Some(diff_line) = source_line_to_diff_line(content, src_line) {
+                    v.scroll_to_line(diff_line, window, cx);
+                  }
+                }
+              }
+            });
           }
         }
       }
       Some(PaneContentKind::GitDiff) => {
-        let file_name = self.projects[pi].diff_view.read(cx).current_file_name().map(str::to_string);
+        let (file_name, source_line) = {
+          let dv = self.projects[pi].diff_view.read(cx);
+          (dv.current_file_name().map(str::to_string), dv.cursor_source_line(cx))
+        };
         if let Some(name) = file_name {
           let full_path = self.projects[pi].path.join(&name);
           if let Some(cv) = self.projects[pi].code_view().cloned() {
-            cv.update(cx, |v, cx| v.open_file(full_path, window, cx));
+            cv.update(cx, |v, cx| {
+              v.open_file(full_path, window, cx);
+              if let Some(line) = source_line {
+                v.scroll_to_line(line, window, cx);
+              }
+            });
           }
           self.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
         }
@@ -1037,16 +1059,16 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     // Build a flat list of (project_index, session_id) in deterministic order.
+    // Skip projects with no attached sessions.
     let mut slots: Vec<(usize, Option<SessionId>)> = Vec::new();
     for (pi, project) in self.projects.iter().enumerate() {
       if project.sessions.is_empty() {
-        slots.push((pi, None));
-      } else {
-        let mut ids: Vec<SessionId> = project.sessions.keys().copied().collect();
-        ids.sort();
-        for id in ids {
-          slots.push((pi, Some(id)));
-        }
+        continue;
+      }
+      let mut ids: Vec<SessionId> = project.sessions.keys().copied().collect();
+      ids.sort();
+      for id in ids {
+        slots.push((pi, Some(id)));
       }
     }
     if slots.len() <= 1 {
@@ -1508,13 +1530,35 @@ impl Workspace {
     if matches!(event.kind, HookEventKind::PromptSubmit) {
       let session_uuid = &event.session_id;
       if !session_uuid.is_empty() {
+        let mut found = false;
         for project in &mut self.projects {
           if let Some(session) =
             project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(session_uuid))
           {
             session.busy = true;
             session.has_ever_been_busy = true;
+            found = true;
             break;
+          }
+        }
+        // If no UUID match, assign to a pending (uuid=None) session in the matching project.
+        if !found {
+          for project in &mut self.projects {
+            if event.project_path.as_deref() != Some(project.path.as_path()) {
+              continue;
+            }
+            if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
+              session.uuid = Some(session_uuid.clone());
+              session.busy = true;
+              session.has_ever_been_busy = true;
+              // Update TODO.md with the new UUID.
+              let label = session.label.clone();
+              project.todo_view.update(cx, |tv, cx| {
+                tv.update_session_uuid(&label, session_uuid, &mut *window, cx);
+                tv.save(cx);
+              });
+              break;
+            }
           }
         }
       }
@@ -1537,44 +1581,50 @@ impl Workspace {
 
     let session_uuid = &event.session_id;
     if !session_uuid.is_empty() {
+      let mut found = false;
+      // First pass: find an existing session with this UUID.
       for project in &mut self.projects {
-        let found = project
+        if let Some(session) = project
           .sessions
           .values_mut()
-          .find(|s| s.uuid.as_deref() == Some(session_uuid));
-        if let Some(session) = found {
+          .find(|s| s.uuid.as_deref() == Some(session_uuid))
+        {
           if clears_busy {
             session.busy = false;
           }
           if let Some(ref pe) = pending {
-            let is_new = session.pending_events.insert(pe.clone());
-            if is_new {
-              matched_project = Some(project.name.clone());
-              matched_label = Some(session.label.clone());
-            }
+            session.pending_events.insert(pe.clone());
           }
+          matched_project = Some(project.name.clone());
+          matched_label = Some(session.label.clone());
+          found = true;
           break;
         }
-        // If no UUID match, try to assign to a pending (uuid=None) session.
-        if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
-          session.uuid = Some(session_uuid.clone());
-          if clears_busy {
-            session.busy = false;
+      }
+      // Fallback: assign UUID to a pending (uuid=None) session in the matching project.
+      if !found {
+        for project in &mut self.projects {
+          if event.project_path.as_deref() != Some(project.path.as_path()) {
+            continue;
           }
-          if let Some(ref pe) = pending {
-            let is_new = session.pending_events.insert(pe.clone());
+          if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
+            session.uuid = Some(session_uuid.clone());
+            if clears_busy {
+              session.busy = false;
+            }
+            if let Some(ref pe) = pending {
+              session.pending_events.insert(pe.clone());
+            }
             // Update TODO.md with the new UUID.
             let label = session.label.clone();
             project.todo_view.update(cx, |tv, cx| {
               tv.update_session_uuid(&label, session_uuid, &mut *window, cx);
               tv.save(cx);
             });
-            if is_new {
-              matched_project = Some(project.name.clone());
-              matched_label = Some(label);
-            }
+            matched_project = Some(project.name.clone());
+            matched_label = Some(label);
+            break;
           }
-          break;
         }
       }
     }

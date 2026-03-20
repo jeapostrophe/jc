@@ -291,7 +291,7 @@ fn modal_overlay(content: &AnyView) -> Deferred {
       .left_0()
       .flex()
       .justify_center()
-      .pt(px(80.0))
+      .py(px(80.0))
       .bg(hsla(0., 0., 0., 0.3))
       .on_mouse_down(MouseButton::Left, |_, _, _cx| {})
       .child(content.clone()),

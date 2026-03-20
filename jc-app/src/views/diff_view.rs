@@ -137,14 +137,22 @@ impl DiffView {
         .iter()
         .zip(self.file_diffs.iter())
         .any(|(a, b)| a.name != b.name || a.checksum != b.checksum);
+    // Preserve the current file across refresh if it still exists.
+    let current_name =
+      self.file_diffs.get(self.current_file_index).map(|fd| fd.name.clone());
+
     self.file_diffs = new_diffs;
 
     self.reviewed.retain(|name, checksum| {
       self.file_diffs.iter().any(|fd| fd.name == *name && fd.checksum == *checksum)
     });
 
-    self.current_file_index =
-      self.file_diffs.iter().position(|fd| !self.is_reviewed(&fd.name)).unwrap_or(0);
+    // Try to stay on the same file; fall back to first unreviewed.
+    self.current_file_index = current_name
+      .and_then(|name| self.file_diffs.iter().position(|fd| fd.name == name))
+      .unwrap_or_else(|| {
+        self.file_diffs.iter().position(|fd| !self.is_reviewed(&fd.name)).unwrap_or(0)
+      });
 
     changed
   }
@@ -238,14 +246,35 @@ impl DiffView {
 
   pub fn comment_context(&self, cx: &App) -> Option<CommentContext> {
     let file_name = self.current_file_name()?;
-    let (start, end) = super::selection_line_range(&self.editor, cx);
-    let lines = super::format_line_range(start, end);
+    let (diff_start, diff_end) = super::selection_line_range(&self.editor, cx);
+    let diff_content = self.current_file_content()?;
     let source_prefix = match &self.source {
       DiffSource::WorkingTree => String::default(),
       DiffSource::Commit { oid, .. } => format!("{:.7}:", oid),
     };
+    // Map diff editor lines to source file lines for the comment.
+    let lines = if let Some((src_start, src_end)) =
+      diff_selection_to_source_range(diff_content, diff_start, diff_end)
+    {
+      super::format_line_range(src_start, src_end)
+    } else {
+      super::format_line_range(diff_start, diff_end)
+    };
     let prefilled = format!("* git-diff:{source_prefix}{file_name}:{lines} \u{2014} ");
     Some(CommentContext { prefilled })
+  }
+
+  /// Returns the content of the current file diff, if any.
+  pub fn current_file_content(&self) -> Option<&str> {
+    self.file_diffs.get(self.current_file_index).map(|fd| fd.content.as_str())
+  }
+
+  /// Map the current diff editor cursor position to a 1-based source file line.
+  pub fn cursor_source_line(&self, cx: &App) -> Option<u32> {
+    let content = self.current_file_content()?;
+    let pos = self.editor.read(cx).cursor_position();
+    let diff_line = pos.line + 1; // 0-based → 1-based
+    diff_line_to_source_line(content, diff_line)
   }
 
   pub fn current_file_language(&self) -> Language {
@@ -446,4 +475,119 @@ fn git_log_inner(path: &Path) -> Result<Vec<GitLogEntry>, git2::Error> {
   }
 
   Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
+// Diff ↔ source line mapping
+// ---------------------------------------------------------------------------
+
+/// Map a 1-based diff editor line to a 1-based source file line.
+/// Returns `None` for header lines, deleted lines, or lines outside any hunk.
+pub fn diff_line_to_source_line(diff_content: &str, diff_line: u32) -> Option<u32> {
+  let mut current_source_line: u32 = 0;
+  let mut in_hunk = false;
+
+  for (i, line) in diff_content.lines().enumerate() {
+    let editor_line = (i + 1) as u32; // 1-based
+
+    if line.starts_with("@@") {
+      // Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
+      if let Some(new_start) = parse_hunk_new_start(line) {
+        current_source_line = new_start;
+        in_hunk = true;
+      }
+      if editor_line == diff_line {
+        return Some(current_source_line);
+      }
+      continue;
+    }
+
+    if !in_hunk {
+      if editor_line == diff_line {
+        return None; // Header lines before any hunk
+      }
+      continue;
+    }
+
+    if editor_line == diff_line {
+      return match line.as_bytes().first() {
+        Some(b'-') => None,            // Deleted line — no source equivalent
+        Some(b'+') | Some(b' ') => Some(current_source_line),
+        _ => Some(current_source_line),
+      };
+    }
+
+    // Advance source line counter
+    match line.as_bytes().first() {
+      Some(b'-') => {}                  // Deleted line — doesn't advance source
+      Some(b'+') | Some(b' ') => current_source_line += 1,
+      _ => current_source_line += 1,    // Context or other
+    }
+  }
+
+  None
+}
+
+/// Map a 1-based source file line to the best 1-based diff editor line.
+/// Returns the first diff line in the hunk that contains the source line,
+/// preferring `+` (added) lines, then context lines.
+pub fn source_line_to_diff_line(diff_content: &str, source_line: u32) -> Option<u32> {
+  let mut current_source_line: u32 = 0;
+  let mut in_hunk = false;
+  let mut best: Option<u32> = None;
+
+  for (i, line) in diff_content.lines().enumerate() {
+    let editor_line = (i + 1) as u32;
+
+    if line.starts_with("@@") {
+      if let Some(new_start) = parse_hunk_new_start(line) {
+        current_source_line = new_start;
+        in_hunk = true;
+      }
+      continue;
+    }
+
+    if !in_hunk {
+      continue;
+    }
+
+    match line.as_bytes().first() {
+      Some(b'-') => {} // Deleted line — no source line
+      Some(b'+') | Some(b' ') | _ => {
+        if current_source_line == source_line {
+          return Some(editor_line);
+        }
+        if current_source_line > source_line && best.is_none() {
+          // Passed the target — use the hunk header or closest prior line
+          best = Some(editor_line);
+        }
+        current_source_line += 1;
+      }
+    }
+  }
+
+  best
+}
+
+/// Parse the `+new_start` from a `@@ -a,b +c,d @@` hunk header.
+fn parse_hunk_new_start(line: &str) -> Option<u32> {
+  let plus = line.find('+')? + 1;
+  let rest = &line[plus..];
+  let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+  rest[..end].parse().ok()
+}
+
+/// Map 1-based diff editor line range to 1-based source file line range.
+pub fn diff_selection_to_source_range(
+  diff_content: &str,
+  diff_start: u32,
+  diff_end: u32,
+) -> Option<(u32, u32)> {
+  let start = diff_line_to_source_line(diff_content, diff_start)?;
+  // For end, walk backwards from diff_end to find a valid source line.
+  let end = (diff_start..=diff_end)
+    .rev()
+    .find_map(|dl| diff_line_to_source_line(diff_content, dl))
+    .unwrap_or(start);
+  Some((start, end))
 }
