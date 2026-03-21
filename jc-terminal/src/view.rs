@@ -17,6 +17,7 @@ use gpui::{
 use parking_lot::Mutex;
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -118,6 +119,12 @@ pub struct TerminalView {
   cached_layout: Option<CellLayout>,
   /// Canvas origin stored during paint so mouse handlers can convert pixels to grid coords.
   canvas_origin: Arc<Mutex<gpui::Point<Pixels>>>,
+  /// Incremented each time the async PTY task processes new data.
+  content_generation: Arc<AtomicU64>,
+  /// The generation value from the last completed paint pass.
+  last_painted_generation: Arc<AtomicU64>,
+  /// The selection range from the last completed paint pass.
+  last_painted_selection: Arc<Mutex<Option<SelectionRange>>>,
   _subscriptions: Vec<Subscription>,
 }
 
@@ -162,6 +169,8 @@ impl TerminalView {
     // Async task: receive bytes -> process -> notify GPUI
     let term_handle = state.term_handle();
     let pty_for_write = pty.clone();
+    let content_generation = Arc::new(AtomicU64::new(0));
+    let content_generation_for_task = content_generation.clone();
     cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
       // Persistent processor retains state for escape sequences spanning reads.
       let mut processor = alacritty_terminal::vte::ansi::Processor::<
@@ -181,6 +190,7 @@ impl TerminalView {
           let mut term = term_handle.lock();
           processor.advance(&mut *term, &all_bytes);
         }
+        content_generation_for_task.fetch_add(1, Ordering::Release);
         // Handle terminal events (PtyWrite for DSR responses, etc.)
         while let Ok(event) = event_rx.try_recv() {
           match event {
@@ -257,6 +267,9 @@ impl TerminalView {
       cursor_reset_at: Instant::now(),
       cached_layout: None,
       canvas_origin: Arc::new(Mutex::new(gpui::Point::default())),
+      content_generation,
+      last_painted_generation: Arc::new(AtomicU64::new(u64::MAX)),
+      last_painted_selection: Arc::new(Mutex::new(None)),
       _subscriptions,
     }
   }
@@ -664,6 +677,9 @@ impl Render for TerminalView {
           let palette = self.palette.clone();
           let pty_for_resize = self.pty.clone();
           let last_size = self.last_size.clone();
+          let content_generation = self.content_generation.clone();
+          let last_painted_generation = self.last_painted_generation.clone();
+          let last_painted_selection = self.last_painted_selection.clone();
 
           move |_bounds: Bounds<Pixels>,
                 (prep_bounds, layout, font_family): (Bounds<Pixels>, CellLayout, SharedString),
@@ -691,6 +707,12 @@ impl Render for TerminalView {
             }
             drop(last);
 
+            // Dirty tracking: skip expensive passes when content hasn't changed.
+            let current_gen = content_generation.load(Ordering::Acquire);
+            let content_changed = current_gen != last_painted_generation.load(Ordering::Acquire);
+            let prev_selection = *last_painted_selection.lock();
+            let selection_changed = selection_range != prev_selection;
+
             let render_state = TerminalRenderState {
               palette: &palette,
               font_family: &font_family,
@@ -699,7 +721,11 @@ impl Render for TerminalView {
               cursor_visible,
               selection: selection_range,
             };
-            paint_terminal(&term, prep_bounds, layout, &render_state, window, cx);
+            paint_terminal(&term, prep_bounds, layout, &render_state, content_changed, selection_changed, window, cx);
+
+            // Store the new generation and selection for next frame.
+            last_painted_generation.store(current_gen, Ordering::Release);
+            *last_painted_selection.lock() = selection_range;
           }
         },
       ).size_full())

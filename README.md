@@ -154,6 +154,26 @@ The primary view. Shows the Claude Code CLI running in a terminal emulator. The 
 
 A separate terminal per session for running arbitrary commands. Tied to the session's working directory (worktree or project root).
 
+### Terminal Architecture
+
+The terminal emulator (`jc-terminal/`) uses `alacritty_terminal` as a crate for VT parsing and grid state management only — not its GPU renderer. Rendering is handled by a custom gpui bridge in `render.rs`.
+
+**Data flow:**
+1. **PTY reader thread** reads raw bytes in 4KB chunks, sends via flume channel
+2. **Async coalescing task** batches received bytes (up to 64KB cap) and calls `processor.advance()` on the alacritty `Term` grid, then `cx.notify()` to trigger a repaint
+3. **Canvas paint closure** locks the `Term`, reads the grid, and calls `paint_terminal()`
+
+**Render pipeline** (`paint_terminal` in `render.rs`):
+- Pass 1: Cell backgrounds — `paint_quad()` per cell with non-default bg color
+- Pass 1.5: Selection highlight — `paint_quad()` per selected cell
+- Pass 2: Text — one `shape_line()` call per row (batches all characters + style runs), painted at row position
+- Pass 3: Cursor — a few `paint_quad()` calls for the cursor shape
+
+**Performance optimizations:**
+- **Dirty tracking**: A `content_generation` counter (incremented after each `advance()`) is compared against `last_painted_generation`. When content hasn't changed (cursor blink, mouse events, focus), Passes 1 and 2 are skipped entirely — only cursor and selection are repainted.
+- **Row-based shaping**: Pass 2 accumulates each row into a single `String` with `Vec<TextRun>` entries split at style boundaries (color/weight/style changes). This produces ~25 `shape_line()` calls per frame instead of ~2000. gpui's `LineLayoutCache` caches shaped lines across frames, so unchanged rows are free on subsequent paints.
+- **Buffer coalescing cap**: The async task caps coalesced PTY data at 64KB to prevent frame stalls from large output bursts.
+
 ### TODO Editor
 
 Source-mode Markdown editing with light rendering (bold, highlights, heading formatting --- not full WYSIWYG). This is where the user drafts notes, reviews accumulated comments, and sends instructions to Claude.
@@ -172,7 +192,7 @@ Syntax-highlighted source viewer with light editing capability (not a full edito
 
 ### Claude Reply Capture
 
-Replies are captured via Claude Code's built-in `/copy` command. Pressing **Cmd-Shift-C** sends `/copy` to the active Claude terminal, polls the clipboard for a change, and writes the result to `.jc/replies/<uuid>.md` (or `.jc/replies/<label>.md` if no UUID is assigned yet). The file is then opened in the code viewer pane for review and annotation.
+Replies are captured via Claude Code's built-in `/copy` command. Pressing **Cmd-Shift-C** sends `/copy` to the active Claude terminal, polls the clipboard for a change (via the `arboard` crate for native clipboard access), and writes the result to `.jc/replies/<uuid>.md` (or `.jc/replies/<label>.md` if no UUID is assigned yet). The file is then opened in the code viewer pane for review and annotation.
 
 This approach avoids parsing JSONL files entirely --- Claude Code handles the extraction, and the app just captures the clipboard result. The saved reply files can be referenced by Claude in future instructions (via file path comments).
 
@@ -253,7 +273,7 @@ Each problem type has a `rank()`, `layer()`, and `description()` method. Ranks a
 Problems are recomputed on a unified refresh cycle rather than managed individually:
 
 - **Push sources** (hooks, BEL): Write into a `pending_events` set on the session. Events persist in this set until their resolution condition is met.
-- **Poll sources** (diff, TODO, status.sh): Computed fresh each cycle by querying the relevant view.
+- **Poll sources** (diff, TODO, status.sh): Computed fresh each cycle by querying the relevant view. Diff generation runs on a background thread (via `std::thread::spawn`) to avoid blocking the UI; `refresh_data()` kicks off a job and picks up results on the next poll cycle.
 - A single `refresh_problems()` method on session/project merges both: it converts pending events into problems, queries poll sources, and replaces the full problem list. It returns whether the problem count changed.
 - Refresh runs on a 2-second timer and on demand when the user switches sessions, reviews a diff file, or interacts. The timer only triggers a re-render (`cx.notify()`) when problems actually change.
 

@@ -64,6 +64,8 @@ pub fn paint_terminal(
   bounds: Bounds<Pixels>,
   layout: CellLayout,
   state: &TerminalRenderState<'_>,
+  content_changed: bool,
+  selection_changed: bool,
   window: &mut Window,
   cx: &mut App,
 ) {
@@ -82,89 +84,151 @@ pub fn paint_terminal(
 
   let selection_color = Hsla { h: 210.0 / 360.0, s: 0.6, l: 0.5, a: 0.35 };
 
-  // Pass 1: Paint cell backgrounds
-  for line_idx in 0..num_lines {
-    let line = Line(line_idx as i32 - display_offset);
-    for col_idx in 0..num_cols {
-      let col = Column(col_idx);
-      let cell = &grid[Point::new(line, col)];
-
-      let bg = if cell.flags.contains(Flags::INVERSE) {
-        palette.resolve_fg(&cell.fg)
-      } else {
-        palette.resolve_bg(&cell.bg)
-      };
-      if bg != palette.background {
-        let x = origin.x + layout.width * col_idx as f32;
-        let y = origin.y + layout.height * line_idx as f32;
-        window.paint_quad(fill(Bounds::new(point(x, y), size(layout.width, layout.height)), bg));
-      }
-    }
-  }
-
-  // Pass 1.5: Paint selection highlight
-  if let Some(ref sel) = state.selection {
+  // Pass 1: Paint cell backgrounds (skip when content unchanged)
+  if content_changed {
     for line_idx in 0..num_lines {
       let line = Line(line_idx as i32 - display_offset);
       for col_idx in 0..num_cols {
-        let pt = Point::new(line, Column(col_idx));
-        if sel.contains(pt) {
+        let col = Column(col_idx);
+        let cell = &grid[Point::new(line, col)];
+
+        let bg = if cell.flags.contains(Flags::INVERSE) {
+          palette.resolve_fg(&cell.fg)
+        } else {
+          palette.resolve_bg(&cell.bg)
+        };
+        if bg != palette.background {
           let x = origin.x + layout.width * col_idx as f32;
           let y = origin.y + layout.height * line_idx as f32;
-          window.paint_quad(fill(
-            Bounds::new(point(x, y), size(layout.width, layout.height)),
-            selection_color,
-          ));
+          window.paint_quad(fill(Bounds::new(point(x, y), size(layout.width, layout.height)), bg));
         }
       }
     }
   }
 
-  // Pass 2: Paint text
-  for line_idx in 0..num_lines {
-    let line = Line(line_idx as i32 - display_offset);
-    for col_idx in 0..num_cols {
-      let col = Column(col_idx);
-      let cell = &grid[Point::new(line, col)];
+  // Pass 1.5: Paint selection highlight (skip when neither content nor selection changed)
+  if content_changed || selection_changed {
+    if let Some(ref sel) = state.selection {
+      for line_idx in 0..num_lines {
+        let line = Line(line_idx as i32 - display_offset);
+        for col_idx in 0..num_cols {
+          let pt = Point::new(line, Column(col_idx));
+          if sel.contains(pt) {
+            let x = origin.x + layout.width * col_idx as f32;
+            let y = origin.y + layout.height * line_idx as f32;
+            window.paint_quad(fill(
+              Bounds::new(point(x, y), size(layout.width, layout.height)),
+              selection_color,
+            ));
+          }
+        }
+      }
+    }
+  }
 
-      if cell.c == ' ' || cell.c == '\0' || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-        continue;
+  // Pass 2: Paint text — one shape_line() call per row (skip when content unchanged)
+  if content_changed {
+    for line_idx in 0..num_lines {
+      let line = Line(line_idx as i32 - display_offset);
+
+      let mut row_string = String::with_capacity(num_cols * 4);
+      let mut runs: Vec<gpui::TextRun> = Vec::new();
+      let mut current_run_len: usize = 0;
+      let mut current_fg = Hsla::default();
+      let mut current_weight = FontWeight::NORMAL;
+      let mut current_style = FontStyle::Normal;
+      let mut has_non_whitespace = false;
+      let mut first_cell = true;
+
+      for col_idx in 0..num_cols {
+        let col = Column(col_idx);
+        let cell = &grid[Point::new(line, col)];
+
+        if cell.c == '\0' || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+          // Null/spacer cells: append a space to keep column alignment
+          let byte_len = ' '.len_utf8();
+          if first_cell {
+            // Initialize style from this cell (won't matter much since it's whitespace)
+            current_fg = palette.resolve_fg(&cell.fg);
+            current_weight = FontWeight::NORMAL;
+            current_style = FontStyle::Normal;
+            first_cell = false;
+          }
+          row_string.push(' ');
+          current_run_len += byte_len;
+          continue;
+        }
+
+        // Compute style for this cell
+        let fg = if cell.flags.contains(Flags::INVERSE) {
+          palette.resolve_bg(&cell.bg)
+        } else {
+          palette.resolve_fg(&cell.fg)
+        };
+        let weight =
+          if cell.flags.contains(Flags::BOLD) { FontWeight::BOLD } else { FontWeight::NORMAL };
+        let style =
+          if cell.flags.contains(Flags::ITALIC) { FontStyle::Italic } else { FontStyle::Normal };
+
+        if cell.c != ' ' {
+          has_non_whitespace = true;
+        }
+
+        if first_cell {
+          current_fg = fg;
+          current_weight = weight;
+          current_style = style;
+          first_cell = false;
+        } else if fg != current_fg || weight != current_weight || style != current_style {
+          // Style changed — push the current run and start a new one
+          if current_run_len > 0 {
+            let mut f = font(state.font_family.clone());
+            f.weight = current_weight;
+            f.style = current_style;
+            runs.push(gpui::TextRun {
+              len: current_run_len,
+              font: f,
+              color: current_fg,
+              background_color: None,
+              underline: None,
+              strikethrough: None,
+            });
+          }
+          current_run_len = 0;
+          current_fg = fg;
+          current_weight = weight;
+          current_style = style;
+        }
+
+        let byte_len = cell.c.len_utf8();
+        row_string.push(cell.c);
+        current_run_len += byte_len;
       }
 
-      let fg = if cell.flags.contains(Flags::INVERSE) {
-        palette.resolve_bg(&cell.bg)
-      } else {
-        palette.resolve_fg(&cell.fg)
-      };
-      let weight =
-        if cell.flags.contains(Flags::BOLD) { FontWeight::BOLD } else { FontWeight::NORMAL };
-      let style =
-        if cell.flags.contains(Flags::ITALIC) { FontStyle::Italic } else { FontStyle::Normal };
-
-      let mut f = font(state.font_family.clone());
-      f.weight = weight;
-      f.style = style;
-
-      let s: String = cell.c.to_string();
-      let len = s.len();
-      let shared: SharedString = s.into();
-
-      // Shape and paint in one go to avoid borrow conflicts
-      let shaped = window.text_system().shape_line(
-        shared,
-        font_size,
-        &[gpui::TextRun {
-          len,
+      // Push the final run
+      if current_run_len > 0 {
+        let mut f = font(state.font_family.clone());
+        f.weight = current_weight;
+        f.style = current_style;
+        runs.push(gpui::TextRun {
+          len: current_run_len,
           font: f,
-          color: fg,
+          color: current_fg,
           background_color: None,
           underline: None,
           strikethrough: None,
-        }],
-        None,
-      );
+        });
+      }
 
-      let x = origin.x + layout.width * col_idx as f32;
+      // Skip rows that are entirely whitespace
+      if !has_non_whitespace || runs.is_empty() {
+        continue;
+      }
+
+      let shared: SharedString = row_string.into();
+      let shaped = window.text_system().shape_line(shared, font_size, &runs, None);
+
+      let x = origin.x;
       let y = origin.y + layout.height * line_idx as f32;
       let _ = shaped.paint(point(x, y), layout.height, window, cx);
     }
