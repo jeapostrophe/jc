@@ -79,12 +79,9 @@ fn palette_from_window(window: &Window) -> Palette {
   Palette::for_appearance(appearance_from_window(window.appearance()))
 }
 
-/// Read the current macOS clipboard contents via `pbpaste`.
+/// Read the current clipboard text contents.
 fn clipboard_contents() -> Option<String> {
-  std::process::Command::new("pbpaste")
-    .output()
-    .ok()
-    .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+  arboard::Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok())
 }
 
 pub struct Workspace {
@@ -453,9 +450,10 @@ impl Workspace {
           if let Some(session) =
             this.projects.get_mut(pi).and_then(|p| p.sessions.get_mut(&session_id))
           {
-            session.pending_events.insert(PendingEvent::TerminalBell);
+            if session.pending_events.insert(PendingEvent::TerminalBell) {
+              cx.notify();
+            }
           }
-          cx.notify();
         }
       },
     )

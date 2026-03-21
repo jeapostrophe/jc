@@ -2,9 +2,11 @@ use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::input::{Input, InputEvent, InputState, Rope};
+use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use crate::language::Language;
 use crate::outline::{OutlineItem, compute_outline};
@@ -167,7 +169,7 @@ pub struct PickerState<D: PickerDelegate> {
   filtered: Vec<FilteredItem>,
   selected_index: usize,
   focus: FocusHandle,
-  scroll_handle: ScrollHandle,
+  scroll_handle: VirtualListScrollHandle,
   _subscription: Subscription,
 }
 
@@ -188,7 +190,7 @@ impl<D: PickerDelegate> PickerState<D> {
       filtered: Vec::new(),
       selected_index: 0,
       focus: cx.focus_handle(),
-      scroll_handle: ScrollHandle::default(),
+      scroll_handle: VirtualListScrollHandle::new(),
       _subscription: subscription,
     };
     state.refilter(cx);
@@ -214,7 +216,7 @@ impl<D: PickerDelegate> PickerState<D> {
   fn select_next(&mut self, _: &SelectNextItem, _window: &mut Window, cx: &mut Context<Self>) {
     if !self.filtered.is_empty() {
       self.selected_index = (self.selected_index + 1) % self.filtered.len();
-      self.scroll_handle.scroll_to_item(self.selected_index);
+      self.scroll_handle.scroll_to_item(self.selected_index, ScrollStrategy::Top);
       cx.notify();
     }
   }
@@ -223,7 +225,7 @@ impl<D: PickerDelegate> PickerState<D> {
     if !self.filtered.is_empty() {
       self.selected_index =
         if self.selected_index == 0 { self.filtered.len() - 1 } else { self.selected_index - 1 };
-      self.scroll_handle.scroll_to_item(self.selected_index);
+      self.scroll_handle.scroll_to_item(self.selected_index, ScrollStrategy::Top);
       cx.notify();
     }
   }
@@ -231,7 +233,7 @@ impl<D: PickerDelegate> PickerState<D> {
   fn select_page_down(&mut self, _: &SelectPageDown, _window: &mut Window, cx: &mut Context<Self>) {
     if !self.filtered.is_empty() {
       self.selected_index = (self.selected_index + 10).min(self.filtered.len() - 1);
-      self.scroll_handle.scroll_to_item(self.selected_index);
+      self.scroll_handle.scroll_to_item(self.selected_index, ScrollStrategy::Top);
       cx.notify();
     }
   }
@@ -239,7 +241,7 @@ impl<D: PickerDelegate> PickerState<D> {
   fn select_page_up(&mut self, _: &SelectPageUp, _window: &mut Window, cx: &mut Context<Self>) {
     if !self.filtered.is_empty() {
       self.selected_index = self.selected_index.saturating_sub(10);
-      self.scroll_handle.scroll_to_item(self.selected_index);
+      self.scroll_handle.scroll_to_item(self.selected_index, ScrollStrategy::Top);
       cx.notify();
     }
   }
@@ -275,24 +277,14 @@ impl<D: PickerDelegate> Render for PickerState<D> {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let theme = cx.theme();
 
-    let results: Vec<Stateful<Div>> = self
-      .filtered
-      .iter()
-      .enumerate()
-      .take(MAX_VISIBLE_RESULTS)
-      .map(|(i, fi)| {
-        let selected = i == self.selected_index;
-        self
-          .delegate
-          .render_item(fi.index, selected, cx)
-          .id(("picker-item", i))
-          .cursor_pointer()
-          .on_click(cx.listener(move |this, _, window, cx| {
-            this.selected_index = i;
-            this.confirm_selected(&ConfirmPicker, window, cx);
-          }))
-      })
-      .collect();
+    let item_count = self.filtered.len().min(MAX_VISIBLE_RESULTS);
+
+    // Each item: text_sm (~14px) + py(3px) top+bottom = ~20px per row.
+    let item_height = px(26.0);
+    let item_sizes: Rc<Vec<Size<Pixels>>> =
+      Rc::new(vec![size(px(500.0), item_height); item_count]);
+
+    let is_empty = self.filtered.is_empty();
 
     div()
       .id("picker")
@@ -323,20 +315,39 @@ impl<D: PickerDelegate> Render for PickerState<D> {
           .border_color(theme.border)
           .child(Input::new(&self.query_input).appearance(false)),
       )
-      .child({
-        let list = div()
+      .child(if is_empty {
+        div()
           .id("picker-results")
-          .flex_1()
-          .overflow_y_scroll()
-          .track_scroll(&self.scroll_handle)
-          .children(results);
-        if self.filtered.is_empty() {
-          list.child(
+          .child(
             div().px_2().py_1().text_sm().text_color(theme.muted_foreground).child("No matches"),
           )
-        } else {
-          list
-        }
+          .into_any_element()
+      } else {
+        v_virtual_list(
+          cx.entity(),
+          "picker-results",
+          item_sizes,
+          move |this: &mut Self, visible_range: Range<usize>, _window, cx| {
+            visible_range
+              .map(|i| {
+                let fi = &this.filtered[i];
+                let selected = i == this.selected_index;
+                this
+                  .delegate
+                  .render_item(fi.index, selected, cx)
+                  .id(("picker-item", i))
+                  .cursor_pointer()
+                  .on_click(cx.listener(move |this, _, window, cx| {
+                    this.selected_index = i;
+                    this.confirm_selected(&ConfirmPicker, window, cx);
+                  }))
+              })
+              .collect()
+          },
+        )
+        .track_scroll(&self.scroll_handle)
+        .flex_1()
+        .into_any_element()
       })
       .children(self.delegate.render_footer(cx).map(|footer| {
         footer.border_t_1().border_color(theme.border)

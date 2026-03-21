@@ -49,7 +49,11 @@ where
 
   cx.spawn_in(window, async move |this: WeakEntity<E>, cx: &mut AsyncWindowContext| {
     while rx.recv_async().await.is_ok() {
-      while rx.try_recv().is_ok() {}
+      for _ in 0..100 {
+        if rx.try_recv().is_err() {
+          break;
+        }
+      }
       let _ = this.update_in(cx, &on_change);
     }
   })

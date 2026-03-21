@@ -168,10 +168,14 @@ impl TerminalView {
         alacritty_terminal::vte::ansi::StdSyncHandler,
       >::default();
 
+      const COALESCE_CAP: usize = 64 * 1024; // 64 KB
       while let Ok(bytes) = bytes_rx.recv_async().await {
         let mut all_bytes = bytes;
-        while let Ok(more) = bytes_rx.try_recv() {
-          all_bytes.extend(more);
+        while all_bytes.len() < COALESCE_CAP {
+          match bytes_rx.try_recv() {
+            Ok(more) => all_bytes.extend(more),
+            Err(_) => break,
+          }
         }
         {
           let mut term = term_handle.lock();
