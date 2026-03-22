@@ -121,14 +121,20 @@ impl DiffView {
     }
   }
 
-  /// Refresh diff data without updating the editor display.
-  /// Used by the background problem poll to keep file lists current.
+  /// Refresh diff data synchronously (convenience for non-polling callers).
   /// Returns true if the diff content actually changed.
+  #[allow(dead_code)]
   pub fn refresh_data(&mut self) -> bool {
     let diff_text = match &self.source {
       DiffSource::WorkingTree => generate_diff(&self.project_path),
       DiffSource::Commit { oid, .. } => generate_commit_diff(&self.project_path, *oid),
     };
+    self.apply_diff_text(diff_text)
+  }
+
+  /// Apply pre-generated diff text to update file list and staleness state.
+  /// Returns true if the diff content actually changed.
+  pub fn apply_diff_text(&mut self, diff_text: String) -> bool {
     let new_diffs = parse_file_diffs(&diff_text);
     self.git_index_mtime = git_index_mtime(&self.project_path);
 
@@ -155,6 +161,11 @@ impl DiffView {
       });
 
     changed
+  }
+
+  /// Returns the info needed to generate a diff on a background thread.
+  pub fn diff_job(&self) -> (PathBuf, DiffSource) {
+    (self.project_path.clone(), self.source.clone())
   }
 
   fn show_current_file(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -336,7 +347,7 @@ impl Render for DiffView {
   }
 }
 
-fn generate_diff(path: &Path) -> String {
+pub fn generate_diff(path: &Path) -> String {
   match generate_diff_inner(path) {
     Ok(result) => result,
     Err(e) => format!("Error generating diff: {e}"),
@@ -396,7 +407,7 @@ fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
   diffs
 }
 
-fn generate_commit_diff(path: &Path, oid: git2::Oid) -> String {
+pub fn generate_commit_diff(path: &Path, oid: git2::Oid) -> String {
   match generate_commit_diff_inner(path, oid) {
     Ok(result) => result,
     Err(e) => format!("Error generating commit diff: {e}"),

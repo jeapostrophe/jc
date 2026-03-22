@@ -17,6 +17,7 @@ use gpui::{
 use parking_lot::Mutex;
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -118,6 +119,9 @@ pub struct TerminalView {
   cached_layout: Option<CellLayout>,
   /// Canvas origin stored during paint so mouse handlers can convert pixels to grid coords.
   canvas_origin: Arc<Mutex<gpui::Point<Pixels>>>,
+  /// Shared flag: when false, the background processing thread batches more
+  /// aggressively and the notification relay skips `cx.notify()`.
+  visible: Arc<AtomicBool>,
   _subscriptions: Vec<Subscription>,
 }
 
@@ -159,19 +163,26 @@ impl TerminalView {
       }
     });
 
-    // Async task: receive bytes -> process -> notify GPUI
+    // Background thread: VTE parsing off the main thread.
+    // The heavy `processor.advance()` work runs here; only lightweight
+    // `cx.notify()` / bell emission happens on the main executor.
     let term_handle = state.term_handle();
     let pty_for_write = pty.clone();
-    cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
-      // Persistent processor retains state for escape sequences spanning reads.
+    let visible = Arc::new(AtomicBool::new(true));
+    let visible_for_bg = visible.clone();
+    let (notify_tx, notify_rx) = flume::unbounded::<bool>(); // true = has bell
+    std::thread::spawn(move || {
       let mut processor = alacritty_terminal::vte::ansi::Processor::<
         alacritty_terminal::vte::ansi::StdSyncHandler,
       >::default();
 
       const COALESCE_CAP: usize = 64 * 1024; // 64 KB
-      while let Ok(bytes) = bytes_rx.recv_async().await {
+      const HIDDEN_COALESCE_CAP: usize = 256 * 1024; // 256 KB
+      while let Ok(bytes) = bytes_rx.recv() {
+        let is_visible = visible_for_bg.load(Ordering::Relaxed);
+        let cap = if is_visible { COALESCE_CAP } else { HIDDEN_COALESCE_CAP };
         let mut all_bytes = bytes;
-        while all_bytes.len() < COALESCE_CAP {
+        while all_bytes.len() < cap {
           match bytes_rx.try_recv() {
             Ok(more) => all_bytes.extend(more),
             Err(_) => break,
@@ -181,27 +192,42 @@ impl TerminalView {
           let mut term = term_handle.lock();
           processor.advance(&mut *term, &all_bytes);
         }
-        // Handle terminal events (PtyWrite for DSR responses, etc.)
+        // Handle terminal events — PtyWrite directly, Bell via main thread.
+        let mut has_bell = false;
         while let Ok(event) = event_rx.try_recv() {
           match event {
             TerminalEvent::PtyWrite(s) => {
               let _ = pty_for_write.write_all(s.as_bytes());
             }
-            TerminalEvent::Bell => {
-              let _ = cx.update(|cx: &mut App| {
-                if let Some(entity) = this.upgrade() {
-                  entity.update(cx, |_view, cx| cx.emit(TerminalViewEvent::Bell));
-                }
-              });
-            }
+            TerminalEvent::Bell => has_bell = true,
             _ => {}
           }
         }
-        let _ = cx.update(|cx: &mut App| {
-          if let Some(entity) = this.upgrade() {
-            cx.notify(entity.entity_id());
-          }
-        });
+        if notify_tx.send(has_bell).is_err() {
+          break;
+        }
+      }
+    });
+
+    // Lightweight main-thread relay: emit bells and notify GPUI for repaint.
+    let visible_for_relay = visible.clone();
+    cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+      while let Ok(has_bell) = notify_rx.recv_async().await {
+        if has_bell {
+          let _ = cx.update(|cx: &mut App| {
+            if let Some(entity) = this.upgrade() {
+              entity.update(cx, |_view, cx| cx.emit(TerminalViewEvent::Bell));
+            }
+          });
+        }
+        // Skip repaint for hidden terminals — no point rendering offscreen content.
+        if visible_for_relay.load(Ordering::Relaxed) {
+          let _ = cx.update(|cx: &mut App| {
+            if let Some(entity) = this.upgrade() {
+              cx.notify(entity.entity_id());
+            }
+          });
+        }
       }
     })
     .detach();
@@ -257,6 +283,7 @@ impl TerminalView {
       cursor_reset_at: Instant::now(),
       cached_layout: None,
       canvas_origin: Arc::new(Mutex::new(gpui::Point::default())),
+      visible,
       _subscriptions,
     }
   }
@@ -264,6 +291,13 @@ impl TerminalView {
   /// Update the terminal color palette at runtime.
   pub fn set_palette(&mut self, palette: Palette) {
     self.palette = palette;
+  }
+
+  /// Mark this terminal as visible or hidden.  Hidden terminals still process
+  /// PTY bytes (so state is correct when switching back) but batch more
+  /// aggressively and skip `cx.notify()` to reduce main-thread overhead.
+  pub fn set_visible(&self, is_visible: bool) {
+    self.visible.store(is_visible, Ordering::Relaxed);
   }
 
   /// Write raw bytes to the terminal's PTY.

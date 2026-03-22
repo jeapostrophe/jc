@@ -242,38 +242,62 @@ impl Workspace {
     let bell_subscriptions = Self::subscribe_bells(&projects, cx);
 
     // Problem refresh poll task — runs immediately, then every 2 seconds.
+    // Git diff generation runs on the background executor to avoid blocking
+    // the main thread; only the lightweight state update happens on main.
     let problems_poll_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+      use crate::views::diff_view::{DiffSource, generate_diff, generate_commit_diff};
       loop {
+        // 1. Gather stale diff jobs from the main thread (cheap).
+        let diff_jobs: Vec<(usize, PathBuf, DiffSource)> = cx
+          .update(|cx: &mut App| {
+            let Some(entity) = this.upgrade() else { return vec![] };
+            entity.read(cx).projects.iter().enumerate().filter_map(|(i, p)| {
+              if p.diff_view.read(cx).is_stale() {
+                let (path, source) = p.diff_view.read(cx).diff_job();
+                Some((i, path, source))
+              } else {
+                None
+              }
+            }).collect()
+          })
+          .unwrap_or_default();
+
+        // 2. Run git diffs on background executor (heavy I/O, off main thread).
+        let mut diff_results: Vec<(usize, String)> = Vec::new();
+        for (idx, path, source) in diff_jobs {
+          let text = cx.background_executor().spawn(async move {
+            match source {
+              DiffSource::WorkingTree => generate_diff(&path),
+              DiffSource::Commit { oid, .. } => generate_commit_diff(&path, oid),
+            }
+          }).await;
+          diff_results.push((idx, text));
+        }
+
+        // 3. Apply results + refresh problems on main thread (cheap).
         let Ok(should_continue) = cx.update(|cx: &mut App| {
-          if let Some(entity) = this.upgrade() {
-            entity.update(cx, |view, cx| {
-              let mut changed = false;
-              // Refresh stale diff views so problem counts reflect git state.
-              for project in &mut view.projects {
-                if project.diff_view.read(cx).is_stale() {
-                  let data_changed =
-                    project.diff_view.update(cx, |dv, _cx| dv.refresh_data());
-                  changed |= data_changed;
-                }
+          let Some(entity) = this.upgrade() else { return false };
+          entity.update(cx, |view, cx| {
+            let mut changed = false;
+            for (idx, diff_text) in diff_results {
+              if idx < view.projects.len() {
+                let data_changed =
+                  view.projects[idx].diff_view.update(cx, |dv, _cx| dv.apply_diff_text(diff_text));
+                changed |= data_changed;
               }
-              for project in &mut view.projects {
-                changed |= project.refresh_problems(cx);
-              }
-              if changed {
-                // Keep TodoView active label in sync (e.g. after a heading rename).
-                {
-                  let pi = view.active_project_index;
-                  let label = view.projects[pi].active_label().map(|s| s.to_string());
-                  let todo_view = view.projects[pi].todo_view.clone();
-                  todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
-                }
-                cx.notify();
-              }
-            });
-            true
-          } else {
-            false
-          }
+            }
+            for project in &mut view.projects {
+              changed |= project.refresh_problems(cx);
+            }
+            if changed {
+              let pi = view.active_project_index;
+              let label = view.projects[pi].active_label().map(|s| s.to_string());
+              let todo_view = view.projects[pi].todo_view.clone();
+              todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
+              cx.notify();
+            }
+          });
+          true
         }) else {
           break;
         };
@@ -1071,12 +1095,22 @@ impl Workspace {
     };
     if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
       session.saved_layout = Some(saved);
+      // Mark outgoing session's terminals as hidden so background processing
+      // batches more aggressively and skips cx.notify().
+      session.claude_terminal.read(cx).set_visible(false);
+      session.general_terminal.read(cx).set_visible(false);
     }
 
     let project_changed = project_idx != self.active_project_index;
 
     self.active_project_index = project_idx;
     self.projects[project_idx].active_session = session_id;
+
+    // Mark incoming session's terminals as visible.
+    if let Some(session) = self.projects[project_idx].active_session() {
+      session.claude_terminal.read(cx).set_visible(true);
+      session.general_terminal.read(cx).set_visible(true);
+    }
 
     // Acknowledge pending events unless skipped (e.g. L0 problem jump).
     if !skip_acknowledge {
