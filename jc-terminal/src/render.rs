@@ -64,8 +64,6 @@ pub fn paint_terminal(
   bounds: Bounds<Pixels>,
   layout: CellLayout,
   state: &TerminalRenderState<'_>,
-  content_changed: bool,
-  selection_changed: bool,
   window: &mut Window,
   cx: &mut App,
 ) {
@@ -84,50 +82,46 @@ pub fn paint_terminal(
 
   let selection_color = Hsla { h: 210.0 / 360.0, s: 0.6, l: 0.5, a: 0.35 };
 
-  // Pass 1: Paint cell backgrounds (skip when content unchanged)
-  if content_changed {
+  // Pass 1: Paint cell backgrounds
+  for line_idx in 0..num_lines {
+    let line = Line(line_idx as i32 - display_offset);
+    for col_idx in 0..num_cols {
+      let col = Column(col_idx);
+      let cell = &grid[Point::new(line, col)];
+
+      let bg = if cell.flags.contains(Flags::INVERSE) {
+        palette.resolve_fg(&cell.fg)
+      } else {
+        palette.resolve_bg(&cell.bg)
+      };
+      if bg != palette.background {
+        let x = origin.x + layout.width * col_idx as f32;
+        let y = origin.y + layout.height * line_idx as f32;
+        window.paint_quad(fill(Bounds::new(point(x, y), size(layout.width, layout.height)), bg));
+      }
+    }
+  }
+
+  // Pass 1.5: Paint selection highlight
+  if let Some(ref sel) = state.selection {
     for line_idx in 0..num_lines {
       let line = Line(line_idx as i32 - display_offset);
       for col_idx in 0..num_cols {
-        let col = Column(col_idx);
-        let cell = &grid[Point::new(line, col)];
-
-        let bg = if cell.flags.contains(Flags::INVERSE) {
-          palette.resolve_fg(&cell.fg)
-        } else {
-          palette.resolve_bg(&cell.bg)
-        };
-        if bg != palette.background {
+        let pt = Point::new(line, Column(col_idx));
+        if sel.contains(pt) {
           let x = origin.x + layout.width * col_idx as f32;
           let y = origin.y + layout.height * line_idx as f32;
-          window.paint_quad(fill(Bounds::new(point(x, y), size(layout.width, layout.height)), bg));
+          window.paint_quad(fill(
+            Bounds::new(point(x, y), size(layout.width, layout.height)),
+            selection_color,
+          ));
         }
       }
     }
   }
 
-  // Pass 1.5: Paint selection highlight (skip when neither content nor selection changed)
-  if content_changed || selection_changed {
-    if let Some(ref sel) = state.selection {
-      for line_idx in 0..num_lines {
-        let line = Line(line_idx as i32 - display_offset);
-        for col_idx in 0..num_cols {
-          let pt = Point::new(line, Column(col_idx));
-          if sel.contains(pt) {
-            let x = origin.x + layout.width * col_idx as f32;
-            let y = origin.y + layout.height * line_idx as f32;
-            window.paint_quad(fill(
-              Bounds::new(point(x, y), size(layout.width, layout.height)),
-              selection_color,
-            ));
-          }
-        }
-      }
-    }
-  }
-
-  // Pass 2: Paint text — one shape_line() call per row (skip when content unchanged)
-  if content_changed {
+  // Pass 2: Paint text — one shape_line() call per row
+  {
     for line_idx in 0..num_lines {
       let line = Line(line_idx as i32 - display_offset);
 

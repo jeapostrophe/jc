@@ -349,9 +349,11 @@ fn generate_diff_inner(path: &Path) -> Result<String, git2::Error> {
   let tree = head.peel_to_tree()?;
 
   // Include untracked files in the diff so new files show up for review.
+  // Do NOT recurse into untracked directories — a directory with hundreds of
+  // files (e.g. node_modules) would appear as hundreds of individual entries.
+  // Instead, untracked directories appear as a single entry (matching `git status`).
   let mut opts = git2::DiffOptions::new();
   opts.include_untracked(true);
-  opts.recurse_untracked_dirs(true);
   opts.show_untracked_content(true);
 
   let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?;
