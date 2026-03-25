@@ -8,45 +8,101 @@ use gpui_component::tooltip::Tooltip;
 
 use super::Workspace;
 
+struct PaneHeader {
+  title: String,
+  breadcrumbs: Vec<String>,
+}
+
+/// Elide middle breadcrumb items so the total char count stays within budget.
+/// Always keeps the first and last items, replacing the middle with "\u{2026}".
+fn elide_breadcrumbs(crumbs: &[String], char_budget: usize) -> Vec<String> {
+  if crumbs.is_empty() {
+    return Vec::new();
+  }
+  let sep_len = 3; // " > "
+  let total: usize = crumbs.iter().map(|c| c.len()).sum::<usize>()
+    + crumbs.len().saturating_sub(1) * sep_len;
+  if total <= char_budget || crumbs.len() <= 2 {
+    return crumbs.to_vec();
+  }
+  // Keep first and last, try adding from the end until we exceed budget.
+  let first = &crumbs[0];
+  let last = &crumbs[crumbs.len() - 1];
+  let ellipsis = "\u{2026}";
+  let base_len = first.len() + sep_len + ellipsis.len() + sep_len + last.len();
+  if base_len >= char_budget {
+    return vec![first.clone(), ellipsis.to_string(), last.clone()];
+  }
+  // Try to keep items from the end (nearest to cursor = most useful).
+  let mut kept_end: Vec<&String> = Vec::new();
+  let mut used = base_len;
+  for c in crumbs[1..crumbs.len() - 1].iter().rev() {
+    let cost = c.len() + sep_len;
+    if used + cost > char_budget {
+      break;
+    }
+    used += cost;
+    kept_end.push(c);
+  }
+  kept_end.reverse();
+  let elided_middle = crumbs.len() - 2 - kept_end.len();
+  let mut result = vec![first.clone()];
+  if elided_middle > 0 {
+    result.push(ellipsis.to_string());
+  }
+  for c in kept_end {
+    result.push(c.clone());
+  }
+  result.push(last.clone());
+  result
+}
+
 impl Workspace {
-  fn pane_header_label(&self, pane: &Entity<Pane>, cx: &App) -> String {
+  fn pane_header_info(&self, pane: &Entity<Pane>, cx: &App) -> PaneHeader {
     let project = self.active_project();
     match pane.read(cx).content_kind() {
       Some(PaneContentKind::CodeViewer) => {
         if let Some(cv) = project.code_view() {
           let cv = cv.read(cx);
           let dirty = if cv.is_dirty(cx) { " [+]" } else { "" };
-          if let Some(path) = cv.file_path() {
+          let title = if let Some(path) = cv.file_path() {
             let relative = path.strip_prefix(&project.path).ok().unwrap_or(path);
             format!("Code: {}{dirty}", relative.display())
           } else {
             format!("Code{dirty}")
-          }
+          };
+          PaneHeader { title, breadcrumbs: cv.breadcrumb().to_vec() }
         } else {
-          "Code".to_string()
+          PaneHeader { title: "Code".to_string(), breadcrumbs: Vec::new() }
         }
       }
       Some(PaneContentKind::TodoEditor) => {
-        let dirty = if project.todo_view.read(cx).is_dirty(cx) { " [+]" } else { "" };
-        format!("TODO{dirty}")
+        let tv = project.todo_view.read(cx);
+        let dirty = if tv.is_dirty(cx) { " [+]" } else { "" };
+        let title = format!("TODO{dirty}");
+        let breadcrumbs = tv.code_view().read(cx).breadcrumb().to_vec();
+        PaneHeader { title, breadcrumbs }
       }
       Some(PaneContentKind::GitDiff) => {
         let dv = project.diff_view.read(cx);
         let reviewed = dv.reviewed_count();
         let total = dv.file_count();
         let source_label = dv.source().label();
-        if let Some(name) = dv.current_file_name() {
+        let title = if let Some(name) = dv.current_file_name() {
           format!("Diff [{source_label}]: {name} ({reviewed}/{total})")
         } else {
           format!("Diff [{source_label}] ({reviewed}/{total})")
-        }
+        };
+        PaneHeader { title, breadcrumbs: Vec::new() }
       }
       Some(PaneContentKind::GlobalTodo) => {
-        let dirty = if self.global_todo_view.read(cx).is_dirty(cx) { " [+]" } else { "" };
-        format!("Global TODO{dirty}")
+        let cv = self.global_todo_view.read(cx);
+        let dirty = if cv.is_dirty(cx) { " [+]" } else { "" };
+        let title = format!("Global TODO{dirty}");
+        PaneHeader { title, breadcrumbs: cv.breadcrumb().to_vec() }
       }
-      Some(kind) => kind.label().to_string(),
-      None => "Empty".to_string(),
+      Some(kind) => PaneHeader { title: kind.label().to_string(), breadcrumbs: Vec::new() },
+      None => PaneHeader { title: "Empty".to_string(), breadcrumbs: Vec::new() },
     }
   }
 
@@ -196,29 +252,57 @@ impl Render for Workspace {
     let active_border = theme.accent;
     let visible = self.visible_pane_count();
 
-    let pane_header = |label: String, active: bool| {
-      div()
+    let fg = theme.foreground;
+    let muted = theme.muted_foreground;
+
+    let pane_header = |info: PaneHeader, active: bool| {
+      // Budget for breadcrumb elision: leave room for the title.
+      let crumb_budget = 60usize.saturating_sub(info.title.len().min(30));
+      let crumbs = elide_breadcrumbs(&info.breadcrumbs, crumb_budget);
+
+      let title_color = if active { fg } else { muted };
+
+      let mut row = div()
+        .flex()
+        .items_center()
+        .overflow_hidden()
         .px_2()
         .py_1()
         .text_sm()
-        .text_color(if active { theme.foreground } else { theme.muted_foreground })
-        .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
         .border_b_1()
         .border_color(theme.border)
-        .truncate()
-        .child(label)
+        .child(
+          div()
+            .flex_shrink_0()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(title_color)
+            .child(info.title),
+        );
+
+      if !crumbs.is_empty() {
+        let crumb_color = if active { muted } else { muted };
+        for c in crumbs {
+          row = row.child(
+            div().flex_shrink_0().text_color(crumb_color).child(" > "),
+          );
+          row = row.child(
+            div().text_color(crumb_color).truncate().child(c),
+          );
+        }
+      }
+      row
     };
 
     let build_pane_wrapper = |i: usize, pane: &Entity<Pane>| {
       let active = self.active_pane_index == i;
-      let label = self.pane_header_label(pane, cx);
+      let info = self.pane_header_info(pane, cx);
       div()
         .size_full()
         .flex()
         .flex_col()
         .border_l_2()
         .border_color(if active { active_border } else { gpui::transparent_black() })
-        .child(pane_header(label, active))
+        .child(pane_header(info, active))
         .child(div().flex_1().min_h_0().overflow_hidden().child(pane.clone()))
     };
 

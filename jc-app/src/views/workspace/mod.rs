@@ -107,6 +107,7 @@ pub struct Workspace {
   _hook_poll_task: Option<Task<()>>,
   _ipc_poll_task: Option<Task<()>>,
   _bell_subscriptions: Vec<Subscription>,
+  _breadcrumb_observers: Vec<Subscription>,
   _problems_poll_task: Option<Task<()>>,
   /// Home session before first L0 cross-session jump (project_index, session_id).
   pre_layer0_home: Option<(usize, SessionId)>,
@@ -380,6 +381,7 @@ impl Workspace {
       _hook_poll_task: hook_poll_task,
       _ipc_poll_task: Some(ipc_poll_task),
       _bell_subscriptions: bell_subscriptions,
+      _breadcrumb_observers: Vec::new(),
       _problems_poll_task: Some(problems_poll_task),
       pre_layer0_home: None,
       problem_cycle: None,
@@ -499,6 +501,30 @@ impl Workspace {
         }
       },
     ));
+
+    self.refresh_breadcrumb_observers(cx);
+  }
+
+  /// Observe CodeView entities so the pane header re-renders when breadcrumbs change.
+  fn refresh_breadcrumb_observers(&mut self, cx: &mut Context<Self>) {
+    let mut observers = Vec::new();
+
+    // Global TODO view.
+    observers.push(cx.observe(&self.global_todo_view, |_, _, cx| cx.notify()));
+
+    let project = &self.projects[self.active_project_index];
+
+    // Active project's todo_view inner code_view.
+    let todo_cv = project.todo_view.read(cx).code_view().clone();
+    observers.push(cx.observe(&todo_cv, |_, _, cx| cx.notify()));
+
+    // Active session's code view.
+    if let Some(cv) = project.code_view() {
+      let cv = cv.clone();
+      observers.push(cx.observe(&cv, |_, _, cx| cx.notify()));
+    }
+
+    self._breadcrumb_observers = observers;
   }
 
   // ---------------------------------------------------------------------------
@@ -1131,6 +1157,9 @@ impl Workspace {
 
     if project_changed {
       self.subscribe_active_project(window, cx);
+    } else {
+      // Breadcrumb observers depend on the active session's code_view.
+      self.refresh_breadcrumb_observers(cx);
     }
 
     // Refresh problems after acknowledge.

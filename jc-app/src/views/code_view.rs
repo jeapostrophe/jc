@@ -1,5 +1,6 @@
 use crate::file_watcher::watch_dir;
 use crate::language::Language;
+use crate::outline::{OutlineItem, breadcrumb_at_byte, compute_outline};
 use crate::views::comment_panel::CommentContext;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -22,7 +23,14 @@ pub struct CodeView {
   saving: Arc<AtomicBool>,
   base_content: String,
   _subscription: Subscription,
+  _observer: Subscription,
   _watcher: Option<notify::RecommendedWatcher>,
+  /// Cached outline items for the current editor text.
+  cached_outline: Vec<OutlineItem>,
+  /// Breadcrumb labels for the current cursor position (e.g. ["impl Foo", "fn bar"]).
+  breadcrumb: Vec<String>,
+  /// Last cursor byte offset used for breadcrumb, to skip redundant lookups.
+  last_breadcrumb_offset: usize,
 }
 
 impl CodeView {
@@ -34,10 +42,15 @@ impl CodeView {
         .line_number(false)
     });
 
-    let subscription = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, _cx| {
+    let subscription = cx.subscribe(&editor, |this: &mut Self, _, event: &InputEvent, cx| {
       if matches!(event, InputEvent::Change) {
         this.dirty = true;
+        this.recompute_outline(cx);
       }
+    });
+
+    let observer = cx.observe(&editor, |this: &mut Self, _, cx| {
+      this.update_breadcrumb(cx);
     });
 
     Self {
@@ -49,7 +62,11 @@ impl CodeView {
       saving: Arc::new(AtomicBool::new(false)),
       base_content: String::default(),
       _subscription: subscription,
+      _observer: observer,
       _watcher: None,
+      cached_outline: Vec::new(),
+      breadcrumb: Vec::new(),
+      last_breadcrumb_offset: usize::MAX,
     }
   }
 
@@ -99,6 +116,7 @@ impl CodeView {
     });
     self.dirty = false;
     self.externally_modified = false;
+    self.recompute_outline(cx);
     cx.notify();
   }
 
@@ -186,6 +204,47 @@ impl CodeView {
 
   pub fn current_language(&self) -> Language {
     self.current_file.as_deref().map(Language::from_path).unwrap_or_default()
+  }
+
+  /// Return the current breadcrumb labels (ancestor chain at cursor).
+  pub fn breadcrumb(&self) -> &[String] {
+    &self.breadcrumb
+  }
+
+  /// Recompute the outline from the current editor text. Called on text changes.
+  fn recompute_outline(&mut self, cx: &mut Context<Self>) {
+    let lang = if self.language_override.as_ref().map(|s| s.as_ref()) == Some("todo-markdown") {
+      Language::Markdown
+    } else {
+      self.current_language()
+    };
+    let text = self.editor.read(cx).value().to_string();
+    self.cached_outline = compute_outline(&text, lang);
+    self.last_breadcrumb_offset = usize::MAX; // force re-evaluation
+    self.update_breadcrumb(cx);
+  }
+
+  /// Update breadcrumb based on current cursor position. Only notifies if changed.
+  fn update_breadcrumb(&mut self, cx: &mut Context<Self>) {
+    if self.cached_outline.is_empty() {
+      if !self.breadcrumb.is_empty() {
+        self.breadcrumb.clear();
+        self.last_breadcrumb_offset = usize::MAX;
+        cx.notify();
+      }
+      return;
+    }
+    let byte_offset = self.editor.read(cx).selection_byte_range().start;
+    if byte_offset == self.last_breadcrumb_offset {
+      return;
+    }
+    self.last_breadcrumb_offset = byte_offset;
+    let chain = breadcrumb_at_byte(&self.cached_outline, byte_offset);
+    let new_breadcrumb: Vec<String> = chain.into_iter().map(|item| item.name.clone()).collect();
+    if new_breadcrumb != self.breadcrumb {
+      self.breadcrumb = new_breadcrumb;
+      cx.notify();
+    }
   }
 
   pub fn comment_context(&self, project_path: &Path, cx: &App) -> Option<CommentContext> {

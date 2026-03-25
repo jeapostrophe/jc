@@ -95,6 +95,32 @@ pub fn compute_outline(text: &str, language: Language) -> Vec<OutlineItem> {
   items
 }
 
+/// Return the chain of outline items (from outermost to innermost) that
+/// contain `byte_offset`. Useful for breadcrumb display.
+pub fn breadcrumb_at_byte(outline: &[OutlineItem], byte_offset: usize) -> Vec<&OutlineItem> {
+  // Find the deepest item whose byte_range contains the offset.
+  let mut best: Option<usize> = None;
+  for (i, item) in outline.iter().enumerate() {
+    if item.byte_range.start <= byte_offset && byte_offset < item.byte_range.end {
+      match best {
+        Some(b) if outline[b].depth < item.depth => best = Some(i),
+        None => best = Some(i),
+        _ => {}
+      }
+    }
+  }
+
+  // Walk up the parent chain to build the breadcrumb.
+  let mut chain = Vec::new();
+  let mut idx = best;
+  while let Some(i) = idx {
+    chain.push(&outline[i]);
+    idx = outline[i].parent;
+  }
+  chain.reverse();
+  chain
+}
+
 fn language_and_query(language: Language) -> Option<(TsLanguage, &'static str)> {
   match language {
     Language::Rust => {
