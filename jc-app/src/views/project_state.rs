@@ -40,23 +40,47 @@ impl ProjectState {
     let diff_view = cx.new(|cx| DiffView::new(path.clone(), window, cx));
     let todo_view = cx.new(|cx| TodoView::new(path.clone(), window, cx));
 
+    // Mark sessions whose JSONL files have been garbage-collected by Claude.
+    let session_dir = Self::session_dir(&path);
+    {
+      let document = todo_view.read(cx).document().clone();
+      let expired_labels: Vec<String> = document
+        .sessions
+        .iter()
+        .filter(|s| {
+          !s.uuid.is_empty()
+            && s.status != jc_core::todo::SessionStatus::Expired
+            && !session_dir.join(format!("{}.jsonl", s.uuid)).exists()
+        })
+        .map(|s| s.label.clone())
+        .collect();
+      if !expired_labels.is_empty() {
+        todo_view.update(cx, |tv, cx| {
+          for label in &expired_labels {
+            tv.mark_session_expired(label, window, cx);
+          }
+          tv.save(cx);
+        });
+      }
+    }
+
     // Lazy adoption: only launch a terminal for the first TODO session whose
     // UUID still has a JSONL file on disk (i.e. the session is resumable).
     // Fall back to the first session if none have a live UUID.
     let document = todo_view.read(cx).document().clone();
     let mut sessions = HashMap::new();
     let mut next_session_id: SessionId = 0;
-
-    let session_dir = Self::session_dir(&path);
     let best = document
       .sessions
       .iter()
-      .filter(|s| !s.disabled)
+      .filter(|s| s.status == jc_core::todo::SessionStatus::Active)
       .find(|s| {
         !s.uuid.is_empty()
           && session_dir.join(format!("{}.jsonl", s.uuid)).exists()
       })
-      .or_else(|| document.sessions.iter().find(|s| !s.disabled));
+      .or_else(|| {
+        document.sessions.iter().find(|s| s.status == jc_core::todo::SessionStatus::Active)
+      });
 
     if let Some(todo_session) = best {
       let uuid = if todo_session.uuid.is_empty() {
@@ -102,7 +126,7 @@ impl ProjectState {
   }
 
   /// Path to Claude's JSONL session directory for this project.
-  fn session_dir(project_path: &Path) -> PathBuf {
+  pub fn session_dir(project_path: &Path) -> PathBuf {
     let encoded = project_path.to_string_lossy().replace('/', "-");
     let home = std::env::var("HOME").expect("HOME not set");
     PathBuf::from(home).join(".claude/projects").join(encoded)

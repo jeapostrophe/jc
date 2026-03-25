@@ -110,6 +110,9 @@ impl Workspace {
       return;
     }
 
+    // Check for sessions whose JSONL files have been garbage-collected and mark them [X].
+    self.mark_expired_sessions(window, cx);
+
     let docs = self.todo_documents(cx);
     let delegate = SessionPickerDelegate::new(&self.projects, self.active_project_index, &docs);
     self.show_session_picker(delegate, window, cx);

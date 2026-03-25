@@ -164,6 +164,24 @@ impl TodoView {
     });
   }
 
+  /// Mark a session as expired (`[X]`) because its JSONL was garbage-collected.
+  pub fn mark_session_expired(
+    &mut self,
+    label: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let text = self.editor_text(cx);
+    if let Some(new_text) = todo::mark_session_expired(&text, &self.document, label) {
+      self.code_view.update(cx, |cv, cx| {
+        cv.editor().update(cx, |state, cx| {
+          state.set_value_preserving_position(new_text, window, cx);
+        });
+      });
+      self.revalidate(cx);
+    }
+  }
+
   /// Toggle the `[D]` (disabled/dormant) prefix on a session heading.
   pub fn toggle_session_disabled(
     &mut self,

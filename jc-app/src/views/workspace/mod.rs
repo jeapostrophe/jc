@@ -1325,7 +1325,7 @@ impl Workspace {
         .read(cx)
         .document()
         .session_by_label(label)
-        .map_or(false, |s| s.disabled);
+        .map_or(false, |s| s.status == jc_core::todo::SessionStatus::Disabled);
       if is_disabled {
         todo_view.update(cx, |tv, cx| {
           tv.toggle_session_disabled(label, window, cx);
@@ -1363,6 +1363,44 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
+  // Session expiration (GC'd JSONL detection)
+  // ---------------------------------------------------------------------------
+
+  /// Scan all projects for unadopted sessions whose JSONL files no longer exist
+  /// and mark them `[X]` in TODO.md so they don't appear in the picker.
+  fn mark_expired_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    for project in &self.projects {
+      let session_dir = ProjectState::session_dir(&project.path);
+      let document = project.todo_view.read(cx).document().clone();
+      let adopted_uuids: std::collections::HashSet<&str> = project
+        .sessions
+        .values()
+        .filter_map(|s| s.uuid.as_deref())
+        .collect();
+      let expired_labels: Vec<String> = document
+        .sessions
+        .iter()
+        .filter(|s| {
+          !s.uuid.is_empty()
+            && s.status != jc_core::todo::SessionStatus::Expired
+            && !adopted_uuids.contains(s.uuid.as_str())
+            && !session_dir.join(format!("{}.jsonl", s.uuid)).exists()
+        })
+        .map(|s| s.label.clone())
+        .collect();
+      if !expired_labels.is_empty() {
+        let todo_view = project.todo_view.clone();
+        todo_view.update(cx, |tv, cx| {
+          for label in &expired_labels {
+            tv.mark_session_expired(label, window, cx);
+          }
+          tv.save(cx);
+        });
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Session disable toggle
   // ---------------------------------------------------------------------------
 
@@ -1386,7 +1424,7 @@ impl Workspace {
 
     // If the session was adopted and is now being disabled, detach it.
     let is_now_disabled = todo_view.read(cx).document().session_by_label(label)
-      .map_or(false, |s| s.disabled);
+      .map_or(false, |s| s.status == jc_core::todo::SessionStatus::Disabled);
     if is_now_disabled {
       if let Some(id) = adopted_id {
         let project = &mut self.projects[project_idx];

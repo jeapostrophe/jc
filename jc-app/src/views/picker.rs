@@ -837,7 +837,7 @@ enum SessionPickerEntryKind {
   /// An adopted session — stores its SessionId.
   Session(SessionId),
   /// A TODO.md session not yet adopted (has uuid + label but no running terminal).
-  Unadopted { uuid: String, disabled: bool },
+  Unadopted { uuid: String, status: jc_core::todo::SessionStatus },
   /// A project with no sessions — selecting it will discover-or-create a session.
   EmptyProject,
 }
@@ -884,7 +884,11 @@ impl SessionPickerDelegate {
 
       let has_adoptable = todo_documents
         .get(pi)
-        .map_or(false, |d| d.sessions.iter().any(|s| !s.uuid.is_empty()));
+        .map_or(false, |d| {
+          d.sessions.iter().any(|s| {
+            !s.uuid.is_empty() && s.status != jc_core::todo::SessionStatus::Expired
+          })
+        });
       if project.sessions.is_empty() && !has_adoptable {
         let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);
         entries.push(SessionPickerEntry {
@@ -935,11 +939,15 @@ impl SessionPickerDelegate {
           if todo_session.uuid.is_empty() {
             continue;
           }
+          // Skip expired sessions — JSONL was garbage-collected.
+          if todo_session.status == jc_core::todo::SessionStatus::Expired {
+            continue;
+          }
           if !uuid_adopted && !label_adopted {
             entries.push(SessionPickerEntry {
               kind: SessionPickerEntryKind::Unadopted {
                 uuid: todo_session.uuid.clone(),
-                disabled: todo_session.disabled,
+                status: todo_session.status,
               },
               project_index: pi,
               project_name: project.name.clone(),
@@ -1097,11 +1105,13 @@ impl PickerDelegate for SessionPickerDelegate {
         let color = if selected { theme.accent_foreground } else { theme.blue };
         picker_marker_base().text_color(color).child("+")
       }
-      SessionPickerEntryKind::Unadopted { disabled: true, .. } => {
+      SessionPickerEntryKind::Unadopted {
+        status: jc_core::todo::SessionStatus::Disabled, ..
+      } => {
         let color = if selected { theme.accent_foreground } else { theme.muted_foreground };
         picker_marker_base().text_color(color).child("~")
       }
-      SessionPickerEntryKind::Unadopted { disabled: false, .. } => {
+      SessionPickerEntryKind::Unadopted { .. } => {
         let color = if selected { theme.accent_foreground } else { theme.yellow };
         picker_marker_base().text_color(color).child("~")
       }
@@ -1126,8 +1136,10 @@ impl PickerDelegate for SessionPickerDelegate {
     let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
     let right = match &entry.kind {
       SessionPickerEntryKind::EmptyProject => "(no sessions)".to_string(),
-      SessionPickerEntryKind::Unadopted { disabled: true, .. } => "(disabled)".to_string(),
-      SessionPickerEntryKind::Unadopted { disabled: false, .. } => "(adopt)".to_string(),
+      SessionPickerEntryKind::Unadopted {
+        status: jc_core::todo::SessionStatus::Disabled, ..
+      } => "(disabled)".to_string(),
+      SessionPickerEntryKind::Unadopted { .. } => "(adopt)".to_string(),
       _ => String::new(),
     };
     let right_el = div().ml_auto().text_xs().text_color(muted_color).child(right);
@@ -1279,7 +1291,7 @@ impl ProjectActionsPickerDelegate {
 
       if let Some(doc) = todo_documents.get(active_project_index) {
         for ts in &doc.sessions {
-          if ts.uuid.is_empty() {
+          if ts.uuid.is_empty() || ts.status == jc_core::todo::SessionStatus::Expired {
             continue;
           }
           let uuid_adopted = adopted_uuids.contains(ts.uuid.as_str());

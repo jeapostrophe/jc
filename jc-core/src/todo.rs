@@ -11,12 +11,23 @@ pub struct TodoDocument {
   pub sessions: Vec<TodoSession>,
 }
 
+/// Session lifecycle state as marked in TODO.md headings.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+  /// Normal active session (no prefix).
+  #[default]
+  Active,
+  /// Disabled/dormant — `[D]` prefix. Present but should not auto-attach.
+  Disabled,
+  /// Expired — `[X]` prefix. JSONL was garbage-collected by Claude.
+  Expired,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct TodoSession {
   pub uuid: String,
   pub label: String,
-  /// Session is present in the document but should not be auto-attached on startup.
-  pub disabled: bool,
+  pub status: SessionStatus,
   pub line: u32,
   pub heading_byte_range: Range<usize>,
   /// 1-based line number of the `> uuid=...` line.
@@ -160,15 +171,17 @@ pub fn parse(text: &str) -> TodoDocument {
       } else if after_h2.starts_with("[DELETED] ") {
         // Skip sessions marked as [DELETED].
       } else if !after_h2.is_empty() {
-        // Check for [D] prefix indicating a disabled (dormant) session.
-        let (label, disabled) = if let Some(rest) = after_h2.strip_prefix("[D] ") {
-          (rest.to_string(), true)
+        // Check for [D] (disabled) or [X] (expired/GC'd) prefix.
+        let (label, status) = if let Some(rest) = after_h2.strip_prefix("[D] ") {
+          (rest.to_string(), SessionStatus::Disabled)
+        } else if let Some(rest) = after_h2.strip_prefix("[X] ") {
+          (rest.to_string(), SessionStatus::Expired)
         } else {
-          (after_h2.to_string(), false)
+          (after_h2.to_string(), SessionStatus::Active)
         };
         expecting_uuid_for = Some(TodoSession {
           label,
-          disabled,
+          status,
           line: line_num,
           heading_byte_range: line_start..line_end,
           ..Default::default()
@@ -350,13 +363,36 @@ pub fn insert_session_heading(
 // Session deletion marking
 // ---------------------------------------------------------------------------
 
+/// Mark a session as expired (`[X]` prefix) because its JSONL was garbage-collected.
+/// Returns the modified text, or `None` if the label was not found or already expired.
+pub fn mark_session_expired(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
+  let session = doc.session_by_label(label)?;
+  if session.status == SessionStatus::Expired {
+    return None; // already marked
+  }
+  let range = session.heading_byte_range.clone();
+  let heading = &text[range.clone()];
+  // Remove [D] if present, then add [X].
+  let new_heading = match session.status {
+    SessionStatus::Disabled => {
+      heading.replacen(&format!("## [D] {label}"), &format!("## [X] {label}"), 1)
+    }
+    _ => heading.replacen(&format!("## {label}"), &format!("## [X] {label}"), 1),
+  };
+  let mut new_text = String::with_capacity(text.len() + 4);
+  new_text.push_str(&text[..range.start]);
+  new_text.push_str(&new_heading);
+  new_text.push_str(&text[range.end..]);
+  Some(new_text)
+}
+
 /// Toggle the `[D]` (disabled/dormant) prefix on a session heading.
 /// Returns the modified text, or `None` if the label was not found.
 pub fn toggle_session_disabled(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
   let session = doc.session_by_label(label)?;
   let range = session.heading_byte_range.clone();
   let heading = &text[range.clone()];
-  let new_heading = if session.disabled {
+  let new_heading = if session.status == SessionStatus::Disabled {
     // Remove [D] prefix: `## [D] Label` → `## Label`
     heading.replacen(&format!("## [D] {label}"), &format!("## {label}"), 1)
   } else {
@@ -981,10 +1017,10 @@ third
     let doc = parse(text);
     assert_eq!(doc.sessions.len(), 2);
     assert_eq!(doc.sessions[0].label, "Dormant Session");
-    assert!(doc.sessions[0].disabled);
+    assert!(doc.sessions[0].status == SessionStatus::Disabled);
     assert_eq!(doc.sessions[0].uuid, "dormant");
     assert_eq!(doc.sessions[1].label, "Active Session");
-    assert!(!doc.sessions[1].disabled);
+    assert_ne!(doc.sessions[1].status, SessionStatus::Disabled);
   }
 
   #[test]
@@ -997,21 +1033,21 @@ third
 ### WAIT
 ";
     let doc = parse(text);
-    assert!(!doc.sessions[0].disabled);
+    assert_ne!(doc.sessions[0].status, SessionStatus::Disabled);
 
     // Disable it.
     let disabled_text = toggle_session_disabled(text, &doc, "My Session").unwrap();
     assert!(disabled_text.contains("## [D] My Session"));
     let doc2 = parse(&disabled_text);
     assert_eq!(doc2.sessions[0].label, "My Session");
-    assert!(doc2.sessions[0].disabled);
+    assert!(doc2.sessions[0].status == SessionStatus::Disabled);
 
     // Re-enable it.
     let enabled_text = toggle_session_disabled(&disabled_text, &doc2, "My Session").unwrap();
     assert!(enabled_text.contains("## My Session"));
     assert!(!enabled_text.contains("[D]"));
     let doc3 = parse(&enabled_text);
-    assert!(!doc3.sessions[0].disabled);
+    assert_ne!(doc3.sessions[0].status, SessionStatus::Disabled);
   }
 
   #[test]
@@ -1049,6 +1085,61 @@ stale draft
     let doc = parse(text);
     assert_eq!(doc.sessions.len(), 1);
     assert_eq!(doc.sessions[0].label, "Active Session");
+  }
+
+  #[test]
+  fn expired_sessions_are_parsed_with_flag() {
+    let text = "\
+# Claude
+## [X] GC'd Session
+> uuid=gone
+## Active Session
+> uuid=active
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions.len(), 2);
+    assert_eq!(doc.sessions[0].label, "GC'd Session");
+    assert_eq!(doc.sessions[0].status, SessionStatus::Expired);
+    assert_eq!(doc.sessions[1].label, "Active Session");
+    assert_eq!(doc.sessions[1].status, SessionStatus::Active);
+  }
+
+  #[test]
+  fn mark_session_expired_adds_prefix() {
+    let text = "\
+# Claude
+## My Session
+> uuid=my-uuid
+### WAIT
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions[0].status, SessionStatus::Active);
+
+    let expired_text = mark_session_expired(text, &doc, "My Session").unwrap();
+    assert!(expired_text.contains("## [X] My Session"));
+    let doc2 = parse(&expired_text);
+    assert_eq!(doc2.sessions[0].status, SessionStatus::Expired);
+    assert_eq!(doc2.sessions[0].label, "My Session");
+
+    // Already expired — returns None.
+    assert!(mark_session_expired(&expired_text, &doc2, "My Session").is_none());
+  }
+
+  #[test]
+  fn mark_disabled_session_expired_replaces_prefix() {
+    let text = "\
+# Claude
+## [D] Dormant Session
+> uuid=old-uuid
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions[0].status, SessionStatus::Disabled);
+
+    let expired_text = mark_session_expired(text, &doc, "Dormant Session").unwrap();
+    assert!(expired_text.contains("## [X] Dormant Session"));
+    assert!(!expired_text.contains("[D]"));
+    let doc2 = parse(&expired_text);
+    assert_eq!(doc2.sessions[0].status, SessionStatus::Expired);
   }
 
   #[test]
