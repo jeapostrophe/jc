@@ -1,56 +1,110 @@
 # TODO
 
 # Claude
-## TODO
-> uuid=40f39fb5-dacf-4da0-9151-f2db04ecba2d
+## Task 1
+> uuid=121d9f8f-f228-475c-ba12-f125050bbeaa
 ### Message 0
-Sometimes saving jumps the TODO.md focus to the top; it doesn't always, but I haven't been able to figure out what is doing it.
-### Message 1
-TI want to revise the Cmd-; command to always use the right-most visible pane to seek. The basic idea is that I almost always want Claude to be on left-pane and then I will use the right-pane for TODO and the third pane for other things; but if the window is small, I'll use the right-pane for the problem seeking
-### Message 2
-Tiny problem: In the TODO view (and presumably code view), when I press Shift-Delete, it doesn't do a character deletion
-### Message 3
-Commit all the changes in the repo
-### WAIT
-## Detach
-> uuid=7e6eef68-f1c6-4e54-b96d-cf985da010c4
-### Message 0
-I want to investigate this problem/feature:
-- I have some projects that I want to use sometimes, but rarely. I don't want to delete them from the state.toml's project list, because I want them easily accessible.
-- The problem is that when I start 'jc' it automatically attaches to everything in the TODO file.
-- I want to extend the TODO format with a simple [D] note that causes the session to NOT be automatically attached.
-- This might be the same thing as the current "deleted" which is bound to Cmd-Shift-Backspace in the picker, but with a bit of a more ergonomic format AND I want it to show up in the 'adopt' list, which I think deleted things don't. If I want something truly deleted, I'll detach and then remove the todo section
-### Message 1
-Let's make Cmd-Shift-Backspace toggle [D] and ensure that if the user changes the '[D]' to '[DELETED]' we notice and remove it from the adoption list. Thus D -> DELETED will always be a human thing
-### Message 2
-Let's remove support for the backwards compatible 'DELETED' option.
+When jc tries to attach to session (uuid) that Claude has garbage collected, it is stuck in memory and can't be removed from the active session list. We have to restarted to get it to forget.
 
-We need to ensure that if a project has no entries in its TODO at all, then in the Cmd-P picker we show the option to create a new one and not auto-create one ourselves on start-up
+It is also surprising for the user when this happens. Given that we can check the presence of the uuid files, we can be proactive about this and (a) not show them in the picker even if they are in the TODO.md and (b) mark them differently (with an [X])
+### Message 1
+Is it sufficient to only mark [X] at project load? I don't anticipate restarting jc every day; do we every regularly look at the session dir?
+
+Should 'disabled' and 'expired' be an enum rather than two bools?
+### Message 2
+Can we modify the Code view (which will be inherited by TODO and Global TODO) to use Treesitter to show an outline bread crumb in the pane label bar for here the user is..
+
+For example, right now the bar says "TODO [+]" but it could say "TODO [+] > Claude > Task 1 > WAIT" ... I think this information is available. We're already displaying this outline with Cmd-Shift-O, but this is just exposing it in a different way.
 ### Message 3
-The project picker (Cmd-P) is too optimistic. It shows things as adoptable sessions even if they have no uuid=, which means trying to use them would actually create a new session.
+How is it implemented when the outline text is very long? I want to ensure it fits on one line and that the file name is always shown. Any eliding should happen in the middle
+
+"TODO [+] > Claude > Task 1 > Subtask 8 > Subsubtask 9 > WAIT"
+
+becomes
+
+"TODO [+] > Claude > Task 1 ... > WAIT"
+
+Stylistically, we want only the filename to be bolded, not the entire label.
 ### Message 4
-It also appears that the TODO parser is marking as sessions everything at the '##' height rather than only things inside '# Claude'. An example is @../gb.rs/TODO.md
+If I disable the last session in a project, we stay in the project rather than going to a new one. This is a bit odd.
 ### Message 5
-Let's make the project actions picker and project picker have a small box at the bottom (after the picker entries, with a bar) that shows a little glossary of what the symbols mean and for Cmd-Shift-P it should say that Cmd-Shift-Backspace detaches a session
+Look at ../dump/published/20260306-context/README.md
+
+I want to write an article that explains how and why jc works the way that it does for interacting quickly with many Claude sessions.
+
+jc is consciously design to optimize the "prepare a plan -> review a plan -> talk to Claude -> review its work -> repeat" cycle without waiting for 7 minutes between Claude interactions or forgetting where you were in a particular project.
+
+The goal of the article is 80% to explain a practice for implementing the context ideas and 20% to promote jc itself as something they should use.
+
+I want it to be short, like that article, but clear.
 ### Message 6
-Change the project picker so that (adopt) and (new) entries are always near the bottom. It should be:
+Good; on "you select the notes", I think we want to say "just press Cmd-Enter and the message is sent"
 
-[this project, problems]
-[this project, attached]
-[other projects, attached (everything for each project together)]
-[other projects, new if no sessions]
-[this project, detached]
-[other projects, detached]
-[the current session]
+Also, I think that we need to make it clear that we save the message so you can easily review what you previously sent so you know the context.
 
-Are there any other categories I'm forgetting about how they should sort?
+Also, the github username is jeapostrophe
+### Message 7
+- We should plan to have a screenshot, maybe?
+- Before I had jc, I tried to do this but it was difficult to manually maintain the TODO.md files, switch between Zed windows without helps or notifications, and remember which session was which terminal tab in Zed. I kind of want to say "How in practice you really do this without jc" and "What the DIY thing fails to deliver"
+- Looking at *this* repo... is there any reason not to make it public?
+### Message 8
+Let's improve the README of this project to make it better as a first read when people come into the project. I think it contains too much information and is not in the order a human would want to read it.
+
+We might need ./ARCH.md and ./DESIGN.md or some other division(s)
+### Message 9
+Move the task checklist into ./PLAN.md
+### Message 10
+I put a screenshot in ./screenshot.png ; let's incorporate it into the README and the article.
+### Message 11
+Nitpick: the caption for the screenshot says "TODO, Claude, diff", but actually it is "Claude, TODO, diff"
+### Message 12
+Do a WebSearch for articles with similar content or tools that offer similar things. My priors are that most tools are trying to be Cursor, sell to enterprises, and manage "agent teams" rather than optimizing individual contributors. But maybe I'm wrong. In either case, how can we change or strengthen the article based on what we learn?
+### Message 13
+On the "DIY Version"... on the switching to other notes, I want to say something in the whole section... I optimized Zed with keybindings for rotating the focus, jumping between panes, I had the diff on the left, the TODO on the right, the terminal beneath with tabs for each. I was using the outline picker to jump to the right spot in the TODO, but it felt slow and brittle and I wasn't fast enough and made mistakes.
+### Message 14
+"So people don't switch" --- They also try to make Claude totally autonmous and interact with it through Github PR review.
+
+Joke call to action in the article or README --- If you have improvements, have your Claude call my Claude. (I don't accept human authored code.)
+### Message 15
+1. Add a link in the project README to the article; it will be at
+
+https://jeapostrophe.github.io/tech/jc-workflow/
+
+2. How does Github README.md rendering deal with large images? The screenshot is 4064 x 2334
+### Message 16
+What is the best way to promote this? I have no meaningful Twitter --- https://x.com/jeapostrophe --- or LinkedIn --- https://www.linkedin.com/in/jeapostrophe/ --- presence; but I have a ton of stars on Github --- https://github.com/jeapostrophe --- do I just post it on HackerNews and /r/claudai ; fire and forget?
 ### WAIT
-## jc from other directories
-> uuid=06486e67-f388-4e12-bdbe-9144bc447675
+
+## M
+xxx promotion
+## [X] Task 2
+> uuid=e662fbbb-b2eb-417c-8f62-5ca8be12e407
+### WAIT
+## [D] Task 3
+> uuid=ce8dfa9f-7a3a-4068-985b-e703062d6cfb
 ### Message 0
-When I am in another directory and I run the 'jc' command in my path
+The new terminal code is broken. The terminal defaults to blank and then when there's activity (like new characters) the content flashes in and then disappears
+### Message 1
+Good, now the git diff code that includes files not in the repo is broken. I have an entire .gitignore'd directory in ../gb.rs/doc/concept-art/db and all 1400+ files/directories in it are being listed as problems in that project
+### Message 2
+This change didn't work, ../gb.rs still says it has 1412 problems but there are really only about 20 files
+### Message 3
+I want to do some more performance analysis. I'm noticing what seems like frame drops while typing. I have 9 active sessions all with active Claudes doing things, printing out to the terminal, modifying files, etc.
 
-lrwxr-xr-x 1 jay staff 25 Mar 17 18:49 /Users/jay/Dev/dot-files/bin/jc -> /Users/jay/Dev/jc/make.sh
+I'm worried that we have a ton of background processing happening that is taking place in the UI thread and instead we should have a separate UI and background thread so that the UI can always modify and stay responsive, but I'm not positive how the architecture is working.
+### Message 4
+Review ../common/icons
 
-It fails. I think we need to launch a sub-shell for the build and then return to the original shell for execution
+I want to generate a new icon. I think our current one is bad.
+
+We need to have some concepts. Read the docs and read ../dump/jc-workflow/README.md to get some inspiration
+
+We want to communicate "efficiency" "human context management" etc
+### Message 5
+I like 1, 2, 5, and 8.
+### Message 6
+Let's go with key-2 but save switchboard-4 as a back up in this directory
+
+Adjust the icon build process and files to use this image instead
 ### WAIT
+
