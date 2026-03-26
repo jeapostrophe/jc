@@ -20,7 +20,10 @@ pub enum HookEventKind {
   IdlePrompt,
   PermissionPrompt,
   /// A `/clear` was detected: the old session ended and a new one started.
-  SessionClear { old_session_id: String, new_session_id: String },
+  SessionClear {
+    old_session_id: String,
+    new_session_id: String,
+  },
 }
 
 /// Lightweight HTTP server that receives Claude Code hook POSTs.
@@ -148,9 +151,7 @@ fn accept_loop(
             new_session_id: session_id.clone(),
           })
         } else {
-          eprintln!(
-            "hook: session-start clear with no matching stash, session_id={session_id}"
-          );
+          eprintln!("hook: session-start clear with no matching stash, session_id={session_id}");
           None
         }
       }

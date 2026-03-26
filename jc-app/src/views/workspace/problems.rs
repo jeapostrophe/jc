@@ -72,9 +72,8 @@ impl Workspace {
     // Phase 2: No L0 problems — return home if we were away.
     if let Some((home_pi, home_sid)) = self.pre_layer0_home.take() {
       // Validate home session still exists.
-      let home_valid = self.projects.get(home_pi)
-        .map(|p| p.sessions.contains_key(&home_sid))
-        .unwrap_or(false);
+      let home_valid =
+        self.projects.get(home_pi).map(|p| p.sessions.contains_key(&home_sid)).unwrap_or(false);
       if home_valid {
         self.switch_to_session(home_pi, Some(home_sid), window, cx);
       }
@@ -191,9 +190,8 @@ impl Workspace {
       // Synthetic L3: session idle and has been busy before.
       if !session.busy && session.has_ever_been_busy {
         // Only add L3 if no other problems target Claude terminal already.
-        let has_claude_problem = session.problems.iter().any(|p| {
-          matches!(p.target(), ProblemTarget::ClaudeTerminal)
-        });
+        let has_claude_problem =
+          session.problems.iter().any(|p| matches!(p.target(), ProblemTarget::ClaudeTerminal));
         if !has_claude_problem {
           problems.push((ProblemLayer::L3, 0, ProblemTarget::ClaudeTerminal));
         }
@@ -231,8 +229,7 @@ impl Workspace {
       for (pi, project) in self.projects.iter().enumerate() {
         // Check session problems.
         for (&sid, session) in &project.sessions {
-          let is_active =
-            pi == self.active_project_index && project.active_session == Some(sid);
+          let is_active = pi == self.active_project_index && project.active_session == Some(sid);
           if is_active {
             continue;
           }
@@ -265,7 +262,9 @@ impl Workspace {
 
         // Check project-level problems (L1: diffs, scripts) — attribute to project name.
         // Skip projects with no attached sessions (nobody is working on them).
-        if *layer == ProblemLayer::L1 && !project.problems.is_empty() && !project.sessions.is_empty()
+        if *layer == ProblemLayer::L1
+          && !project.problems.is_empty()
+          && !project.sessions.is_empty()
         {
           let label = format!("{} (files)", project.name);
           // Avoid duplicating if a session already added this project.
@@ -291,8 +290,7 @@ impl Workspace {
     }
 
     // If a visible pane already shows this content kind, use it.
-    if let Some(idx) = (0..visible).find(|&i| self.panes[i].read(cx).content_kind() == Some(kind))
-    {
+    if let Some(idx) = (0..visible).find(|&i| self.panes[i].read(cx).content_kind() == Some(kind)) {
       return idx;
     }
 
@@ -341,8 +339,7 @@ impl Workspace {
       ProblemTarget::CodeView { file, line } if kind == PaneContentKind::CodeViewer => {
         let project_path = self.projects[self.active_project_index].path.clone();
         let full_path = project_path.join(&file);
-        let Some(code_view) = self.projects[self.active_project_index].code_view().cloned()
-        else {
+        let Some(code_view) = self.projects[self.active_project_index].code_view().cloned() else {
           return;
         };
         code_view.update(cx, |v, cx| {

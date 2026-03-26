@@ -1347,10 +1347,7 @@ impl Element for TextElement {
           for (bg_range, bg_color) in &state.line_backgrounds {
             if bg_range.start < line_byte_range.end && bg_range.end > line_byte_range.start {
               let p = point(input_bounds.origin.x, origin.y + offset_y);
-              window.paint_quad(fill(
-                Bounds::new(p, size(bounds.size.width, height)),
-                *bg_color,
-              ));
+              window.paint_quad(fill(Bounds::new(p, size(bounds.size.width, height)), *bg_color));
               break;
             }
           }

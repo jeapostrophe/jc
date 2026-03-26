@@ -3,16 +3,15 @@ use crate::input::keystroke_to_bytes;
 use crate::pty::PtyHandle;
 use crate::render::{CellLayout, TerminalRenderState, measure_cell, paint_terminal};
 use crate::terminal::{TerminalEvent, TerminalState};
+use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
-use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
 use gpui::{
   App, AsyncApp, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
   InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
   MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
-  Styled, Subscription,
-  Timer, WeakEntity, Window, actions, canvas, div, px,
+  Styled, Subscription, Timer, WeakEntity, Window, actions, canvas, div, px,
 };
 use parking_lot::Mutex;
 use std::io::Read;
@@ -27,7 +26,17 @@ const FONT_SIZE_MAX: Pixels = px(72.0);
 
 actions!(
   terminal,
-  [IncreaseFontSize, DecreaseFontSize, ResetFontSize, Copy, Paste, SendTab, SendShiftTab, SendEnter, SendShiftEnter]
+  [
+    IncreaseFontSize,
+    DecreaseFontSize,
+    ResetFontSize,
+    Copy,
+    Paste,
+    SendTab,
+    SendShiftTab,
+    SendEnter,
+    SendShiftEnter
+  ]
 );
 
 /// Register terminal keybindings. Call once during app initialization.
@@ -463,7 +472,12 @@ impl TerminalView {
     let _ = self.pty.write_all(b"\r");
   }
 
-  fn send_shift_enter(&mut self, _: &SendShiftEnter, _window: &mut Window, _cx: &mut Context<Self>) {
+  fn send_shift_enter(
+    &mut self,
+    _: &SendShiftEnter,
+    _window: &mut Window,
+    _cx: &mut Context<Self>,
+  ) {
     self.reset_cursor_blink();
     self.state.with_term_mut(|term| {
       term.selection = None;
@@ -684,57 +698,60 @@ impl Render for TerminalView {
           }
         }
       }))
-      .child(canvas(
-        {
-          let font_family = font_family.clone();
-          let canvas_origin = self.canvas_origin.clone();
-          move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
-            *canvas_origin.lock() = bounds.origin;
-            (bounds, layout, font_family)
-          }
-        },
-        {
-          let term_handle = self.state.term_handle();
-          let palette = self.palette.clone();
-          let pty_for_resize = self.pty.clone();
-          let last_size = self.last_size.clone();
-          move |_bounds: Bounds<Pixels>,
-                (prep_bounds, layout, font_family): (Bounds<Pixels>, CellLayout, SharedString),
-                window: &mut Window,
-                cx: &mut App| {
-            let mut term = term_handle.lock();
-
-            // The layout bounds may be larger than the visible area because
-            // `height: 100%` in the size_full() chain can resolve against the
-            // window rather than the flex-allocated space.  Use the content
-            // mask (set by parent overflow_hidden) to get the true visible size.
-            let visible = prep_bounds.intersect(&window.content_mask().bounds);
-            let new_cols = (visible.size.width / layout.width).floor() as u16;
-            let new_rows = (visible.size.height / layout.height).floor() as u16;
-            let mut last = last_size.lock();
-            if new_cols > 0 && new_rows > 0 && (new_cols != last.0 || new_rows != last.1) {
-              *last = (new_cols, new_rows);
-              let pixel_width = f32::from(visible.size.width) as u16;
-              let pixel_height = f32::from(visible.size.height) as u16;
-              let _ = pty_for_resize.resize(new_cols, new_rows, pixel_width, pixel_height);
-              term.resize(crate::terminal::TermDimensions {
-                cols: new_cols as usize,
-                rows: new_rows as usize,
-              });
+      .child(
+        canvas(
+          {
+            let font_family = font_family.clone();
+            let canvas_origin = self.canvas_origin.clone();
+            move |bounds: Bounds<Pixels>, _window: &mut Window, _cx: &mut App| {
+              *canvas_origin.lock() = bounds.origin;
+              (bounds, layout, font_family)
             }
-            drop(last);
+          },
+          {
+            let term_handle = self.state.term_handle();
+            let palette = self.palette.clone();
+            let pty_for_resize = self.pty.clone();
+            let last_size = self.last_size.clone();
+            move |_bounds: Bounds<Pixels>,
+                  (prep_bounds, layout, font_family): (Bounds<Pixels>, CellLayout, SharedString),
+                  window: &mut Window,
+                  cx: &mut App| {
+              let mut term = term_handle.lock();
 
-            let render_state = TerminalRenderState {
-              palette: &palette,
-              font_family: &font_family,
-              font_size,
-              focused,
-              cursor_visible,
-              selection: selection_range,
-            };
-            paint_terminal(&term, prep_bounds, layout, &render_state, window, cx);
-          }
-        },
-      ).size_full())
+              // The layout bounds may be larger than the visible area because
+              // `height: 100%` in the size_full() chain can resolve against the
+              // window rather than the flex-allocated space.  Use the content
+              // mask (set by parent overflow_hidden) to get the true visible size.
+              let visible = prep_bounds.intersect(&window.content_mask().bounds);
+              let new_cols = (visible.size.width / layout.width).floor() as u16;
+              let new_rows = (visible.size.height / layout.height).floor() as u16;
+              let mut last = last_size.lock();
+              if new_cols > 0 && new_rows > 0 && (new_cols != last.0 || new_rows != last.1) {
+                *last = (new_cols, new_rows);
+                let pixel_width = f32::from(visible.size.width) as u16;
+                let pixel_height = f32::from(visible.size.height) as u16;
+                let _ = pty_for_resize.resize(new_cols, new_rows, pixel_width, pixel_height);
+                term.resize(crate::terminal::TermDimensions {
+                  cols: new_cols as usize,
+                  rows: new_rows as usize,
+                });
+              }
+              drop(last);
+
+              let render_state = TerminalRenderState {
+                palette: &palette,
+                font_family: &font_family,
+                font_size,
+                focused,
+                cursor_visible,
+                selection: selection_range,
+              };
+              paint_terminal(&term, prep_bounds, layout, &render_state, window, cx);
+            }
+          },
+        )
+        .size_full(),
+      )
   }
 }

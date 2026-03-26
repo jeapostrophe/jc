@@ -281,8 +281,7 @@ pub fn insert_wait_section(text: &str, doc: &TodoDocument, label: &str) -> Optio
     // If the body is empty (or whitespace-only) and the very next byte is
     // not a newline, we need to insert a blank line.
     let body = &text[wait.body_byte_range.clone()];
-    let needs_blank = body.trim().is_empty()
-      && text.as_bytes().get(body_start) != Some(&b'\n');
+    let needs_blank = body.trim().is_empty() && text.as_bytes().get(body_start) != Some(&b'\n');
     if !needs_blank {
       return None;
     }
@@ -314,12 +313,7 @@ pub fn insert_wait_section(text: &str, doc: &TodoDocument, label: &str) -> Optio
 /// Build new text with a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading inserted.
 /// If a `# Claude` section exists, the heading goes right after it. Otherwise
 /// a `# Claude` section is appended at the end of the text.
-pub fn insert_session_heading(
-  text: &str,
-  doc: &TodoDocument,
-  uuid: &str,
-  label: &str,
-) -> String {
+pub fn insert_session_heading(text: &str, doc: &TodoDocument, uuid: &str, label: &str) -> String {
   let heading = format!("## {label}\n> uuid={uuid}\n\n### WAIT\n");
 
   if let Some(claude_line) = doc.claude_section_line {
@@ -406,14 +400,18 @@ pub fn toggle_session_disabled(text: &str, doc: &TodoDocument, label: &str) -> O
   Some(new_text)
 }
 
-
 // ---------------------------------------------------------------------------
 // UUID update
 // ---------------------------------------------------------------------------
 
 /// Update a session's UUID in the document text. Returns the modified text,
 /// or `None` if the session is not found.
-pub fn update_session_uuid(text: &str, doc: &TodoDocument, label: &str, new_uuid: &str) -> Option<String> {
+pub fn update_session_uuid(
+  text: &str,
+  doc: &TodoDocument,
+  label: &str,
+  new_uuid: &str,
+) -> Option<String> {
   let session = doc.session_by_label(label)?;
   if session.uuid_byte_range == (0..0) {
     return None;

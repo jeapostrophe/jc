@@ -74,31 +74,17 @@ impl ProjectState {
       .sessions
       .iter()
       .filter(|s| s.status == jc_core::todo::SessionStatus::Active)
-      .find(|s| {
-        !s.uuid.is_empty()
-          && session_dir.join(format!("{}.jsonl", s.uuid)).exists()
-      })
+      .find(|s| !s.uuid.is_empty() && session_dir.join(format!("{}.jsonl", s.uuid)).exists())
       .or_else(|| {
         document.sessions.iter().find(|s| s.status == jc_core::todo::SessionStatus::Active)
       });
 
     if let Some(todo_session) = best {
-      let uuid = if todo_session.uuid.is_empty() {
-        None
-      } else {
-        Some(todo_session.uuid.clone())
-      };
+      let uuid = if todo_session.uuid.is_empty() { None } else { Some(todo_session.uuid.clone()) };
       let id = next_session_id;
       next_session_id += 1;
-      let state = SessionState::create(
-        id,
-        uuid,
-        todo_session.label.clone(),
-        &path,
-        palette,
-        window,
-        cx,
-      );
+      let state =
+        SessionState::create(id, uuid, todo_session.label.clone(), &path, palette, window, cx);
       sessions.insert(id, state);
     }
 
@@ -165,11 +151,8 @@ impl ProjectState {
     // Match by UUID (stable) first, then fall back to label for sessions without a UUID.
     let document = todo_view.document();
     for todo_session in &document.sessions {
-      let new_uuid = if todo_session.uuid.is_empty() {
-        None
-      } else {
-        Some(todo_session.uuid.as_str())
-      };
+      let new_uuid =
+        if todo_session.uuid.is_empty() { None } else { Some(todo_session.uuid.as_str()) };
 
       let matched = self.sessions.values_mut().find(|session| {
         // Primary match: both have UUIDs and they match.
@@ -229,10 +212,6 @@ impl ProjectState {
 
   /// Find a session by UUID.
   pub fn session_by_uuid(&self, uuid: &str) -> Option<(SessionId, &SessionState)> {
-    self
-      .sessions
-      .iter()
-      .find(|(_, s)| s.uuid.as_deref() == Some(uuid))
-      .map(|(&id, s)| (id, s))
+    self.sessions.iter().find(|(_, s)| s.uuid.as_deref() == Some(uuid)).map(|(&id, s)| (id, s))
   }
 }

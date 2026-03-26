@@ -165,12 +165,7 @@ impl TodoView {
   }
 
   /// Mark a session as expired (`[X]`) because its JSONL was garbage-collected.
-  pub fn mark_session_expired(
-    &mut self,
-    label: &str,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
+  pub fn mark_session_expired(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
     let text = self.editor_text(cx);
     if let Some(new_text) = todo::mark_session_expired(&text, &self.document, label) {
       self.code_view.update(cx, |cv, cx| {
@@ -200,7 +195,6 @@ impl TodoView {
     }
   }
 
-
   /// Extract the selected text (or entire WAIT body if no selection) from the
   /// active session's WAIT section, wrap it in a new `### Message N` heading,
   /// and update the editor. Returns `(message_text, message_index)` on success.
@@ -226,12 +220,7 @@ impl TodoView {
 
   /// Ensure the session has a WAIT section, inserting one if missing.
   /// Returns true if a WAIT section was added.
-  pub fn ensure_wait(
-    &mut self,
-    label: &str,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) -> bool {
+  pub fn ensure_wait(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
     let text = self.editor_text(cx);
     if let Some(new_text) = todo::insert_wait_section(&text, &self.document, label) {
       self.code_view.update(cx, |cv, cx| {

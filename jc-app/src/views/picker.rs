@@ -281,8 +281,7 @@ impl<D: PickerDelegate> Render for PickerState<D> {
 
     // Each item: text_sm (~14px) + py(3px) top+bottom = ~20px per row.
     let item_height = px(26.0);
-    let item_sizes: Rc<Vec<Size<Pixels>>> =
-      Rc::new(vec![size(px(500.0), item_height); item_count]);
+    let item_sizes: Rc<Vec<Size<Pixels>>> = Rc::new(vec![size(px(500.0), item_height); item_count]);
 
     let is_empty = self.filtered.is_empty();
 
@@ -349,9 +348,12 @@ impl<D: PickerDelegate> Render for PickerState<D> {
         .flex_1()
         .into_any_element()
       })
-      .children(self.delegate.render_footer(cx).map(|footer| {
-        footer.border_t_1().border_color(theme.border)
-      }))
+      .children(
+        self
+          .delegate
+          .render_footer(cx)
+          .map(|footer| footer.border_t_1().border_color(theme.border)),
+      )
   }
 }
 
@@ -404,7 +406,16 @@ impl OpenPickerDelegate {
     // File labels: prefix each file with `/`.
     labels.extend(files.iter().map(|f| format!("/{f}")));
 
-    Self { labels, pane_count, kinds, code_view, project_path, modified_files, recent_indices, result: None }
+    Self {
+      labels,
+      pane_count,
+      kinds,
+      code_view,
+      project_path,
+      modified_files,
+      recent_indices,
+      result: None,
+    }
   }
 
   pub fn result(&self) -> Option<&OpenPickerResult> {
@@ -586,7 +597,9 @@ impl PickerDelegate for DiffDrillDownPickerDelegate {
         if *reviewed {
           let marker_color = if selected { theme.accent_foreground } else { theme.green };
           row
-            .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("✓"))
+            .child(
+              div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("✓"),
+            )
             .child(name.clone())
         } else {
           row.child(div().text_xs().w(px(10.0))).child(name.clone())
@@ -876,19 +889,14 @@ impl SessionPickerDelegate {
 
     for (pi, project) in projects.iter().enumerate() {
       // Collect UUIDs already adopted into running sessions.
-      let adopted_uuids: HashSet<&str> = project
-        .sessions
-        .values()
-        .filter_map(|s| s.uuid.as_deref())
-        .collect();
+      let adopted_uuids: HashSet<&str> =
+        project.sessions.values().filter_map(|s| s.uuid.as_deref()).collect();
 
-      let has_adoptable = todo_documents
-        .get(pi)
-        .map_or(false, |d| {
-          d.sessions.iter().any(|s| {
-            !s.uuid.is_empty() && s.status != jc_core::todo::SessionStatus::Expired
-          })
-        });
+      let has_adoptable = todo_documents.get(pi).map_or(false, |d| {
+        d.sessions
+          .iter()
+          .any(|s| !s.uuid.is_empty() && s.status != jc_core::todo::SessionStatus::Expired)
+      });
       if project.sessions.is_empty() && !has_adoptable {
         let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);
         entries.push(SessionPickerEntry {
@@ -932,8 +940,8 @@ impl SessionPickerDelegate {
         project.sessions.values().map(|s| s.label.as_str()).collect();
       if let Some(doc) = todo_documents.get(pi) {
         for todo_session in &doc.sessions {
-          let uuid_adopted = !todo_session.uuid.is_empty()
-            && adopted_uuids.contains(todo_session.uuid.as_str());
+          let uuid_adopted =
+            !todo_session.uuid.is_empty() && adopted_uuids.contains(todo_session.uuid.as_str());
           let label_adopted = adopted_labels.contains(todo_session.label.as_str());
           // Skip sessions with no UUID — nothing to adopt/resume.
           if todo_session.uuid.is_empty() {
@@ -1067,9 +1075,7 @@ impl PickerDelegate for SessionPickerDelegate {
   fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
     let e = &self.entries[index];
     self.result = Some(match &e.kind {
-      SessionPickerEntryKind::Session(id) => {
-        SessionPickerResult::Session(e.project_index, *id)
-      }
+      SessionPickerEntryKind::Session(id) => SessionPickerResult::Session(e.project_index, *id),
       SessionPickerEntryKind::Unadopted { uuid, .. } => {
         SessionPickerResult::Adopt(e.project_index, uuid.clone(), e.label.clone())
       }
@@ -1081,10 +1087,7 @@ impl PickerDelegate for SessionPickerDelegate {
     let e = &self.entries[index];
     match &e.kind {
       SessionPickerEntryKind::Session(_) | SessionPickerEntryKind::Unadopted { .. } => {
-        self.result = Some(SessionPickerResult::ToggleDisabled(
-          e.project_index,
-          e.label.clone(),
-        ));
+        self.result = Some(SessionPickerResult::ToggleDisabled(e.project_index, e.label.clone()));
         cx.emit(PickerEvent::Confirmed);
       }
       _ => {}
@@ -1151,13 +1154,22 @@ impl PickerDelegate for SessionPickerDelegate {
     let theme = cx.theme();
     let muted = theme.muted_foreground;
     Some(
-      div().px_2().py_1().flex().flex_wrap().gap_x_3().gap_y_0p5().text_xs().text_color(muted).children([
-        legend_item(">", theme.green, "active", muted),
-        legend_item("~", theme.yellow, "adopt", muted),
-        legend_item("~", theme.muted_foreground, "disabled", muted),
-        legend_item("+", theme.blue, "new", muted),
-        div().child("Cmd-Shift-Bksp: toggle disable"),
-      ])
+      div()
+        .px_2()
+        .py_1()
+        .flex()
+        .flex_wrap()
+        .gap_x_3()
+        .gap_y_0p5()
+        .text_xs()
+        .text_color(muted)
+        .children([
+          legend_item(">", theme.green, "active", muted),
+          legend_item("~", theme.yellow, "adopt", muted),
+          legend_item("~", theme.muted_foreground, "disabled", muted),
+          legend_item("+", theme.blue, "new", muted),
+          div().child("Cmd-Shift-Bksp: toggle disable"),
+        ]),
     )
   }
 }
@@ -1176,12 +1188,25 @@ pub enum ProjectActionsResult {
 }
 
 enum ProjectActionsEntry {
-  Problem { pi: usize, kind: SessionPickerEntryKind, project_name: String, label: String, problems: usize, min_rank: i8 },
+  Problem {
+    pi: usize,
+    kind: SessionPickerEntryKind,
+    project_name: String,
+    label: String,
+    problems: usize,
+    min_rank: i8,
+  },
   /// A TODO.md session that isn't currently running.
-  Dormant { uuid: String, label: String },
+  Dormant {
+    uuid: String,
+    label: String,
+  },
   NewSession,
   /// A JSONL session not referenced in TODO.md.
-  Unattached { uuid: String, summary: String },
+  Unattached {
+    uuid: String,
+    summary: String,
+  },
 }
 
 pub struct ProjectActionsPickerDelegate {
@@ -1283,11 +1308,8 @@ impl ProjectActionsPickerDelegate {
         .values()
         .filter_map(|s| s.uuid.as_deref())
         .collect();
-      let adopted_labels: HashSet<&str> = projects[active_project_index]
-        .sessions
-        .values()
-        .map(|s| s.label.as_str())
-        .collect();
+      let adopted_labels: HashSet<&str> =
+        projects[active_project_index].sessions.values().map(|s| s.label.as_str()).collect();
 
       if let Some(doc) = todo_documents.get(active_project_index) {
         for ts in &doc.sessions {
@@ -1377,9 +1399,11 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
         }
         SessionPickerEntryKind::EmptyProject => ProjectActionsResult::InitProject(*pi),
       },
-      ProjectActionsEntry::Dormant { uuid, label } => {
-        ProjectActionsResult::AdoptTodoSession(self.active_project_index, uuid.clone(), label.clone())
-      }
+      ProjectActionsEntry::Dormant { uuid, label } => ProjectActionsResult::AdoptTodoSession(
+        self.active_project_index,
+        uuid.clone(),
+        label.clone(),
+      ),
       ProjectActionsEntry::NewSession => ProjectActionsResult::CreateNew,
       ProjectActionsEntry::Unattached { uuid, summary } => {
         ProjectActionsResult::AdoptJsonlSession(uuid.clone(), summary.clone())
@@ -1401,7 +1425,8 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
           _ => label.clone(),
         };
         let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
-        let right_el = div().ml_auto().text_xs().text_color(muted_color).child(format!("{problems}"));
+        let right_el =
+          div().ml_auto().text_xs().text_color(muted_color).child(format!("{problems}"));
         row.child(marker).child(main_text).child(right_el)
       }
       ProjectActionsEntry::Dormant { label, .. } => {
@@ -1426,12 +1451,21 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
     let theme = cx.theme();
     let muted = theme.muted_foreground;
     Some(
-      div().px_2().py_1().flex().flex_wrap().gap_x_3().gap_y_0p5().text_xs().text_color(muted).children([
-        legend_item("!", theme.red, "problem", muted),
-        legend_item("*", theme.cyan, "dormant", muted),
-        legend_item("+", theme.green, "new", muted),
-        legend_item("~", theme.yellow, "unattached", muted),
-      ])
+      div()
+        .px_2()
+        .py_1()
+        .flex()
+        .flex_wrap()
+        .gap_x_3()
+        .gap_y_0p5()
+        .text_xs()
+        .text_color(muted)
+        .children([
+          legend_item("!", theme.red, "problem", muted),
+          legend_item("*", theme.cyan, "dormant", muted),
+          legend_item("+", theme.green, "new", muted),
+          legend_item("~", theme.yellow, "unattached", muted),
+        ]),
     )
   }
 }

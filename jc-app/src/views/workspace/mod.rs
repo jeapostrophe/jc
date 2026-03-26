@@ -218,19 +218,20 @@ impl Workspace {
         }
         // Spawn async task to consume hook events.
         let rx = server.rx.clone();
-        let task = cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
-          while let Ok(event) = rx.recv_async().await {
-            let Ok(should_continue) = this.update_in(cx, |view, window, cx| {
-              view.handle_hook_event(event, window, cx);
-              true
-            }) else {
-              break;
-            };
-            if !should_continue {
-              break;
+        let task =
+          cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+            while let Ok(event) = rx.recv_async().await {
+              let Ok(should_continue) = this.update_in(cx, |view, window, cx| {
+                view.handle_hook_event(event, window, cx);
+                true
+              }) else {
+                break;
+              };
+              if !should_continue {
+                break;
+              }
             }
-          }
-        });
+          });
         (Some(server), Some(task))
       }
       Err(e) => {
@@ -246,32 +247,41 @@ impl Workspace {
     // Git diff generation runs on the background executor to avoid blocking
     // the main thread; only the lightweight state update happens on main.
     let problems_poll_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-      use crate::views::diff_view::{DiffSource, generate_diff, generate_commit_diff};
+      use crate::views::diff_view::{DiffSource, generate_commit_diff, generate_diff};
       loop {
         // 1. Gather stale diff jobs from the main thread (cheap).
         let diff_jobs: Vec<(usize, PathBuf, DiffSource)> = cx
           .update(|cx: &mut App| {
             let Some(entity) = this.upgrade() else { return vec![] };
-            entity.read(cx).projects.iter().enumerate().filter_map(|(i, p)| {
-              if p.diff_view.read(cx).is_stale() {
-                let (path, source) = p.diff_view.read(cx).diff_job();
-                Some((i, path, source))
-              } else {
-                None
-              }
-            }).collect()
+            entity
+              .read(cx)
+              .projects
+              .iter()
+              .enumerate()
+              .filter_map(|(i, p)| {
+                if p.diff_view.read(cx).is_stale() {
+                  let (path, source) = p.diff_view.read(cx).diff_job();
+                  Some((i, path, source))
+                } else {
+                  None
+                }
+              })
+              .collect()
           })
           .unwrap_or_default();
 
         // 2. Run git diffs on background executor (heavy I/O, off main thread).
         let mut diff_results: Vec<(usize, String)> = Vec::new();
         for (idx, path, source) in diff_jobs {
-          let text = cx.background_executor().spawn(async move {
-            match source {
-              DiffSource::WorkingTree => generate_diff(&path),
-              DiffSource::Commit { oid, .. } => generate_commit_diff(&path, oid),
-            }
-          }).await;
+          let text = cx
+            .background_executor()
+            .spawn(async move {
+              match source {
+                DiffSource::WorkingTree => generate_diff(&path),
+                DiffSource::Commit { oid, .. } => generate_commit_diff(&path, oid),
+              }
+            })
+            .await;
           diff_results.push((idx, text));
         }
 
@@ -646,12 +656,7 @@ impl Workspace {
 
   /// Count sessions that are actively working (not idle/stopped).
   fn active_session_count(&self) -> usize {
-    self
-      .projects
-      .iter()
-      .flat_map(|p| p.sessions.values())
-      .filter(|s| s.busy)
-      .count()
+    self.projects.iter().flat_map(|p| p.sessions.values()).filter(|s| s.busy).count()
   }
 
   fn show_close_confirm(
@@ -665,24 +670,22 @@ impl Workspace {
     self.close_confirm_is_quit = is_quit;
     self.pre_close_confirm_focus = window.focused(cx);
     let view = cx.new(|cx| CloseConfirm::new(session_count, conflicts, is_quit, cx));
-    let sub = cx.subscribe_in(&view, window, |this: &mut Self, _, event, window, cx| {
-      match event {
-        CloseConfirmEvent::Confirmed => {
-          this.close_confirm = None;
-          this.pre_close_confirm_focus = None;
-          if this.close_confirm_is_quit {
-            cx.quit();
-          } else {
-            window.remove_window();
-          }
+    let sub = cx.subscribe_in(&view, window, |this: &mut Self, _, event, window, cx| match event {
+      CloseConfirmEvent::Confirmed => {
+        this.close_confirm = None;
+        this.pre_close_confirm_focus = None;
+        if this.close_confirm_is_quit {
+          cx.quit();
+        } else {
+          window.remove_window();
         }
-        CloseConfirmEvent::Cancelled => {
-          this.close_confirm = None;
-          if let Some(focus) = this.pre_close_confirm_focus.take() {
-            focus.focus(window);
-          }
-          cx.notify();
+      }
+      CloseConfirmEvent::Cancelled => {
+        this.close_confirm = None;
+        if let Some(focus) = this.pre_close_confirm_focus.take() {
+          focus.focus(window);
         }
+        cx.notify();
       }
     });
     view.read(cx).focus_handle(cx).focus(window);
@@ -945,7 +948,8 @@ impl Workspace {
               p.strip_prefix(&project.path).ok().map(|r| r.to_string_lossy().into_owned())
             })
           });
-          let line = project.code_view().map(|cv| cv.read(cx).editor().read(cx).cursor_position().line + 1);
+          let line =
+            project.code_view().map(|cv| cv.read(cx).editor().read(cx).cursor_position().line + 1);
           (rel, line)
         };
         self.set_active_pane_view(PaneContentKind::GitDiff, window, cx);
@@ -1193,7 +1197,8 @@ impl Workspace {
       return;
     }
 
-    let current = (self.active_project_index, self.projects[self.active_project_index].active_session);
+    let current =
+      (self.active_project_index, self.projects[self.active_project_index].active_session);
     let pos = slots.iter().position(|s| *s == current).unwrap_or(0);
     let (next_pi, next_sid) = slots[(pos + 1) % slots.len()];
     self.switch_to_session(next_pi, next_sid, window, cx);
@@ -1201,7 +1206,12 @@ impl Workspace {
 
   /// Find a session by ID across all projects and switch to it.
   /// Used by notification click handler which passes session UUIDs.
-  fn switch_to_session_id(&mut self, session_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+  fn switch_to_session_id(
+    &mut self,
+    session_id: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
     for (pi, project) in self.projects.iter().enumerate() {
       if let Some((id, _)) = project.session_by_uuid(session_id) {
         self.switch_to_session(pi, Some(id), window, cx);
@@ -1371,15 +1381,8 @@ impl Workspace {
     project.next_session_id += 1;
 
     let uuid_opt = if uuid.is_empty() { None } else { Some(uuid.to_string()) };
-    let session = SessionState::create(
-      id,
-      uuid_opt,
-      label.to_string(),
-      &project_path,
-      &palette,
-      window,
-      cx,
-    );
+    let session =
+      SessionState::create(id, uuid_opt, label.to_string(), &project_path, &palette, window, cx);
 
     project.sessions.insert(id, session);
     self.subscribe_session_bell(project_idx, id, cx);
@@ -1401,11 +1404,8 @@ impl Workspace {
     for project in &self.projects {
       let session_dir = ProjectState::session_dir(&project.path);
       let document = project.todo_view.read(cx).document().clone();
-      let adopted_uuids: std::collections::HashSet<&str> = project
-        .sessions
-        .values()
-        .filter_map(|s| s.uuid.as_deref())
-        .collect();
+      let adopted_uuids: std::collections::HashSet<&str> =
+        project.sessions.values().filter_map(|s| s.uuid.as_deref()).collect();
       let expired_labels: Vec<String> = document
         .sessions
         .iter()
@@ -1452,7 +1452,10 @@ impl Workspace {
     });
 
     // If the session was adopted and is now being disabled, detach it.
-    let is_now_disabled = todo_view.read(cx).document().session_by_label(label)
+    let is_now_disabled = todo_view
+      .read(cx)
+      .document()
+      .session_by_label(label)
       .map_or(false, |s| s.status == jc_core::todo::SessionStatus::Disabled);
     if is_now_disabled {
       if let Some(id) = adopted_id {
@@ -1472,7 +1475,10 @@ impl Workspace {
         } else {
           // Last session in this project was disabled — jump to the next
           // project that has sessions, falling back to staying put.
-          let next = self.projects.iter().enumerate()
+          let next = self
+            .projects
+            .iter()
+            .enumerate()
             .find(|(pi, p)| *pi != project_idx && !p.sessions.is_empty());
           if let Some((pi, p)) = next {
             let sid = p.active_session;
@@ -1532,7 +1538,9 @@ impl Workspace {
     let todo_view = project.todo_view.clone();
 
     // Insert a WAIT section if the session doesn't have one.
-    todo_view.update(cx, |tv, cx| { tv.ensure_wait(&label, window, cx); });
+    todo_view.update(cx, |tv, cx| {
+      tv.ensure_wait(&label, window, cx);
+    });
 
     let Some((message_text, _)) =
       todo_view.update(cx, |tv, cx| tv.send_selection(&label, window, cx))
@@ -1575,7 +1583,9 @@ impl Workspace {
     let todo_view = project.todo_view.clone();
 
     // Insert a WAIT section if the session doesn't have one.
-    todo_view.update(cx, |tv, cx| { tv.ensure_wait(&label, window, cx); });
+    todo_view.update(cx, |tv, cx| {
+      tv.ensure_wait(&label, window, cx);
+    });
 
     let document = todo_view.read(cx).document().clone();
     let Some(session) = document.session_by_label(&label) else {
@@ -1589,9 +1599,8 @@ impl Workspace {
     // If a visible pane already shows the TODO editor, focus it instead of
     // replacing the current pane.
     let visible = self.visible_pane_count();
-    let existing = (0..visible).find(|&i| {
-      self.panes[i].read(cx).content_kind() == Some(PaneContentKind::TodoEditor)
-    });
+    let existing = (0..visible)
+      .find(|&i| self.panes[i].read(cx).content_kind() == Some(PaneContentKind::TodoEditor));
     if let Some(idx) = existing {
       self.active_pane_index = idx;
       self.panes[idx].read(cx).focus_content(window);
@@ -1613,11 +1622,7 @@ impl Workspace {
     };
 
     // Determine file name: use UUID if available, otherwise the label.
-    let filename = session
-      .uuid
-      .as_deref()
-      .filter(|u| !u.is_empty())
-      .unwrap_or(&session.label);
+    let filename = session.uuid.as_deref().filter(|u| !u.is_empty()).unwrap_or(&session.label);
     let reply_dir = project.path.join(".jc/replies");
     let reply_path = reply_dir.join(format!("{filename}.md"));
 
@@ -1675,12 +1680,7 @@ impl Workspace {
   // Hook events
   // ---------------------------------------------------------------------------
 
-  fn handle_hook_event(
-    &mut self,
-    event: HookEvent,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
+  fn handle_hook_event(&mut self, event: HookEvent, window: &mut Window, cx: &mut Context<Self>) {
     eprintln!("hook: {:?} session={}", event.kind, event.session_id);
 
     // Handle session clear: update the session's UUID.
@@ -1756,10 +1756,8 @@ impl Workspace {
       let mut found = false;
       // First pass: find an existing session with this UUID.
       for project in &mut self.projects {
-        if let Some(session) = project
-          .sessions
-          .values_mut()
-          .find(|s| s.uuid.as_deref() == Some(session_uuid))
+        if let Some(session) =
+          project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(session_uuid))
         {
           if clears_busy {
             session.busy = false;
@@ -1808,7 +1806,8 @@ impl Workspace {
     if let (Some(project_name), Some(session_label)) = (matched_project, matched_label)
       && !self.window_active
     {
-      let critical = matches!(event.kind, HookEventKind::PermissionPrompt | HookEventKind::StopFailure);
+      let critical =
+        matches!(event.kind, HookEventKind::PermissionPrompt | HookEventKind::StopFailure);
       let title = format!("{project_name} > {session_label}");
       let message = match event.kind {
         HookEventKind::Stop => "Claude finished",
@@ -1817,7 +1816,8 @@ impl Workspace {
         HookEventKind::IdlePrompt => "Claude is idle",
         HookEventKind::PromptSubmit | HookEventKind::SessionClear { .. } => unreachable!(),
       };
-      let notify_id = if event.session_id.is_empty() { None } else { Some(event.session_id.as_str()) };
+      let notify_id =
+        if event.session_id.is_empty() { None } else { Some(event.session_id.as_str()) };
       crate::notify::notify(&title, message, critical, notify_id);
     }
 
@@ -1838,7 +1838,9 @@ impl Workspace {
   ) {
     let Some(project_path) = project_path else { return };
     let Some(project) = self.projects.iter_mut().find(|p| p.path == *project_path) else { return };
-    let Some(session) = project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(old_session_id)) else {
+    let Some(session) =
+      project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(old_session_id))
+    else {
       eprintln!("hook: session-clear for unknown uuid {old_session_id}");
       return;
     };

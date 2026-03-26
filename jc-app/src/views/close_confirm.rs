@@ -51,10 +51,8 @@ impl Render for CloseConfirm {
 
     if self.session_count > 0 {
       let sessions = if self.session_count == 1 { "session" } else { "sessions" };
-      messages.push(format!(
-        "{} active Claude {} will be terminated.",
-        self.session_count, sessions
-      ));
+      messages
+        .push(format!("{} active Claude {} will be terminated.", self.session_count, sessions));
     }
 
     if !self.conflicts.is_empty() {
@@ -97,9 +95,7 @@ impl Render for CloseConfirm {
               .text_color(theme.foreground)
               .child(format!("{action}?")),
           )
-          .children(messages.into_iter().map(|msg| {
-            div().text_color(theme.foreground).child(msg)
-          }))
+          .children(messages.into_iter().map(|msg| div().text_color(theme.foreground).child(msg)))
           .child(
             div()
               .flex()

@@ -20,8 +20,8 @@ fn elide_breadcrumbs(crumbs: &[String], char_budget: usize) -> Vec<String> {
     return Vec::new();
   }
   let sep_len = 3; // " > "
-  let total: usize = crumbs.iter().map(|c| c.len()).sum::<usize>()
-    + crumbs.len().saturating_sub(1) * sep_len;
+  let total: usize =
+    crumbs.iter().map(|c| c.len()).sum::<usize>() + crumbs.len().saturating_sub(1) * sep_len;
   if total <= char_budget || crumbs.len() <= 2 {
     return crumbs.to_vec();
   }
@@ -149,21 +149,16 @@ impl Workspace {
                 let fg = theme.foreground;
                 let dim = theme.muted_foreground;
                 let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
-                let all_descs: Vec<&String> = session_problems
-                  .iter()
-                  .chain(project_problems.iter())
-                  .collect();
+                let all_descs: Vec<&String> =
+                  session_problems.iter().chain(project_problems.iter()).collect();
                 let total = all_descs.len();
                 let limit = 10;
                 for desc in all_descs.iter().take(limit) {
                   col = col.child(div().text_color(fg).child((*desc).clone()));
                 }
                 if total > limit {
-                  col = col.child(
-                    div()
-                      .text_color(dim)
-                      .child(format!("…and {} more", total - limit)),
-                  );
+                  col =
+                    col.child(div().text_color(dim).child(format!("…and {} more", total - limit)));
                 }
                 col
               })
@@ -180,26 +175,18 @@ impl Workspace {
       let has_any = layer_sessions.iter().any(|s| !s.is_empty());
       if has_any {
         let layer_colors = [theme.red, theme.yellow, theme.blue, theme.muted_foreground];
-        let mut segments = div()
-          .id("global-problems")
-          .flex()
-          .items_center()
-          .gap_0p5()
-          .text_xs();
+        let mut segments = div().id("global-problems").flex().items_center().gap_0p5().text_xs();
         let mut first = true;
         for (i, sessions) in layer_sessions.iter().enumerate() {
           if sessions.is_empty() {
             continue;
           }
           if !first {
-            segments = segments.child(
-              div().text_color(theme.muted_foreground).child(" / "),
-            );
+            segments = segments.child(div().text_color(theme.muted_foreground).child(" / "));
           }
           first = false;
-          segments = segments.child(
-            div().text_color(layer_colors[i]).child(sessions.len().to_string()),
-          );
+          segments =
+            segments.child(div().text_color(layer_colors[i]).child(sessions.len().to_string()));
         }
 
         let sessions_for_tooltip = layer_sessions.clone();
@@ -221,12 +208,7 @@ impl Workspace {
                   .child(format!("{}:", layer_labels[i])),
               );
               for name in layer {
-                col = col.child(
-                  div()
-                    .text_color(layer_colors[i])
-                    .pl_2()
-                    .child(name.clone()),
-                );
+                col = col.child(div().text_color(layer_colors[i]).pl_2().child(name.clone()));
               }
             }
             col
@@ -282,12 +264,8 @@ impl Render for Workspace {
       if !crumbs.is_empty() {
         let crumb_color = if active { muted } else { muted };
         for c in crumbs {
-          row = row.child(
-            div().flex_shrink_0().text_color(crumb_color).child(" > "),
-          );
-          row = row.child(
-            div().text_color(crumb_color).truncate().child(c),
-          );
+          row = row.child(div().flex_shrink_0().text_color(crumb_color).child(" > "));
+          row = row.child(div().text_color(crumb_color).truncate().child(c));
         }
       }
       row

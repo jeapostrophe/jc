@@ -2,13 +2,11 @@ use crate::file_watcher::watch_dir;
 use crate::views::comment_panel::{CommentPanel, CommentPanelEvent};
 use crate::views::pane::PaneContentKind;
 use crate::views::picker::{
-  CodeSymbolPickerDelegate, DiffDrillDownPickerDelegate,
-  DrillDownPicker, LineSearchPickerDelegate, OpenPicker, OpenPickerDelegate,
-  OpenPickerResult, PickerEvent, PickerState,
-  ProjectActionsPickerDelegate, ProjectActionsPicker, ProjectActionsResult,
-  SearchLines, SessionPickerDelegate,
-  SessionPickerResult, ShowSessionPicker, ShowSnippetPicker,
-  SnippetPickerDelegate, SnippetTarget, TodoHeaderPickerDelegate,
+  CodeSymbolPickerDelegate, DiffDrillDownPickerDelegate, DrillDownPicker, LineSearchPickerDelegate,
+  OpenPicker, OpenPickerDelegate, OpenPickerResult, PickerEvent, PickerState, ProjectActionsPicker,
+  ProjectActionsPickerDelegate, ProjectActionsResult, SearchLines, SessionPickerDelegate,
+  SessionPickerResult, ShowSessionPicker, ShowSnippetPicker, SnippetPickerDelegate, SnippetTarget,
+  TodoHeaderPickerDelegate,
 };
 use gpui::*;
 use jc_core::snippets;
@@ -48,11 +46,8 @@ impl Workspace {
 
     let project = self.active_project();
     let Some(code_view) = project.code_view().cloned() else { return };
-    let delegate = OpenPickerDelegate::new(
-      project.path.clone(),
-      code_view,
-      self.recent_files.clone(),
-    );
+    let delegate =
+      OpenPickerDelegate::new(project.path.clone(), code_view, self.recent_files.clone());
     let picker = cx.new(|cx| PickerState::new(delegate, window, cx));
     self.pre_picker_focus = window.focused(cx);
 
@@ -69,7 +64,11 @@ impl Workspace {
               }
               Some(OpenPickerResult::OpenFile) => {
                 // Track the opened file in recent_files
-                if let Some(path) = this.active_project().code_view().and_then(|cv| cv.read(cx).file_path().map(|p| p.to_path_buf())) {
+                if let Some(path) = this
+                  .active_project()
+                  .code_view()
+                  .and_then(|cv| cv.read(cx).file_path().map(|p| p.to_path_buf()))
+                {
                   this.recent_files.retain(|p| p != &path);
                   this.recent_files.insert(0, path);
                   this.recent_files.truncate(50);
@@ -328,7 +327,11 @@ impl Workspace {
     let subscription =
       cx.subscribe_in(&picker, window, move |this: &mut Self, _, event, window, cx| match event {
         PickerEvent::Confirmed => {
-          if let Some(path) = this.active_project().code_view().and_then(|cv| cv.read(cx).file_path().map(|p| p.to_path_buf())) {
+          if let Some(path) = this
+            .active_project()
+            .code_view()
+            .and_then(|cv| cv.read(cx).file_path().map(|p| p.to_path_buf()))
+          {
             this.recent_files.retain(|p| p != &path);
             this.recent_files.insert(0, path);
             this.recent_files.truncate(50);

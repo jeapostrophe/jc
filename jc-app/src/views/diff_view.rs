@@ -144,8 +144,7 @@ impl DiffView {
         .zip(self.file_diffs.iter())
         .any(|(a, b)| a.name != b.name || a.checksum != b.checksum);
     // Preserve the current file across refresh if it still exists.
-    let current_name =
-      self.file_diffs.get(self.current_file_index).map(|fd| fd.name.clone());
+    let current_name = self.file_diffs.get(self.current_file_index).map(|fd| fd.name.clone());
 
     self.file_diffs = new_diffs;
 
@@ -524,7 +523,7 @@ pub fn diff_line_to_source_line(diff_content: &str, diff_line: u32) -> Option<u3
 
     if editor_line == diff_line {
       return match line.as_bytes().first() {
-        Some(b'-') => None,            // Deleted line — no source equivalent
+        Some(b'-') => None, // Deleted line — no source equivalent
         Some(b'+') | Some(b' ') => Some(current_source_line),
         _ => Some(current_source_line),
       };
@@ -532,9 +531,9 @@ pub fn diff_line_to_source_line(diff_content: &str, diff_line: u32) -> Option<u3
 
     // Advance source line counter
     match line.as_bytes().first() {
-      Some(b'-') => {}                  // Deleted line — doesn't advance source
+      Some(b'-') => {} // Deleted line — doesn't advance source
       Some(b'+') | Some(b' ') => current_source_line += 1,
-      _ => current_source_line += 1,    // Context or other
+      _ => current_source_line += 1, // Context or other
     }
   }
 
