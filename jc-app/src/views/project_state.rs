@@ -127,7 +127,11 @@ impl ProjectState {
 
   /// Path to Claude's JSONL session directory for this project.
   pub fn session_dir(project_path: &Path) -> PathBuf {
-    let encoded = project_path.to_string_lossy().replace('/', "-");
+    let encoded: String = project_path
+      .to_string_lossy()
+      .chars()
+      .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+      .collect();
     let home = std::env::var("HOME").expect("HOME not set");
     PathBuf::from(home).join(".claude/projects").join(encoded)
   }

@@ -1466,7 +1466,21 @@ impl Workspace {
 
         self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
         let active = self.projects[project_idx].active_session;
-        self.switch_to_session(project_idx, active, window, cx);
+        if active.is_some() {
+          // Another session in the same project — switch to it.
+          self.switch_to_session(project_idx, active, window, cx);
+        } else {
+          // Last session in this project was disabled — jump to the next
+          // project that has sessions, falling back to staying put.
+          let next = self.projects.iter().enumerate()
+            .find(|(pi, p)| *pi != project_idx && !p.sessions.is_empty());
+          if let Some((pi, p)) = next {
+            let sid = p.active_session;
+            self.switch_to_session(pi, sid, window, cx);
+          } else {
+            self.switch_to_session(project_idx, None, window, cx);
+          }
+        }
       }
     }
   }
