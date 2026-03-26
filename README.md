@@ -1,6 +1,22 @@
-# jc
+<p align="center">
+  <img src="icon.png" width="128" height="128" alt="jc icon" />
+</p>
 
-A native macOS app for orchestrating multiple Claude Code sessions across projects. Keyboard-driven workflow for managing sessions, reviewing diffs, annotating code, and sending instructions to Claude — all from a single window.
+<h1 align="center">jc</h1>
+
+<p align="center">
+  Orchestrate multiple Claude Code sessions across projects.<br>
+  Review diffs, annotate code, send instructions — all from one window.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-macOS-blue" alt="macOS" />
+  <img src="https://img.shields.io/badge/built_with-Rust_%2B_GPUI-orange" alt="Rust + GPUI" />
+</p>
+
+<p align="center">
+  <a href="#why">Why</a> · <a href="#getting-started">Getting Started</a> · <a href="#keybindings">Keybindings</a> · <a href="DESIGN.md">Design</a> · <a href="ARCH.md">Architecture</a>
+</p>
 
 ![jc screenshot — 3-pane layout with Claude terminal, TODO editor, and diff view](screenshot.png)
 
@@ -161,3 +177,13 @@ PRs welcome. Preferably have your Claude open one against mine — I don't accep
 - [PLAN.md](PLAN.md) — Task checklist
 - [DESIGN.md](DESIGN.md) — Design principles, why not an editor plugin, remote workflow philosophy
 - [ARCH.md](ARCH.md) — Implementation details: session lifecycle, terminal pipeline, problem system, hooks, TODO.md format
+
+## Star History
+
+<a href="https://star-history.com/#jeapostrophe/jc&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=jeapostrophe/jc&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=jeapostrophe/jc&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=jeapostrophe/jc&type=Date" />
+  </picture>
+</a>

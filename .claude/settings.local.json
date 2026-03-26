@@ -20,7 +20,9 @@
       "Bash(echo parse failed:*)",
       "Bash(lsof:*)",
       "Bash(pgrep:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Read(//Users/jay/Dev/gb-rs/**)",
+      "Read(//Users/jay/.claude/projects/-Users-jay-Dev-gb-rs/**)"
     ]
   },
   "hooks": {
@@ -37,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "curl -sf -X POST http://127.0.0.1:64555/jc-hook/session-start -H 'Content-Type: application/json' -d @-",
+            "command": "curl -sf -X POST http://127.0.0.1:53696/jc-hook/session-start -H 'Content-Type: application/json' -d @-",
             "timeout": 5
           }
         ]
@@ -56,7 +58,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "curl -sf -X POST http://127.0.0.1:64555/jc-hook/session-end -H 'Content-Type: application/json' -d @-",
+            "command": "curl -sf -X POST http://127.0.0.1:53696/jc-hook/session-end -H 'Content-Type: application/json' -d @-",
             "timeout": 5
           }
         ]
@@ -67,7 +69,7 @@
         "hooks": [
           {
             "type": "http",
-            "url": "http://127.0.0.1:64555/jc-hook/prompt-submit"
+            "url": "http://127.0.0.1:53696/jc-hook/prompt-submit"
           }
         ]
       }
@@ -77,7 +79,17 @@
         "hooks": [
           {
             "type": "http",
-            "url": "http://127.0.0.1:64555/jc-hook/stop"
+            "url": "http://127.0.0.1:53696/jc-hook/stop"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:53696/jc-hook/stop-failure"
           }
         ]
       }
@@ -88,7 +100,7 @@
         "hooks": [
           {
             "type": "http",
-            "url": "http://127.0.0.1:64555/jc-hook/notification"
+            "url": "http://127.0.0.1:53696/jc-hook/notification"
           }
         ]
       }
@@ -98,7 +110,7 @@
         "hooks": [
           {
             "type": "http",
-            "url": "http://127.0.0.1:64555/jc-hook/permission"
+            "url": "http://127.0.0.1:53696/jc-hook/permission"
           }
         ]
       }

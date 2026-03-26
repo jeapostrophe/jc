@@ -73,8 +73,9 @@ https://jeapostrophe.github.io/tech/jc-workflow/
 2. How does Github README.md rendering deal with large images? The screenshot is 4064 x 2334
 ### Message 16
 What is the best way to promote this? I have no meaningful Twitter --- https://x.com/jeapostrophe --- or LinkedIn --- https://www.linkedin.com/in/jeapostrophe/ --- presence; but I have a ton of stars on Github --- https://github.com/jeapostrophe --- do I just post it on HackerNews and /r/claudai ; fire and forget?
+### Message 17
+There's a trope on Github of banners at the tops of READMEs with things like the logo, some links, and stuff like that; plus at the bottom a star history chart. Can you look into that on a few popular repos and add it here?
 ### WAIT
-
 ## M
 xxx promotion
 ## [X] Task 2
