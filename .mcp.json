@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "drawthings": {
-      "command": "npx",
-      "args": ["-y", "mcp-drawthings"]
-    }
-  }
-}
