@@ -35,15 +35,22 @@ data/
   dark_theme.toml                   # unified dark theme: terminal palette, UI chrome, syntax (Tomorrow Night)
   light_theme.toml                  # unified light theme: terminal palette, UI chrome, syntax (Tomorrow)
   fonts/                            # bundled Lilex font (Regular, Bold, Italic, BoldItalic)
+scripts/
+  bundle.sh                         # release build + macOS .app bundle + icon + codesign
+  update-outline-queries.sh         # fetch outline.scm files from Zed repo
+  update-gpui-component.sh          # re-vendor gpui-component from cargo cache + apply patches
 jc-core/                            # data model + config persistence
-  src/lib.rs, config.rs, model.rs, problem.rs, theme.rs
+  src/lib.rs, config.rs, model.rs, problem.rs, theme.rs, todo.rs, hooks.rs, hooks_settings.rs, snippets.rs, status_script.rs
 jc-terminal/                        # embedded terminal emulator
   src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
   examples/terminal_window.rs
 jc-app/                             # binary: CLI + GPUI app
-  src/main.rs, app.rs, outline.rs, language.rs, views/{workspace,pane,picker,project_state,session_state,diff_view,code_view,todo_view}.rs
+  src/main.rs, app.rs, outline.rs, language.rs, ipc.rs, file_watcher.rs, notify.rs
+  src/views/{workspace/{mod,pickers,problems,render},pane,picker,project_state,session_state,diff_view,code_view,todo_view,comment_panel,close_confirm,keybinding_help}.rs
   src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
   examples/basic_window.rs
+vendor/
+  gpui-component/                   # vendored + patched Longbridge GPUI component library
 ```
 
 ## Design Principles
@@ -121,8 +128,9 @@ The `### WAIT` marker separates what has been sent from what is being drafted. W
 
 The `## Label` heading followed by `> uuid=...` is parsed by the app. The label is a freeform description. The UUID links the session to a Claude Code session for `--resume`.
 
-Session headings support two special prefixes:
+Session headings support three special prefixes:
 - `## [D] Label` — **disabled/dormant**. The session is parsed and appears in the adopt list but is not auto-attached on startup. Toggle via Cmd-Shift-Backspace in the session picker.
+- `## [X] Label` — **expired**. The session's JSONL was garbage-collected by Claude. Parsed but not attachable.
 - `## [DELETED] Label` — **deleted**. The session is completely skipped by the parser and does not appear anywhere. This is a manual edit; the app never writes this prefix directly.
 
 ### Comment Format
@@ -142,9 +150,7 @@ From any view (diff, terminal, code), the user can press a comment keybinding to
 
 ## Views & Panels
 
-The window supports **1, 2, or 3 panes** (Cmd-1/2/3). Any view can appear in any pane via the view picker (Cmd-.). Cmd-[/] cycle focus between visible panes. When reducing pane count, the focused pane swaps into a visible position so you never lose your place. A **Quake-style terminal** can be toggled at the bottom of the window via a keybinding for quick commands.
-
-Multiple windows can be open simultaneously. Windows share state: if two windows show the same session's Claude terminal, scrolling or changes in one are reflected in the other.
+The window supports **1, 2, or 3 panes** (Cmd-1/2/3). Any view can appear in any pane via the open picker (Cmd-O). Cmd-[/] cycle focus between visible panes. When reducing pane count, the focused pane swaps into a visible position so you never lose your place. Per-session pane layouts are saved and restored on session switch.
 
 ### Claude Terminal
 
@@ -158,10 +164,10 @@ A separate terminal per session for running arbitrary commands. Tied to the sess
 
 The terminal emulator (`jc-terminal/`) uses `alacritty_terminal` as a crate for VT parsing and grid state management only — not its GPU renderer. Rendering is handled by a custom gpui bridge in `render.rs`.
 
-**Data flow:**
-1. **PTY reader thread** reads raw bytes in 4KB chunks, sends via flume channel
-2. **Async coalescing task** batches received bytes (up to 64KB cap) and calls `processor.advance()` on the alacritty `Term` grid, then `cx.notify()` to trigger a repaint
-3. **Canvas paint closure** locks the `Term`, reads the grid, and calls `paint_terminal()`
+**Data flow (3-thread pipeline):**
+1. **PTY reader thread** — blocking read loop on the PTY fd, reads raw bytes in 4KB chunks, sends via flume channel to the parser thread
+2. **VTE parser thread** (`std::thread`) — receives bytes from the reader, runs alacritty's `Processor::advance()` (the expensive VTE state machine) under a `Mutex<Term>` lock, then signals the main thread via a notify channel. Batches input with visibility-aware caps: 64KB when the terminal is visible, 256KB when hidden (background tabs batch more aggressively to reduce overhead).
+3. **Main-thread relay task** — lightweight async task that receives notifications from the parser thread, emits Bell events, and calls `cx.notify()` to trigger a GPUI repaint. Skips repaint entirely when the terminal is hidden.
 
 **Render pipeline** (`paint_terminal` in `render.rs`):
 - Pass 1: Cell backgrounds — `paint_quad()` per cell with non-default bg color
@@ -170,9 +176,10 @@ The terminal emulator (`jc-terminal/`) uses `alacritty_terminal` as a crate for 
 - Pass 3: Cursor — a few `paint_quad()` calls for the cursor shape
 
 **Performance optimizations:**
+- **Off-main-thread VTE parsing**: The expensive `Processor::advance()` state machine runs on a dedicated thread, keeping the main thread free for rendering and input.
 - **Dirty tracking**: A `content_generation` counter (incremented after each `advance()`) is compared against `last_painted_generation`. When content hasn't changed (cursor blink, mouse events, focus), Passes 1 and 2 are skipped entirely — only cursor and selection are repainted.
 - **Row-based shaping**: Pass 2 accumulates each row into a single `String` with `Vec<TextRun>` entries split at style boundaries (color/weight/style changes). This produces ~25 `shape_line()` calls per frame instead of ~2000. gpui's `LineLayoutCache` caches shaped lines across frames, so unchanged rows are free on subsequent paints.
-- **Buffer coalescing cap**: The async task caps coalesced PTY data at 64KB to prevent frame stalls from large output bursts.
+- **Adaptive coalescing**: The parser thread caps coalesced PTY data based on visibility — 64KB visible / 256KB hidden — preventing frame stalls from large output bursts while minimizing CPU for background terminals.
 
 ### TODO Editor
 
@@ -185,10 +192,15 @@ Shows `git diff` output for the project's working tree. The user scrolls through
 ### Code Viewer
 
 Syntax-highlighted source viewer with light editing capability (not a full editor). Features:
-- Fuzzy file picker (Cmd-O, searches repository files)
-- Context picker (Cmd-T) powered by tree-sitter `outline.scm` queries with hierarchy-preserving filter --- shows symbols with their parent context (e.g., which `impl` block a function belongs to). Also works in Diff view (pick modified files) and TODO view (pick markdown headers).
-- Comment keybinding works here too
-- Keybinding to open the file in an external editor (Zed)
+- Open picker (Cmd-O) lists pane views and repository files in one unified picker
+- Drill-down picker (Cmd-Shift-O) adapts to the focused pane: tree-sitter outline symbols in code view, modified files + git log in diff view, session headings in TODO view
+- Line search (Cmd-F) for full-text search within the current editor
+- Comment keybinding (Cmd-K) works here too
+- Open in external editor (Cmd-Shift-E) to open the file in Zed
+
+### Global TODO
+
+Read-only view of `~/.claude/TODO.md` — the global session tracker maintained by Claude Code. Available as a pane content type via the open picker.
 
 ### Claude Reply Capture
 
@@ -336,7 +348,7 @@ The fundamental gap: **there is no Claude Code mechanism for "show the user some
 
 ### What's Worth Implementing Anyway
 
-Despite the limitations, a small subset of CLI subcommands are useful for scripting, interop, and the occasional Remote Control check-in:
+Despite the limitations, a small subset of CLI subcommands would be useful for scripting, interop, and the occasional Remote Control check-in:
 
 ```
 jc status              # JSON: projects, sessions, problems, usage
@@ -344,7 +356,9 @@ jc problems            # JSON: all problems with ranks
 jc note <text>         # Append text below WAIT marker
 ```
 
-These three cover the most common remote needs: "what's happening?", "what needs attention?", and "add a quick note." They're useful from any terminal --- Remote Control, SSH, scripts, cron jobs --- without needing skills or bang commands as wrappers.
+These three would cover the most common remote needs: "what's happening?", "what needs attention?", and "add a quick note." They'd be useful from any terminal --- Remote Control, SSH, scripts, cron jobs --- without needing skills or bang commands as wrappers. **Currently not implemented** — see the task checklist.
+
+The only CLI subcommand currently available is `jc clean-hooks`, which removes stale jc hooks from all configured projects.
 
 The remaining operations (`wait`, `send`, `turns`, `diff`) are better performed in the desktop app where you have the full viewport. Wrapping them as skills would burn tokens for a worse experience.
 
@@ -362,49 +376,53 @@ Hooks are the one extension point that works well today. Claude Code fires event
 
 | Component | Approach |
 |---|---|
-| GUI framework | `gpui` 0.2.x (from Zed) + `gpui-component` (Longbridge, 60+ widgets) |
-| Terminal emulator | `alacritty_terminal` 0.25 + `portable-pty` 0.9 --- full escape sequence support for Claude Code's TUI |
+| GUI framework | `gpui` 0.2.x (from Zed) + `gpui-component` (Longbridge, vendored + patched) |
+| Terminal emulator | `alacritty_terminal` 0.25 + `portable-pty` 0.9 --- 3-thread pipeline (PTY reader → VTE parser → main relay) with off-main-thread parsing |
 | Markdown editor | `gpui-component` editor widget + `ropey` + `tree-sitter-md`, custom TODO.md highlight pass |
-| Syntax highlighting | `tree-sitter` 0.25.x (via `gpui-component`) + `tree-sitter-highlight` + per-language grammar crates |
+| Syntax highlighting | `tree-sitter` 0.25.x (via `gpui-component`) + `tree-sitter-highlight` + per-language grammar crates (18 languages) |
 | Symbol navigation | tree-sitter custom `outline.scm` queries (sourced from Zed, updated via `scripts/update-outline-queries.sh`) |
-| Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff` for word-level highlighting |
-| Git worktrees | `git2` worktree API (create/list/prune) |
+| Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff` for word-level highlighting; diff generation on background thread |
 | Problem tracking | Per-view typed enums (`ClaudeProblem`, `TerminalProblem`, `DiffProblem`, `AppTodoProblem`) + wrapper enums (`SessionProblem`, `ProjectProblem`); push via hooks + BEL into `pending_events`; poll via diff/TODO every 2s; `refresh_problems()` merges both and skips re-render when unchanged |
-| Claude reply capture | `/copy` command + clipboard polling, writes to `.jc/replies/<uuid>.md` |
-| Claude usage dashboard | Poll `GET https://api.anthropic.com/api/oauth/usage` (OAuth token from macOS Keychain) |
+| Claude reply capture | `/copy` command + clipboard polling (`arboard` crate), writes to `.jc/replies/<uuid>.md` |
+| IPC | Unix socket (`~/.config/jc/jc.sock`) for single-instance convergence — multiple `jc .` invocations route to one running app |
+| File watching | `notify` 7.x with debouncing for TODO.md, code files, and snippet file changes |
+| Snippets | `~/.claude/jc.md` parsed into named snippets, insertable via Cmd-Shift-K picker |
+| Status scripts | Optional `./status.sh` per project, parsed into `ScriptProblem` objects for problem navigation |
+| Desktop notifications | macOS native: `UNUserNotificationCenter` banners (requires `.app` bundle) + dock bounce via `objc2-app-kit` as fallback |
 | Persistent state | `~/.config/jc/` --- project registry, window layout; session state in TODO.md |
-| Desktop notifications | Dock bounce via `objc2-app-kit` (`NSApplication::requestUserAttention`); no bundling required. Banners need `.app` bundle. |
 
 ## Keybindings
 
 ### Global (Workspace)
 
-| Key | Action | Context |
-|---|---|---|
-| Cmd-1 | 1-pane layout (focused pane goes full-screen) | |
-| Cmd-2 | 2-pane layout (equal widths) | |
-| Cmd-3 | 3-pane layout (equal widths) | |
-| Cmd-. | View picker (place view in focused pane) | |
-| Cmd-[ | Focus previous pane | |
-| Cmd-] | Focus next pane | |
-| Cmd-P | Session picker | |
-| Cmd-O | File picker | |
-| Cmd-T | Context picker (symbols / headings / modified files) | |
-| Cmd-Shift-O | Git log picker | |
-| Cmd-F | Search lines | |
-| Cmd-K | Open comment panel | |
-| Cmd-Shift-K | Snippet picker (`~/.claude/jc.md`) | |
-| Cmd-S | Save file | |
-| Cmd-Enter | Send to terminal | |
-| Cmd-Shift-C | Copy reply (/copy → clipboard → .jc/replies/) | |
-| Cmd-; | Next problem (current project) / jump to WAIT if none | |
-| Cmd-. | Jump to WAIT section of active session | |
-| Cmd-: | Urgency-sorted session picker | |
-| Cmd-? | Keybinding help overlay | |
-| Cmd-Shift-E | Open in external editor | |
-| Cmd-W | Close window | |
-| Cmd-M | Minimize window | |
-| Cmd-Q | Quit | |
+| Key | Action |
+|---|---|
+| Cmd-1 | 1-pane layout (focused pane goes full-screen) |
+| Cmd-2 | 2-pane layout (equal widths) |
+| Cmd-3 | 3-pane layout (equal widths) |
+| Cmd-[ | Focus previous pane |
+| Cmd-] | Focus next pane |
+| Cmd-O | Open picker (pane views + files) |
+| Cmd-Shift-O | Drill-down picker (symbols / modified files / headings) |
+| Cmd-P | Session picker |
+| Cmd-Shift-P | Project actions picker |
+| Cmd-F | Search lines |
+| Cmd-K | Open comment panel |
+| Cmd-Shift-K | Snippet picker (`~/.claude/jc.md`) |
+| Cmd-S | Save file |
+| Cmd-Enter | Send to terminal |
+| Cmd-Shift-C | Copy reply (/copy → clipboard → .jc/replies/) |
+| Cmd-; | Next problem (current project) |
+| Cmd-. | Jump to WAIT section of active session |
+| Cmd-` | Rotate to next project |
+| Cmd-D | Toggle Code/Diff for current file |
+| Cmd-? | Keybinding help overlay |
+| Cmd-Shift-E | Open in external editor |
+| Cmd-Alt-↑/↓ | Scroll other pane up/down |
+| Cmd-Alt-PgUp/PgDn | Page other pane up/down |
+| Cmd-W | Close window |
+| Cmd-M | Minimize window |
+| Cmd-Q | Quit |
 
 ### View-Specific
 
@@ -426,41 +444,40 @@ Hooks are the one extension point that works well today. Claude Code fires event
 | Escape / Ctrl-C | Cancel |
 | Down / Ctrl-N | Next item |
 | Up / Ctrl-P | Previous item |
-| Page Down / Page Up | Page navigation |
-| Cmd-Shift-Backspace | Remove session (session/problem picker only) |
+| Cmd-Shift-Backspace | Remove session (session picker only) |
 
 ### Comment Panel
 
 | Key | Action |
 |---|---|
 | Cmd-Enter | Submit comment |
-| Escape / Cmd-W | Dismiss |
+| Escape | Dismiss |
 
 ## Workflow Walkthrough
 
 ### Reviewing Claude's Output
 
 1. Claude finishes working. A desktop notification fires and the in-app indicator lights up.
-2. Use the view picker (Cmd-.) to show Claude's terminal in a pane.
-3. Press a keybinding to switch to the diff view. Scroll through changes.
-4. Highlight a region (with mouse or keybindings) in the diff, press the comment key, type a note. It appears in TODO.md under `### WAIT`.
-5. Mark reviewed files as done (they collapse).
-6. Switch to the general terminal to run tests or inspect behavior. Highlight output, press comment key.
+2. Use the open picker (Cmd-O) to show Claude's terminal in a pane.
+3. Switch to the diff view via Cmd-O or Cmd-D. Scroll through changes.
+4. Highlight a region in the diff, press Cmd-K (comment), type a note. It appears in TODO.md under `### WAIT`.
+5. Mark reviewed files as done with Cmd-R (they collapse).
+6. Switch to the general terminal to run tests or inspect behavior. Highlight output, press Cmd-K.
 7. Press Cmd-Shift-C to capture Claude's reply via `/copy`. The reply is saved to `.jc/replies/` and opened in the code viewer for annotation.
 
 ### Navigating Code
 
-1. Press a keybinding to open the file picker. Fuzzy-search for a filename.
+1. Press Cmd-O to open the file picker. Fuzzy-search for a filename.
 2. The file opens in the code viewer with syntax highlighting.
-3. Press a keybinding to open the symbol picker. Type to filter (e.g., "new" shows all functions with "new" in the name, with their `impl` context).
-4. Browse the code. Press the comment key to annotate a line --- it flows into TODO.md.
-5. Press a keybinding to open the file in Zed for real editing.
+3. Press Cmd-Shift-O to open the drill-down picker. Type to filter symbols (e.g., "new" shows all functions with "new" in the name, with their `impl` context).
+4. Browse the code. Press Cmd-K to annotate a line --- it flows into TODO.md.
+5. Press Cmd-Shift-E to open the file in Zed for real editing.
 
 ### Sending Instructions to Claude
 
 1. Navigate to the TODO editor. Review accumulated comments and notes below `### WAIT`.
 2. Rearrange, elaborate, or trim the notes.
-3. Select the text to send. Press the send keybinding.
+3. Select the text to send. Press Cmd-Enter.
 4. The selected text becomes `### Message N`, is sent to the Claude terminal, and `### WAIT` moves below it. Remaining unselected text stays as future notes.
 
 ### Managing Projects and Sessions
@@ -484,7 +501,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 - [ ] [H] Add word-level inline highlighting via `similar` with background highlights NOT diagnostics
 
 ### Window & Pane Management
-- [ ] [H] Implement multi-window with shared session state
+- [ ] [H] Implement multi-window with shared session state (currently single-window only)
 
 ### Remote Workflow (CLI & Hooks)
 - [ ] [H] `jc status` subcommand: JSON output of projects, sessions, problems, usage
@@ -506,7 +523,7 @@ Hooks are the one extension point that works well today. Claude Code fires event
 
 ## Claude Code Hook Opportunities
 
-Currently used hooks: `UserPromptSubmit`, `Stop`, `Notification` (idle/permission), `PermissionRequest`, `SessionStart`, `SessionEnd`.
+Currently used hooks: `prompt-submit`, `stop`, `stop-failure`, `notification` (idle/permission/auth/elicitation), `permission`, `session-start` (source: clear/startup/resume/compact), `session-end` (reason: clear/logout/prompt_input_exit). The hook server correlates `SessionEnd(clear)` + `SessionStart(clear)` pairs to emit a unified `SessionClear` event for `/clear` handling.
 
 Hooks worth exploring:
 

@@ -1,5 +1,7 @@
 # Mobile WebSocket Protocol
 
+> **Status: Design spec — not yet implemented.** This documents the planned protocol for a future iOS companion app. See README.md "Remote Workflow" for current thinking.
+
 Protocol specification for communication between the jc desktop app and the iOS companion app.
 
 ## Connection

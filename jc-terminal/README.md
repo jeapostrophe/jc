@@ -9,14 +9,18 @@ GPUI Window
   └─ TerminalView (Render + Focusable)
        ├─ TerminalState (Arc<Mutex<Term<EventProxy>>>)
        ├─ PtyHandle (Mutex<MasterPty>, Arc<Mutex<Writer>>)
-       ├─ std::thread (blocking PTY reads → flume channel)
-       └─ GPUI async task (receives bytes → process → cx.notify)
+       ├─ Thread 1: PTY reader (blocking reads → bytes_tx channel)
+       ├─ Thread 2: VTE parser (bytes_rx → Processor.advance() → notify_tx)
+       └─ Main thread: relay task (notify_rx → Bell events + cx.notify)
 ```
 
-**Data flow:**
+**Data flow (3-thread pipeline):**
 - **Input:** GPUI `KeyDownEvent` → `keystroke_to_bytes()` → `PtyHandle.write_all()`
-- **Output:** PTY reader thread → flume channel → GPUI task → VTE `Processor.advance()` → `cx.notify()` → render
-- **Render:** `canvas()` locks `Term`, iterates grid cells, paints backgrounds + text + cursor
+- **Output:**
+  1. **PTY reader thread** — blocking read loop on PTY fd, 4KB chunks, sends raw bytes via flume channel
+  2. **VTE parser thread** (`std::thread`) — receives bytes, coalesces with visibility-aware caps (64KB visible / 256KB hidden), runs `Processor.advance()` under `Mutex<Term>` lock, signals main thread via notify channel
+  3. **Main-thread relay** — async task receives notifications, emits Bell events, calls `cx.notify()` for GPUI repaint (skipped when terminal is hidden)
+- **Render:** `canvas()` locks `Term`, iterates grid cells, paints backgrounds + text + cursor via 3-pass pipeline
 - **Resize:** Detected in canvas paint closure, propagated to both PTY and terminal grid
 
 ## Modules
