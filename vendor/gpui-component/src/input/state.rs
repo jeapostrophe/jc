@@ -1589,7 +1589,7 @@ impl InputState {
       }
 
       self.replace_text_in_range_silent(None, &new_text, window, cx);
-      self.scroll_to(self.cursor(), None, cx);
+      self.scroll_to(self.cursor(), Some(MoveDirection::Down), cx);
     }
   }
 
@@ -2124,7 +2124,7 @@ impl EntityInputHandler for InputState {
       self.handle_completion_trigger(&range, &new_text, window, cx);
     }
     cx.emit(InputEvent::Change);
-    cx.notify();
+    self.scroll_to(new_offset, Some(MoveDirection::Down), cx);
   }
 
   /// Mark text is the IME temporary insert on typing.
@@ -2184,7 +2184,8 @@ impl EntityInputHandler for InputState {
     self.mode.update_auto_grow(&self.text_wrapper);
     self.history.start_grouping();
     self.push_history(&old_text, &range, new_text);
-    cx.notify();
+    let cursor = self.selected_range.end;
+    self.scroll_to(cursor, Some(MoveDirection::Down), cx);
   }
 
   /// Used to position IME candidates.
