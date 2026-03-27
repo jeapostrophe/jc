@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/jeapostrophe/jc/actions/workflows/ci.yml"><img src="https://github.com/jeapostrophe/jc/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/platform-macOS-blue" alt="macOS" />
   <img src="https://img.shields.io/badge/built_with-Rust_%2B_GPUI-orange" alt="Rust + GPUI" />
 </p>
