@@ -967,7 +967,7 @@ impl InputState {
     cx: &mut Context<Self>,
   ) {
     let line = self.cursor_position().line;
-    self.scroll_to_center_line(line as u32, cx);
+    self.scroll_to_center_line(line, cx);
   }
 
   pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {

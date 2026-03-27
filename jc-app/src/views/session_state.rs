@@ -17,6 +17,7 @@ pub enum PendingEvent {
 }
 
 pub struct SessionState {
+  #[allow(dead_code)]
   pub id: SessionId,
   pub uuid: Option<String>,
   pub label: String,

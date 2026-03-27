@@ -262,7 +262,7 @@ impl Render for Workspace {
         );
 
       if !crumbs.is_empty() {
-        let crumb_color = if active { muted } else { muted };
+        let crumb_color = muted;
         for c in crumbs {
           row = row.child(div().flex_shrink_0().text_color(crumb_color).child(" > "));
           row = row.child(div().text_color(crumb_color).truncate().child(c));

@@ -182,23 +182,21 @@ unsafe extern "C" fn did_receive_response(
 /// Register an observer for NSApplicationDidBecomeActiveNotification so that
 /// any activation (dock click, Cmd-Tab, etc.) switches to the window's Space.
 unsafe fn observe_app_activation() {
-  unsafe {
-    let nc: Retained<AnyObject> =
-      msg_send![AnyClass::get(c"NSNotificationCenter").unwrap(), defaultCenter];
-    let name = NSString::from_str("NSApplicationDidBecomeActiveNotification");
-    let block = RcBlock::new(|_notif: *mut AnyObject| {
-      unsafe { bring_window_to_front() };
-    });
-    let () = msg_send![
-      &*nc,
-      addObserverForName: &*name,
-      object: std::ptr::null::<AnyObject>(),
-      queue: std::ptr::null::<AnyObject>(),
-      usingBlock: &*block
-    ];
-    // Leak the block so it lives for the app's lifetime.
-    std::mem::forget(block);
-  }
+  let nc: Retained<AnyObject> =
+    msg_send![AnyClass::get(c"NSNotificationCenter").unwrap(), defaultCenter];
+  let name = NSString::from_str("NSApplicationDidBecomeActiveNotification");
+  let block = RcBlock::new(|_notif: *mut AnyObject| {
+    unsafe { bring_window_to_front() };
+  });
+  let () = msg_send![
+    &*nc,
+    addObserverForName: &*name,
+    object: std::ptr::null::<AnyObject>(),
+    queue: std::ptr::null::<AnyObject>(),
+    usingBlock: &*block
+  ];
+  // Leak the block so it lives for the app's lifetime.
+  std::mem::forget(block);
 }
 
 /// Switch to the Space containing the app's window and bring it forward.

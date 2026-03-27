@@ -90,6 +90,7 @@ pub struct Workspace {
   layout: PaneLayout,
   projects: Vec<ProjectState>,
   active_project_index: usize,
+  #[allow(dead_code)]
   config: AppConfig,
   focus: FocusHandle,
   active_picker: Option<AnyView>,
@@ -485,10 +486,9 @@ impl Workspace {
         TerminalViewEvent::Bell => {
           if let Some(session) =
             this.projects.get_mut(pi).and_then(|p| p.sessions.get_mut(&session_id))
+            && session.pending_events.insert(PendingEvent::TerminalBell)
           {
-            if session.pending_events.insert(PendingEvent::TerminalBell) {
-              cx.notify();
-            }
+            cx.notify();
           }
         }
       },
@@ -635,7 +635,6 @@ impl Workspace {
               conflicts.push(relative.display().to_string());
             }
           } else {
-            drop(cv);
             session.code_view.update(cx, |v, cx| v.save(cx));
           }
         }
@@ -883,11 +882,11 @@ impl Workspace {
       let project = &self.projects[self.active_project_index];
       if let Some(label) = project.active_label() {
         let todo_view = project.todo_view.clone();
-        todo_view.update(cx, |tv, cx| tv.ensure_wait(&label, window, cx));
+        todo_view.update(cx, |tv, cx| tv.ensure_wait(label, window, cx));
         let project = &self.projects[self.active_project_index];
         let tv = project.todo_view.read(cx);
         let text = tv.editor_text(cx);
-        if let Some(wait_line) = tv.document().wait_body_end_line(&label, &text) {
+        if let Some(wait_line) = tv.document().wait_body_end_line(label, &text) {
           let wait_line_0 = wait_line.saturating_sub(1);
           let _ = tv;
           project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
@@ -960,12 +959,11 @@ impl Workspace {
             diff_view.update(cx, |v, cx| {
               v.set_file_index(idx, window, cx);
               // Scroll diff to the source line.
-              if let Some(src_line) = source_line {
-                if let Some(content) = v.current_file_content() {
-                  if let Some(diff_line) = source_line_to_diff_line(content, src_line) {
-                    v.scroll_to_line(diff_line, window, cx);
-                  }
-                }
+              if let Some(src_line) = source_line
+                && let Some(content) = v.current_file_content()
+                && let Some(diff_line) = source_line_to_diff_line(content, src_line)
+              {
+                v.scroll_to_line(diff_line, window, cx);
               }
             });
           }
@@ -1143,10 +1141,8 @@ impl Workspace {
     }
 
     // Acknowledge pending events unless skipped (e.g. L0 problem jump).
-    if !skip_acknowledge {
-      if let Some(session) = self.projects[project_idx].active_session_mut() {
-        session.acknowledge();
-      }
+    if !skip_acknowledge && let Some(session) = self.projects[project_idx].active_session_mut() {
+      session.acknowledge();
     }
 
     // Reset problem cycle on manual session switches.
@@ -1364,7 +1360,7 @@ impl Workspace {
         .read(cx)
         .document()
         .session_by_label(label)
-        .map_or(false, |s| s.status == jc_core::todo::SessionStatus::Disabled);
+        .is_some_and(|s| s.status == jc_core::todo::SessionStatus::Disabled);
       if is_disabled {
         todo_view.update(cx, |tv, cx| {
           tv.toggle_session_disabled(label, window, cx);
@@ -1456,36 +1452,34 @@ impl Workspace {
       .read(cx)
       .document()
       .session_by_label(label)
-      .map_or(false, |s| s.status == jc_core::todo::SessionStatus::Disabled);
-    if is_now_disabled {
-      if let Some(id) = adopted_id {
-        let project = &mut self.projects[project_idx];
-        project.sessions.remove(&id);
+      .is_some_and(|s| s.status == jc_core::todo::SessionStatus::Disabled);
+    if is_now_disabled && let Some(id) = adopted_id {
+      let project = &mut self.projects[project_idx];
+      project.sessions.remove(&id);
 
-        if project.active_session == Some(id) {
-          let next_id = project.sessions.keys().next().copied();
-          project.active_session = next_id;
-        }
+      if project.active_session == Some(id) {
+        let next_id = project.sessions.keys().next().copied();
+        project.active_session = next_id;
+      }
 
-        self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
-        let active = self.projects[project_idx].active_session;
-        if active.is_some() {
-          // Another session in the same project — switch to it.
-          self.switch_to_session(project_idx, active, window, cx);
+      self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
+      let active = self.projects[project_idx].active_session;
+      if active.is_some() {
+        // Another session in the same project — switch to it.
+        self.switch_to_session(project_idx, active, window, cx);
+      } else {
+        // Last session in this project was disabled — jump to the next
+        // project that has sessions, falling back to staying put.
+        let next = self
+          .projects
+          .iter()
+          .enumerate()
+          .find(|(pi, p)| *pi != project_idx && !p.sessions.is_empty());
+        if let Some((pi, p)) = next {
+          let sid = p.active_session;
+          self.switch_to_session(pi, sid, window, cx);
         } else {
-          // Last session in this project was disabled — jump to the next
-          // project that has sessions, falling back to staying put.
-          let next = self
-            .projects
-            .iter()
-            .enumerate()
-            .find(|(pi, p)| *pi != project_idx && !p.sessions.is_empty());
-          if let Some((pi, p)) = next {
-            let sid = p.active_session;
-            self.switch_to_session(pi, sid, window, cx);
-          } else {
-            self.switch_to_session(project_idx, None, window, cx);
-          }
+          self.switch_to_session(project_idx, None, window, cx);
         }
       }
     }
@@ -1645,11 +1639,12 @@ impl Workspace {
       let mut new_content = None;
       for _ in 0..15 {
         Timer::after(StdDuration::from_millis(200)).await;
-        if let Some(current) = clipboard_contents() {
-          if current != initial && !current.is_empty() {
-            new_content = Some(current);
-            break;
-          }
+        if let Some(current) = clipboard_contents()
+          && current != initial
+          && !current.is_empty()
+        {
+          new_content = Some(current);
+          break;
         }
       }
 

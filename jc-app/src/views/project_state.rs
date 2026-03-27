@@ -91,10 +91,10 @@ impl ProjectState {
     let active_session = sessions.keys().next().copied();
 
     // Highlight the initial active session in the TODO view.
-    if let Some(id) = active_session {
-      if let Some(session) = sessions.get(&id) {
-        todo_view.update(cx, |tv, cx| tv.set_active_label(Some(&session.label), cx));
-      }
+    if let Some(id) = active_session
+      && let Some(session) = sessions.get(&id)
+    {
+      todo_view.update(cx, |tv, cx| tv.set_active_label(Some(&session.label), cx));
     }
 
     Self {

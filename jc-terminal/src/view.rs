@@ -505,7 +505,7 @@ impl TerminalView {
       let seq = format!("\x1b[<{button};{col};{row}{suffix}");
       let _ = self.pty.write_all(seq.as_bytes());
     } else {
-      let cb = (button + 32) as u8;
+      let cb = button + 32;
       let cx_byte = (col as u8).saturating_add(32);
       let cy_byte = (row as u8).saturating_add(32);
       let seq = [b'\x1b', b'[', b'M', cb, cx_byte, cy_byte];
@@ -667,7 +667,7 @@ impl Render for TerminalView {
                 let _ = this.pty.write_all(seq.as_bytes());
               }
             } else {
-              let cb = (button + 32) as u8;
+              let cb = button + 32;
               let cx_byte = (col as u8).saturating_add(32);
               let cy_byte = (row as u8).saturating_add(32);
               let seq = [b'\x1b', b'[', b'M', cb, cx_byte, cy_byte];

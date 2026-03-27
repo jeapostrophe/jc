@@ -565,7 +565,7 @@ pub fn source_line_to_diff_line(diff_content: &str, source_line: u32) -> Option<
 
     match line.as_bytes().first() {
       Some(b'-') => {} // Deleted line — no source line
-      Some(b'+') | Some(b' ') | _ => {
+      _ => {
         if current_source_line == source_line {
           return Some(editor_line);
         }

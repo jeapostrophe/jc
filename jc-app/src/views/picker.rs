@@ -842,6 +842,7 @@ struct SessionPickerEntry {
   /// Total problem count (session + project).
   problems: usize,
   /// Minimum problem rank (lower = more urgent). `i8::MAX` if no problems.
+  #[allow(dead_code)]
   min_rank: i8,
 }
 
@@ -892,7 +893,7 @@ impl SessionPickerDelegate {
       let adopted_uuids: HashSet<&str> =
         project.sessions.values().filter_map(|s| s.uuid.as_deref()).collect();
 
-      let has_adoptable = todo_documents.get(pi).map_or(false, |d| {
+      let has_adoptable = todo_documents.get(pi).is_some_and(|d| {
         d.sessions
           .iter()
           .any(|s| !s.uuid.is_empty() && s.status != jc_core::todo::SessionStatus::Expired)
@@ -1031,6 +1032,7 @@ impl SessionPickerDelegate {
 
   /// Like `new()` but sorted by urgency: sessions with problems first (lowest rank = most urgent).
   /// The first entry is pre-selected so Enter immediately confirms the neediest session.
+  #[allow(dead_code)]
   pub fn new_urgency_sorted(
     projects: &[ProjectState],
     active_project_index: usize,
@@ -1194,6 +1196,7 @@ enum ProjectActionsEntry {
     project_name: String,
     label: String,
     problems: usize,
+    #[allow(dead_code)]
     min_rank: i8,
   },
   /// A TODO.md session that isn't currently running.
@@ -1243,8 +1246,7 @@ impl ProjectActionsPickerDelegate {
       let pi = active_project_index;
       let project = &projects[pi];
 
-      if project.sessions.is_empty()
-        && todo_documents.get(pi).map_or(true, |d| d.sessions.is_empty())
+      if project.sessions.is_empty() && todo_documents.get(pi).is_none_or(|d| d.sessions.is_empty())
       {
         if !project.problems.is_empty() {
           let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);

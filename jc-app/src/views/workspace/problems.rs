@@ -37,10 +37,10 @@ impl Workspace {
 
     if !l0_problems.is_empty() {
       // Store home session on FIRST L0 jump only.
-      if self.pre_layer0_home.is_none() {
-        if let Some(active_sid) = self.projects[self.active_project_index].active_session {
-          self.pre_layer0_home = Some((self.active_project_index, active_sid));
-        }
+      if self.pre_layer0_home.is_none()
+        && let Some(active_sid) = self.projects[self.active_project_index].active_session
+      {
+        self.pre_layer0_home = Some((self.active_project_index, active_sid));
       }
 
       // Advance cycle within L0 list.
