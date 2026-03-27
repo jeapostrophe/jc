@@ -431,6 +431,8 @@ pub struct SendResult {
   pub new_text: String,
   pub message_text: String,
   pub message_index: usize,
+  /// Byte offset of the first character after the new `### WAIT\n` heading.
+  pub wait_body_offset: usize,
 }
 
 /// Extract text from the WAIT section and turn it into a new `### Message N`.
@@ -488,10 +490,11 @@ pub fn send_from_wait(
   new_text.push_str(&message_text);
   new_text.push('\n');
   new_text.push_str("### WAIT\n");
+  let wait_body_offset = new_text.len();
   new_text.push_str(&remaining);
   new_text.push_str(after_body);
 
-  Some(SendResult { new_text, message_text, message_index })
+  Some(SendResult { new_text, message_text, message_index, wait_body_offset })
 }
 
 // ---------------------------------------------------------------------------

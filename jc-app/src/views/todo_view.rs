@@ -1,7 +1,7 @@
 use crate::views::code_view::CodeView;
 use gpui::*;
 use gpui_component::ActiveTheme;
-use gpui_component::input::{InputEvent, Rope};
+use gpui_component::input::{InputEvent, Rope, RopeExt as _};
 use jc_core::todo::{self, TodoDocument, TodoProblem};
 use std::path::{Path, PathBuf};
 
@@ -208,9 +208,12 @@ impl TodoView {
     let selection = self.code_view.read(cx).editor().read(cx).selection_byte_range();
     let session = self.document.session_by_label(label)?;
     let result = todo::send_from_wait(&text, session, selection)?;
+    let wait_body_offset = result.wait_body_offset;
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {
         state.set_value_preserving_position(result.new_text, window, cx);
+        let pos = state.text().offset_to_position(wait_body_offset);
+        state.set_cursor_position(pos, window, cx);
       });
     });
     self.revalidate(cx);

@@ -1542,6 +1542,11 @@ impl Workspace {
       return;
     };
 
+    // Re-run ensure_wait so the empty WAIT body gets a blank line for typing.
+    todo_view.update(cx, |tv, cx| {
+      tv.ensure_wait(&label, window, cx);
+    });
+
     // Mark session as busy — we're about to submit work to Claude.
     if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
       session.busy = true;
@@ -1559,10 +1564,7 @@ impl Workspace {
       let _ = pty.write_all(b"\r");
     });
 
-    // Show Claude terminal in the "other" pane so the user can see it working.
-    let target = if self.active_pane_index == 0 { 1.min(self.panes.len() - 1) } else { 0 };
-    self.active_pane_index = target;
-    self.set_active_pane_view(PaneContentKind::ClaudeTerminal, window, cx);
+    cx.notify();
   }
 
   // ---------------------------------------------------------------------------
