@@ -101,8 +101,8 @@ fn install_signal_handler(state: &config::AppState) {
   *SIGNAL_CLEANUP_PATHS.lock().unwrap() = paths;
 
   unsafe {
-    libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
-    libc::signal(libc::SIGTERM, sigint_handler as libc::sighandler_t);
+    libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+    libc::signal(libc::SIGTERM, sigint_handler as *const () as libc::sighandler_t);
   }
 }
 
