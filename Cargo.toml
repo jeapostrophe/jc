@@ -7,6 +7,12 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+# gpui and gpui-component are vendored in vendor/ so we can patch them:
+# - gpui: InputRateTracker replaces the naive last_input_timestamp check that
+#   caused continuous GPU frame presentation on any mouse movement (backport of
+#   Zed PR #45369). See vendor/gpui/src/input_rate_tracker.rs.
+# - gpui-component: patched for custom input/theme behaviors (see
+#   scripts/update-gpui-component.sh and vendor/patches/).
 gpui = "0.2.2"
 gpui-component = { path = "vendor/gpui-component", features = ["tree-sitter-languages"] }
 git2 = { version = "0.20", default-features = false }
@@ -43,3 +49,8 @@ objc2-user-notifications = { version = "0.3", features = [
   "UNNotificationAction", "UNNotificationCategory", "UNNotificationSound",
   "UNNotificationResponse", "UNNotificationSettings",
 ] }
+
+# Redirect all gpui references (including transitive deps like gpui-component)
+# to our patched vendor copy.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
