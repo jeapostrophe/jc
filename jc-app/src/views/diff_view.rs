@@ -359,16 +359,19 @@ fn generate_diff_inner(path: &Path) -> Result<String, git2::Error> {
   let tree = head.peel_to_tree()?;
 
   // Include untracked files in the diff so new files show up for review.
-  // Do NOT recurse into untracked directories — a directory with hundreds of
-  // files (e.g. node_modules) would appear as hundreds of individual entries.
-  // Instead, untracked directories appear as a single entry (matching `git status`).
+  // Recurse into untracked directories so individual files are listed.
+  // Ignored files are excluded by default (include_ignored defaults to false).
   let mut opts = git2::DiffOptions::new();
   opts.include_untracked(true);
+  opts.recurse_untracked_dirs(true);
   opts.show_untracked_content(true);
 
   let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts))?;
   diff_to_string(&diff)
 }
+
+/// Cap file count to prevent UI slowdown from huge untracked directories.
+const MAX_FILE_DIFFS: usize = 200;
 
 fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
   let mut diffs = Vec::new();
@@ -381,6 +384,9 @@ fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
       if let Some(name) = current_name.take() {
         let checksum = super::compute_checksum(&current_content);
         diffs.push(FileDiff { name, content: std::mem::take(&mut current_content), checksum });
+        if diffs.len() >= MAX_FILE_DIFFS {
+          return diffs;
+        }
       }
       let name = rest.split(" b/").next().unwrap_or(rest).to_string();
       if name == "TODO.md" || name == ".claude/settings.local.json" {
@@ -398,7 +404,9 @@ fn parse_file_diffs(diff_text: &str) -> Vec<FileDiff> {
   }
 
   // Flush last file.
-  if let Some(name) = current_name {
+  if let Some(name) = current_name
+    && diffs.len() < MAX_FILE_DIFFS
+  {
     let checksum = super::compute_checksum(&current_content);
     diffs.push(FileDiff { name, content: current_content, checksum });
   }
