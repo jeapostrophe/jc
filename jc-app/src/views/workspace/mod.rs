@@ -18,6 +18,8 @@ use jc_core::theme::Appearance;
 use jc_terminal::{Palette, TerminalView, TerminalViewEvent};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
 actions!(
@@ -120,6 +122,10 @@ pub struct Workspace {
   keybinding_help: Option<(AnyView, Subscription)>,
   pre_help_focus: Option<FocusHandle>,
   window_active: bool,
+  /// Shared flag so the async poll task can check window focus without a main-thread round-trip.
+  window_active_flag: Arc<AtomicBool>,
+  /// Send a project index to trigger an immediate one-shot problems refresh.
+  problems_refresh_tx: flume::Sender<usize>,
   _window_activation_subscription: Subscription,
   _notification_poll_task: Option<Task<()>>,
   close_confirm: Option<(AnyView, Subscription)>,
@@ -186,10 +192,16 @@ impl Workspace {
         this.apply_appearance(appearance_from_window(window.appearance()), window, cx);
       });
 
-    // Track window activation for notification suppression.
+    // Track window activation for notification suppression + poll gating.
+    let window_active_flag = Arc::new(AtomicBool::new(true));
+    let window_active_flag_for_sub = window_active_flag.clone();
     let window_activation_subscription =
-      cx.observe_window_activation(window, |this: &mut Self, window, _cx| {
-        this.window_active = window.is_window_active();
+      cx.observe_window_activation(window, move |this: &mut Self, window, _cx| {
+        let active = window.is_window_active();
+        this.window_active = active;
+        this.window_active_flag.store(active, Ordering::Relaxed);
+        // Wake the poll task so it can adjust its sleep interval.
+        let _ = this.problems_refresh_tx.try_send(usize::MAX);
       });
 
     let mut focus_in_subscriptions = Vec::new();
@@ -244,79 +256,136 @@ impl Workspace {
     // Subscribe to bell events from all sessions' claude terminals.
     let bell_subscriptions = Self::subscribe_bells(&projects, cx);
 
-    // Problem refresh poll task — runs immediately, then every 2 seconds.
-    // Git diff generation runs on the background executor to avoid blocking
-    // the main thread; only the lightweight state update happens on main.
+    // Problem refresh poll task.
+    //
+    // Energy-conscious design:
+    // - Only polls the *active* project (diff + problems) on a 2s timer.
+    // - Inactive projects are refreshed on-demand when a hook event arrives
+    //   (Stop, StopFailure, PermissionPrompt, IdlePrompt) via `problems_refresh_tx`.
+    // - When the window is inactive, polling stops entirely — only hook-signalled
+    //   refreshes are processed (the task blocks on the channel).
+    // - The channel also wakes the task immediately for on-demand refreshes.
+    let (problems_refresh_tx, problems_refresh_rx) = flume::bounded::<usize>(8);
+    let window_active_for_poll = window_active_flag.clone();
     let problems_poll_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
       use crate::views::diff_view::{DiffSource, generate_commit_diff, generate_diff};
+
       loop {
-        // 1. Gather stale diff jobs from the main thread (cheap).
-        let diff_jobs: Vec<(usize, PathBuf, DiffSource)> = cx
-          .update(|cx: &mut App| {
-            let Some(entity) = this.upgrade() else { return vec![] };
-            entity
-              .read(cx)
-              .projects
-              .iter()
-              .enumerate()
-              .filter_map(|(i, p)| {
-                if p.diff_view.read(cx).is_stale() {
-                  let (path, source) = p.diff_view.read(cx).diff_job();
-                  Some((i, path, source))
-                } else {
-                  None
+        // Determine which project indices to refresh this cycle.
+        let mut refresh_indices: Vec<usize> = Vec::new();
+        let is_active = window_active_for_poll.load(Ordering::Relaxed);
+
+        // Drain any pending signals (non-blocking).
+        while let Ok(idx) = problems_refresh_rx.try_recv() {
+          if idx != usize::MAX {
+            refresh_indices.push(idx);
+          }
+        }
+
+        // Only include the active project when the window is focused.
+        if is_active {
+          let active_idx = cx
+            .update(|cx: &mut App| this.upgrade().map(|e| e.read(cx).active_project_index))
+            .ok()
+            .flatten();
+          let Some(active_idx) = active_idx else { break };
+          if !refresh_indices.contains(&active_idx) {
+            refresh_indices.push(active_idx);
+          }
+        }
+
+        if !refresh_indices.is_empty() {
+          refresh_indices.sort_unstable();
+          refresh_indices.dedup();
+
+          // 1. Gather stale diff jobs from the main thread (cheap).
+          let diff_jobs: Vec<(usize, PathBuf, DiffSource)> = cx
+            .update(|cx: &mut App| {
+              let Some(entity) = this.upgrade() else { return vec![] };
+              entity
+                .read(cx)
+                .projects
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| refresh_indices.contains(i))
+                .filter_map(|(i, p)| {
+                  if p.diff_view.read(cx).is_stale() {
+                    let (path, source) = p.diff_view.read(cx).diff_job();
+                    Some((i, path, source))
+                  } else {
+                    None
+                  }
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+
+          // 2. Run git diffs on background executor (heavy I/O, off main thread).
+          let mut diff_results: Vec<(usize, String)> = Vec::new();
+          for (idx, path, source) in diff_jobs {
+            let text = cx
+              .background_executor()
+              .spawn(async move {
+                match source {
+                  DiffSource::WorkingTree => generate_diff(&path),
+                  DiffSource::Commit { oid, .. } => generate_commit_diff(&path, oid),
                 }
               })
-              .collect()
-          })
-          .unwrap_or_default();
+              .await;
+            diff_results.push((idx, text));
+          }
 
-        // 2. Run git diffs on background executor (heavy I/O, off main thread).
-        let mut diff_results: Vec<(usize, String)> = Vec::new();
-        for (idx, path, source) in diff_jobs {
-          let text = cx
-            .background_executor()
-            .spawn(async move {
-              match source {
-                DiffSource::WorkingTree => generate_diff(&path),
-                DiffSource::Commit { oid, .. } => generate_commit_diff(&path, oid),
+          // 3. Apply results + refresh problems on main thread (cheap).
+          let Ok(should_continue) = cx.update(|cx: &mut App| {
+            let Some(entity) = this.upgrade() else { return false };
+            entity.update(cx, |view, cx| {
+              let mut changed = false;
+              for (idx, diff_text) in diff_results {
+                if idx < view.projects.len() {
+                  let data_changed = view.projects[idx]
+                    .diff_view
+                    .update(cx, |dv, _cx| dv.apply_diff_text(diff_text));
+                  changed |= data_changed;
+                }
               }
-            })
-            .await;
-          diff_results.push((idx, text));
+              for &idx in &refresh_indices {
+                if idx < view.projects.len() {
+                  changed |= view.projects[idx].refresh_problems(cx);
+                }
+              }
+              if changed {
+                let pi = view.active_project_index;
+                let label = view.projects[pi].active_label().map(|s| s.to_string());
+                let todo_view = view.projects[pi].todo_view.clone();
+                todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
+                cx.notify();
+              }
+            });
+            true
+          }) else {
+            break;
+          };
+          if !should_continue {
+            break;
+          }
         }
 
-        // 3. Apply results + refresh problems on main thread (cheap).
-        let Ok(should_continue) = cx.update(|cx: &mut App| {
-          let Some(entity) = this.upgrade() else { return false };
-          entity.update(cx, |view, cx| {
-            let mut changed = false;
-            for (idx, diff_text) in diff_results {
-              if idx < view.projects.len() {
-                let data_changed =
-                  view.projects[idx].diff_view.update(cx, |dv, _cx| dv.apply_diff_text(diff_text));
-                changed |= data_changed;
-              }
-            }
-            for project in &mut view.projects {
-              changed |= project.refresh_problems(cx);
-            }
-            if changed {
-              let pi = view.active_project_index;
-              let label = view.projects[pi].active_label().map(|s| s.to_string());
-              let todo_view = view.projects[pi].todo_view.clone();
-              todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
-              cx.notify();
-            }
-          });
-          true
-        }) else {
-          break;
-        };
-        if !should_continue {
-          break;
+        // When active: poll every 2s, waking early for hook signals.
+        // When inactive: block on channel only (no timer-based polling).
+        if is_active {
+          futures_lite::future::or(
+            async {
+              Timer::after(StdDuration::from_secs(2)).await;
+            },
+            async {
+              let _ = problems_refresh_rx.recv_async().await;
+            },
+          )
+          .await;
+        } else {
+          // Sleep until a hook event or window activation wakes us.
+          let _ = problems_refresh_rx.recv_async().await;
         }
-        Timer::after(StdDuration::from_secs(2)).await;
       }
     });
 
@@ -402,6 +471,8 @@ impl Workspace {
       keybinding_help: None,
       pre_help_focus: None,
       window_active: true,
+      window_active_flag: window_active_flag_for_sub,
+      problems_refresh_tx,
       _window_activation_subscription: window_activation_subscription,
       _notification_poll_task: Some(notification_poll_task),
       close_confirm: None,
@@ -1747,12 +1818,13 @@ impl Workspace {
     // Match by UUID (session_id from hook) across all projects.
     let mut matched_project: Option<String> = None;
     let mut matched_label: Option<String> = None;
+    let mut matched_project_idx: Option<usize> = None;
 
     let session_uuid = &event.session_id;
     if !session_uuid.is_empty() {
       let mut found = false;
       // First pass: find an existing session with this UUID.
-      for project in &mut self.projects {
+      for (pi, project) in self.projects.iter_mut().enumerate() {
         if let Some(session) =
           project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(session_uuid))
         {
@@ -1766,13 +1838,14 @@ impl Workspace {
           }
           matched_project = Some(project.name.clone());
           matched_label = Some(session.label.clone());
+          matched_project_idx = Some(pi);
           found = true;
           break;
         }
       }
       // Fallback: assign UUID to a pending (uuid=None) session in the matching project.
       if !found {
-        for project in &mut self.projects {
+        for (pi, project) in self.projects.iter_mut().enumerate() {
           if event.project_path.as_deref() != Some(project.path.as_path()) {
             continue;
           }
@@ -1793,10 +1866,16 @@ impl Workspace {
             });
             matched_project = Some(project.name.clone());
             matched_label = Some(label);
+            matched_project_idx = Some(pi);
             break;
           }
         }
       }
+    }
+
+    // Signal the problems poll to refresh this project immediately.
+    if let Some(pi) = matched_project_idx {
+      let _ = self.problems_refresh_tx.try_send(pi);
     }
 
     // Notify when the window is not active (user is in another app).

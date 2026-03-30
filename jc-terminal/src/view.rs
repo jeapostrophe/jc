@@ -132,6 +132,8 @@ pub struct TerminalView {
   /// aggressively and the notification relay skips `cx.notify()`.
   visible: Arc<AtomicBool>,
   _subscriptions: Vec<Subscription>,
+  /// Cursor blink task — only runs while focused.
+  _blink_task: Option<gpui::Task<()>>,
 }
 
 impl TerminalView {
@@ -241,35 +243,6 @@ impl TerminalView {
     })
     .detach();
 
-    // Cursor blink timer — only toggles when focused and terminal says blinking is enabled.
-    cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
-      loop {
-        Timer::after(CURSOR_BLINK_INTERVAL).await;
-        let Ok(should_continue) = cx.update(|cx: &mut App| {
-          if let Some(entity) = this.upgrade() {
-            entity.update(cx, |view, cx| {
-              if view.focused {
-                if view.cursor_reset_at.elapsed() < CURSOR_BLINK_INTERVAL {
-                  return;
-                }
-                view.cursor_visible = !view.cursor_visible;
-                cx.notify();
-              }
-            });
-            true
-          } else {
-            false
-          }
-        }) else {
-          break;
-        };
-        if !should_continue {
-          break;
-        }
-      }
-    })
-    .detach();
-
     let palette = config.palette.take().unwrap_or_default();
     let default_font_size = config.font_size;
     let focus = cx.focus_handle();
@@ -294,6 +267,7 @@ impl TerminalView {
       canvas_origin: Arc::new(Mutex::new(gpui::Point::default())),
       visible,
       _subscriptions,
+      _blink_task: None,
     }
   }
 
@@ -381,11 +355,14 @@ impl TerminalView {
       let _ = self.pty.write_all(b"\x1b[I");
     }
     self.reset_cursor_blink();
+    self.start_blink_task(cx);
     cx.notify();
   }
 
   fn on_blur(&mut self, _: &mut Window, cx: &mut Context<Self>) {
     self.focused = false;
+    // Stop the blink timer — no point toggling the cursor while unfocused.
+    self._blink_task = None;
     let send_blur = self.state.with_term_mut(|term| {
       term.is_focused = false;
       term.mode().contains(TermMode::FOCUS_IN_OUT)
@@ -394,6 +371,39 @@ impl TerminalView {
       let _ = self.pty.write_all(b"\x1b[O");
     }
     cx.notify();
+  }
+
+  /// Start the cursor blink async task. Replaces any existing task.
+  fn start_blink_task(&mut self, cx: &mut Context<Self>) {
+    self._blink_task =
+      Some(cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+        loop {
+          Timer::after(CURSOR_BLINK_INTERVAL).await;
+          let Ok(should_continue) = cx.update(|cx: &mut App| {
+            if let Some(entity) = this.upgrade() {
+              entity.update(cx, |view, cx| {
+                if !view.focused {
+                  // Focus was lost between timer fire and main-thread update — stop.
+                  view._blink_task = None;
+                  return false;
+                }
+                if view.cursor_reset_at.elapsed() >= CURSOR_BLINK_INTERVAL {
+                  view.cursor_visible = !view.cursor_visible;
+                  cx.notify();
+                }
+                true
+              })
+            } else {
+              false
+            }
+          }) else {
+            break;
+          };
+          if !should_continue {
+            break;
+          }
+        }
+      }));
   }
 
   fn reset_cursor_blink(&mut self) {

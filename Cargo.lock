@@ -3844,6 +3844,7 @@ dependencies = [
  "clap",
  "diffy",
  "flume",
+ "futures-lite 2.6.1",
  "git2",
  "gpui",
  "gpui-component",

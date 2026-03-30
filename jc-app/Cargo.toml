@@ -31,3 +31,4 @@ objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
 objc2-user-notifications.workspace = true
 arboard = "3"
+futures-lite = "2"
