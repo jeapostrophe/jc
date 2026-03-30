@@ -86,8 +86,16 @@ impl DiffView {
   }
 
   pub fn set_source(&mut self, source: DiffSource, window: &mut Window, cx: &mut Context<Self>) {
+    // Only clear reviewed state when actually switching sources.
+    let same_source = match (&self.source, &source) {
+      (DiffSource::WorkingTree, DiffSource::WorkingTree) => true,
+      (DiffSource::Commit { oid: a, .. }, DiffSource::Commit { oid: b, .. }) => a == b,
+      _ => false,
+    };
     self.source = source;
-    self.reviewed.clear();
+    if !same_source {
+      self.reviewed.clear();
+    }
     self.refresh(window, cx);
   }
 
