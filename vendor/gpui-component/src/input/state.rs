@@ -1552,6 +1552,16 @@ impl InputState {
     cx.notify();
   }
 
+  pub fn scroll_offset(&self) -> Point<Pixels> {
+    self.scroll_handle.offset()
+  }
+
+  /// Deferred until next paint.
+  pub fn set_scroll_offset(&mut self, offset: Point<Pixels>, cx: &mut Context<Self>) {
+    self.deferred_scroll_offset = Some(offset);
+    cx.notify();
+  }
+
   pub(super) fn show_character_palette(
     &mut self,
     _: &ShowCharacterPalette,

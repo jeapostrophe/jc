@@ -7,7 +7,7 @@ use crate::views::diff_view::DiffViewEvent;
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
-use crate::views::session_state::{PendingEvent, SessionId, SessionState};
+use crate::views::session_state::{PendingEvent, SavedViewState, SessionId, SessionState};
 use gpui::*;
 use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
@@ -815,7 +815,7 @@ impl Workspace {
         Some(OtherPaneScrollable::Editor(project.diff_view.read(cx).editor().clone()))
       }
       PaneContentKind::TodoEditor => {
-        let editor = project.todo_view.read(cx).code_view().read(cx).editor().clone();
+        let editor = project.todo_view.read(cx).editor(cx);
         Some(OtherPaneScrollable::Editor(editor))
       }
       PaneContentKind::GlobalTodo => {
@@ -1116,9 +1116,8 @@ impl Workspace {
         }
       }
       Some(PaneContentKind::TodoEditor) => {
-        let tv = project.todo_view.read(cx);
-        let path = tv.file_path().to_path_buf();
-        let line = tv.code_view().read(cx).editor().read(cx).cursor_position().line;
+        let path = project.todo_view.read(cx).file_path().to_path_buf();
+        let line = project.todo_view.read(cx).editor(cx).read(cx).cursor_position().line;
         (Some(path), line)
       }
       _ => (None, 0),
@@ -1187,15 +1186,21 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    // Save the current session's pane layout before switching away.
-    let saved = SavedPaneLayout {
-      pane_kinds: std::array::from_fn(|i| self.panes[i].read(cx).content_kind()),
-      active_pane_index: self.active_pane_index,
-    };
+    // Save the outgoing session's viewport state.
+    let todo_editor = self.projects[self.active_project_index].todo_view.read(cx).editor(cx);
+    let todo_cursor = todo_editor.read(cx).cursor_position();
+    let todo_scroll = todo_editor.read(cx).scroll_offset();
     if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
-      session.saved_layout = Some(saved);
-      // Mark outgoing session's terminals as hidden so background processing
-      // batches more aggressively and skips cx.notify().
+      session.saved_view = Some(SavedViewState {
+        layout: SavedPaneLayout {
+          pane_kinds: std::array::from_fn(|i| self.panes[i].read(cx).content_kind()),
+          active_pane_index: self.active_pane_index,
+        },
+        todo_cursor,
+        todo_scroll,
+        claude_scroll: session.claude_terminal.read(cx).display_offset(),
+        general_scroll: session.general_terminal.read(cx).display_offset(),
+      });
       session.claude_terminal.read(cx).set_visible(false);
       session.general_terminal.read(cx).set_visible(false);
     }
@@ -1205,10 +1210,14 @@ impl Workspace {
     self.active_project_index = project_idx;
     self.projects[project_idx].active_session = session_id;
 
-    // Mark incoming session's terminals as visible.
+    // Restore incoming session's terminal visibility and scroll positions.
     if let Some(session) = self.projects[project_idx].active_session() {
       session.claude_terminal.read(cx).set_visible(true);
       session.general_terminal.read(cx).set_visible(true);
+      if let Some(saved) = &session.saved_view {
+        session.claude_terminal.read(cx).set_display_offset(saved.claude_scroll);
+        session.general_terminal.read(cx).set_display_offset(saved.general_scroll);
+      }
     }
 
     // Acknowledge pending events unless skipped (e.g. L0 problem jump).
@@ -1216,15 +1225,25 @@ impl Workspace {
       session.acknowledge();
     }
 
-    // Reset problem cycle on manual session switches.
     self.problem_cycle = None;
 
-    // Update the TODO view's active session highlight.
+    // Restore incoming session's TODO cursor and scroll position.
+    if let Some(saved) =
+      self.projects[project_idx].active_session().and_then(|s| s.saved_view.as_ref())
     {
-      let label = self.projects[project_idx].active_label().map(|s| s.to_string());
-      let todo_view = self.projects[project_idx].todo_view.clone();
-      todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
+      let cursor = saved.todo_cursor;
+      let scroll = saved.todo_scroll;
+      let todo_editor = self.projects[project_idx].todo_view.read(cx).editor(cx);
+      todo_editor.update(cx, |state, cx| {
+        state.set_cursor_position(cursor, window, cx);
+        state.set_scroll_offset(scroll, cx);
+      });
     }
+
+    // Update the TODO view's active session highlight.
+    let label = self.projects[project_idx].active_label().map(|s| s.to_string());
+    let todo_view = self.projects[project_idx].todo_view.clone();
+    todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
 
     if project_changed {
       self.subscribe_active_project(window, cx);
@@ -1298,8 +1317,8 @@ impl Workspace {
     // Copy saved layout data to avoid borrow conflict with set_pane_view.
     let saved = self.projects[self.active_project_index]
       .active_session()
-      .and_then(|s| s.saved_layout.as_ref())
-      .map(|s| (s.pane_kinds, s.active_pane_index));
+      .and_then(|s| s.saved_view.as_ref())
+      .map(|s| (s.layout.pane_kinds, s.layout.active_pane_index));
 
     if let Some((kinds, active)) = saved {
       for (i, kind) in kinds.iter().enumerate() {
@@ -1618,6 +1637,11 @@ impl Workspace {
       tv.ensure_wait(&label, window, cx);
     });
 
+    // Scroll to the WAIT section so the user sees their new typing area.
+    if let Some(wait_line) = todo_view.read(cx).wait_line(&label) {
+      todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line, window, cx));
+    }
+
     // Mark session as busy — we're about to submit work to Claude.
     if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
       session.busy = true;
@@ -1654,14 +1678,9 @@ impl Workspace {
       tv.ensure_wait(&label, window, cx);
     });
 
-    let document = todo_view.read(cx).document().clone();
-    let Some(session) = document.session_by_label(&label) else {
+    let Some(wait_line) = todo_view.read(cx).wait_line(&label) else {
       return;
     };
-    let Some(wait) = &session.wait else {
-      return;
-    };
-    let wait_line = wait.line;
 
     // If a visible pane already shows the TODO editor, focus it instead of
     // replacing the current pane.

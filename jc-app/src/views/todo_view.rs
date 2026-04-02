@@ -67,6 +67,10 @@ impl TodoView {
     &self.code_view
   }
 
+  pub fn editor(&self, cx: &App) -> Entity<gpui_component::input::InputState> {
+    self.code_view.read(cx).editor().clone()
+  }
+
   pub fn is_dirty(&self, cx: &App) -> bool {
     self.code_view.read(cx).is_dirty(cx)
   }
@@ -81,6 +85,11 @@ impl TodoView {
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
     self.code_view.update(cx, |cv, cx| cv.scroll_to_line(line, window, cx));
+  }
+
+  /// Return the line number of the WAIT heading for `label`, if it exists.
+  pub fn wait_line(&self, label: &str) -> Option<u32> {
+    self.document.session_by_label(label)?.wait.as_ref().map(|w| w.line)
   }
 }
 

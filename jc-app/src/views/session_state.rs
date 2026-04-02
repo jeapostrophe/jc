@@ -1,11 +1,22 @@
 use crate::views::code_view::CodeView;
 use crate::views::project_state::SavedPaneLayout;
 use gpui::*;
+use gpui_component::input::Position;
 use jc_core::problem::{AppTodoProblem, ClaudeProblem, SessionProblem, TerminalProblem};
 use jc_core::todo::TodoProblem;
 use jc_terminal::{Palette, TerminalConfig, TerminalView};
 use std::collections::HashSet;
 use std::path::Path;
+
+/// Snapshot of per-session viewport state, saved on switch-away and restored on switch-back.
+pub struct SavedViewState {
+  pub layout: SavedPaneLayout,
+  pub todo_cursor: Position,
+  pub todo_scroll: Point<Pixels>,
+  /// Terminal display offsets (lines scrolled back from bottom).
+  pub claude_scroll: usize,
+  pub general_scroll: usize,
+}
 
 pub type SessionId = usize;
 
@@ -31,8 +42,7 @@ pub struct SessionState {
   pub busy: bool,
   /// True once Claude has been busy at least once in this jc run.
   pub has_ever_been_busy: bool,
-  /// Saved pane layout for this session, restored when switching back.
-  pub saved_layout: Option<SavedPaneLayout>,
+  pub saved_view: Option<SavedViewState>,
 }
 
 impl SessionState {
@@ -76,7 +86,7 @@ impl SessionState {
       problems: Vec::new(),
       busy: false,
       has_ever_been_busy: false,
-      saved_layout: None,
+      saved_view: None,
     }
   }
 

@@ -314,6 +314,22 @@ impl TerminalView {
     }
   }
 
+  /// Lines scrolled back from bottom (0 = at bottom).
+  pub fn display_offset(&self) -> usize {
+    self.state.with_term(|t| t.grid().display_offset())
+  }
+
+  /// Scroll to `offset` lines from bottom. Clamped to available history.
+  pub fn set_display_offset(&self, offset: usize) {
+    self.state.with_term_mut(|term| {
+      // No Scroll::Absolute variant — reset then scroll up.
+      term.scroll_display(Scroll::Bottom);
+      if offset > 0 {
+        term.scroll_display(Scroll::Delta(offset.min(i32::MAX as usize) as i32));
+      }
+    });
+  }
+
   /// Scroll the terminal scrollback by the given number of lines (positive = down).
   pub fn scroll_lines(&mut self, lines: i32, cx: &mut Context<Self>) {
     // Scroll::Delta uses the opposite convention: positive scrolls *up* (toward history).
