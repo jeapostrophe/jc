@@ -1,3 +1,5 @@
 /target
 .claude/worktrees/
 .jc
+.claude/settings.local.json
+TODO.md
