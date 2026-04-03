@@ -481,6 +481,14 @@ impl Workspace {
     };
 
     ws.subscribe_active_project(window, cx);
+
+    // Intercept the native close button (red circle) so it goes through
+    // the same confirmation path as Cmd-W instead of closing immediately.
+    window.on_window_should_close(cx, move |window, cx| {
+      window.dispatch_action(Box::new(CloseWindow), cx);
+      false
+    });
+
     ws
   }
 
