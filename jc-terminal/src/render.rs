@@ -7,8 +7,8 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-  App, Bounds, FontStyle, FontWeight, Hsla, Pixels, SharedString, Window, fill, font, point, px,
-  size,
+  App, Bounds, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, SharedString, Window, fill, font,
+  point, px, size,
 };
 
 /// Measured cell dimensions for the current font.
@@ -120,41 +120,38 @@ pub fn paint_terminal(
     }
   }
 
-  // Pass 2: Paint text — one shape_line() call per row
+  // Pass 2: Paint text — one shape_line() per styled segment, each at its
+  // exact grid x-position.  This prevents glyph-advance drift and ligatures
+  // from misaligning text with cell backgrounds.
   {
+    let no_ligatures = FontFeatures::disable_ligatures();
+
+    // Reuse buffers across rows to avoid per-row allocation.
+    let mut seg_text = String::with_capacity(num_cols * 4);
+    let mut segments: Vec<(usize, String, Hsla, FontWeight, FontStyle)> = Vec::new();
+
     for line_idx in 0..num_lines {
       let line = Line(line_idx as i32 - display_offset);
+      let y = origin.y + layout.height * line_idx as f32;
 
-      let mut row_string = String::with_capacity(num_cols * 4);
-      let mut runs: Vec<gpui::TextRun> = Vec::new();
-      let mut current_run_len: usize = 0;
-      let mut current_fg = Hsla::default();
-      let mut current_weight = FontWeight::NORMAL;
-      let mut current_style = FontStyle::Normal;
-      let mut has_non_whitespace = false;
+      let mut seg_start: usize = 0;
+      seg_text.clear();
+      segments.clear();
+      let mut seg_has_visible = false;
+      let mut seg_fg = Hsla::default();
+      let mut seg_weight = FontWeight::NORMAL;
+      let mut seg_style = FontStyle::Normal;
       let mut first_cell = true;
 
       for col_idx in 0..num_cols {
         let col = Column(col_idx);
         let cell = &grid[Point::new(line, col)];
 
-        if cell.c == '\0' || cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-          // Null/spacer cells: append a space to keep column alignment
-          let byte_len = ' '.len_utf8();
-          if first_cell {
-            // Initialize style from this cell (won't matter much since it's whitespace)
-            current_fg = palette.resolve_fg(&cell.fg);
-            current_weight = FontWeight::NORMAL;
-            current_style = FontStyle::Normal;
-            first_cell = false;
-          }
-          row_string.push(' ');
-          current_run_len += byte_len;
-          continue;
-        }
-
-        // Compute style for this cell
-        let fg = if cell.flags.contains(Flags::INVERSE) {
+        let is_blank = cell.c == '\0' || cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+        let ch = if is_blank { ' ' } else { cell.c };
+        let fg = if is_blank {
+          seg_fg
+        } else if cell.flags.contains(Flags::INVERSE) {
           palette.resolve_bg(&cell.bg)
         } else {
           palette.resolve_fg(&cell.fg)
@@ -164,67 +161,58 @@ pub fn paint_terminal(
         let style =
           if cell.flags.contains(Flags::ITALIC) { FontStyle::Italic } else { FontStyle::Normal };
 
-        if cell.c != ' ' {
-          has_non_whitespace = true;
-        }
-
         if first_cell {
-          current_fg = fg;
-          current_weight = weight;
-          current_style = style;
+          seg_fg = fg;
+          seg_weight = weight;
+          seg_style = style;
           first_cell = false;
-        } else if fg != current_fg || weight != current_weight || style != current_style {
-          // Style changed — push the current run and start a new one
-          if current_run_len > 0 {
-            let mut f = font(state.font_family.clone());
-            f.weight = current_weight;
-            f.style = current_style;
-            runs.push(gpui::TextRun {
-              len: current_run_len,
-              font: f,
-              color: current_fg,
-              background_color: None,
-              underline: None,
-              strikethrough: None,
-            });
+        } else if fg != seg_fg || weight != seg_weight || style != seg_style {
+          if seg_has_visible {
+            segments.push((
+              seg_start,
+              std::mem::take(&mut seg_text),
+              seg_fg,
+              seg_weight,
+              seg_style,
+            ));
+          } else {
+            seg_text.clear();
           }
-          current_run_len = 0;
-          current_fg = fg;
-          current_weight = weight;
-          current_style = style;
+          seg_start = col_idx;
+          seg_has_visible = false;
+          seg_fg = fg;
+          seg_weight = weight;
+          seg_style = style;
         }
 
-        let byte_len = cell.c.len_utf8();
-        row_string.push(cell.c);
-        current_run_len += byte_len;
+        if ch != ' ' {
+          seg_has_visible = true;
+        }
+        seg_text.push(ch);
+      }
+      if seg_has_visible {
+        segments.push((seg_start, std::mem::take(&mut seg_text), seg_fg, seg_weight, seg_style));
       }
 
-      // Push the final run
-      if current_run_len > 0 {
+      for (start_col, text, fg, weight, fstyle) in segments.drain(..) {
+        let byte_len = text.len();
+        let shared: SharedString = text.into();
         let mut f = font(state.font_family.clone());
-        f.weight = current_weight;
-        f.style = current_style;
-        runs.push(gpui::TextRun {
-          len: current_run_len,
+        f.weight = weight;
+        f.style = fstyle;
+        f.features = no_ligatures.clone();
+        let run = gpui::TextRun {
+          len: byte_len,
           font: f,
-          color: current_fg,
+          color: fg,
           background_color: None,
           underline: None,
           strikethrough: None,
-        });
+        };
+        let shaped = window.text_system().shape_line(shared, font_size, &[run], None);
+        let x = origin.x + layout.width * start_col as f32;
+        let _ = shaped.paint(point(x, y), layout.height, window, cx);
       }
-
-      // Skip rows that are entirely whitespace
-      if !has_non_whitespace || runs.is_empty() {
-        continue;
-      }
-
-      let shared: SharedString = row_string.into();
-      let shaped = window.text_system().shape_line(shared, font_size, &runs, None);
-
-      let x = origin.x;
-      let y = origin.y + layout.height * line_idx as f32;
-      let _ = shaped.paint(point(x, y), layout.height, window, cx);
     }
   }
 

@@ -107,12 +107,21 @@ impl CodeView {
   fn load_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let Some(path) = self.current_file.as_ref() else { return };
     let content = std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {e}"));
+    // Single pass: find the first changed line (or None if identical).
+    let first_changed_line = first_differing_line(&self.base_content, &content);
+    if first_changed_line.is_none() && !self.dirty {
+      return;
+    }
     self.base_content = content.clone();
     let lang: SharedString =
       self.language_override.clone().unwrap_or_else(|| Language::from_path(path).name().into());
     self.editor.update(cx, |state, cx| {
       state.set_highlighter(lang, cx);
       state.set_value_preserving_position(content, window, cx);
+      // Scroll to the first changed line so external edits are visible.
+      if let Some(line) = first_changed_line {
+        state.scroll_to_center_line(line, cx);
+      }
     });
     self.dirty = false;
     self.externally_modified = false;
@@ -290,5 +299,24 @@ impl Render for CodeView {
       .on_action(cx.listener(Self::reload_from_disk))
       .child(super::external_change_banner(self.externally_modified, cx))
       .child(Input::new(&self.editor).h_full().appearance(false).bordered(false))
+  }
+}
+
+/// Return the 0-based line index of the first line that differs between `old`
+/// and `new`, or `None` when the texts are identical (or either is empty on
+/// first load).
+fn first_differing_line(old: &str, new: &str) -> Option<u32> {
+  if old.is_empty() {
+    return None; // initial load — don't scroll
+  }
+  let mut old_lines = old.lines();
+  let mut new_lines = new.lines();
+  let mut line = 0u32;
+  loop {
+    match (old_lines.next(), new_lines.next()) {
+      (Some(a), Some(b)) if a == b => line += 1,
+      (None, None) => return None, // identical
+      _ => return Some(line),
+    }
   }
 }
