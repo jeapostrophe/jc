@@ -87,9 +87,14 @@ impl TodoView {
     self.code_view.update(cx, |cv, cx| cv.scroll_to_line(line, window, cx));
   }
 
-  /// Return the line number of the WAIT heading for `label`, if it exists.
-  pub fn wait_line(&self, label: &str) -> Option<u32> {
-    self.document.session_by_label(label)?.wait.as_ref().map(|w| w.line)
+  /// Return the line number at the end of the WAIT body for `label`, if it exists.
+  pub fn wait_line(&self, label: &str, cx: &App) -> Option<u32> {
+    let wait = self.document.session_by_label(label)?.wait.as_ref()?;
+    let text = self.editor_text(cx);
+    let body_end = wait.body_byte_range.end.min(text.len());
+    // Count newlines up to body_end to get the 0-based line number.
+    let line = text[..body_end].bytes().filter(|&b| b == b'\n').count() as u32;
+    Some(line)
   }
 }
 

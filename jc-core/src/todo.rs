@@ -438,8 +438,9 @@ pub struct SendResult {
 /// Extract text from the WAIT section and turn it into a new `### Message N`.
 ///
 /// `selection` is a byte range in the full document. If it's empty (collapsed
-/// cursor), the entire WAIT body is sent. Returns `None` if there's no WAIT
-/// section or the effective text is empty.
+/// cursor), everything before the cursor in the WAIT body is sent (or the
+/// entire body if the cursor is outside/at the start of the body). Returns
+/// `None` if there's no WAIT section or the effective text is empty.
 pub fn send_from_wait(
   text: &str,
   session: &TodoSession,
@@ -450,8 +451,14 @@ pub fn send_from_wait(
 
   // Determine the effective range within the body.
   let effective = if selection.start == selection.end {
-    // No selection — send the whole body.
-    body_range.clone()
+    // No selection — send everything before the cursor (or the whole body if
+    // the cursor is outside/at the start of the body).
+    let cursor = selection.start;
+    if cursor > body_range.start && cursor <= body_range.end {
+      body_range.start..cursor
+    } else {
+      body_range.clone()
+    }
   } else {
     // Intersect selection with the body range.
     let start = selection.start.max(body_range.start);
@@ -948,6 +955,60 @@ line three
     assert!(new_body.contains("line one"));
     assert!(new_body.contains("line three"));
     assert!(!new_body.contains("line two"));
+  }
+
+  #[test]
+  fn send_from_wait_cursor_sends_before_cursor() {
+    let text = "\
+# Claude
+## S
+> uuid=s
+
+### WAIT
+one two three
+";
+    let doc = parse(text);
+    let session = doc.session_by_label("S").unwrap();
+    let wait = session.wait.as_ref().unwrap();
+    // Place cursor after "one two" — find the exact position.
+    let body = &text[wait.body_byte_range.clone()];
+    let offset_in_body = body.find(" three").unwrap();
+    let cursor = wait.body_byte_range.start + offset_in_body;
+    let result = send_from_wait(text, session, cursor..cursor).unwrap();
+    assert_eq!(result.message_text, "one two");
+    // The remaining text ("three\n") stays in the WAIT body.
+    let new_doc = parse(&result.new_text);
+    let new_session = new_doc.session_by_label("S").unwrap();
+    let new_body = &result.new_text[new_session.wait.as_ref().unwrap().body_byte_range.clone()];
+    assert_eq!(new_body.trim(), "three");
+  }
+
+  #[test]
+  fn send_from_wait_cursor_multiline() {
+    let text = "\
+# Claude
+## S
+> uuid=s
+
+### WAIT
+line one
+line two
+line three
+";
+    let doc = parse(text);
+    let session = doc.session_by_label("S").unwrap();
+    let wait = session.wait.as_ref().unwrap();
+    // Place cursor at the start of "line two" — should send "line one".
+    let body = &text[wait.body_byte_range.clone()];
+    let offset_in_body = body.find("line two").unwrap();
+    let cursor = wait.body_byte_range.start + offset_in_body;
+    let result = send_from_wait(text, session, cursor..cursor).unwrap();
+    assert_eq!(result.message_text, "line one");
+    let new_doc = parse(&result.new_text);
+    let new_session = new_doc.session_by_label("S").unwrap();
+    let new_body = &result.new_text[new_session.wait.as_ref().unwrap().body_byte_range.clone()];
+    assert!(new_body.contains("line two"));
+    assert!(new_body.contains("line three"));
   }
 
   #[test]

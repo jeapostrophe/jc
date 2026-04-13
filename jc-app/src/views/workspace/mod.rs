@@ -1646,7 +1646,7 @@ impl Workspace {
     });
 
     // Scroll to the WAIT section so the user sees their new typing area.
-    if let Some(wait_line) = todo_view.read(cx).wait_line(&label) {
+    if let Some(wait_line) = todo_view.read(cx).wait_line(&label, cx) {
       todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line, window, cx));
     }
 
@@ -1686,7 +1686,7 @@ impl Workspace {
       tv.ensure_wait(&label, window, cx);
     });
 
-    let Some(wait_line) = todo_view.read(cx).wait_line(&label) else {
+    let Some(wait_line) = todo_view.read(cx).wait_line(&label, cx) else {
       return;
     };
 
