@@ -107,9 +107,9 @@ impl CodeView {
   fn load_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let Some(path) = self.current_file.as_ref() else { return };
     let content = std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {e}"));
-    // Single pass: find the first changed line (or None if identical).
+    // Single pass: find the first changed line (or None if identical / initial load).
     let first_changed_line = first_differing_line(&self.base_content, &content);
-    if first_changed_line.is_none() && !self.dirty {
+    if first_changed_line.is_none() && !self.base_content.is_empty() && !self.dirty {
       return;
     }
     self.base_content = content.clone();
