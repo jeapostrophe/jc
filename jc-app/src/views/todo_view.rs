@@ -221,7 +221,11 @@ impl TodoView {
     let text = self.editor_text(cx);
     let selection = self.code_view.read(cx).editor().read(cx).selection_byte_range();
     let session = self.document.session_by_label(label)?;
-    let result = todo::send_from_wait(&text, session, selection)?;
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap_or_default()
+      .as_secs();
+    let result = todo::send_from_wait(&text, session, selection, Some(now))?;
     let wait_body_offset = result.wait_body_offset;
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {

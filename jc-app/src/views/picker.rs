@@ -842,8 +842,9 @@ struct SessionPickerEntry {
   /// Total problem count (session + project).
   problems: usize,
   /// Minimum problem rank (lower = more urgent). `i8::MAX` if no problems.
-  #[allow(dead_code)]
   min_rank: i8,
+  /// Unix timestamp of the last TODO submit (from `> last=`). `0` if unknown.
+  last_active: u64,
 }
 
 #[derive(Clone)]
@@ -908,6 +909,7 @@ impl SessionPickerDelegate {
           ambiguous_label: false,
           problems: project.problems.len(),
           min_rank,
+          last_active: 0,
         });
         continue;
       }
@@ -925,6 +927,11 @@ impl SessionPickerDelegate {
           .chain(project.problems.iter().map(|p| p.rank()))
           .min()
           .unwrap_or(i8::MAX);
+        let last_active = todo_documents
+          .get(pi)
+          .and_then(|d| d.session_by_label(&session.label))
+          .and_then(|ts| ts.last_active)
+          .unwrap_or(0);
         entries.push(SessionPickerEntry {
           kind: SessionPickerEntryKind::Session(id),
           project_index: pi,
@@ -933,6 +940,7 @@ impl SessionPickerDelegate {
           ambiguous_label: false, // computed below
           problems: session.problems.len() + project.problems.len(),
           min_rank,
+          last_active,
         });
       }
 
@@ -964,6 +972,7 @@ impl SessionPickerDelegate {
               ambiguous_label: false,
               problems: 0,
               min_rank: i8::MAX,
+              last_active: todo_session.last_active.unwrap_or(0),
             });
           }
         }
@@ -983,33 +992,48 @@ impl SessionPickerDelegate {
       }
     }
 
-    // Sort into groups:
-    //   0: this project, attached with problems
-    //   1: this project, attached without problems (non-active)
-    //   2: other projects, attached (grouped by project)
-    //   3: other projects, empty (no sessions)
-    //   4: this project, detached (unadopted)
-    //   5: other projects, detached
-    //   6: current active session
-    let sort_group = |e: &SessionPickerEntry, idx: usize| -> (u8, usize) {
+    // Sort into groups (lower = higher in picker):
+    //   0: this project, sessions (problems first, then recency DESC)
+    //   1: other projects, sessions (recency DESC)
+    //   2: unadopted sessions (this project first, then recency DESC)
+    //   3: empty projects
+    //   4: current active session (always last)
+    let sort_group = |e: &SessionPickerEntry, idx: usize| -> u8 {
       let is_this = e.project_index == active_project_index;
       let is_active = active_entry == Some(idx);
       match &e.kind {
-        _ if is_active => (6, e.project_index),
-        SessionPickerEntryKind::Session(_) if is_this && e.problems > 0 => (0, 0),
-        SessionPickerEntryKind::Session(_) if is_this => (1, 0),
-        SessionPickerEntryKind::Session(_) => (2, e.project_index),
-        SessionPickerEntryKind::EmptyProject => (3, e.project_index),
-        SessionPickerEntryKind::Unadopted { .. } if is_this => (4, 0),
-        SessionPickerEntryKind::Unadopted { .. } => (5, e.project_index),
+        _ if is_active => 4,
+        SessionPickerEntryKind::Session(_) if is_this => 0,
+        SessionPickerEntryKind::Session(_) => 1,
+        SessionPickerEntryKind::Unadopted { .. } => 2,
+        SessionPickerEntryKind::EmptyProject => 3,
       }
     };
 
     let mut indices: Vec<usize> = (0..entries.len()).collect();
     indices.sort_by(|&a, &b| {
-      let ga = sort_group(&entries[a], a);
-      let gb = sort_group(&entries[b], b);
+      let ea = &entries[a];
+      let eb = &entries[b];
+      let ga = sort_group(ea, a);
+      let gb = sort_group(eb, b);
       ga.cmp(&gb)
+        .then_with(|| {
+          // Within group 0 (this project): problems first, then recency DESC.
+          if ga == 0 {
+            let pa = if ea.problems > 0 { 0u8 } else { 1 };
+            let pb = if eb.problems > 0 { 0u8 } else { 1 };
+            pa.cmp(&pb)
+          } else if ga == 2 {
+            // Unadopted: this project before others.
+            let ta = if ea.project_index == active_project_index { 0u8 } else { 1 };
+            let tb = if eb.project_index == active_project_index { 0u8 } else { 1 };
+            ta.cmp(&tb)
+          } else {
+            std::cmp::Ordering::Equal
+          }
+        })
+        // Within each sub-group, most recent first.
+        .then(eb.last_active.cmp(&ea.last_active))
     });
 
     let sorted_entries: Vec<_> = indices.iter().map(|&i| entries[i].clone()).collect();
@@ -1240,6 +1264,7 @@ impl ProjectActionsPickerDelegate {
         label: String,
         problems: usize,
         min_rank: i8,
+        last_active: u64,
       }
 
       let mut candidates: Vec<ProblemCandidate> = Vec::new();
@@ -1257,6 +1282,7 @@ impl ProjectActionsPickerDelegate {
             label: String::new(),
             problems: project.problems.len(),
             min_rank,
+            last_active: 0,
           });
         }
       } else {
@@ -1271,6 +1297,11 @@ impl ProjectActionsPickerDelegate {
               .chain(project.problems.iter().map(|p| p.rank()))
               .min()
               .unwrap_or(i8::MAX);
+            let last_active = todo_documents
+              .get(pi)
+              .and_then(|d| d.session_by_label(&session.label))
+              .and_then(|ts| ts.last_active)
+              .unwrap_or(0);
             candidates.push(ProblemCandidate {
               pi,
               kind: SessionPickerEntryKind::Session(id),
@@ -1278,13 +1309,15 @@ impl ProjectActionsPickerDelegate {
               label: session.label.clone(),
               problems: total_problems,
               min_rank,
+              last_active,
             });
           }
         }
       }
 
-      // Sort by urgency: min_rank ASC.
-      candidates.sort_by(|a, b| a.min_rank.cmp(&b.min_rank).then(a.pi.cmp(&b.pi)));
+      // Sort by urgency (min_rank ASC), then recency DESC.
+      candidates
+        .sort_by(|a, b| a.min_rank.cmp(&b.min_rank).then(b.last_active.cmp(&a.last_active)));
 
       for c in candidates {
         let label_text = match &c.kind {
@@ -1303,7 +1336,7 @@ impl ProjectActionsPickerDelegate {
       }
     }
 
-    // 2. Dormant sessions: in TODO.md but not currently running.
+    // 2. Dormant sessions: in TODO.md but not currently running, sorted by recency.
     {
       let adopted_uuids: HashSet<&str> = projects[active_project_index]
         .sessions
@@ -1313,6 +1346,7 @@ impl ProjectActionsPickerDelegate {
       let adopted_labels: HashSet<&str> =
         projects[active_project_index].sessions.values().map(|s| s.label.as_str()).collect();
 
+      let mut dormant: Vec<(String, String, u64)> = Vec::new();
       if let Some(doc) = todo_documents.get(active_project_index) {
         for ts in &doc.sessions {
           if ts.uuid.is_empty() || ts.status == jc_core::todo::SessionStatus::Expired {
@@ -1321,13 +1355,15 @@ impl ProjectActionsPickerDelegate {
           let uuid_adopted = adopted_uuids.contains(ts.uuid.as_str());
           let label_adopted = adopted_labels.contains(ts.label.as_str());
           if !uuid_adopted && !label_adopted {
-            labels.push(format!("* {}", ts.label));
-            entries.push(ProjectActionsEntry::Dormant {
-              uuid: ts.uuid.clone(),
-              label: ts.label.clone(),
-            });
+            dormant.push((ts.uuid.clone(), ts.label.clone(), ts.last_active.unwrap_or(0)));
           }
         }
+      }
+      // Most recent first.
+      dormant.sort_by(|a, b| b.2.cmp(&a.2));
+      for (uuid, label, _) in dormant {
+        labels.push(format!("* {}", label));
+        entries.push(ProjectActionsEntry::Dormant { uuid, label });
       }
     }
 

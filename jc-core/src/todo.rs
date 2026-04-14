@@ -35,6 +35,10 @@ pub struct TodoSession {
   /// Byte range of the uuid value within the full document text
   /// (i.e. the characters after `> uuid=`).
   pub uuid_byte_range: Range<usize>,
+  /// Unix timestamp (seconds) of the last TODO submit, parsed from `> last=`.
+  pub last_active: Option<u64>,
+  /// Byte range of the entire `> last=TIMESTAMP` line (for replacement).
+  pub last_active_line_range: Option<Range<usize>>,
   pub messages: Vec<TodoMessage>,
   pub wait: Option<TodoWait>,
 }
@@ -115,6 +119,18 @@ impl TodoDocument {
   }
 }
 
+/// Advance past a single `\n` or `\r\n` at `offset`, returning the new offset.
+fn skip_newline(bytes: &[u8], offset: usize) -> usize {
+  if offset < bytes.len() && bytes[offset] == b'\n' {
+    offset + 1
+  } else if offset < bytes.len() && bytes[offset] == b'\r' {
+    let past_cr = offset + 1;
+    if past_cr < bytes.len() && bytes[past_cr] == b'\n' { past_cr + 1 } else { past_cr }
+  } else {
+    offset
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
@@ -125,6 +141,8 @@ pub fn parse(text: &str) -> TodoDocument {
   let mut byte_offset: usize = 0;
   // State: we just saw an `## Label` heading and are looking for `> uuid=...` next.
   let mut expecting_uuid_for: Option<TodoSession> = None;
+  // State: we just consumed `> uuid=` and are looking for `> last=` on the next line.
+  let mut expecting_last = false;
   // Only create sessions for `##` headings inside a `# Claude` section.
   let mut in_claude_section = false;
 
@@ -132,6 +150,21 @@ pub fn parse(text: &str) -> TodoDocument {
     let line_num = line_idx as u32 + 1;
     let line_start = byte_offset;
     let line_end = line_start + line.len();
+
+    // If we just consumed `> uuid=` on the previous line, check for `> last=`.
+    if expecting_last {
+      expecting_last = false;
+      if let Some(ref mut session) = current_session
+        && let Some(rest) = line.strip_prefix("> last=")
+      {
+        if let Ok(ts) = rest.parse::<u64>() {
+          session.last_active = Some(ts);
+        }
+        session.last_active_line_range = Some(line_start..line_end);
+        byte_offset = skip_newline(text.as_bytes(), line_end);
+        continue;
+      }
+    }
 
     // If we're expecting a `> uuid=` line after a heading:
     if let Some(ref mut pending) = expecting_uuid_for {
@@ -143,6 +176,7 @@ pub fn parse(text: &str) -> TodoDocument {
         // Promote to current session.
         finalize_session(&mut doc, &mut current_session, line_start);
         current_session = expecting_uuid_for.take();
+        expecting_last = true;
       } else {
         // No uuid line — accept the session with an empty UUID.
         finalize_session(&mut doc, &mut current_session, line_start);
@@ -211,21 +245,7 @@ pub fn parse(text: &str) -> TodoDocument {
       }
     }
 
-    // Advance byte_offset past this line and its newline character.
-    // Account for the newline separator. The last line may not have a trailing
-    // newline, so we check bounds.
-    byte_offset = line_end;
-    if byte_offset < text.len() {
-      // Skip the newline character(s).
-      if text.as_bytes()[byte_offset] == b'\n' {
-        byte_offset += 1;
-      } else if text.as_bytes()[byte_offset] == b'\r' {
-        byte_offset += 1;
-        if byte_offset < text.len() && text.as_bytes()[byte_offset] == b'\n' {
-          byte_offset += 1;
-        }
-      }
-    }
+    byte_offset = skip_newline(text.as_bytes(), line_end);
   }
 
   // Finalize the last session at the end of the document.
@@ -445,6 +465,7 @@ pub fn send_from_wait(
   text: &str,
   session: &TodoSession,
   selection: Range<usize>,
+  timestamp: Option<u64>,
 ) -> Option<SendResult> {
   let wait = session.wait.as_ref()?;
   let body_range = wait.body_byte_range.clone();
@@ -484,7 +505,7 @@ pub fn send_from_wait(
   let remaining = format!("{}{}", before_sel, after_sel);
 
   // Rebuild the document:
-  //   everything before WAIT heading
+  //   everything before WAIT heading (with optional `> last=` update)
   //   + ### Message N\n{text}\n
   //   + ### WAIT\n{remaining}
   //   + everything after body end
@@ -492,7 +513,26 @@ pub fn send_from_wait(
   let after_body = &text[body_range.end..];
 
   let mut new_text = String::with_capacity(text.len() + message_text.len() + 32);
-  new_text.push_str(before_wait);
+  if let Some(ts) = timestamp {
+    let ts_line = format!("> last={}", ts);
+    if let Some(ref range) = session.last_active_line_range {
+      // Replace existing `> last=` line within before_wait.
+      new_text.push_str(&before_wait[..range.start]);
+      new_text.push_str(&ts_line);
+      new_text.push_str(&before_wait[range.end..]);
+    } else if !session.uuid.is_empty() {
+      // Insert after `> uuid=` line.
+      let insert_at = skip_newline(text.as_bytes(), session.uuid_byte_range.end);
+      new_text.push_str(&before_wait[..insert_at]);
+      new_text.push_str(&ts_line);
+      new_text.push('\n');
+      new_text.push_str(&before_wait[insert_at..]);
+    } else {
+      new_text.push_str(before_wait);
+    }
+  } else {
+    new_text.push_str(before_wait);
+  }
   new_text.push_str(&format!("### Message {}\n", message_index));
   new_text.push_str(&message_text);
   new_text.push('\n');
@@ -502,6 +542,43 @@ pub fn send_from_wait(
   new_text.push_str(after_body);
 
   Some(SendResult { new_text, message_text, message_index, wait_body_offset })
+}
+
+/// Update (or insert) the `> last=TIMESTAMP` line for a session.
+///
+/// If the session already has a `> last=` line, it is replaced in-place.
+/// Otherwise a new line is inserted right after the `> uuid=` line.
+/// Returns the updated document text.
+pub fn update_last_active(text: &str, session: &TodoSession, timestamp: u64) -> String {
+  let new_line = format!("> last={}", timestamp);
+
+  if let Some(ref range) = session.last_active_line_range {
+    // Replace existing `> last=` line.
+    let mut result = String::with_capacity(text.len());
+    result.push_str(&text[..range.start]);
+    result.push_str(&new_line);
+    result.push_str(&text[range.end..]);
+    result
+  } else if !session.uuid.is_empty() {
+    // Insert after the `> uuid=` line.  The uuid_byte_range covers just the
+    // value; we need to find the end of the full `> uuid=...` line + its newline.
+    let uuid_line_end = session.uuid_byte_range.end;
+    // Skip past the newline after the uuid line.
+    let insert_at = if uuid_line_end < text.len() && text.as_bytes()[uuid_line_end] == b'\n' {
+      uuid_line_end + 1
+    } else {
+      uuid_line_end
+    };
+    let mut result = String::with_capacity(text.len() + new_line.len() + 1);
+    result.push_str(&text[..insert_at]);
+    result.push_str(&new_line);
+    result.push('\n');
+    result.push_str(&text[insert_at..]);
+    result
+  } else {
+    // No uuid — can't attach metadata. Return unchanged.
+    text.to_string()
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +830,70 @@ body
   }
 
   #[test]
+  fn last_active_parsed() {
+    let text = "# Claude\n## S\n> uuid=abc\n> last=1700000000\n\n### WAIT\n";
+    let doc = parse(text);
+    let session = &doc.sessions[0];
+    assert_eq!(session.last_active, Some(1700000000));
+    let range = session.last_active_line_range.as_ref().unwrap();
+    assert_eq!(&text[range.clone()], "> last=1700000000");
+  }
+
+  #[test]
+  fn last_active_missing() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n";
+    let doc = parse(text);
+    let session = &doc.sessions[0];
+    assert_eq!(session.last_active, None);
+    assert!(session.last_active_line_range.is_none());
+  }
+
+  #[test]
+  fn last_active_does_not_disrupt_body() {
+    let text = "\
+# Claude
+## S
+> uuid=abc
+> last=1700000000
+
+### WAIT
+body here
+";
+    let doc = parse(text);
+    let session = &doc.sessions[0];
+    assert_eq!(session.last_active, Some(1700000000));
+    let body = &text[session.wait.as_ref().unwrap().body_byte_range.clone()];
+    assert!(body.contains("body here"));
+  }
+
+  #[test]
+  fn update_last_active_inserts() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n";
+    let doc = parse(text);
+    let session = &doc.sessions[0];
+    let updated = update_last_active(text, session, 1700000000);
+    assert!(updated.contains("> last=1700000000\n"));
+    // Re-parse to verify round-trip.
+    let doc2 = parse(&updated);
+    assert_eq!(doc2.sessions[0].last_active, Some(1700000000));
+    // WAIT body should still be parseable.
+    assert!(doc2.sessions[0].wait.is_some());
+  }
+
+  #[test]
+  fn update_last_active_replaces() {
+    let text = "# Claude\n## S\n> uuid=abc\n> last=1000\n\n### WAIT\n";
+    let doc = parse(text);
+    let session = &doc.sessions[0];
+    assert_eq!(session.last_active, Some(1000));
+    let updated = update_last_active(text, session, 2000);
+    assert!(updated.contains("> last=2000"));
+    assert!(!updated.contains("> last=1000"));
+    let doc2 = parse(&updated);
+    assert_eq!(doc2.sessions[0].last_active, Some(2000));
+  }
+
+  #[test]
   fn heading_byte_range_covers_full_line() {
     let text = "# Claude\n## Test Label\n> uuid=test\nsome body\n";
     let doc = parse(text);
@@ -891,7 +1032,7 @@ draft text
     let sel_start = body_start + text[body_start..].find("draft text").unwrap();
     let sel_end = sel_start + "draft text".len();
 
-    let result = send_from_wait(text, session, sel_start..sel_end).unwrap();
+    let result = send_from_wait(text, session, sel_start..sel_end, None).unwrap();
     assert_eq!(result.message_text, "draft text");
     assert_eq!(result.message_index, 1);
     assert!(result.new_text.contains("### Message 1\ndraft text\n### WAIT\n"));
@@ -917,7 +1058,7 @@ all body content
     let session = doc.session_by_label("S").unwrap();
 
     // Empty selection (collapsed cursor) → send entire body.
-    let result = send_from_wait(text, session, 0..0).unwrap();
+    let result = send_from_wait(text, session, 0..0, None).unwrap();
     assert_eq!(result.message_text, "all body content");
     assert_eq!(result.message_index, 0);
     assert!(result.new_text.contains("### Message 0\nall body content\n### WAIT\n"));
@@ -945,7 +1086,7 @@ line three
     let sel_start = wait.body_byte_range.start + offset_in_body;
     let sel_end = sel_start + "line two".len();
 
-    let result = send_from_wait(text, session, sel_start..sel_end).unwrap();
+    let result = send_from_wait(text, session, sel_start..sel_end, None).unwrap();
     assert_eq!(result.message_text, "line two");
 
     // Remaining body should have line one and line three.
@@ -974,7 +1115,7 @@ one two three
     let body = &text[wait.body_byte_range.clone()];
     let offset_in_body = body.find(" three").unwrap();
     let cursor = wait.body_byte_range.start + offset_in_body;
-    let result = send_from_wait(text, session, cursor..cursor).unwrap();
+    let result = send_from_wait(text, session, cursor..cursor, None).unwrap();
     assert_eq!(result.message_text, "one two");
     // The remaining text ("three\n") stays in the WAIT body.
     let new_doc = parse(&result.new_text);
@@ -1002,7 +1143,7 @@ line three
     let body = &text[wait.body_byte_range.clone()];
     let offset_in_body = body.find("line two").unwrap();
     let cursor = wait.body_byte_range.start + offset_in_body;
-    let result = send_from_wait(text, session, cursor..cursor).unwrap();
+    let result = send_from_wait(text, session, cursor..cursor, None).unwrap();
     assert_eq!(result.message_text, "line one");
     let new_doc = parse(&result.new_text);
     let new_session = new_doc.session_by_label("S").unwrap();
@@ -1024,7 +1165,7 @@ line three
     let session = doc.session_by_label("S").unwrap();
 
     // Empty body → should return None.
-    assert!(send_from_wait(text, session, 0..0).is_none());
+    assert!(send_from_wait(text, session, 0..0, None).is_none());
   }
 
   #[test]
@@ -1039,7 +1180,7 @@ hello
 ";
     let doc = parse(text);
     let session = doc.session_by_label("S").unwrap();
-    assert!(send_from_wait(text, session, 0..0).is_none());
+    assert!(send_from_wait(text, session, 0..0, None).is_none());
   }
 
   #[test]
@@ -1058,9 +1199,33 @@ third
 ";
     let doc = parse(text);
     let session = doc.session_by_label("S").unwrap();
-    let result = send_from_wait(text, session, 0..0).unwrap();
+    let result = send_from_wait(text, session, 0..0, None).unwrap();
     assert_eq!(result.message_index, 2);
     assert_eq!(result.message_text, "third");
+  }
+
+  #[test]
+  fn send_from_wait_stamps_timestamp() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\nhello\n";
+    let doc = parse(text);
+    let session = doc.session_by_label("S").unwrap();
+    let result = send_from_wait(text, session, 0..0, Some(1700000000)).unwrap();
+    assert!(result.new_text.contains("> last=1700000000\n"));
+    let doc2 = parse(&result.new_text);
+    assert_eq!(doc2.sessions[0].last_active, Some(1700000000));
+  }
+
+  #[test]
+  fn send_from_wait_updates_existing_timestamp() {
+    let text = "# Claude\n## S\n> uuid=abc\n> last=1000\n\n### WAIT\nhello\n";
+    let doc = parse(text);
+    let session = doc.session_by_label("S").unwrap();
+    assert_eq!(session.last_active, Some(1000));
+    let result = send_from_wait(text, session, 0..0, Some(2000)).unwrap();
+    assert!(result.new_text.contains("> last=2000"));
+    assert!(!result.new_text.contains("> last=1000"));
+    let doc2 = parse(&result.new_text);
+    assert_eq!(doc2.sessions[0].last_active, Some(2000));
   }
 
   #[test]
@@ -1220,7 +1385,7 @@ draft
     let session = doc.session_by_label("S").unwrap();
 
     // Selection entirely before the WAIT body.
-    assert!(send_from_wait(text, session, 0..5).is_none());
+    assert!(send_from_wait(text, session, 0..5, None).is_none());
   }
 
   #[test]
