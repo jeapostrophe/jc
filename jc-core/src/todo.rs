@@ -57,6 +57,20 @@ pub struct TodoWait {
   pub body_byte_range: Range<usize>,
 }
 
+impl TodoWait {
+  /// 0-based line number of the last line within the WAIT body.
+  ///
+  /// Backs up past a trailing newline so the result points at the last body
+  /// line rather than the next heading.
+  pub fn body_end_line(&self, text: &str) -> u32 {
+    let mut end = self.body_byte_range.end.min(text.len());
+    if end > self.body_byte_range.start && text.as_bytes()[end - 1] == b'\n' {
+      end -= 1;
+    }
+    text[..end].bytes().filter(|&b| b == b'\n').count() as u32
+  }
+}
+
 #[derive(Debug, Clone)]
 pub enum TodoProblem {
   UnsentWait { label: String },
@@ -942,6 +956,94 @@ wait content
     assert!(body.contains("wait content"));
     // Body should NOT contain the next session heading.
     assert!(!body.contains("## B"));
+  }
+
+  #[test]
+  fn body_end_line_lands_on_last_content_line() {
+    // Body has content followed by next heading — cursor should land on the
+    // last body line ("three"), not on "## More".
+    let text = "\
+# Claude
+## S
+> uuid=s
+
+### WAIT
+one
+two
+three
+## More
+";
+    let doc = parse(text);
+    let wait = doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
+    let line = wait.body_end_line(text);
+    // "three" is on line 7 (0-indexed).
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[line as usize], "three");
+  }
+
+  #[test]
+  fn body_end_line_with_trailing_blank_line() {
+    // Body has a blank line before the next heading — cursor should land on
+    // that blank line, not on "## More".
+    let text = "\
+# Claude
+## S
+> uuid=s
+
+### WAIT
+one
+two
+three
+
+## More
+";
+    let doc = parse(text);
+    let wait = doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
+    let line = wait.body_end_line(text);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[line as usize], "");
+    // And the line after is the next heading.
+    assert_eq!(lines[line as usize + 1], "## More");
+  }
+
+  #[test]
+  fn body_end_line_at_end_of_document() {
+    // WAIT body extends to end of document (no following heading).
+    let text = "\
+# Claude
+## S
+> uuid=s
+
+### WAIT
+only line
+";
+    let doc = parse(text);
+    let wait = doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
+    let line = wait.body_end_line(text);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[line as usize], "only line");
+  }
+
+  #[test]
+  fn body_end_line_empty_body() {
+    // Empty WAIT body — cursor should land on the WAIT heading line itself.
+    let text = "\
+# Claude
+## S
+> uuid=s
+
+### WAIT
+## Next
+";
+    let doc = parse(text);
+    let wait = doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
+    let line = wait.body_end_line(text);
+    let lines: Vec<&str> = text.lines().collect();
+    // With empty body, body_start == body_end (after backing up), so we
+    // get the WAIT heading line or the line right after it.
+    assert!(line <= 5, "line {} should be at or near WAIT heading", line);
+    // Should NOT be on "## Next".
+    assert_ne!(lines[line as usize], "## Next");
   }
 
   #[test]
