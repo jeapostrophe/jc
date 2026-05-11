@@ -209,7 +209,7 @@ impl<D: PickerDelegate> PickerState<D> {
     let query = self.query_input.read(cx).value().as_ref().to_string();
     let query_lower: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
     self.filtered = self.delegate.filter(&query_lower);
-    self.filtered.sort_by(|a, b| b.score.cmp(&a.score));
+    self.filtered.sort_by_key(|b| std::cmp::Reverse(b.score));
     self.selected_index = 0;
   }
 
@@ -1360,7 +1360,7 @@ impl ProjectActionsPickerDelegate {
         }
       }
       // Most recent first.
-      dormant.sort_by(|a, b| b.2.cmp(&a.2));
+      dormant.sort_by_key(|b| std::cmp::Reverse(b.2));
       for (uuid, label, _) in dormant {
         labels.push(format!("* {}", label));
         entries.push(ProjectActionsEntry::Dormant { uuid, label });
@@ -1403,7 +1403,7 @@ impl ProjectActionsPickerDelegate {
         }
 
         // Sort newest first.
-        discovered.sort_by(|a, b| b.2.cmp(&a.2));
+        discovered.sort_by_key(|b| std::cmp::Reverse(b.2));
 
         for (uuid, summary, mtime) in discovered {
           let age = format_relative_time(mtime);
