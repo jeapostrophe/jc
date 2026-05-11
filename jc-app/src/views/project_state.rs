@@ -83,8 +83,16 @@ impl ProjectState {
       let uuid = if todo_session.uuid.is_empty() { None } else { Some(todo_session.uuid.clone()) };
       let id = next_session_id;
       next_session_id += 1;
-      let state =
-        SessionState::create(id, uuid, todo_session.label.clone(), &path, palette, window, cx);
+      let state = SessionState::create(
+        id,
+        uuid,
+        todo_session.label.clone(),
+        &path,
+        palette,
+        todo_session.dangerous,
+        window,
+        cx,
+      );
       sessions.insert(id, state);
     }
 

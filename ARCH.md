@@ -103,6 +103,16 @@ Annotations from diff/terminal/code views are appended.
 | `## [X] Label` | Expired | JSONL garbage-collected, not attachable |
 | `## [DELETED] Label` | Deleted | Skipped entirely by parser |
 
+### Session Metadata
+
+Lines starting with `> ` immediately after the `## Label` heading are parsed as session metadata. They may appear in any order; unknown keys are silently ignored (forward compatibility).
+
+| Line | Meaning |
+|---|---|
+| `> uuid=<id>` | Claude session UUID. Required for resume; populated by jc on first hook. |
+| `> last=<unix-secs>` | Timestamp of the last `Cmd-Enter` send. Used to sort the Cmd-P / Cmd-Shift-P pickers by recency. Updated automatically. |
+| `> dangerous` | When set, jc spawns this session's `claude` process with `--dangerously-skip-permissions`. Add manually; takes effect at next session spawn (relaunch jc, or re-adopt the session via Cmd-Shift-P). |
+
 ### Comment Formats
 
 From any view, Cmd-K annotates a selection. Comments are appended below WAIT:

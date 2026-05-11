@@ -39,6 +39,9 @@ pub struct TodoSession {
   pub last_active: Option<u64>,
   /// Byte range of the entire `> last=TIMESTAMP` line (for replacement).
   pub last_active_line_range: Option<Range<usize>>,
+  /// True if the session has a `> dangerous` metadata line — spawn `claude`
+  /// with `--dangerously-skip-permissions`.
+  pub dangerous: bool,
   pub messages: Vec<TodoMessage>,
   pub wait: Option<TodoWait>,
 }
@@ -155,8 +158,9 @@ pub fn parse(text: &str) -> TodoDocument {
   let mut byte_offset: usize = 0;
   // State: we just saw an `## Label` heading and are looking for `> uuid=...` next.
   let mut expecting_uuid_for: Option<TodoSession> = None;
-  // State: we just consumed `> uuid=` and are looking for `> last=` on the next line.
-  let mut expecting_last = false;
+  // State: we're inside a session's metadata block (after `> uuid=`); each line
+  // starting with `> ` is parsed as metadata until we hit a non-metadata line.
+  let mut in_metadata = false;
   // Only create sessions for `##` headings inside a `# Claude` section.
   let mut in_claude_section = false;
 
@@ -165,20 +169,25 @@ pub fn parse(text: &str) -> TodoDocument {
     let line_start = byte_offset;
     let line_end = line_start + line.len();
 
-    // If we just consumed `> uuid=` on the previous line, check for `> last=`.
-    if expecting_last {
-      expecting_last = false;
-      if let Some(ref mut session) = current_session
-        && let Some(rest) = line.strip_prefix("> last=")
-      {
-        if let Ok(ts) = rest.parse::<u64>() {
+    // Inside a session's metadata block, parse `> key[=value]` lines.
+    if in_metadata
+      && let Some(ref mut session) = current_session
+      && let Some(rest) = line.strip_prefix("> ")
+    {
+      if let Some(ts_str) = rest.strip_prefix("last=") {
+        if let Ok(ts) = ts_str.parse::<u64>() {
           session.last_active = Some(ts);
         }
         session.last_active_line_range = Some(line_start..line_end);
-        byte_offset = skip_newline(text.as_bytes(), line_end);
-        continue;
+      } else if rest == "dangerous" {
+        session.dangerous = true;
       }
+      // Unknown metadata keys are silently consumed so future additions
+      // don't break older parsers.
+      byte_offset = skip_newline(text.as_bytes(), line_end);
+      continue;
     }
+    in_metadata = false;
 
     // If we're expecting a `> uuid=` line after a heading:
     if let Some(ref mut pending) = expecting_uuid_for {
@@ -190,7 +199,7 @@ pub fn parse(text: &str) -> TodoDocument {
         // Promote to current session.
         finalize_session(&mut doc, &mut current_session, line_start);
         current_session = expecting_uuid_for.take();
-        expecting_last = true;
+        in_metadata = true;
       } else {
         // No uuid line — accept the session with an empty UUID.
         finalize_session(&mut doc, &mut current_session, line_start);
@@ -860,6 +869,42 @@ body
     let session = &doc.sessions[0];
     assert_eq!(session.last_active, None);
     assert!(session.last_active_line_range.is_none());
+  }
+
+  #[test]
+  fn dangerous_flag_parsed() {
+    let text = "# Claude\n## S\n> uuid=abc\n> dangerous\n\n### WAIT\n";
+    let doc = parse(text);
+    assert!(doc.sessions[0].dangerous);
+  }
+
+  #[test]
+  fn dangerous_flag_default_false() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n";
+    let doc = parse(text);
+    assert!(!doc.sessions[0].dangerous);
+  }
+
+  #[test]
+  fn dangerous_flag_with_last_active_any_order() {
+    // dangerous before last
+    let text1 = "# Claude\n## S\n> uuid=abc\n> dangerous\n> last=42\n\n### WAIT\n";
+    let s1 = &parse(text1).sessions[0];
+    assert!(s1.dangerous);
+    assert_eq!(s1.last_active, Some(42));
+    // last before dangerous
+    let text2 = "# Claude\n## S\n> uuid=abc\n> last=42\n> dangerous\n\n### WAIT\n";
+    let s2 = &parse(text2).sessions[0];
+    assert!(s2.dangerous);
+    assert_eq!(s2.last_active, Some(42));
+  }
+
+  #[test]
+  fn unknown_metadata_keys_ignored() {
+    // Unknown keys are silently consumed; subsequent known keys still parse.
+    let text = "# Claude\n## S\n> uuid=abc\n> futureKey=xyz\n> dangerous\n\n### WAIT\n";
+    let doc = parse(text);
+    assert!(doc.sessions[0].dangerous);
   }
 
   #[test]

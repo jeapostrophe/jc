@@ -46,21 +46,26 @@ pub struct SessionState {
 }
 
 impl SessionState {
+  #[allow(clippy::too_many_arguments)]
   pub fn create(
     id: SessionId,
     uuid: Option<String>,
     label: String,
     project_path: &Path,
     palette: &Palette,
+    dangerous: bool,
     window: &mut Window,
     cx: &mut App,
   ) -> Self {
     // If we have a UUID, resume that session. Otherwise launch plain `claude`.
-    let command = uuid
+    let mut command = uuid
       .as_ref()
       .filter(|u| !u.is_empty())
       .map(|u| format!("claude --resume {u}"))
       .unwrap_or_else(|| "claude".to_string());
+    if dangerous {
+      command.push_str(" --dangerously-skip-permissions");
+    }
 
     let claude_config = TerminalConfig {
       command: Some(command),

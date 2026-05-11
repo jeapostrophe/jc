@@ -1411,6 +1411,7 @@ impl Workspace {
       label.clone(),
       &project_path,
       &palette,
+      false,
       window,
       cx,
     );
@@ -1471,12 +1472,22 @@ impl Workspace {
     let palette = palette_from_window(window);
 
     let project = &mut self.projects[project_idx];
+    let dangerous =
+      project.todo_view.read(cx).document().session_by_label(label).is_some_and(|s| s.dangerous);
     let id = project.next_session_id;
     project.next_session_id += 1;
 
     let uuid_opt = if uuid.is_empty() { None } else { Some(uuid.to_string()) };
-    let session =
-      SessionState::create(id, uuid_opt, label.to_string(), &project_path, &palette, window, cx);
+    let session = SessionState::create(
+      id,
+      uuid_opt,
+      label.to_string(),
+      &project_path,
+      &palette,
+      dangerous,
+      window,
+      cx,
+    );
 
     project.sessions.insert(id, session);
     self.subscribe_session_bell(project_idx, id, cx);

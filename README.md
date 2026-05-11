@@ -67,6 +67,8 @@ The `### WAIT` marker separates what you've sent from what you're drafting. Anno
 
 Sessions are resumed automatically on startup via `claude --resume <uuid>`. New sessions get their UUID from Claude Code's hook system. `/clear` is handled transparently.
 
+Per-session metadata lives on `> ` lines under the heading. `> uuid=` and `> last=` are managed by jc; add `> dangerous` by hand to spawn that session's `claude` with `--dangerously-skip-permissions` (takes effect on next spawn). See `ARCH.md` for the full list.
+
 ### Problem Navigation
 
 The app tracks **problems** — things that need your attention:
