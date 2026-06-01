@@ -205,11 +205,17 @@ impl Workspace {
       });
 
     let mut focus_in_subscriptions = Vec::new();
-    for (i, pane) in panes.iter().enumerate() {
+    for pane in panes.iter() {
       let focus = pane.read(cx).focus_handle(cx);
+      // Capture the pane *entity*, not its index: set_layout can reorder the
+      // `panes` Vec, so a captured index goes stale and the cache would point
+      // at the wrong pane. Resolve the live index when the event fires.
+      let pane_entity = pane.clone();
       focus_in_subscriptions.push(cx.on_focus_in(&focus, window, move |this, _window, cx| {
-        if this.active_pane_index != i {
-          this.active_pane_index = i;
+        if let Some(idx) = this.panes.iter().position(|p| p == &pane_entity)
+          && this.active_pane_index != idx
+        {
+          this.active_pane_index = idx;
           cx.notify();
         }
       }));
@@ -783,9 +789,30 @@ impl Workspace {
     }
   }
 
+  /// Visible pane that currently holds keyboard focus, if any. Returns `None`
+  /// when focus is outside every pane (e.g. a modal/picker is open). This is the
+  /// source of truth for "which pane is active"; `active_pane_index` is only a
+  /// cache that can briefly lag real focus.
+  fn focused_pane_index(&self, window: &Window, cx: &App) -> Option<usize> {
+    (0..self.visible_pane_count())
+      .find(|&i| self.panes[i].read(cx).focus_handle(cx).contains_focused(window, cx))
+  }
+
+  /// Correct the cached `active_pane_index` to match real keyboard focus.
+  /// Call before reading the cache to drive an action, so a briefly-stale cache
+  /// can't make e.g. Cmd-Enter or Cmd-S act on the wrong pane.
+  fn sync_active_pane_to_focus(&mut self, window: &Window, cx: &App) {
+    if let Some(idx) = self.focused_pane_index(window, cx) {
+      self.active_pane_index = idx;
+    }
+  }
+
   fn focus_prev_pane(&mut self, _: &FocusPrevPane, window: &mut Window, cx: &mut Context<Self>) {
-    if self.active_pane_index > 0 {
-      self.active_pane_index -= 1;
+    // Start from where focus actually is, not the (possibly stale) cache, so the
+    // first press never gets "wasted" resyncing and appears to skip a pane.
+    let current = self.focused_pane_index(window, cx).unwrap_or(self.active_pane_index);
+    if current > 0 {
+      self.active_pane_index = current - 1;
       self.panes[self.active_pane_index].read(cx).focus_content(window);
       cx.notify();
     }
@@ -793,8 +820,9 @@ impl Workspace {
 
   fn focus_next_pane(&mut self, _: &FocusNextPane, window: &mut Window, cx: &mut Context<Self>) {
     let count = self.visible_pane_count();
-    if self.active_pane_index + 1 < count {
-      self.active_pane_index += 1;
+    let current = self.focused_pane_index(window, cx).unwrap_or(self.active_pane_index);
+    if current + 1 < count {
+      self.active_pane_index = current + 1;
       self.panes[self.active_pane_index].read(cx).focus_content(window);
       cx.notify();
     }
@@ -1598,7 +1626,8 @@ impl Workspace {
   // Save file
   // ---------------------------------------------------------------------------
 
-  fn save_file(&mut self, _: &SaveFile, _window: &mut Window, cx: &mut Context<Self>) {
+  fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
+    self.sync_active_pane_to_focus(window, cx);
     let pane = self.active_pane_entity().clone();
     let kind = pane.read(cx).content_kind();
     let project = &self.projects[self.active_project_index];
@@ -1624,7 +1653,9 @@ impl Workspace {
   // ---------------------------------------------------------------------------
 
   fn send_to_terminal(&mut self, _: &SendToTerminal, window: &mut Window, cx: &mut Context<Self>) {
-    // Only send when the TODO editor is focused.
+    // Only send when the TODO editor is focused. Resync the cache from real
+    // focus first so a stale index can't make this silently no-op.
+    self.sync_active_pane_to_focus(window, cx);
     let active_kind = self.panes[self.active_pane_index].read(cx).content_kind();
     if active_kind != Some(PaneContentKind::TodoEditor) {
       return;

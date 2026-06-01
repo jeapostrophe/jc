@@ -60,6 +60,8 @@ Each `ProjectState` owns a TODO view, diff view, code view, and a `HashMap<Sessi
 
 The workspace has an active project with an active session. The active session drives which terminals appear in the panes. Switching sessions swaps pane contents without disconnecting terminals.
 
+**Active pane:** real keyboard focus is the source of truth for which pane is "active". The pane border and Cmd-[/Cmd-] navigation derive from `focused_pane_index()` (which queries gpui focus); `active_pane_index` is only a cache, kept in sync by an `on_focus_in` subscription per pane (resolved by pane *entity*, not a captured index, so `set_layout` reordering can't make it stale) and resynced before cache-dependent actions like Cmd-Enter/Cmd-S.
+
 ### Session Lifecycle
 
 - **Project init:** The app reads TODO.md for session headings with UUIDs. Each is resumed via `claude --resume <uuid>`. If no sessions exist, a plain `claude` instance is launched.

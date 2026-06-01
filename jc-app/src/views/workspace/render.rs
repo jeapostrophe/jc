@@ -229,10 +229,14 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-  fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+  fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let theme = cx.theme();
     let active_border = theme.accent;
     let visible = self.visible_pane_count();
+
+    // Highlight the pane that actually holds keyboard focus. Fall back to the
+    // cached index only when nothing in a pane is focused (e.g. a modal is open).
+    let focused_pane = self.focused_pane_index(window, cx);
 
     let fg = theme.foreground;
     let muted = theme.muted_foreground;
@@ -272,7 +276,7 @@ impl Render for Workspace {
     };
 
     let build_pane_wrapper = |i: usize, pane: &Entity<Pane>| {
-      let active = self.active_pane_index == i;
+      let active = focused_pane.map_or(self.active_pane_index == i, |f| f == i);
       let info = self.pane_header_info(pane, cx);
       div()
         .size_full()
