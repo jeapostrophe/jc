@@ -114,6 +114,11 @@ pub struct Workspace {
   _bell_subscriptions: Vec<Subscription>,
   _breadcrumb_observers: Vec<Subscription>,
   _problems_poll_task: Option<Task<()>>,
+  /// Periodic task that re-arms scheduled-send timers from the live TODO markers.
+  _schedule_reconcile_task: Option<Task<()>>,
+  /// (project path, session label, delivery time) tuples that already have a
+  /// timer armed, so reconciliation doesn't double-arm the same scheduled send.
+  armed_schedules: std::collections::HashSet<(PathBuf, String, NaiveDateTime)>,
   /// Home session before first L0 cross-session jump (project_index, session_id).
   pre_layer0_home: Option<(usize, SessionId)>,
   /// Current cycling state within the layered problem rotation.
@@ -471,6 +476,8 @@ impl Workspace {
       _bell_subscriptions: bell_subscriptions,
       _breadcrumb_observers: Vec::new(),
       _problems_poll_task: Some(problems_poll_task),
+      _schedule_reconcile_task: None,
+      armed_schedules: std::collections::HashSet::new(),
       pre_layer0_home: None,
       problem_cycle: None,
       snippets,
@@ -489,7 +496,8 @@ impl Workspace {
     };
 
     ws.subscribe_active_project(window, cx);
-    ws.arm_existing_schedules(window, cx);
+    ws.reconcile_schedules(window, cx);
+    ws.start_schedule_reconcile_loop(window, cx);
 
     // Intercept the native close button (red circle) so it goes through
     // the same confirmation path as Cmd-W instead of closing immediately.
@@ -1708,7 +1716,7 @@ impl Workspace {
       // fire time (see `fire_scheduled_send`), not now. No workspace state
       // changed here (the TodoView mutated itself and notified), so we don't.
       let project_path = self.projects[self.active_project_index].path.clone();
-      self.arm_scheduled_send(project_path, label, when, window, cx);
+      self.ensure_scheduled_armed(project_path, label, when, window, cx);
     } else {
       // Immediate send: mark busy and deliver now.
       if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
@@ -1753,17 +1761,19 @@ impl Workspace {
     cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
       Timer::after(delay).await;
       let _ = this.update_in(cx, |ws, window, cx| {
-        ws.fire_scheduled_send(&project_path, &label, window, cx);
+        ws.fire_scheduled_send(&project_path, &label, when, window, cx);
       });
     })
     .detach();
   }
 
-  /// Deliver (or re-arm / drop) a scheduled send when its timer fires.
+  /// Deliver (or re-arm / drop) a scheduled send when its timer fires. `when` is
+  /// the instant this timer was armed for.
   fn fire_scheduled_send(
     &mut self,
     project_path: &Path,
     label: &str,
+    when: NaiveDateTime,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -1795,7 +1805,7 @@ impl Workspace {
         cx.notify();
       }
       ScheduledFire::Reschedule(new_when) => {
-        self.arm_scheduled_send(
+        self.ensure_scheduled_armed(
           project_path.to_path_buf(),
           label.to_string(),
           new_when,
@@ -1805,13 +1815,38 @@ impl Workspace {
       }
       ScheduledFire::Cancelled => {}
     }
+
+    // This timer has fired and consumed its slot; drop the dedup entry so a later
+    // schedule that resolves to the same instant (possible within one minute) can
+    // re-arm. Reached only after `deliver_scheduled` ran, so the marker is already
+    // gone/updated and reconcile won't spuriously re-arm this same `when`.
+    self.armed_schedules.remove(&(project_path.to_path_buf(), label.to_string(), when));
   }
 
-  /// On startup, re-arm timers for scheduled messages still pending in the
-  /// restored TODO files (past-due ones fire after the catch-up grace). Only
-  /// Active sessions are adopted into the live `sessions` map, so a marker on a
-  /// Disabled/Expired session is skipped — it has no terminal to deliver to.
-  fn arm_existing_schedules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+  /// Arm a timer for a `(path, label, when)` scheduled send unless one is already
+  /// armed for that exact tuple. Editing a marker's time yields a new `when`, so
+  /// the edited instant gets its own timer (and the stale one harmlessly no-ops
+  /// at fire, since `deliver_scheduled` re-reads the live marker).
+  fn ensure_scheduled_armed(
+    &mut self,
+    project_path: PathBuf,
+    label: String,
+    when: NaiveDateTime,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    if self.armed_schedules.insert((project_path.clone(), label.clone(), when)) {
+      self.arm_scheduled_send(project_path, label, when, window, cx);
+    }
+  }
+
+  /// Arm timers for every scheduled marker currently pending in the live TODO
+  /// documents (idempotent via `armed_schedules`). Runs at startup and on a
+  /// short interval, so adding/editing/removing a `@jc(...)` time takes effect —
+  /// including edits to an *earlier* time, which the fire-time re-check alone
+  /// can't catch. Only Active sessions are adopted, so markers on
+  /// Disabled/Expired sessions (no terminal) are skipped.
+  fn reconcile_schedules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let pending: Vec<(PathBuf, String, NaiveDateTime)> = self
       .projects
       .iter()
@@ -1831,8 +1866,23 @@ impl Workspace {
       })
       .collect();
     for (path, label, when) in pending {
-      self.arm_scheduled_send(path, label, when, window, cx);
+      self.ensure_scheduled_armed(path, label, when, window, cx);
     }
+  }
+
+  /// Spawn the periodic task that reconciles scheduled-send timers against the
+  /// live TODO markers, so time edits are picked up without waiting for the
+  /// original (possibly later) timer to fire.
+  fn start_schedule_reconcile_loop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let task = cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+      loop {
+        Timer::after(StdDuration::from_secs(2)).await;
+        if this.update_in(cx, |ws, window, cx| ws.reconcile_schedules(window, cx)).is_err() {
+          break; // workspace dropped
+        }
+      }
+    });
+    self._schedule_reconcile_task = Some(task);
   }
 
   // ---------------------------------------------------------------------------

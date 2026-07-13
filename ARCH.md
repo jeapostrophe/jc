@@ -144,9 +144,11 @@ highlighted in the `@keyword` color.
 - **One at a time / all sends blocked.** While a session has a pending scheduled
   message, every Cmd-Enter (immediate or scheduled) is rejected with the system beep.
 - **Cancel** by deleting the `@jc(...)` marker or the whole `### Message N` block.
-  **Reschedule** by editing the datetime — the timer re-arms at fire time.
+  **Reschedule** by editing the datetime — a periodic reconcile (and the startup scan)
+  re-arms timers from the live markers, so edits in either direction take effect.
 - **Persistence & catch-up.** The marker lives in TODO.md, so timers re-arm on restart;
-  a scheduled time that already passed while jc was closed fires immediately.
+  a scheduled time that already passed while jc was closed fires immediately (after a
+  brief grace so the resumed terminal is ready).
 - `> last=` is stamped at delivery time, not when the message is queued.
 
 ## Terminal Architecture

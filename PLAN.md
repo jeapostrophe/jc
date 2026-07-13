@@ -80,14 +80,13 @@ Interaction model (decided):
 - [x] [E] jc-app: startup re-arm (`arm_existing_schedules` in `Workspace::new`) re-scans
       pending `@jc` markers and arms timers (fire-immediately if past). Cancellation and
       later-datetime edits reconcile self-correctingly at fire time (`ScheduledFire`).
-- [ ] [H] jc-app: make pending `@jc` markers the single source of truth for the timer set
-      by reconciling on every TODO save (the scan `arm_existing_schedules` already does at
-      startup), keyed by (label, when) with an already-armed dedup set. This replaces the
-      scattered imperative arm-at-send / re-arm-at-fire / scan-at-startup trio with one
-      declarative path, closing the *earlier* mid-session datetime-edit gap (today an
-      earlier edit still fires at the original later instant, since arming is once + a
-      fire-time re-check that only handles delete and later-push). Flagged by /simplify
-      (altitude); split out as its own task rather than bolted onto the current arming.
+- [x] [H] jc-app: pending `@jc` markers are the single source of truth for the timer set.
+      `reconcile_schedules` arms timers from the live markers (dedup via an
+      `armed_schedules` HashSet keyed by (path, label, when)); it runs at startup and on a
+      2s windowed loop (`start_schedule_reconcile_loop`), plus immediately on send and on
+      fire-time reschedule. This closes the *earlier* mid-session datetime-edit gap — an
+      edit in either direction re-arms within ~2s; the stale timer harmlessly no-ops at
+      fire since `fire_scheduled` re-reads the live marker. Flagged by /simplify (altitude).
 - [ ] [T] jc-app: a scheduled send defers `> last=` to delivery time, so if jc restarts
       before the fire, `ProjectState::create` may focus a different session as active
       (last-active picks the stale max). Minor cosmetic focus quirk; revisit if annoying.
