@@ -1546,7 +1546,11 @@ impl Workspace {
   /// and mark them `[X]` in TODO.md so they don't appear in the picker.
   fn mark_expired_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     for project in &self.projects {
-      let session_dir = ProjectState::session_dir(&project.path);
+      // None when $HOME is unset; we then can't locate any bucket, so skip
+      // expiry rather than marking every live session `[X]`.
+      let Some(session_dirs) = ProjectState::session_dirs(&project.path) else {
+        continue;
+      };
       let document = project.todo_view.read(cx).document().clone();
       let adopted_uuids: std::collections::HashSet<&str> =
         project.sessions.values().filter_map(|s| s.uuid.as_deref()).collect();
@@ -1557,7 +1561,7 @@ impl Workspace {
           !s.uuid.is_empty()
             && s.status != jc_core::todo::SessionStatus::Expired
             && !adopted_uuids.contains(s.uuid.as_str())
-            && !session_dir.join(format!("{}.jsonl", s.uuid)).exists()
+            && !jc_core::claude::transcript_in(&session_dirs, &s.uuid)
         })
         .map(|s| s.label.clone())
         .collect();

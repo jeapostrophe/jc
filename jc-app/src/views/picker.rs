@@ -1371,46 +1371,43 @@ impl ProjectActionsPickerDelegate {
     labels.push("+ New session".to_string());
     entries.push(ProjectActionsEntry::NewSession);
 
-    // 4. Unattached JSONL sessions for current project (not in TODO.md).
+    // 4. Unattached JSONL sessions for current project (not in TODO.md). A
+    //    project's transcripts live in its root bucket plus any git-worktree
+    //    buckets (each transcript in exactly one bucket), so scan them all.
     {
       let existing_uuids: HashSet<&str> = todo_documents
         .get(active_project_index)
         .map(|doc| doc.sessions.iter().map(|s| s.uuid.as_str()).collect())
         .unwrap_or_default();
 
-      let encoded = project_path.to_string_lossy().replace('/', "-");
-      let home = std::env::var("HOME").unwrap_or_default();
-      let session_dir = PathBuf::from(home).join(".claude/projects").join(encoded);
-
-      if let Ok(read_dir) = std::fs::read_dir(&session_dir) {
-        let mut discovered: Vec<(String, String, std::time::SystemTime)> = Vec::new();
-
+      let mut discovered: Vec<(String, String, std::time::SystemTime)> = Vec::new();
+      for session_dir in ProjectState::session_dirs(project_path).unwrap_or_default() {
+        let Ok(read_dir) = std::fs::read_dir(&session_dir) else { continue };
         for entry in read_dir.flatten() {
           let path = entry.path();
           if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
           }
-          let uuid = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) => s.to_string(),
-            None => continue,
-          };
-          if existing_uuids.contains(uuid.as_str()) {
+          let Some(uuid) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+          if existing_uuids.contains(uuid) {
             continue;
           }
-          let mtime = entry.metadata().ok().and_then(|m| m.modified().ok());
-          let summary = extract_first_user_summary(&path).unwrap_or_else(|| uuid[..8].to_string());
-          discovered.push((uuid, summary, mtime.unwrap_or(std::time::UNIX_EPOCH)));
+          let mtime =
+            entry.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(std::time::UNIX_EPOCH);
+          let summary = extract_first_user_summary(&path)
+            .unwrap_or_else(|| uuid.get(..8).unwrap_or(uuid).to_string());
+          discovered.push((uuid.to_string(), summary, mtime));
         }
+      }
 
-        // Sort newest first.
-        discovered.sort_by_key(|b| std::cmp::Reverse(b.2));
+      // Sort newest first.
+      discovered.sort_by_key(|b| std::cmp::Reverse(b.2));
 
-        for (uuid, summary, mtime) in discovered {
-          let age = format_relative_time(mtime);
-          let label_text = format!("~ {summary} ({age})");
-          labels.push(label_text);
-          entries.push(ProjectActionsEntry::Unattached { uuid, summary });
-        }
+      for (uuid, summary, mtime) in discovered {
+        let age = format_relative_time(mtime);
+        let label_text = format!("~ {summary} ({age})");
+        labels.push(label_text);
+        entries.push(ProjectActionsEntry::Unattached { uuid, summary });
       }
     }
 

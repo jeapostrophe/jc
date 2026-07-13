@@ -116,3 +116,25 @@ Restore ALL active sessions per project, not just one. Root cause: `ProjectState
 - [x] [T] jc-app: select active session by most-recent `> last=` (fallback: first).
 - [x] [T] Docs: ARCH.md "Session Lifecycle / Project init" — describe all-active adoption
       + last-active selection (current text is aspirational; code only did one).
+- [x] [H] Worktree transcript buckets: a session run in a git worktree
+      (`<root>/.claude/worktrees/<b>`) lands in a *sibling* `~/.claude/projects` bucket
+      `<encoded_root>--claude-worktrees-<b>`, not the root bucket. jc scanned only the root
+      bucket, so worktree sessions were falsely marked `[X]` expired on restart and hidden
+      from unattached-session discovery. Fix: `jc_core::claude` (new module) enumerates root +
+      worktree buckets (`session_dirs`); rewired expiry checks (project_state.rs, workspace/mod.rs)
+      and picker unattached-discovery through it; unified the picker's ad-hoc `/`-only encoding
+      onto the correct non-`[A-Za-z0-9-]`→`-` encoder. Prefix-scan only (no `git worktree list`),
+      so out-of-tree `git worktree add ../elsewhere` buckets are not covered — see below.
+- [ ] [E] Out-of-tree worktree buckets: `git worktree add ../pgm-feat` produces an
+      unrelated-looking bucket (`-Users-jay-Dev-pgm-feat`) the prefix-scan can't associate with
+      the project. If needed, enumerate real worktree paths via `git worktree list --porcelain`
+      (off the main thread) and add their encoded buckets to `session_dirs`.
+- [ ] [H] Move session-bucket scanning off the main thread + scan once. `session_dirs` does a
+      synchronous `read_dir` of `~/.claude/projects` (pre-existing `.exists()` checks at these
+      sites already blocked the main thread; the worktree fix broadened them to a directory
+      scan). `ProjectState::new_project` and `mark_expired_sessions` call it during init/refresh;
+      per the gpui rule this should run on `cx.background_executor()`. Also: `mark_expired_sessions`
+      re-scans the shared `~/.claude/projects` once **per open project** on every picker open —
+      hoist to one scan and filter the in-memory listing per project (e.g. a `jc_core::claude`
+      `all_project_dirs()` + pure `session_dirs_from(&entries, path)`). Requires threading the
+      result back into the synchronous constructor/refresh paths.

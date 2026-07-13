@@ -11,6 +11,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+/// `$HOME` as a path, or `None` if unset/empty. Callers deciding session
+/// liveness MUST treat `None` as "can't tell" and take no destructive action
+/// (never mark sessions expired): an empty home resolves every transcript bucket
+/// to a nonexistent relative path, which would falsely expire every live session.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+  std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
 pub struct SavedPaneLayout {
   pub pane_kinds: [Option<PaneContentKind>; 3],
   pub active_pane_index: usize,
@@ -40,20 +48,26 @@ impl ProjectState {
     let diff_view = cx.new(|cx| DiffView::new(path.clone(), window, cx));
     let todo_view = cx.new(|cx| TodoView::new(path.clone(), window, cx));
 
-    // Mark sessions whose JSONL files have been garbage-collected by Claude.
-    let session_dir = Self::session_dir(&path);
+    // Mark sessions whose JSONL files have been garbage-collected by Claude. A
+    // session's transcript may live in the project's root bucket or in any of its
+    // git-worktree buckets, so check all of them before declaring it gone. With
+    // no $HOME we can't locate any bucket, so expire nothing rather than wrongly
+    // persisting `[X]` for live sessions.
     {
       let document = todo_view.read(cx).document().clone();
-      let expired_labels: Vec<String> = document
-        .sessions
-        .iter()
-        .filter(|s| {
-          !s.uuid.is_empty()
-            && s.status != jc_core::todo::SessionStatus::Expired
-            && !session_dir.join(format!("{}.jsonl", s.uuid)).exists()
-        })
-        .map(|s| s.label.clone())
-        .collect();
+      let expired_labels: Vec<String> = match Self::session_dirs(&path) {
+        None => Vec::new(),
+        Some(session_dirs) => document
+          .sessions
+          .iter()
+          .filter(|s| {
+            !s.uuid.is_empty()
+              && s.status != jc_core::todo::SessionStatus::Expired
+              && !jc_core::claude::transcript_in(&session_dirs, &s.uuid)
+          })
+          .map(|s| s.label.clone())
+          .collect(),
+      };
       if !expired_labels.is_empty() {
         todo_view.update(cx, |tv, cx| {
           for label in &expired_labels {
@@ -123,15 +137,12 @@ impl ProjectState {
     }
   }
 
-  /// Path to Claude's JSONL session directory for this project.
-  pub fn session_dir(project_path: &Path) -> PathBuf {
-    let encoded: String = project_path
-      .to_string_lossy()
-      .chars()
-      .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-      .collect();
-    let home = std::env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".claude/projects").join(encoded)
+  /// All of Claude's JSONL session buckets for this project (root + worktrees),
+  /// or `None` if `$HOME` is unset — buckets then can't be located and callers
+  /// must take no destructive action (never expire/prune sessions). The `Some`
+  /// vec always has at least the root bucket.
+  pub fn session_dirs(project_path: &Path) -> Option<Vec<PathBuf>> {
+    home_dir().map(|home| jc_core::claude::session_dirs(&home, project_path))
   }
 
   pub fn active_session(&self) -> Option<&SessionState> {
