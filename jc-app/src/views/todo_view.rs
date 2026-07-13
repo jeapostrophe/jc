@@ -1,9 +1,25 @@
 use crate::views::code_view::CodeView;
+use chrono::NaiveDateTime;
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{InputEvent, Rope, RopeExt as _};
 use jc_core::todo::{self, TodoDocument, TodoProblem};
 use std::path::{Path, PathBuf};
+
+/// Current Unix time in whole seconds, used for `> last=` timestamps.
+fn now_unix_secs() -> u64 {
+  std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Outcome of firing a scheduled-send timer, computed against the live TODO text.
+pub enum ScheduledFire {
+  /// Deliver this (current) message body to the Claude terminal now.
+  Deliver(String),
+  /// The scheduled time was pushed into the future — re-arm for this instant.
+  Reschedule(NaiveDateTime),
+  /// The marker was removed (or the session/body is gone) — do nothing.
+  Cancelled,
+}
 
 /// TodoView wraps a [`CodeView`] opened on the project's `TODO.md` file,
 /// adding parsing, highlighting, validation, and event emission on changes.
@@ -205,23 +221,24 @@ impl TodoView {
     }
   }
 
-  /// Extract the selected text (or entire WAIT body if no selection) from the
-  /// active session's WAIT section, wrap it in a new `### Message N` heading,
-  /// and update the editor. Returns `(message_text, message_index)` on success.
+  /// Extract the selected text (or everything before the cursor in the WAIT
+  /// body) from the active session's WAIT section into a new `### Message N`
+  /// heading, and update the editor. Returns the message text and — when the
+  /// WAIT began with a `@jc(HH:MM)` marker — the resolved scheduled delivery
+  /// time (in which case the caller must defer delivery rather than sending
+  /// immediately).
   pub fn send_selection(
     &mut self,
     label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
-  ) -> Option<(String, usize)> {
+  ) -> Option<(String, Option<NaiveDateTime>)> {
     let text = self.editor_text(cx);
     let selection = self.code_view.read(cx).editor().read(cx).selection_byte_range();
     let session = self.document.session_by_label(label)?;
-    let now = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap_or_default()
-      .as_secs();
-    let result = todo::send_from_wait(&text, session, selection, Some(now))?;
+    let now = now_unix_secs();
+    let now_local = chrono::Local::now().naive_local();
+    let result = todo::send_from_wait(&text, session, selection, Some(now), now_local)?;
     let wait_body_offset = result.wait_body_offset;
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {
@@ -232,7 +249,54 @@ impl TodoView {
     });
     self.revalidate(cx);
     self.save(cx);
-    Some((result.message_text, result.message_index))
+    Some((result.message_text, result.schedule))
+  }
+
+  /// Whether `label` currently has a pending scheduled `### Message N @jc(...)`
+  /// marker. Reads the cached `self.document`, which is re-parsed on every
+  /// editor change, so a marker the user just added or removed is already
+  /// reflected — no re-parse needed on this per-send hot path.
+  pub fn has_pending_schedule(&self, label: &str) -> bool {
+    self.document.session_by_label(label).and_then(|s| s.pending_scheduled()).is_some()
+  }
+
+  /// Fire a scheduled send for `label`. jc-core [`todo::fire_scheduled`] owns the
+  /// policy (has the time arrived? cancelled? rescheduled?) and text rewrite;
+  /// this only applies the rewritten text and maps to a [`ScheduledFire`] for the
+  /// workspace to act on.
+  pub fn deliver_scheduled(
+    &mut self,
+    label: &str,
+    now_local: NaiveDateTime,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> ScheduledFire {
+    let text = self.editor_text(cx);
+    match todo::fire_scheduled(&text, label, now_local, now_unix_secs()) {
+      todo::FireOutcome::Deliver { new_text, body } => {
+        self.set_text_and_save(new_text, window, cx);
+        ScheduledFire::Deliver(body)
+      }
+      todo::FireOutcome::Reschedule(when) => ScheduledFire::Reschedule(when),
+      todo::FireOutcome::Cancelled { new_text } => {
+        if let Some(new_text) = new_text {
+          self.set_text_and_save(new_text, window, cx);
+        }
+        ScheduledFire::Cancelled
+      }
+    }
+  }
+
+  /// Replace the editor contents (preserving cursor position), then revalidate
+  /// and save.
+  fn set_text_and_save(&mut self, new_text: String, window: &mut Window, cx: &mut Context<Self>) {
+    self.code_view.update(cx, |cv, cx| {
+      cv.editor().update(cx, |state, cx| {
+        state.set_value_preserving_position(new_text, window, cx);
+      });
+    });
+    self.revalidate(cx);
+    self.save(cx);
   }
 
   /// Ensure the session has a WAIT section, inserting one if missing.
@@ -297,7 +361,9 @@ impl TodoView {
   }
 
   /// Apply foreground highlights to the active session's headings.
-  /// h2 (`## Label`) → `@type` color, h3 (`### Message` / `### WAIT`) → `@function` color.
+  /// h2 (`## Label`) → `@type` color, h3 (`### Message` / `### WAIT`) → `@function`
+  /// color, except a pending scheduled `### Message N @jc(...)` heading → `@keyword`
+  /// color so it stands out as not-yet-delivered.
   fn apply_session_highlights(&self, cx: &mut Context<Self>) {
     let session =
       self.active_label.as_deref().and_then(|label| self.document.session_by_label(label));
@@ -314,6 +380,7 @@ impl TodoView {
     let theme = &cx.theme().highlight_theme;
     let h2_style = theme.style("type").unwrap_or_default();
     let h3_style = theme.style("function").unwrap_or_default();
+    let scheduled_style = theme.style("keyword").unwrap_or_default();
 
     let mut highlights = Vec::new();
 
@@ -321,8 +388,10 @@ impl TodoView {
     highlights.push((session.heading_byte_range.clone(), h2_style));
 
     // Highlight all ### Message and ### WAIT headings within this session.
+    // A pending scheduled message gets a distinct color until it's delivered.
     for msg in &session.messages {
-      highlights.push((msg.heading_byte_range.clone(), h3_style));
+      let style = if msg.schedule.is_some() { scheduled_style } else { h3_style };
+      highlights.push((msg.heading_byte_range.clone(), style));
     }
     if let Some(wait) = &session.wait {
       highlights.push((wait.heading_byte_range.clone(), h3_style));

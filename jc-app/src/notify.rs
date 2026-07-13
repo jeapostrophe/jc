@@ -11,6 +11,12 @@ use objc2_foundation::NSString;
 static ACTION_TX: OnceLock<flume::Sender<String>> = OnceLock::new();
 static AUTHORIZED: AtomicBool = AtomicBool::new(false);
 
+/// Play the macOS system alert sound as invalid-action feedback (e.g. a
+/// Cmd-Enter that is rejected because a scheduled message is pending).
+pub fn beep() {
+  objc2_app_kit::NSBeep();
+}
+
 /// Returns a receiver for session IDs from notification clicks.
 /// Call once at startup before `init()`.
 pub fn action_receiver() -> flume::Receiver<String> {

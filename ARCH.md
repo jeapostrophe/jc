@@ -64,7 +64,7 @@ The workspace has an active project with an active session. The active session d
 
 ### Session Lifecycle
 
-- **Project init:** The app reads TODO.md for session headings with UUIDs. Each is resumed via `claude --resume <uuid>`. If no sessions exist, a plain `claude` instance is launched.
+- **Project init:** The app reads TODO.md for session headings and adopts **every** active session (skipping `[D]`/`[X]`/`[DELETED]`), each resumed via `claude --resume <uuid>` (empty-UUID pending sessions launch a plain `claude` and re-acquire a UUID on their first hook). Sessions whose JSONL was GC'd are marked `[X]` first and skipped. The active session is the one with the most recent `> last=` timestamp (ties fall back to document order). If no sessions exist, a plain `claude` instance is launched.
 - **New session:** From the session picker (Cmd-P), launch a fresh Claude Code instance. The UUID is auto-detected from the first hook event.
 - **UUID assignment:** New sessions start without a UUID. The first hook event carries `session_id`; the app matches it to the pending session by project `cwd` and assigns the UUID. Constraint: one pending (UUID-less) session per project at a time.
 - **`/clear` handling:** `SessionEnd(reason=clear)` is stashed. When `SessionStart(source=clear)` arrives within 10s, the session's UUID is updated in-place. No terminal relaunch needed — the same Claude process continues.
@@ -121,6 +121,33 @@ From any view, Cmd-K annotates a selection. Comments are appended below WAIT:
 
 - **From diff or code view:** `* <file>:<start_line>-<end_line> --- Comment text`
 - **From terminal:** `* TERMINAL\n\`\`\`\n[selected content]\n\`\`\`\nComment text`
+
+### Scheduled Messages
+
+Primary use: auto-resume a session after a Claude usage-limit reset. Begin the WAIT
+body with a `@jc(HH:MM)` marker (24h) and press Cmd-Enter. The message (text before the
+cursor / selection, minus the marker) is moved into a `### Message N @jc(<datetime>)`
+heading with the time **resolved to the next absolute occurrence**, e.g.:
+
+```markdown
+### Message 3 @jc(2026-07-13 07:30)
+finish the parser refactor
+### WAIT
+```
+
+Delivery to the Claude PTY is deferred to that instant. The message body under the
+heading stays editable — jc delivers whatever it *currently* says at fire time, not a
+schedule-time snapshot. On delivery the `@jc(...)` marker is dropped, leaving a plain
+`### Message N` (that is the "delivered" indication); while pending, the heading is
+highlighted in the `@keyword` color.
+
+- **One at a time / all sends blocked.** While a session has a pending scheduled
+  message, every Cmd-Enter (immediate or scheduled) is rejected with the system beep.
+- **Cancel** by deleting the `@jc(...)` marker or the whole `### Message N` block.
+  **Reschedule** by editing the datetime — the timer re-arms at fire time.
+- **Persistence & catch-up.** The marker lives in TODO.md, so timers re-arm on restart;
+  a scheduled time that already passed while jc was closed fires immediately.
+- `> last=` is stamped at delivery time, not when the message is queued.
 
 ## Terminal Architecture
 

@@ -8,6 +8,8 @@ use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
 use crate::views::session_state::{PendingEvent, SavedViewState, SessionId, SessionState};
+use crate::views::todo_view::ScheduledFire;
+use chrono::NaiveDateTime;
 use gpui::*;
 use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
@@ -487,6 +489,7 @@ impl Workspace {
     };
 
     ws.subscribe_active_project(window, cx);
+    ws.arm_existing_schedules(window, cx);
 
     // Intercept the native close button (red circle) so it goes through
     // the same confirmation path as Cmd-W instead of closing immediately.
@@ -1671,12 +1674,20 @@ impl Workspace {
     let claude_terminal = session.claude_terminal.clone();
     let todo_view = project.todo_view.clone();
 
+    // Block all sends while a scheduled message is pending on this session — a
+    // second queued send to the same Claude is undefined. Beep like a rejected
+    // keystroke and no-op; the user cancels by editing out the `@jc(...)` marker.
+    if todo_view.read(cx).has_pending_schedule(&label) {
+      crate::notify::beep();
+      return;
+    }
+
     // Insert a WAIT section if the session doesn't have one.
     todo_view.update(cx, |tv, cx| {
       tv.ensure_wait(&label, window, cx);
     });
 
-    let Some((message_text, _)) =
+    let Some((message_text, schedule)) =
       todo_view.update(cx, |tv, cx| tv.send_selection(&label, window, cx))
     else {
       return;
@@ -1692,24 +1703,136 @@ impl Workspace {
       todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line, window, cx));
     }
 
-    // Mark session as busy — we're about to submit work to Claude.
-    if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
-      session.busy = true;
-      session.has_ever_been_busy = true;
+    if let Some(when) = schedule {
+      // Deferred send: arm a timer. Delivery, busy, and `> last=` happen at
+      // fire time (see `fire_scheduled_send`), not now. No workspace state
+      // changed here (the TodoView mutated itself and notified), so we don't.
+      let project_path = self.projects[self.active_project_index].path.clone();
+      self.arm_scheduled_send(project_path, label, when, window, cx);
+    } else {
+      // Immediate send: mark busy and deliver now.
+      if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
+        session.busy = true;
+        session.has_ever_been_busy = true;
+      }
+      Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
+      cx.notify();
     }
+  }
 
-    // Paste the message into the Claude terminal, then send Enter to submit.
-    claude_terminal.read(cx).write_text(&message_text);
-
-    // Send Enter (\r) from a background thread after a delay so the
-    // application has time to process the pasted content.
+  /// Paste `message_text` into the Claude terminal, then submit with a delayed
+  /// Enter so the app has time to process the pasted content.
+  fn deliver_to_terminal(claude_terminal: &Entity<TerminalView>, message_text: &str, cx: &App) {
+    claude_terminal.read(cx).write_text(message_text);
     let pty = claude_terminal.read(cx).pty_handle();
     std::thread::spawn(move || {
       std::thread::sleep(StdDuration::from_millis(200));
       let _ = pty.write_all(b"\r");
     });
+  }
 
-    cx.notify();
+  /// Arm a timer to deliver a scheduled message at `when`. A past-due target
+  /// (e.g. a catch-up send re-armed at startup) fires after a short grace so a
+  /// freshly-spawned Claude terminal has time to reach its prompt. The timer
+  /// re-reads the live TODO at fire time, so a cancelled or rescheduled marker
+  /// is handled there rather than tracked here.
+  fn arm_scheduled_send(
+    &mut self,
+    project_path: PathBuf,
+    label: String,
+    when: NaiveDateTime,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    /// Grace before firing a past-due send, so a just-launched terminal is ready.
+    const CATCHUP_GRACE: StdDuration = StdDuration::from_secs(5);
+
+    let now = chrono::Local::now().naive_local();
+    let raw = (when - now).to_std().unwrap_or(StdDuration::ZERO);
+    let delay = if raw.is_zero() { CATCHUP_GRACE } else { raw };
+    cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+      Timer::after(delay).await;
+      let _ = this.update_in(cx, |ws, window, cx| {
+        ws.fire_scheduled_send(&project_path, &label, window, cx);
+      });
+    })
+    .detach();
+  }
+
+  /// Deliver (or re-arm / drop) a scheduled send when its timer fires.
+  fn fire_scheduled_send(
+    &mut self,
+    project_path: &Path,
+    label: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(project_idx) = self.projects.iter().position(|p| p.path == project_path) else {
+      return;
+    };
+
+    // The target session must still be live to receive the message. Resolve its
+    // terminal BEFORE `deliver_scheduled` consumes the marker, so a message is
+    // never marked delivered (and lost) when there's nowhere to send it — the
+    // marker stays pending and can re-arm on a later startup.
+    let Some((id, claude_terminal)) = self.projects[project_idx]
+      .session_by_label(label)
+      .map(|(id, s)| (id, s.claude_terminal.clone()))
+    else {
+      return;
+    };
+
+    let todo_view = self.projects[project_idx].todo_view.clone();
+    let now = chrono::Local::now().naive_local();
+
+    match todo_view.update(cx, |tv, cx| tv.deliver_scheduled(label, now, window, cx)) {
+      ScheduledFire::Deliver(body) => {
+        Self::deliver_to_terminal(&claude_terminal, &body, cx);
+        if let Some(session) = self.projects[project_idx].sessions.get_mut(&id) {
+          session.busy = true;
+          session.has_ever_been_busy = true;
+        }
+        cx.notify();
+      }
+      ScheduledFire::Reschedule(new_when) => {
+        self.arm_scheduled_send(
+          project_path.to_path_buf(),
+          label.to_string(),
+          new_when,
+          window,
+          cx,
+        );
+      }
+      ScheduledFire::Cancelled => {}
+    }
+  }
+
+  /// On startup, re-arm timers for scheduled messages still pending in the
+  /// restored TODO files (past-due ones fire after the catch-up grace). Only
+  /// Active sessions are adopted into the live `sessions` map, so a marker on a
+  /// Disabled/Expired session is skipped — it has no terminal to deliver to.
+  fn arm_existing_schedules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let pending: Vec<(PathBuf, String, NaiveDateTime)> = self
+      .projects
+      .iter()
+      .flat_map(|project| {
+        let path = project.path.clone();
+        project
+          .todo_view
+          .read(cx)
+          .document()
+          .sessions
+          .iter()
+          .filter(|s| s.status == jc_core::todo::SessionStatus::Active)
+          .filter_map(move |s| {
+            s.pending_scheduled()
+              .and_then(|m| m.schedule.map(|dt| (path.clone(), s.label.clone(), dt)))
+          })
+      })
+      .collect();
+    for (path, label, when) in pending {
+      self.arm_scheduled_send(path, label, when, window, cx);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1762,14 +1885,9 @@ impl Workspace {
     let reply_dir = project.path.join(".jc/replies");
     let reply_path = reply_dir.join(format!("{filename}.md"));
 
-    // Send `/copy\n` to the Claude terminal.
+    // Send `/copy` to the Claude terminal (paste + delayed Enter).
     let claude_terminal = session.claude_terminal.clone();
-    claude_terminal.read(cx).write_text("/copy");
-    let pty = claude_terminal.read(cx).pty_handle();
-    std::thread::spawn(move || {
-      std::thread::sleep(StdDuration::from_millis(200));
-      let _ = pty.write_all(b"\r");
-    });
+    Self::deliver_to_terminal(&claude_terminal, "/copy", cx);
 
     // Read clipboard now, then poll for change.
     let code_view = session.code_view.clone();

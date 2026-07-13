@@ -64,22 +64,21 @@ impl ProjectState {
       }
     }
 
-    // Lazy adoption: only launch a terminal for the first TODO session whose
-    // UUID still has a JSONL file on disk (i.e. the session is resumable).
-    // Fall back to the first session if none have a live UUID.
+    // Adopt every active TODO session so the full set of open sessions is
+    // restored, not just one. Sessions whose JSONL was GC'd are already marked
+    // `[X]` (Expired) above and filtered out here; empty-UUID (pending) sessions
+    // relaunch a plain `claude` and re-acquire a UUID on their first hook.
     let document = todo_view.read(cx).document().clone();
     let mut sessions = HashMap::new();
     let mut next_session_id: SessionId = 0;
-    let best = document
-      .sessions
-      .iter()
-      .filter(|s| s.status == jc_core::todo::SessionStatus::Active)
-      .find(|s| !s.uuid.is_empty() && session_dir.join(format!("{}.jsonl", s.uuid)).exists())
-      .or_else(|| {
-        document.sessions.iter().find(|s| s.status == jc_core::todo::SessionStatus::Active)
-      });
 
-    if let Some(todo_session) = best {
+    // The active session is the one with the most recent `> last=` submit;
+    // sessions without one sort as 0, so ties fall back to document order (first).
+    let mut best_active: Option<(SessionId, u64)> = None;
+
+    for todo_session in
+      document.sessions.iter().filter(|s| s.status == jc_core::todo::SessionStatus::Active)
+    {
       let uuid = if todo_session.uuid.is_empty() { None } else { Some(todo_session.uuid.clone()) };
       let id = next_session_id;
       next_session_id += 1;
@@ -94,9 +93,14 @@ impl ProjectState {
         cx,
       );
       sessions.insert(id, state);
+
+      let last = todo_session.last_active.unwrap_or(0);
+      if best_active.is_none_or(|(_, best_last)| last > best_last) {
+        best_active = Some((id, last));
+      }
     }
 
-    let active_session = sessions.keys().next().copied();
+    let active_session = best_active.map(|(id, _)| id);
 
     // Highlight the initial active session in the TODO view.
     if let Some(id) = active_session

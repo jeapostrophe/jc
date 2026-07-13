@@ -54,6 +54,30 @@ If Claude Code is meant to be the primary developer environment, users need a wa
 
 Hooks are the one extension point that works well today. Claude Code fires events on stop, permission prompt, idle, and API error. jc's hook server receives these and updates problem state. The same hooks can trigger external notification services (e.g., ntfy, Pushover) for phone alerts when away from the desktop. No skills or context pollution required — hooks are push-only and invisible to the conversation.
 
+## Scheduled Messages
+
+Claude Code enforces usage limits that reset at a wall-clock time. When you hit one
+mid-task, the natural move is to queue the next instruction and have it submitted the
+moment the limit lifts — otherwise you either babysit the clock or lose the overnight
+window entirely. jc handles this with a `@jc(HH:MM)` marker at the top of a WAIT draft:
+Cmd-Enter records the message as a `### Message N @jc(<datetime>)` and defers delivery to
+that time.
+
+Design choices follow from the use case:
+
+- **The marker lives in TODO.md, not a side table.** jc is already the sole writer of
+  TODO.md and treats it as the durable session store, so a scheduled send is just a
+  Message heading with an extra token. This gives persistence, restart re-arming, and
+  cancel/edit (delete or retype the marker) for free, with no new state file.
+- **The body is live, delivered at fire time.** Because the queued text sits in an
+  editable block, you refine the instruction right up to delivery — you're scheduling an
+  *intent*, not freezing a string.
+- **One at a time, all sends blocked while pending.** Two queued messages racing into the
+  same Claude is undefined, so a second Cmd-Enter beeps rather than guessing an order.
+- **Absolute-time storage + catch-up.** Resolving `HH:MM` to a concrete datetime removes
+  "which 07:30?" ambiguity and lets a send that came due while jc was closed fire on the
+  next launch — which is exactly the limit-reset scenario.
+
 ## Hook Opportunities
 
 Currently used hooks: `prompt-submit`, `stop`, `stop-failure`, `notification` (idle/permission/auth/elicitation), `permission`, `session-start` (source: clear/startup/resume/compact), `session-end` (reason: clear/logout/prompt_input_exit). The hook server correlates `SessionEnd(clear)` + `SessionStart(clear)` pairs to emit a unified `SessionClear` event for `/clear` handling.

@@ -1096,6 +1096,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
 ]
@@ -3839,6 +3840,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "block2",
+ "chrono",
  "clap",
  "diffy",
  "flume",
@@ -3871,6 +3873,7 @@ name = "jc-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs 6.0.0",
  "flume",
  "serde",

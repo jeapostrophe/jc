@@ -1,3 +1,6 @@
+#[cfg(test)]
+use chrono::NaiveDate;
+use chrono::{NaiveDateTime, NaiveTime, Timelike};
 use std::ops::Range;
 use std::path::Path;
 
@@ -51,6 +54,12 @@ pub struct TodoMessage {
   pub index: usize,
   pub line: u32,
   pub heading_byte_range: Range<usize>,
+  /// Byte range of the message body (text after the heading line up to the next
+  /// heading). `0..0` until finalized by the parser.
+  pub body_byte_range: Range<usize>,
+  /// Set when the heading carries a pending `@jc(<datetime>)` scheduled-send
+  /// marker. `None` once delivered (marker dropped) or for a normal message.
+  pub schedule: Option<NaiveDateTime>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -77,6 +86,15 @@ impl TodoWait {
 #[derive(Debug, Clone)]
 pub enum TodoProblem {
   UnsentWait { label: String },
+}
+
+impl TodoSession {
+  /// The session's pending scheduled message, if any (a `### Message N`
+  /// heading carrying an undelivered `@jc(<datetime>)` marker). At most one
+  /// exists at a time — sends are blocked while one is pending.
+  pub fn pending_scheduled(&self) -> Option<&TodoMessage> {
+    self.messages.iter().find(|m| m.schedule.is_some())
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +164,82 @@ fn skip_newline(bytes: &[u8], offset: usize) -> usize {
   } else {
     offset
   }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled-send markers
+// ---------------------------------------------------------------------------
+
+/// Format used to store a resolved schedule on a `### Message N @jc(...)` heading.
+const SCHEDULE_FMT: &str = "%Y-%m-%d %H:%M";
+
+/// Render a resolved schedule for a Message heading marker, e.g. `2026-07-13 07:30`.
+pub fn format_schedule(dt: NaiveDateTime) -> String {
+  dt.format(SCHEDULE_FMT).to_string()
+}
+
+/// Parse a stored `@jc(<datetime>)` marker value back into a datetime.
+pub fn parse_schedule_datetime(s: &str) -> Option<NaiveDateTime> {
+  NaiveDateTime::parse_from_str(s, SCHEDULE_FMT).ok()
+}
+
+/// Detect a leading `@jc(HH:MM)` schedule marker (24h) at the start of `s`
+/// (ignoring leading whitespace). Returns `(hour, minute, token_end)` where
+/// `token_end` is the byte offset in `s` just past the closing `)`.
+pub fn parse_schedule_prefix(s: &str) -> Option<(u32, u32, usize)> {
+  let lead = s.len() - s.trim_start().len();
+  let inner = s[lead..].strip_prefix("@jc(")?;
+  let close = inner.find(')')?;
+  let (hh, mm) = inner[..close].split_once(':')?;
+  let hour: u32 = hh.trim().parse().ok()?;
+  let minute: u32 = mm.trim().parse().ok()?;
+  if hour > 23 || minute > 59 {
+    return None;
+  }
+  let token_end = lead + "@jc(".len() + close + 1;
+  Some((hour, minute, token_end))
+}
+
+/// Resolve an `HH:MM` time to the next wall-clock occurrence at minute
+/// granularity: today if this minute hasn't yet passed (so `@jc(07:30)` typed at
+/// 07:30:40 still fires today, not ~24h later), otherwise tomorrow.
+pub fn resolve_schedule(hour: u32, minute: u32, now: NaiveDateTime) -> Option<NaiveDateTime> {
+  let time = NaiveTime::from_hms_opt(hour, minute, 0)?;
+  let candidate = NaiveDateTime::new(now.date(), time);
+  // Compare against `now` truncated to the minute so the current minute counts
+  // as "not yet passed".
+  let now_minute = NaiveDateTime::new(now.date(), now.time().with_second(0)?.with_nanosecond(0)?);
+  if candidate >= now_minute {
+    Some(candidate)
+  } else {
+    Some(NaiveDateTime::new(now.date().succ_opt()?, time))
+  }
+}
+
+/// Parse the text after `### Message ` into `(index, schedule)`. A malformed
+/// `@jc(...)` marker is ignored (yielding `schedule = None`) rather than
+/// dropping the message, so body text is never misattributed.
+fn parse_message_heading(rest: &str) -> Option<(usize, Option<NaiveDateTime>)> {
+  let rest = rest.trim_end();
+  let (num_part, schedule) = match rest.split_once(" @jc(") {
+    Some((num, after)) => {
+      let dt = after.strip_suffix(')').and_then(|v| parse_schedule_datetime(v.trim()));
+      (num.trim(), dt)
+    }
+    None => (rest.trim(), None),
+  };
+  let n = num_part.parse::<usize>().ok()?;
+  Some((n, schedule))
+}
+
+/// Rewrite a scheduled message's heading to drop its `@jc(...)` marker, turning
+/// `### Message N @jc(<datetime>)` into a plain `### Message N` on delivery.
+pub fn drop_schedule_marker(text: &str, message: &TodoMessage) -> String {
+  let mut new_text = String::with_capacity(text.len());
+  new_text.push_str(&text[..message.heading_byte_range.start]);
+  new_text.push_str(&format!("### Message {}", message.index));
+  new_text.push_str(&text[message.heading_byte_range.end..]);
+  new_text
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +341,8 @@ pub fn parse(text: &str) -> TodoDocument {
     } else if let Some(after_h3) = line.strip_prefix("### ") {
       if after_h3 == "WAIT" {
         if let Some(ref mut session) = current_session {
-          // Close any previous WAIT body range (shouldn't happen, but be safe).
+          // Close any open Message body and any previous WAIT body range.
+          finalize_message_body(session, line_start);
           finalize_wait_body(session, line_start);
 
           session.wait = Some(TodoWait {
@@ -257,13 +352,17 @@ pub fn parse(text: &str) -> TodoDocument {
           });
         }
       } else if let Some(rest) = after_h3.strip_prefix("Message ")
-        && let Ok(n) = rest.parse::<usize>()
+        && let Some((n, schedule)) = parse_message_heading(rest)
         && let Some(ref mut session) = current_session
       {
+        // Close the previous message's body before starting a new one.
+        finalize_message_body(session, line_start);
         session.messages.push(TodoMessage {
           index: n,
           line: line_num,
           heading_byte_range: line_start..line_end,
+          body_byte_range: 0..0, // will be finalized later
+          schedule,
         });
       }
     }
@@ -284,8 +383,19 @@ fn finalize_session(
   boundary: usize,
 ) {
   if let Some(mut session) = current_session.take() {
+    finalize_message_body(&mut session, boundary);
     finalize_wait_body(&mut session, boundary);
     doc.sessions.push(session);
+  }
+}
+
+/// Close the most recent message's body range (from the end of its heading line
+/// to `boundary`) if it hasn't been finalized yet.
+fn finalize_message_body(session: &mut TodoSession, boundary: usize) {
+  if let Some(msg) = session.messages.last_mut()
+    && msg.body_byte_range == (0..0)
+  {
+    msg.body_byte_range = msg.heading_byte_range.end..boundary;
   }
 }
 
@@ -476,6 +586,10 @@ pub struct SendResult {
   pub message_index: usize,
   /// Byte offset of the first character after the new `### WAIT\n` heading.
   pub wait_body_offset: usize,
+  /// When the effective WAIT text began with a `@jc(HH:MM)` marker, the resolved
+  /// delivery time. The message was recorded as `### Message N @jc(<datetime>)`
+  /// and must NOT be delivered until this instant; `None` for an immediate send.
+  pub schedule: Option<NaiveDateTime>,
 }
 
 /// Extract text from the WAIT section and turn it into a new `### Message N`.
@@ -484,11 +598,17 @@ pub struct SendResult {
 /// cursor), everything before the cursor in the WAIT body is sent (or the
 /// entire body if the cursor is outside/at the start of the body). Returns
 /// `None` if there's no WAIT section or the effective text is empty.
+///
+/// If the effective text begins with a `@jc(HH:MM)` marker, the message is
+/// recorded as a pending scheduled `### Message N @jc(<datetime>)` (resolved
+/// against `now_local`) with the marker stripped from the body, and `> last=`
+/// is left untouched (it's set at delivery time, not here).
 pub fn send_from_wait(
   text: &str,
   session: &TodoSession,
   selection: Range<usize>,
   timestamp: Option<u64>,
+  now_local: NaiveDateTime,
 ) -> Option<SendResult> {
   let wait = session.wait.as_ref()?;
   let body_range = wait.body_byte_range.clone();
@@ -514,10 +634,19 @@ pub fn send_from_wait(
   };
 
   let selected_text = text[effective.clone()].trim();
-  if selected_text.is_empty() {
+
+  // A leading `@jc(HH:MM)` turns this into a scheduled send: strip the marker
+  // from the message body and resolve the delivery time.
+  let (body, schedule) = match parse_schedule_prefix(selected_text)
+    .and_then(|(h, m, tok_end)| resolve_schedule(h, m, now_local).map(|dt| (dt, tok_end)))
+  {
+    Some((dt, tok_end)) => (selected_text[tok_end..].trim(), Some(dt)),
+    None => (selected_text, None),
+  };
+  if body.is_empty() {
     return None;
   }
-  let message_text = selected_text.to_string();
+  let message_text = body.to_string();
 
   // Compute next message index.
   let message_index = session.messages.iter().map(|m| m.index + 1).max().unwrap_or(0);
@@ -535,8 +664,11 @@ pub fn send_from_wait(
   let before_wait = &text[..wait.heading_byte_range.start];
   let after_body = &text[body_range.end..];
 
+  // A scheduled send does not touch `> last=` — that's stamped on delivery.
+  let effective_ts = if schedule.is_some() { None } else { timestamp };
+
   let mut new_text = String::with_capacity(text.len() + message_text.len() + 32);
-  if let Some(ts) = timestamp {
+  if let Some(ts) = effective_ts {
     let ts_line = format!("> last={}", ts);
     if let Some(ref range) = session.last_active_line_range {
       // Replace existing `> last=` line within before_wait.
@@ -556,7 +688,12 @@ pub fn send_from_wait(
   } else {
     new_text.push_str(before_wait);
   }
-  new_text.push_str(&format!("### Message {}\n", message_index));
+  match schedule {
+    Some(dt) => {
+      new_text.push_str(&format!("### Message {} @jc({})\n", message_index, format_schedule(dt)))
+    }
+    None => new_text.push_str(&format!("### Message {}\n", message_index)),
+  }
   new_text.push_str(&message_text);
   new_text.push('\n');
   new_text.push_str("### WAIT\n");
@@ -564,7 +701,60 @@ pub fn send_from_wait(
   new_text.push_str(&remaining);
   new_text.push_str(after_body);
 
-  Some(SendResult { new_text, message_text, message_index, wait_body_offset })
+  Some(SendResult { new_text, message_text, message_index, wait_body_offset, schedule })
+}
+
+/// Outcome of evaluating a session's pending scheduled send at time `now_local`.
+/// All text rewriting is done here; the caller only applies `new_text` (if any)
+/// to the editor and acts on the variant.
+pub enum FireOutcome {
+  /// The scheduled time arrived. Write `new_text` (marker dropped, `> last=`
+  /// stamped) and deliver `body` to the terminal.
+  Deliver { new_text: String, body: String },
+  /// The marker's time was edited into the future — re-arm for this instant.
+  /// No text change.
+  Reschedule(NaiveDateTime),
+  /// Nothing to deliver. `new_text` is `Some` when the marker was dropped
+  /// (empty body → cancel, but unblock the session) and must be written,
+  /// `None` when there was no pending marker to begin with.
+  Cancelled { new_text: Option<String> },
+}
+
+/// Evaluate `label`'s pending scheduled send against `now_local`, producing the
+/// rewritten document text and what the caller should do. Pure: parses `text`
+/// once and owns the marker-drop + `> last=` stamp so callers never reason about
+/// byte-range validity across intermediate strings.
+pub fn fire_scheduled(
+  text: &str,
+  label: &str,
+  now_local: NaiveDateTime,
+  now_secs: u64,
+) -> FireOutcome {
+  let doc = parse(text);
+  let Some(session) = doc.session_by_label(label) else {
+    return FireOutcome::Cancelled { new_text: None };
+  };
+  let Some(pending) = session.pending_scheduled() else {
+    return FireOutcome::Cancelled { new_text: None };
+  };
+  if let Some(when) = pending.schedule
+    && when > now_local
+  {
+    return FireOutcome::Reschedule(when);
+  }
+
+  let body = text[pending.body_byte_range.clone()].trim().to_string();
+  // Drop the marker unconditionally so the session isn't left blocked; an empty
+  // body cancels the send but must still clear the marker.
+  let dropped = drop_schedule_marker(text, pending);
+  if body.is_empty() {
+    FireOutcome::Cancelled { new_text: Some(dropped) }
+  } else {
+    // `session`'s metadata byte ranges precede the heading `drop_schedule_marker`
+    // shortened, so they stay valid against `dropped`.
+    let new_text = update_last_active(&dropped, session, now_secs);
+    FireOutcome::Deliver { new_text, body }
+  }
 }
 
 /// Update (or insert) the `> last=TIMESTAMP` line for a session.
@@ -630,6 +820,11 @@ pub fn validate(doc: &TodoDocument, _project_path: &Path, text: &str) -> Vec<Tod
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Fixed local "now" for send tests that don't exercise scheduling.
+  fn test_now() -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(9, 0, 0).unwrap()
+  }
 
   #[test]
   fn empty_document() {
@@ -1179,7 +1374,7 @@ draft text
     let sel_start = body_start + text[body_start..].find("draft text").unwrap();
     let sel_end = sel_start + "draft text".len();
 
-    let result = send_from_wait(text, session, sel_start..sel_end, None).unwrap();
+    let result = send_from_wait(text, session, sel_start..sel_end, None, test_now()).unwrap();
     assert_eq!(result.message_text, "draft text");
     assert_eq!(result.message_index, 1);
     assert!(result.new_text.contains("### Message 1\ndraft text\n### WAIT\n"));
@@ -1205,7 +1400,7 @@ all body content
     let session = doc.session_by_label("S").unwrap();
 
     // Empty selection (collapsed cursor) → send entire body.
-    let result = send_from_wait(text, session, 0..0, None).unwrap();
+    let result = send_from_wait(text, session, 0..0, None, test_now()).unwrap();
     assert_eq!(result.message_text, "all body content");
     assert_eq!(result.message_index, 0);
     assert!(result.new_text.contains("### Message 0\nall body content\n### WAIT\n"));
@@ -1233,7 +1428,7 @@ line three
     let sel_start = wait.body_byte_range.start + offset_in_body;
     let sel_end = sel_start + "line two".len();
 
-    let result = send_from_wait(text, session, sel_start..sel_end, None).unwrap();
+    let result = send_from_wait(text, session, sel_start..sel_end, None, test_now()).unwrap();
     assert_eq!(result.message_text, "line two");
 
     // Remaining body should have line one and line three.
@@ -1262,7 +1457,7 @@ one two three
     let body = &text[wait.body_byte_range.clone()];
     let offset_in_body = body.find(" three").unwrap();
     let cursor = wait.body_byte_range.start + offset_in_body;
-    let result = send_from_wait(text, session, cursor..cursor, None).unwrap();
+    let result = send_from_wait(text, session, cursor..cursor, None, test_now()).unwrap();
     assert_eq!(result.message_text, "one two");
     // The remaining text ("three\n") stays in the WAIT body.
     let new_doc = parse(&result.new_text);
@@ -1290,7 +1485,7 @@ line three
     let body = &text[wait.body_byte_range.clone()];
     let offset_in_body = body.find("line two").unwrap();
     let cursor = wait.body_byte_range.start + offset_in_body;
-    let result = send_from_wait(text, session, cursor..cursor, None).unwrap();
+    let result = send_from_wait(text, session, cursor..cursor, None, test_now()).unwrap();
     assert_eq!(result.message_text, "line one");
     let new_doc = parse(&result.new_text);
     let new_session = new_doc.session_by_label("S").unwrap();
@@ -1312,7 +1507,7 @@ line three
     let session = doc.session_by_label("S").unwrap();
 
     // Empty body → should return None.
-    assert!(send_from_wait(text, session, 0..0, None).is_none());
+    assert!(send_from_wait(text, session, 0..0, None, test_now()).is_none());
   }
 
   #[test]
@@ -1327,7 +1522,7 @@ hello
 ";
     let doc = parse(text);
     let session = doc.session_by_label("S").unwrap();
-    assert!(send_from_wait(text, session, 0..0, None).is_none());
+    assert!(send_from_wait(text, session, 0..0, None, test_now()).is_none());
   }
 
   #[test]
@@ -1346,7 +1541,7 @@ third
 ";
     let doc = parse(text);
     let session = doc.session_by_label("S").unwrap();
-    let result = send_from_wait(text, session, 0..0, None).unwrap();
+    let result = send_from_wait(text, session, 0..0, None, test_now()).unwrap();
     assert_eq!(result.message_index, 2);
     assert_eq!(result.message_text, "third");
   }
@@ -1356,7 +1551,7 @@ third
     let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\nhello\n";
     let doc = parse(text);
     let session = doc.session_by_label("S").unwrap();
-    let result = send_from_wait(text, session, 0..0, Some(1700000000)).unwrap();
+    let result = send_from_wait(text, session, 0..0, Some(1700000000), test_now()).unwrap();
     assert!(result.new_text.contains("> last=1700000000\n"));
     let doc2 = parse(&result.new_text);
     assert_eq!(doc2.sessions[0].last_active, Some(1700000000));
@@ -1368,11 +1563,189 @@ third
     let doc = parse(text);
     let session = doc.session_by_label("S").unwrap();
     assert_eq!(session.last_active, Some(1000));
-    let result = send_from_wait(text, session, 0..0, Some(2000)).unwrap();
+    let result = send_from_wait(text, session, 0..0, Some(2000), test_now()).unwrap();
     assert!(result.new_text.contains("> last=2000"));
     assert!(!result.new_text.contains("> last=1000"));
     let doc2 = parse(&result.new_text);
     assert_eq!(doc2.sessions[0].last_active, Some(2000));
+  }
+
+  // -------------------------------------------------------------------------
+  // Scheduled sends
+  // -------------------------------------------------------------------------
+
+  #[test]
+  fn parse_schedule_prefix_valid() {
+    assert_eq!(parse_schedule_prefix("@jc(07:30) do the thing"), Some((7, 30, 10)));
+    assert_eq!(parse_schedule_prefix("  @jc(23:05)rest"), Some((23, 5, 12)));
+  }
+
+  #[test]
+  fn parse_schedule_prefix_rejects_bad() {
+    assert_eq!(parse_schedule_prefix("hello @jc(07:30)"), None); // not leading
+    assert_eq!(parse_schedule_prefix("@jc(24:00)"), None); // hour out of range
+    assert_eq!(parse_schedule_prefix("@jc(07:60)"), None); // minute out of range
+    assert_eq!(parse_schedule_prefix("@jc(0730)"), None); // no colon
+    assert_eq!(parse_schedule_prefix("@jc(07:30"), None); // unclosed
+  }
+
+  #[test]
+  fn resolve_schedule_today_vs_tomorrow() {
+    let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(9, 0, 0).unwrap();
+    // Later today.
+    let later = resolve_schedule(17, 30, now).unwrap();
+    assert_eq!(
+      later,
+      NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(17, 30, 0).unwrap()
+    );
+    // Already passed → tomorrow.
+    let next = resolve_schedule(7, 30, now).unwrap();
+    assert_eq!(next, NaiveDate::from_ymd_opt(2026, 7, 14).unwrap().and_hms_opt(7, 30, 0).unwrap());
+  }
+
+  #[test]
+  fn resolve_schedule_same_minute_fires_today() {
+    // 07:30:40 with @jc(07:30): the minute hasn't fully passed, so fire today.
+    let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 30, 40).unwrap();
+    let when = resolve_schedule(7, 30, now).unwrap();
+    assert_eq!(when, NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 30, 0).unwrap());
+    // But a minute already fully elapsed rolls to tomorrow.
+    let when2 = resolve_schedule(7, 29, now).unwrap();
+    assert_eq!(when2, NaiveDate::from_ymd_opt(2026, 7, 14).unwrap().and_hms_opt(7, 29, 0).unwrap());
+  }
+
+  #[test]
+  fn schedule_roundtrips_through_marker() {
+    let dt = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 30, 0).unwrap();
+    let s = format_schedule(dt);
+    assert_eq!(s, "2026-07-13 07:30");
+    assert_eq!(parse_schedule_datetime(&s), Some(dt));
+  }
+
+  #[test]
+  fn send_from_wait_schedules_message() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n@jc(07:30) fix the parser\n";
+    let doc = parse(text);
+    let session = doc.session_by_label("S").unwrap();
+    let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(9, 0, 0).unwrap();
+    let result = send_from_wait(text, session, 0..0, Some(1700000000), now).unwrap();
+
+    // Marker stripped from the message body; resolved time is tomorrow.
+    assert_eq!(result.message_text, "fix the parser");
+    assert_eq!(
+      result.schedule,
+      Some(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap().and_hms_opt(7, 30, 0).unwrap())
+    );
+    // Heading carries the resolved marker; `> last=` is NOT stamped.
+    assert!(result.new_text.contains("### Message 0 @jc(2026-07-14 07:30)\n"));
+    assert!(!result.new_text.contains("> last="));
+
+    // Re-parsing surfaces the pending schedule on the message.
+    let doc2 = parse(&result.new_text);
+    let session2 = doc2.session_by_label("S").unwrap();
+    let pending = session2.pending_scheduled().unwrap();
+    assert_eq!(pending.index, 0);
+    assert_eq!(
+      pending.schedule,
+      Some(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap().and_hms_opt(7, 30, 0).unwrap())
+    );
+  }
+
+  #[test]
+  fn scheduled_message_body_is_readable_and_editable() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-14 07:30)\nfix the parser\n### WAIT\n";
+    let doc = parse(text);
+    let session = doc.session_by_label("S").unwrap();
+    let pending = session.pending_scheduled().unwrap();
+    let body = text[pending.body_byte_range.clone()].trim();
+    assert_eq!(body, "fix the parser");
+  }
+
+  #[test]
+  fn empty_schedule_marker_does_not_send() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n@jc(07:30)\n";
+    let doc = parse(text);
+    let session = doc.session_by_label("S").unwrap();
+    let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(9, 0, 0).unwrap();
+    assert!(send_from_wait(text, session, 0..0, Some(1), now).is_none());
+  }
+
+  #[test]
+  fn fire_scheduled_delivers_when_due() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-13 07:30)\nfix the parser\n### WAIT\n";
+    let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 31, 0).unwrap();
+    match fire_scheduled(text, "S", now, 1700000000) {
+      FireOutcome::Deliver { new_text, body } => {
+        assert_eq!(body, "fix the parser");
+        assert!(new_text.contains("### Message 0\n")); // marker dropped
+        assert!(!new_text.contains("@jc("));
+        assert!(new_text.contains("> last=1700000000")); // stamped on delivery
+      }
+      _ => panic!("expected Deliver"),
+    }
+  }
+
+  #[test]
+  fn fire_scheduled_reschedules_when_future() {
+    let text =
+      "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-13 09:00)\nbody\n### WAIT\n";
+    let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 0, 0).unwrap();
+    match fire_scheduled(text, "S", now, 1) {
+      FireOutcome::Reschedule(when) => {
+        assert_eq!(
+          when,
+          NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(9, 0, 0).unwrap()
+        );
+      }
+      _ => panic!("expected Reschedule"),
+    }
+  }
+
+  #[test]
+  fn fire_scheduled_empty_body_cancels_but_drops_marker() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-13 07:30)\n\n### WAIT\n";
+    let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 31, 0).unwrap();
+    match fire_scheduled(text, "S", now, 1) {
+      FireOutcome::Cancelled { new_text: Some(nt) } => {
+        assert!(!nt.contains("@jc(")); // marker dropped so session isn't locked
+        assert!(!nt.contains("> last=")); // nothing delivered → no stamp
+      }
+      _ => panic!("expected Cancelled with dropped marker"),
+    }
+  }
+
+  #[test]
+  fn fire_scheduled_no_marker_is_noop() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0\nbody\n### WAIT\n";
+    let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 31, 0).unwrap();
+    assert!(matches!(fire_scheduled(text, "S", now, 1), FireOutcome::Cancelled { new_text: None }));
+  }
+
+  #[test]
+  fn drop_schedule_marker_delivers() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-14 07:30)\nfix the parser\n### WAIT\n";
+    let doc = parse(text);
+    let session = doc.session_by_label("S").unwrap();
+    let pending = session.pending_scheduled().unwrap();
+    let delivered = drop_schedule_marker(text, pending);
+    assert!(delivered.contains("### Message 0\n"));
+    assert!(!delivered.contains("@jc("));
+    // Now no longer pending, body preserved.
+    let doc2 = parse(&delivered);
+    let session2 = doc2.session_by_label("S").unwrap();
+    assert!(session2.pending_scheduled().is_none());
+    assert_eq!(session2.messages[0].index, 0);
+  }
+
+  #[test]
+  fn malformed_heading_marker_kept_as_plain_message() {
+    let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(not-a-date)\nbody\n### WAIT\n";
+    let doc = parse(text);
+    let session = doc.session_by_label("S").unwrap();
+    // Message still parsed (not dropped), just with no schedule.
+    assert_eq!(session.messages.len(), 1);
+    assert!(session.messages[0].schedule.is_none());
+    assert!(session.pending_scheduled().is_none());
   }
 
   #[test]
@@ -1532,7 +1905,7 @@ draft
     let session = doc.session_by_label("S").unwrap();
 
     // Selection entirely before the WAIT body.
-    assert!(send_from_wait(text, session, 0..5, None).is_none());
+    assert!(send_from_wait(text, session, 0..5, None, test_now()).is_none());
   }
 
   #[test]
