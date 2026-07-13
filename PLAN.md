@@ -27,7 +27,7 @@
 ### Automation
 - [ ] [D] Auto-creating and running sessions
 
-### Scheduled Messages
+### Scheduled Messages  ✅ shipped & verified working end-to-end (2026-07-13)
 **Purpose:** auto-resume a session after a Claude usage-limit reset — queue the message
 now, have jc submit it when the limit lifts. The `claude` process stays alive in the PTY
 (limit-blocked, not exited), so delivery is the same type-into-terminal path as a normal
@@ -105,7 +105,7 @@ Interaction model (decided):
       `self.document` instead of re-parsing on every send, `send_selection` drops the
       unused index, `copy_reply` reuses `deliver_to_terminal`. Unit-tested.
 
-### Session Restore Reliability
+### Session Restore Reliability  ✅ shipped (2026-07-13)
 Restore ALL active sessions per project, not just one. Root cause: `ProjectState::create`
 (project_state.rs:67-99) picks a single "best" session via `.find().or_else()` + one
 `sessions.insert`. state.toml stores only project paths; the session set comes from TODO.md.
