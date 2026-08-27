@@ -105,6 +105,15 @@ limit. Indices are never renumbered, so a session settles into a sliding window
 — `### Message 76` through `### Message 100`. A send truncates only the session
 it writes to; the rest of the document is untouched.
 
+The first launch after this landed removes a lot of text at once, and the sweep
+is not undoable. `TodoView::truncate_logs` writes a one-time `TODO.md.bak` beside
+each file before shortening it, and `./make.sh --backup-todos` takes the same
+snapshot from the shell just before launching (`scripts/backup-todos.sh`, driven
+by the project list in `~/.config/jc/state.toml`). Neither ever overwrites an
+existing `.bak`: the first snapshot is the pre-truncation one and the one worth
+keeping. The shell copy exists because the in-app one runs on a path that only
+executes at startup — take it on the launch that first picks up the sweep.
+
 Sessions that have gone quiet are caught by a startup sweep:
 `todo::truncate_all_sessions` runs in `ProjectState::create` immediately after
 the TODO.md buffer is read, before the expiry pass and the session-restore loop,
