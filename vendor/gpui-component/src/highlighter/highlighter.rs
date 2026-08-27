@@ -329,13 +329,20 @@ impl SyntaxHighlighter {
       }
     };
 
-    // An edit describes a change to the text this highlighter last parsed, so
-    // it is meaningless against any other text -- a highlighter built moments
-    // ago has parsed nothing, and `CodeBlock::new` and the line-search picker
-    // reuse one across documents. Reject an edit that cannot fit and reparse in
-    // full instead, so this holds for every caller without one of them having
-    // to know. Defensive: tree-sitter was measured to tolerate such an edit
-    // here, so this pins the precondition rather than fixing an observed fault.
+    // An edit describes a change to the text this highlighter last parsed, so it
+    // is meaningless against any other text. The case that actually occurs: a
+    // keystroke arriving before `Render` has run `ensure_highlighter` reaches a
+    // highlighter built moments earlier, whose `self.text` is still empty, with
+    // an edit describing the whole document. Reject an edit that cannot fit and
+    // reparse in full, so no caller has to know.
+    //
+    // The bounds below are checked independently, which accepts an edit that
+    // fits `text` but does not follow from `self.text`; the exact invariant is
+    // `self.text.len() - (old_end - start) + (new_end - start) == text.len()`.
+    // Left loose deliberately -- tree-sitter was measured to tolerate a bad edit
+    // here, so this pins a precondition rather than fixing an observed fault,
+    // and a stricter test risks silently downgrading every keystroke to a full
+    // reparse if the two texts ever drift for a benign reason.
     let edit = edit
       .filter(|edit| {
         edit.start_byte <= edit.old_end_byte

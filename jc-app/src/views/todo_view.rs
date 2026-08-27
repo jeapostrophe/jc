@@ -52,7 +52,7 @@ impl TodoView {
           let text = this.code_view.read(cx).editor_text(cx);
           this.document = todo::parse(&text);
           this.apply_session_highlights(cx);
-          // Skip re-validation on every keystroke (it scans the filesystem).
+          // Skip re-validation on every keystroke (it re-parses the document).
           cx.notify();
         }
       });
@@ -203,6 +203,39 @@ impl TodoView {
     }
   }
 
+  /// Bound every session's message log to the most recent
+  /// [`todo::MAX_MESSAGES`], dropping older entries and saving if any went.
+  ///
+  /// Sends bound only the session written to; this is the startup sweep that
+  /// catches sessions which have gone quiet. Callers must run it before reading
+  /// the document for anything else.
+  ///
+  /// Unlike its neighbours here it saves rather than leaving that to the caller,
+  /// so the backup below and the destructive write it exists to protect have one
+  /// owner -- a `.bak` must never outlive a rewrite that did not reach disk.
+  pub fn truncate_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let text = self.editor_text(cx);
+    let Some(new_text) = todo::truncate_all_sessions(&text, todo::MAX_MESSAGES) else {
+      return;
+    };
+
+    // The sweep is not undoable -- `set_value_preserving_position` replaces the
+    // buffer with history suppressed, and the save lands before the window is
+    // even shown -- and TODO.md is typically not in version control. Keep one
+    // copy of what the log looked like before it was first bounded. Only the
+    // first sweep writes it; later ones are no-ops anyway, and never clobber it.
+    let mut backup = self.file_path.clone().into_os_string();
+    backup.push(".bak");
+    let backup = std::path::PathBuf::from(backup);
+    if !backup.exists()
+      && let Err(e) = std::fs::write(&backup, &text)
+    {
+      eprintln!("Failed to back up {} before truncating: {e}", self.file_path.display());
+    }
+
+    self.set_text_and_save(new_text, window, cx);
+  }
+
   /// Toggle the `[D]` (disabled/dormant) prefix on a session heading.
   pub fn toggle_session_disabled(
     &mut self,
@@ -337,7 +370,7 @@ impl TodoView {
   }
 
   /// Re-validate and refresh diagnostics. Call after loading or when the user
-  /// explicitly requests a check (not on every keystroke, since it hits the FS).
+  /// explicitly requests a check (not on every keystroke, since it re-parses).
   pub fn revalidate(&mut self, cx: &mut Context<Self>) {
     let text = self.code_view.read(cx).editor_text(cx);
     self.document = todo::parse(&text);

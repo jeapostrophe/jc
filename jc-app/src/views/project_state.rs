@@ -48,6 +48,10 @@ impl ProjectState {
     let diff_view = cx.new(|cx| DiffView::new(path.clone(), window, cx));
     let todo_view = cx.new(|cx| TodoView::new(path.clone(), window, cx));
 
+    // Bound each session's message log first, so the expiry pass and the
+    // session-restore loop below both see the bounded document.
+    todo_view.update(cx, |tv, cx| tv.truncate_logs(window, cx));
+
     // Mark sessions whose JSONL files have been garbage-collected by Claude. A
     // session's transcript may live in the project's root bucket or in any of its
     // git-worktree buckets, so check all of them before declaring it gone. With

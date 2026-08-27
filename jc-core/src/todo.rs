@@ -363,6 +363,12 @@ pub fn parse(text: &str) -> TodoDocument {
       } else if let Some(rest) = after_h3.strip_prefix("Message ")
         && let Some((n, schedule)) = parse_message_heading(rest)
         && let Some(ref mut session) = current_session
+        // Everything below `### WAIT` is draft, not log. A `### Message N` line
+        // there is the user quoting an old message, and reading it as a real
+        // message of this session makes the next send take its index, lets a
+        // quoted `@jc(...)` marker block sends outright, and puts draft text
+        // inside the range the log truncator is allowed to delete.
+        && session.wait.is_none()
       {
         // Close the previous message's body before starting a new one.
         finalize_message_body(session, line_start);
@@ -724,14 +730,42 @@ pub fn send_from_wait(
   Some(SendResult { new_text, message_text, message_index, wait_body_offset, schedule })
 }
 
+/// Bound every session's message log in `text` to its most recent `keep`
+/// entries, returning the rewritten document or `None` if nothing was dropped.
+///
+/// Sends bound only the session being written to, which leaves a session that
+/// has gone quiet holding whatever it had accumulated. This is the sweep for
+/// those, meant for startup, before anything else reads the document.
+pub fn truncate_all_sessions(text: &str, keep: usize) -> Option<String> {
+  let doc = parse(text);
+  // `parse` yields sessions in document order and each span sits inside its own
+  // session's log, so the spans come out ascending and disjoint.
+  let spans: Vec<Range<usize>> =
+    doc.sessions.iter().filter_map(|session| stale_log_span(session, keep)).collect();
+  if spans.is_empty() {
+    return None;
+  }
+
+  let mut out = String::with_capacity(text.len());
+  let mut at = 0;
+  for span in spans {
+    debug_assert!(span.start >= at, "stale spans out of order or overlapping");
+    out.push_str(&text[at..span.start]);
+    at = span.end;
+  }
+  out.push_str(&text[at..]);
+  Some(out)
+}
+
 /// Byte span of the oldest `### Message N` entries of `session` to drop so that
 /// at most `keep` remain in its log, or `None` when nothing needs dropping.
 ///
 /// Offsets are in the document `session` was parsed from. Only entries above the
-/// session's `### WAIT` heading count: a `### Message N` line inside the draft
-/// body -- pasted while quoting an old message, say -- parses as a message of
-/// this session too, and counting those would inflate the span until it swallows
-/// the WAIT heading and the unsent draft with it.
+/// session's `### WAIT` heading count. [`parse`] no longer puts any below it --
+/// a `### Message N` line in the draft body is draft text -- so this is
+/// unreachable by construction; it stays because the alternative to being wrong
+/// here is deleting the user's unsent draft, and a parser change should not be
+/// able to cause that.
 ///
 /// A message still carrying an undelivered `@jc(...)` marker bounds the span, so
 /// dropping one can never silently cancel a scheduled send. Callers gate sends
@@ -1618,6 +1652,155 @@ third
     parse(text).session_by_label("S").unwrap().clone()
   }
 
+  /// Everything below `### WAIT` is draft. Quoting an old message there is
+  /// ordinary drafting, and must not register as a message of the session.
+  #[test]
+  fn wait_draft_message_lines_are_not_messages() {
+    let text = "\
+# Claude
+## S
+> uuid=s
+
+### Message 0
+real
+### WAIT
+as I said in
+### Message 99
+quoted text
+please do it
+";
+    let session = parsed_session(text);
+
+    assert_eq!(session.messages.iter().map(|m| m.index).collect::<Vec<_>>(), vec![0]);
+
+    // Ask `send_from_wait` itself rather than retyping how it picks an index.
+    let result = send_from_wait(text, &session, 0..0, None, test_now()).unwrap();
+    assert_eq!(result.message_index, 1, "next send must not take the quoted index");
+    // And the quoted lines are draft, so they are what gets sent.
+    assert!(result.message_text.contains("### Message 99"));
+    assert!(result.message_text.contains("please do it"));
+  }
+
+  /// A quoted `@jc(...)` marker in the draft must not read as a pending
+  /// scheduled send -- callers gate on this, so it would lock the session out
+  /// of sending with no way to see why.
+  #[test]
+  fn wait_draft_schedule_marker_does_not_block_sends() {
+    let text = "\
+# Claude
+## S
+> uuid=s
+
+### Message 0
+real
+### WAIT
+remember
+### Message 3 @jc(2026-07-14 07:30)
+quoted
+";
+    let session = parsed_session(text);
+    assert!(session.pending_scheduled().is_none());
+  }
+
+  /// Defence in depth for the truncator: even handed a session whose messages
+  /// run past the WAIT heading, the span stops above it. The parser no longer
+  /// produces such a session, so build one directly.
+  #[test]
+  fn stale_log_span_ignores_messages_below_wait() {
+    let mut session = TodoSession { label: "S".into(), ..Default::default() };
+    let mut at = 0;
+    let mut push = |session: &mut TodoSession, at: &mut usize| {
+      session.messages.push(TodoMessage {
+        index: session.messages.len(),
+        heading_byte_range: *at..*at + 10,
+        body_byte_range: *at + 10..*at + 20,
+        ..Default::default()
+      });
+      *at += 20;
+    };
+    for _ in 0..3 {
+      push(&mut session, &mut at);
+    }
+    let wait_start = at;
+    session.wait = Some(TodoWait {
+      heading_byte_range: wait_start..wait_start + 8,
+      body_byte_range: wait_start + 8..wait_start + 100,
+      ..Default::default()
+    });
+    at = wait_start + 8;
+    for _ in 0..5 {
+      push(&mut session, &mut at);
+    }
+
+    let span = stale_log_span(&session, 1).unwrap();
+    assert!(span.end <= wait_start, "span {span:?} reaches past WAIT at {wait_start}");
+  }
+
+  /// The startup sweep bounds every session in the document at once, and
+  /// leaves a document that is already within the bound untouched.
+  #[test]
+  fn truncate_all_sessions_bounds_every_session() {
+    let mut text = String::from("# Claude\n");
+    let counts = [40usize, 3, 60];
+    for (n, count) in counts.iter().enumerate() {
+      text.push_str(&format!("## S{n}\n> uuid=u{n}\n\n"));
+      for i in 0..*count {
+        text.push_str(&format!("### Message {i}\nbody {n}-{i}\n"));
+      }
+      // Distinct per session, so a draft spliced from the wrong one shows up.
+      text.push_str(&format!("### WAIT\ndraft for session {n}\n"));
+    }
+
+    let out = truncate_all_sessions(&text, MAX_MESSAGES).unwrap();
+    let before = parse(&text);
+    let doc = parse(&out);
+
+    assert_eq!(doc.sessions.len(), counts.len());
+    for ((n, session), count) in doc.sessions.iter().enumerate().zip(counts.iter()) {
+      assert_eq!(session.messages.len(), (*count).min(MAX_MESSAGES));
+      // Newest kept, indices intact.
+      assert_eq!(session.messages.last().unwrap().index, count - 1);
+      // Identity and draft belong to THIS session and survive byte-for-byte.
+      assert_eq!(session.uuid, format!("u{n}"));
+      assert_eq!(session.label, format!("S{n}"));
+      let draft = &out[session.wait.as_ref().unwrap().body_byte_range.clone()];
+      let was = &text[before.sessions[n].wait.as_ref().unwrap().body_byte_range.clone()];
+      assert_eq!(draft, was);
+      // The surviving bodies are this session's, not a neighbour's.
+      let oldest = session.messages.first().unwrap();
+      let body = &out[oldest.body_byte_range.clone()];
+      assert!(body.ends_with(&format!("body {n}-{}\n", oldest.index)), "body was {body:?}");
+    }
+
+    // Idempotent: a second sweep finds nothing to do.
+    assert!(truncate_all_sessions(&out, MAX_MESSAGES).is_none());
+  }
+
+  /// A pending `@jc(...)` marker pins everything from it onward, and the pin
+  /// converges: the first sweep clears what is above the marker, after which the
+  /// marker sits at index 0 and no later sweep can drop anything. The session
+  /// stays above the bound until the scheduled send fires. Documented in
+  /// ARCH.md and README.md, so pin it.
+  #[test]
+  fn truncate_all_sessions_converges_while_a_send_is_pending() {
+    let pinned = 3;
+    let total = MAX_MESSAGES + 20;
+    let text = session_log(total, Some(pinned), "draft\n");
+
+    let first = truncate_all_sessions(&text, MAX_MESSAGES).unwrap();
+    let after = parse(&first);
+    let session = after.session_by_label("S").unwrap();
+
+    // Exactly the entries above the marker went; the marker leads what remains.
+    assert_eq!(session.messages.len(), total - pinned);
+    assert_eq!(session.messages[0].index, pinned);
+    assert!(session.messages[0].schedule.is_some());
+    assert!(session.messages.len() > MAX_MESSAGES, "still above the bound, by design");
+
+    // And it is now stuck there until the send fires.
+    assert!(truncate_all_sessions(&first, MAX_MESSAGES).is_none());
+  }
+
   #[test]
   fn stale_log_span_leaves_short_logs_alone() {
     for count in [0, 1, 2, 3] {
@@ -1660,27 +1843,6 @@ third
     // Nothing to do at all when the marker sits on the oldest entry.
     let text = session_log(6, Some(0), "");
     assert!(stale_log_span(&parsed_session(&text), 2).is_none());
-  }
-
-  /// A `### Message N` line inside the WAIT draft parses as a message of the
-  /// session, but it is not log: counting it inflates the span past the WAIT
-  /// heading, and the cut then takes the heading and the unsent draft with it.
-  #[test]
-  fn stale_log_span_never_reaches_the_wait_draft() {
-    let mut draft = String::from("keep this draft\n");
-    for i in 0..8 {
-      draft.push_str(&format!("### Message {i}\nquoted {i}\n"));
-    }
-    let text = session_log(4, None, &draft);
-    let session = parsed_session(&text);
-    let wait_start = session.wait.as_ref().unwrap().heading_byte_range.start;
-
-    let span = stale_log_span(&session, 2).unwrap();
-    assert!(span.end <= wait_start, "span {span:?} reaches past the WAIT heading at {wait_start}");
-
-    // Everything from the WAIT heading on survives byte-for-byte.
-    let cut = format!("{}{}", &text[..span.start], &text[span.end..]);
-    assert!(cut.ends_with(&text[wait_start..]));
   }
 
   /// A send bounds the log to the most recent `MAX_MESSAGES`, dropping the

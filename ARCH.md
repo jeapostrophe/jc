@@ -102,13 +102,23 @@ Annotations from diff/terminal/code views are appended.
 Each send keeps the most recent `todo::MAX_MESSAGES` (25) `### Message N`
 entries in that session and drops the older ones, so TODO.md cannot grow without
 limit. Indices are never renumbered, so a session settles into a sliding window
-— `### Message 76` through `### Message 100`. Only the session being sent to is
-truncated; the rest of the document is untouched.
+— `### Message 76` through `### Message 100`. A send truncates only the session
+it writes to; the rest of the document is untouched.
+
+Sessions that have gone quiet are caught by a startup sweep:
+`todo::truncate_all_sessions` runs in `ProjectState::create` immediately after
+the TODO.md buffer is read, before the expiry pass and the session-restore loop,
+and shares their single save. It applies the same bound to every session in the
+document and is idempotent. It only reaches sessions the parser sees: `##`
+headings inside the `# Claude` section. A `## [DELETED] …` heading is skipped by
+`parse`, so such a session's log is never bounded and keeps whatever size it had.
 
 Truncation stops at a message still carrying an undelivered `@jc(...)` marker, so
-it can never silently cancel a scheduled send. Sends are already gated on
-`TodoSession::pending_scheduled`, so this is unreachable in practice — it is kept
-so a change to that gate cannot turn into lost work.
+it can never silently cancel a scheduled send. A send cannot hit this (sends are
+gated on `TodoSession::pending_scheduled`), but the startup sweep can, and the
+clamp converges: the first sweep drops everything above the marker, leaving it at
+index 0, after which every later sweep drops nothing. So a session holding a
+pending schedule stays above the bound until that send fires.
 
 ### Heading Prefixes
 
