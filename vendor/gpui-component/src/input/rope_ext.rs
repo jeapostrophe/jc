@@ -154,6 +154,15 @@ pub trait RopeExt {
   /// ```
   fn replace(&mut self, range: Range<usize>, new_text: &str);
 
+  /// Clip `range` to the char boundaries [`RopeExt::replace`] would use: start
+  /// outward to the left, end outward to the right, so the range covers whole
+  /// characters. An inverted range collapses to empty at its clipped start.
+  ///
+  /// Callers that must describe a replacement after the fact -- building a
+  /// `tree_sitter::InputEdit`, say -- have to clip identically or they report a
+  /// span that is not the one the rope actually removed.
+  fn clip_range(&self, range: Range<usize>) -> Range<usize>;
+
   /// Get char at the given offset (byte).
   ///
   /// - If the offset is in the middle of a multi-byte character will panic.
@@ -385,9 +394,14 @@ impl RopeExt for Rope {
   }
 
   fn replace(&mut self, range: Range<usize>, new_text: &str) {
-    let range = self.clip_offset(range.start, Bias::Left)..self.clip_offset(range.end, Bias::Right);
+    let range = self.clip_range(range);
     self.remove(range.clone());
     self.insert(range.start, new_text);
+  }
+
+  fn clip_range(&self, range: Range<usize>) -> Range<usize> {
+    let start = self.clip_offset(range.start, Bias::Left);
+    start..self.clip_offset(range.end, Bias::Right).max(start)
   }
 
   fn clip_offset(&self, offset: usize, bias: Bias) -> usize {

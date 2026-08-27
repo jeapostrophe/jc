@@ -145,6 +145,28 @@ impl<'a> sum_tree::Dimension<'a, HighlightSummary> for Range<usize> {
   }
 }
 
+/// Return the bytes of `text` starting at byte `offset`, up to the end of the
+/// chunk containing it, or empty at (or past) the end.
+///
+/// This is the body of the read callback tree-sitter invokes from C, where a
+/// panic cannot unwind and therefore aborts the process rather than surfacing
+/// an error. Slicing `str` here does panic: tree-sitter addresses the input by
+/// byte and can ask for an offset that splits a multi-byte character when it
+/// resolves a node reused from the previous tree against edited text. Slicing
+/// the bytes instead is total over every in-bounds offset, and tree-sitter --
+/// which takes `impl AsRef<[u8]>` and decodes UTF-8 itself -- gets exactly the
+/// bytes it asked for. Reporting a short read would be no better than the
+/// panic: it means end-of-input, so the tree would silently truncate there and
+/// every later incremental parse would build on the truncation.
+fn read_chunk(text: &Rope, offset: usize) -> &[u8] {
+  if offset >= text.len() {
+    return b"";
+  }
+
+  let (chunk, chunk_byte_ix) = text.chunk(offset);
+  &chunk.as_bytes()[offset - chunk_byte_ix..]
+}
+
 impl SyntaxHighlighter {
   /// Create a new SyntaxHighlighter for HTML.
   pub fn new(lang: &str) -> Self {
@@ -295,27 +317,39 @@ impl SyntaxHighlighter {
       return;
     }
 
-    let edit = edit.unwrap_or(InputEdit {
-      start_byte: 0,
-      old_end_byte: 0,
-      new_end_byte: text.len(),
-      start_position: Point::new(0, 0),
-      old_end_position: Point::new(0, 0),
-      new_end_position: Point::new(0, 0),
-    });
+    let mut old_tree = match self.tree.take() {
+      Some(tree) => tree,
+      None => {
+        // Nothing has been parsed, so the tree below describes empty text --
+        // keep `self.text` saying so, since it is what every edit is measured
+        // against. (`update` returns early without storing a tree when a parse
+        // fails, which is the other way to land here.)
+        self.text = Rope::new();
+        self.parser.parse("", None).unwrap()
+      }
+    };
 
-    let mut old_tree = self.tree.take().unwrap_or(self.parser.parse("", None).unwrap());
+    // An edit describes a change to the text this highlighter last parsed, so
+    // it is meaningless against any other text -- a highlighter built moments
+    // ago has parsed nothing, and `CodeBlock::new` and the line-search picker
+    // reuse one across documents. Reject an edit that cannot fit and reparse in
+    // full instead, so this holds for every caller without one of them having
+    // to know. Defensive: tree-sitter was measured to tolerate such an edit
+    // here, so this pins the precondition rather than fixing an observed fault.
+    let edit = edit
+      .filter(|edit| edit.start_byte <= edit.old_end_byte && edit.old_end_byte <= self.text.len())
+      .unwrap_or_else(|| InputEdit {
+        start_byte: 0,
+        old_end_byte: self.text.len(),
+        new_end_byte: text.len(),
+        start_position: Point::new(0, 0),
+        old_end_position: self.text.offset_to_point(self.text.len()),
+        new_end_position: text.offset_to_point(text.len()),
+      });
     old_tree.edit(&edit);
 
     let new_tree = self.parser.parse_with_options(
-      &mut move |offset, _| {
-        if offset >= text.len() {
-          ""
-        } else {
-          let (chunk, chunk_byte_ix) = text.chunk(offset);
-          &chunk[offset - chunk_byte_ix..]
-        }
-      },
+      &mut move |offset, _| read_chunk(text, offset),
       Some(&old_tree),
       None,
     );
@@ -804,5 +838,69 @@ mod tests {
         (60..65, clean),
       ],
     );
+  }
+
+  /// Long enough that ropey splits it across chunks, so `read_chunk`'s
+  /// chunk-relative arithmetic is exercised, and multi-byte throughout, so
+  /// offsets that split a character are reachable.
+  fn read_chunk_fixture() -> Rope {
+    let mut source = String::new();
+    for i in 0..100 {
+      source.push_str(&format!("- \u{2705} item {i} \u{2014} note \u{23f3}\n"));
+    }
+    let rope = Rope::from(source.as_str());
+    assert!(rope.chunks().count() > 1, "fixture must span multiple chunks");
+    rope
+  }
+
+  /// A byte offset that splits a character must not panic: `read_chunk` is
+  /// called from tree-sitter's C code, so a panic aborts the process instead of
+  /// unwinding. It must also return the real bytes rather than a short read,
+  /// which tree-sitter would take for end-of-input.
+  #[test]
+  fn test_read_chunk_non_char_boundary() {
+    let text = read_chunk_fixture();
+    let source = text.to_string();
+
+    // Derive the split offsets from the text itself rather than hard-coding
+    // them, and cover every one so no chunk is skipped.
+    let mut checked = 0;
+    for (ix, ch) in source.char_indices() {
+      if ch.len_utf8() == 1 {
+        continue;
+      }
+      let non_boundary = ix + 1;
+      assert!(!source.is_char_boundary(non_boundary));
+
+      let got = read_chunk(&text, non_boundary);
+      assert!(!got.is_empty(), "short read at {non_boundary} means EOF to tree-sitter");
+      assert!(source.as_bytes()[non_boundary..].starts_with(got));
+      checked += 1;
+    }
+    assert!(checked > 0);
+  }
+
+  /// Every offset returns the bytes at that offset, and only the end returns
+  /// empty -- including at chunk seams, where `chunk_byte_ix` is non-zero.
+  #[test]
+  fn test_read_chunk_spans_chunks() {
+    let text = read_chunk_fixture();
+    let source = text.to_string();
+
+    let mut seams = 0;
+    let mut offset = 0;
+    for chunk in text.chunks() {
+      // The first offset of each chunk after the first is a seam: there
+      // `chunk_byte_ix == offset`, so the returned slice must start at 0.
+      if offset > 0 {
+        assert_eq!(read_chunk(&text, offset), &source.as_bytes()[offset..offset + chunk.len()]);
+        seams += 1;
+      }
+      offset += chunk.len();
+    }
+    assert!(seams > 0, "fixture must have at least one chunk seam");
+
+    assert_eq!(read_chunk(&text, source.len()), b"");
+    assert_eq!(read_chunk(&text, source.len() + 10), b"");
   }
 }

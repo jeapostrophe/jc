@@ -2123,7 +2123,7 @@ impl EntityInputHandler for InputState {
       diagnostics.reset(&self.text)
     }
     self.text_wrapper.update(&self.text, &range, &Rope::from(new_text), cx);
-    self.mode.update_highlighter(&range, &self.text, &new_text, true, cx);
+    self.mode.update_highlighter(&range, &old_text, &self.text, &new_text, cx);
     self.lsp.update(&self.text, window, cx);
     self.selected_range = (new_offset..new_offset).into();
     self.ime_marked_range.take();
@@ -2176,7 +2176,7 @@ impl EntityInputHandler for InputState {
       diagnostics.reset(&self.text)
     }
     self.text_wrapper.update(&self.text, &range, &Rope::from(new_text), cx);
-    self.mode.update_highlighter(&range, &self.text, &new_text, true, cx);
+    self.mode.update_highlighter(&range, &old_text, &self.text, &new_text, cx);
     self.lsp.update(&self.text, window, cx);
     if new_text.is_empty() {
       // Cancel selection, when cancel IME input.
@@ -2284,7 +2284,7 @@ impl Focusable for InputState {
 impl Render for InputState {
   fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     if self._pending_update {
-      self.mode.update_highlighter(&(0..0), &self.text, "", false, cx);
+      self.mode.ensure_highlighter(&self.text, cx);
       self.lsp.update(&self.text, window, cx);
       self._pending_update = false;
     }
