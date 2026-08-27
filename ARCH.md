@@ -107,12 +107,21 @@ it writes to; the rest of the document is untouched.
 
 The first launch after this landed removes a lot of text at once, and the sweep
 is not undoable. `TodoView::truncate_logs` writes a one-time `TODO.md.bak` beside
-each file before shortening it, and `./make.sh --backup-todos` takes the same
-snapshot from the shell just before launching (`scripts/backup-todos.sh`, driven
-by the project list in `~/.config/jc/state.toml`). Neither ever overwrites an
-existing `.bak`: the first snapshot is the pre-truncation one and the one worth
-keeping. The shell copy exists because the in-app one runs on a path that only
-executes at startup — take it on the launch that first picks up the sweep.
+each file before shortening it, and `scripts/backup-todos.sh` takes the same
+snapshot from the shell just before launching, driven by the project list in
+`~/.config/jc/state.toml` so it covers exactly what jc will sweep. Neither ever
+overwrites an existing `.bak`: the first snapshot is the pre-truncation one and
+the one worth keeping. The shell copy exists because the in-app one runs on a
+path that only executes at startup — take it on the launch that first picks up
+the sweep.
+
+**`make.sh` currently requires `--backup-todos` or `--no-backup-todos` and
+refuses to launch without one** (checked before the build, so a forgotten flag
+costs a second rather than a compile). jc is a live-in tool and weeks can pass
+between restarts, which is long enough to forget a flag that only matters once —
+so there is no default, because the failure mode of a default here is silent and
+permanent. **This is temporary**: once the snapshots exist, delete the marked
+block in `make.sh` and `scripts/backup-todos.sh`.
 
 Sessions that have gone quiet are caught by a startup sweep:
 `todo::truncate_all_sessions` runs in `ProjectState::create` immediately after
