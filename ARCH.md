@@ -97,6 +97,19 @@ Future notes accumulate here.
 Annotations from diff/terminal/code views are appended.
 ```
 
+### Message Log Bound
+
+Each send keeps the most recent `todo::MAX_MESSAGES` (25) `### Message N`
+entries in that session and drops the older ones, so TODO.md cannot grow without
+limit. Indices are never renumbered, so a session settles into a sliding window
+— `### Message 76` through `### Message 100`. Only the session being sent to is
+truncated; the rest of the document is untouched.
+
+Truncation stops at a message still carrying an undelivered `@jc(...)` marker, so
+it can never silently cancel a scheduled send. Sends are already gated on
+`TodoSession::pending_scheduled`, so this is unreachable in practice — it is kept
+so a change to that gate cannot turn into lost work.
+
 ### Heading Prefixes
 
 | Prefix | Status | Behavior |

@@ -176,6 +176,12 @@ impl InputMode {
     new_text: &str,
     cx: &mut App,
   ) {
+    // `parse_highlighter` would no-op anyway; returning here is to skip the
+    // rope walk in `input_edit` for every keystroke in a plain input.
+    if !self.is_code_editor() {
+      return;
+    }
+
     let edit = input_edit(replaced_range, old_text, text, new_text);
     self.parse_highlighter(Some(edit), text, cx);
   }
@@ -248,10 +254,13 @@ fn input_edit(
   // the byte offsets, the `Point`s and the bytes the rope actually removed all
   // agree.
   let Range { start, end: old_end } = old_text.clip_range(replaced_range.clone());
-  // `text` is normally `old_text` spliced, which cannot be shorter than
-  // `start + new_text.len()` -- but `InputState::replace_text_in_range` can
-  // substitute a masked rope, so keep the edit inside the text it describes.
-  let new_end = (start + new_text.len()).min(text.len());
+  // Left unclamped on purpose. `text` is normally `old_text` spliced, but
+  // `InputState::replace_text_in_range` can substitute a masked rope, and then
+  // no edit describes the change at all: clamping to `text.len()` would either
+  // invert the edit or, worse, produce a plausible-looking wrong one.
+  // `SyntaxHighlighter::update` rejects an edit that does not fit and reparses
+  // in full, which is the honest outcome.
+  let new_end = start + new_text.len();
 
   InputEdit {
     start_byte: start,

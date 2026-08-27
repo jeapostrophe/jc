@@ -337,7 +337,12 @@ impl SyntaxHighlighter {
     // to know. Defensive: tree-sitter was measured to tolerate such an edit
     // here, so this pins the precondition rather than fixing an observed fault.
     let edit = edit
-      .filter(|edit| edit.start_byte <= edit.old_end_byte && edit.old_end_byte <= self.text.len())
+      .filter(|edit| {
+        edit.start_byte <= edit.old_end_byte
+          && edit.old_end_byte <= self.text.len()
+          && edit.start_byte <= edit.new_end_byte
+          && edit.new_end_byte <= text.len()
+      })
       .unwrap_or_else(|| InputEdit {
         start_byte: 0,
         old_end_byte: self.text.len(),

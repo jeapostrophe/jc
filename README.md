@@ -63,7 +63,9 @@ second instruction
 Notes for next message go here.
 ```
 
-The `### WAIT` marker separates what you've sent from what you're drafting. Annotations from any view (diff, terminal, code) accumulate below WAIT. When you send (Cmd-Enter), the notes become a numbered message and WAIT moves below it — so you always have a full history of what you asked.
+The `### WAIT` marker separates what you've sent from what you're drafting. Annotations from any view (diff, terminal, code) accumulate below WAIT. When you send (Cmd-Enter), the notes become a numbered message and WAIT moves below it — so you have the recent history of what you asked.
+
+The log is bounded: each send keeps the 25 most recent messages and drops the rest, so a long-running session settles into a sliding window (`### Message 76` through `### Message 100`). Numbers are never reused, so a message keeps the number it was sent under. jc never sends TODO.md to Claude — messages are delivered to the session terminal and Claude resumes from its own transcript — so dropping old entries costs it no context.
 
 Sessions are resumed automatically on startup via `claude --resume <uuid>`. New sessions get their UUID from Claude Code's hook system. `/clear` is handled transparently.
 

@@ -2,7 +2,8 @@
 * Before committing, run `cargo fmt --all -- --check && cargo clippy --workspace -- -D warnings` to catch CI failures locally.
 * If you see any `[?]` labels in PLAN.md, triage them first: read the task, examine the relevant code, and replace `[?]` with the correct difficulty label (`[T]`/`[E]`/`[H]`/`[D]`) before starting other work.
 * Run `cargo test --workspace` after any code changes. Keep existing tests passing and add new tests for any new or changed behavior.
-* When updating gpui-component, run `scripts/update-gpui-component.sh` to re-vendor from cargo cache and apply patches.
+* `vendor/gpui-component` is the source of truth for local changes and is committed to git. `vendor/patches/` does NOT reproduce it — the patches are written against 4-space upstream while the tree is formatted to this repo's 2-space rustfmt, and some local changes (the tree-sitter read-callback and `InputEdit` crash fix in `highlighter.rs` / `input/mode.rs`) have no patch file at all. Edit the vendored tree directly and commit.
+* `scripts/update-gpui-component.sh` re-vendors from the cargo cache and is LOSSY: it deletes the tree and re-applies only `vendor/patches/`, silently reverting local changes. It refuses to run over uncommitted changes. Only run it to pick up a new upstream version, and afterwards recover local changes from git (`git diff <pre-vendor-rev> -- vendor/gpui-component`) and re-apply them by hand.
 * When a picker confirm handler calls a method that sets focus itself (e.g. `switch_to_session`), drop `pre_picker_focus` instead of restoring it — the stale handle points at a view that may no longer be in a pane, causing focus to be lost.
 * gpui performance rules:
   - Never use `window.refresh()` — use `cx.notify()` on the specific entity.

@@ -17,8 +17,10 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 VENDOR_DIR="$ROOT_DIR/vendor/gpui-component"
 PATCHES_DIR="$ROOT_DIR/vendor/patches"
 
+UNTRACKED=$(git -C "$ROOT_DIR" ls-files --others --exclude-standard -- "$VENDOR_DIR")
 if ! git -C "$ROOT_DIR" diff --quiet -- "$VENDOR_DIR" ||
-  ! git -C "$ROOT_DIR" diff --cached --quiet -- "$VENDOR_DIR"; then
+  ! git -C "$ROOT_DIR" diff --cached --quiet -- "$VENDOR_DIR" ||
+  [ -n "$UNTRACKED" ]; then
   echo "ERROR: vendor/gpui-component has uncommitted changes." >&2
   echo "Re-vendoring deletes the tree; these changes are not in vendor/patches/" >&2
   echo "and would be unrecoverable. Commit or stash them first." >&2
