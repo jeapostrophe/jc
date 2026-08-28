@@ -63,9 +63,9 @@ be reviewed on its own.
       `TerminalView` counts parsed output batches (`output_batches`) against a baseline
       (`seen_batches`), `has_unseen_output` compares them, and
       `Workspace::switch_to_session` rebaselines on switch-**away** so the marker means
-      the same thing however you left. `SessionState::ActivityBaseline` discounts each
-      session's own launch output. The picker sorts activity-first in both the current
-      project and the others.
+      the same thing however you left. A session's own launch output is discounted by
+      `jc_terminal::SettleWindow`, driven by the terminal's own batch signal. The picker
+      sorts activity-first in both the current project and the others.
 - [x] **[SIMP-11]** Assign session UUIDs instead of detecting them. `create_new_session`
       mints a v4 UUID and spawns `claude --session-id <uuid>`, writing the heading and the
       UUID together; the "launch bare `claude`, fill the UUID in from the first hook"
@@ -86,9 +86,36 @@ be reviewed on its own.
       detect-the-UUID flow) are **not** rewritten at startup: minting there would bind the
       heading to an empty conversation and orphan whatever real transcript it had. They
       are listed as adoptable in both pickers, and `adopt_session` mints and records the
-      UUID at that point. Duplicate labels are repaired at startup
-      (`ProjectState::dedupe_labels`), since TODO.md's text operations still address a
-      session by label.
+      UUID at that point.
+
+### Follow-ups from the simplify review  ✅ shipped (2026-08-28)
+Both were flagged by the four-agent simplify pass over SIMP-01..SIMP-13 and done as
+independent units in worktrees.
+
+- [x] **[SIMP-14]** Address TODO.md headings by UUID, not by label. Every text operation
+      that resolved a session by label — `insert_wait_section`, `send_from_wait`,
+      `fire_scheduled`, `TodoView::{wait_line, send_selection, has_pending_schedule,
+      ensure_wait, deliver_scheduled}`, the active-heading highlight, and
+      `Workspace::armed_schedules` — took the FIRST heading with that label, and label
+      uniqueness was only *repaired at startup* over a file you edit by hand. Pasting a
+      duplicate heading mid-session silently misrouted sends until restart. Now keyed on
+      the UUID, with `TodoDocument::session_by_uuid` rejecting the empty string so the
+      family is safe by construction rather than by a repair pass. An unbound legacy
+      heading is addressed by `SessionKey::Unbound { index, label }`, re-verified against
+      the live document at use. Deleted: `dedupe_labels`, `rename_session_at`,
+      `session_by_label` as an address, and `TodoDocument::wait_body_end_line` (a
+      duplicate of `TodoWait::body_end_line` that was off by one line).
+      `todo::unique_label` survives, explicitly cosmetic — it keeps the picker from
+      showing identical rows and carries no invariant.
+- [x] **[SIMP-15]** Move launch-settle detection into the terminal that sees the batches.
+      The workspace was polling `output_batches` on the 2 s reconcile tick to decide when
+      a freshly-spawned `claude` had stopped printing, with the settle policy expressed in
+      tick counts whose meaning lived in another symbol. `jc_terminal::SettleWindow` now
+      holds that policy against `Instant`s and is driven by the relay's own per-batch
+      wake; the claude-specific durations live in `SessionState::CLAUDE_LAUNCH_SETTLE` and
+      are passed in via `TerminalConfig`, so the general terminal opts out by passing
+      `None`. `SessionState::ActivityBaseline` and `Workspace::step_activity_baselines`
+      are gone, and the policy is unit-tested (7 tests) where before it had none.
 
 ### Scheduled Messages  ✅ shipped & verified working end-to-end (2026-07-13)
 **Purpose:** auto-resume a session after a Claude usage-limit reset — queue the message
@@ -137,7 +164,7 @@ Interaction model (decided):
 - [x] [H] jc-app: on scheduled send, arm `cx.spawn`+`Timer::after` in workspace; at fire
       time re-read the block's current text (`TodoView::deliver_scheduled`), deliver via
       the session's `claude_terminal` (`deliver_to_terminal` helper), set busy + `> last=`,
-      and drop the `@jc(...)` marker. Session looked up by label; skipped if gone.
+      and drop the `@jc(...)` marker. Session looked up by UUID; skipped if gone.
 - [x] [T] jc-app: distinct highlight color (`@keyword`) for a pending scheduled Message
       heading in `apply_session_highlights` (todo_view.rs); plain color once delivered.
 - [x] [E] jc-app: startup re-arm (`arm_existing_schedules` in `Workspace::new`) re-scans
@@ -145,7 +172,7 @@ Interaction model (decided):
       later-datetime edits reconcile self-correctingly at fire time (`ScheduledFire`).
 - [x] [H] jc-app: pending `@jc` markers are the single source of truth for the timer set.
       `reconcile_schedules` arms timers from the live markers (dedup via an
-      `armed_schedules` HashSet keyed by (path, label, when)); it runs at startup and on a
+      `armed_schedules` HashSet keyed by (path, uuid, when)); it runs at startup and on a
       2s windowed loop (`start_schedule_reconcile_loop`), plus immediately on send and on
       fire-time reschedule. This closes the *earlier* mid-session datetime-edit gap — an
       edit in either direction re-arms within ~2s; the stale timer harmlessly no-ops at
