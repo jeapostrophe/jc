@@ -75,6 +75,8 @@ jc mints the session UUID itself. A new session launches `claude --session-id <u
 
 Per-session metadata lives on `> ` lines under the heading. `> uuid=` and `> last=` are managed by jc; add `> dangerous` by hand to spawn that session's `claude` with `--dangerously-skip-permissions` (takes effect on next spawn). See `ARCH.md` for the full list.
 
+The `> uuid=` line, not the heading text, is what identifies a session — everything jc writes into TODO.md is addressed by it. Rename a heading to whatever you like, and give two headings the same name if that is what you want; sends and scheduled deliveries still land on the right one.
+
 ### Session Activity
 
 The Cmd-P session picker marks each session with a single character:

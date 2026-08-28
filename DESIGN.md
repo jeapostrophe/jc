@@ -32,6 +32,10 @@ So the transcript check survives — it is `ProjectState::launch_for`, and it ch
 
 `/clear` handling is untouched, and is now the only place a session's UUID changes after launch: `SessionEnd(clear)` + `SessionStart(clear)` pair into a `SessionClear` event and `Workspace::handle_session_clear` rewrites `> uuid=` in place.
 
+The third consequence is that the heading *label* stops being an address. TODO.md's text operations — sends, WAIT insertion and cursor placement, `@jc(...)` scheduled delivery, the active-session highlight — all used to resolve a session by label, and every label lookup takes the first heading that matches. That was made safe by keeping labels unique: a `unique_label` at each creation point, plus a `dedupe_labels` repair pass over older files. The repair ran **once, at startup**, over a file the user edits by hand — so pasting a second `## New Session` heading mid-session left every send and every scheduled delivery addressing the wrong heading until the next restart. The machinery existed to prevent exactly that failure and did not cover it.
+
+With the UUID always populated, every one of those callers already holds a unique address, so they key on it and the uniqueness machinery is gone. The one heading a UUID cannot name is one an older jc left unbound (empty `> uuid=`), which is addressed by *verified position* instead: the picker carries the document index, and the writer re-checks against the live document that the heading at that index is still unbound and still carries the label the key was taken with, refusing otherwise. That is a continuous check rather than a startup pass, and it is what makes the address survive the window between a picker snapshot and its confirm. `jc-core/src/todo.rs`'s `SessionKey` doc comment is the canonical statement.
+
 ## Why Not an Editor Plugin
 
 It's tempting to decompose jc into a Zed or nvim plugin + tmux + scripts. Editors already provide editing, syntax highlighting, and terminals.
