@@ -89,11 +89,13 @@ The workspace has an active project with an active session. The active session d
 | grey `~` | Same, but disabled (`[D]`) |
 | blue `+` | Registered project with no sessions |
 
-**Activity marker.** `TerminalView` keeps two `Arc<AtomicUsize>` counters: `output_batches`, bumped by the VTE background thread once per coalesced batch it parses (hidden terminals still parse, so a backgrounded session still records activity), and `seen_batches`, the value `clear_output_seen` snapshotted. `TerminalView::has_unseen_output` is just the two being unequal; `output_batches()` is exposed separately so a caller can tell whether output is *still arriving*. The picker reads it on each session's *Claude* terminal only. `TerminalView::clear_output_seen` is called from two places.
+**Activity marker.** `TerminalView` keeps two counters: `output_batches`, bumped by the VTE background thread once per coalesced batch it parses (hidden terminals still parse, so a backgrounded session still records activity), and `seen_batches`, the value `clear_output_seen` snapshotted. `TerminalView::has_unseen_output` is just the two being unequal, and it is the only one of the three the app crate sees. The picker reads it on each session's *Claude* terminal only. `clear_output_seen` is called from two places.
 
 The first is `Workspace::switch_to_session`, on the session being switched *away from*. Clearing on the way out rather than the way in is what makes the marker mean "since you last had it on screen" no matter how the switch was made (picker, Cmd-\`, notification click). The session currently on screen is excluded by the picker itself (`is_active`), since you are looking at it.
 
-The second is the **startup baseline**. A freshly spawned `claude` prints a banner and, when resuming, replays its transcript; that is jc launching the session, not work done while you were away. `Workspace::step_activity_baselines` runs on the 2 s reconcile tick and advances a per-session `ActivityBaseline` state machine: a session is baselined once its child has printed *something* and then held still for two consecutive ticks, or unconditionally after 15 ticks if it never settles. Requiring a non-zero count first keeps a slow-starting child from being baselined before its banner ever appears. The state lives on `SessionState`, not on the workspace, for two reasons: `Workspace::open_project` can restore a project's sessions at any point in the run, so a startup-only pass would mark every session of a later-opened project; and a session is baselined exactly once, so real output arriving after it settles is never silently swallowed.
+The second is the **launch-settle window**, which lives in `jc-terminal` next to the events that drive it. A freshly spawned `claude` prints a banner and, when resuming, replays its transcript; that is jc launching the session, not work done while you were away. `SessionState::create` calls `TerminalView::discount_launch_output` on the Claude terminal just after spawning it; the notification relay — which already sees every parsed batch — stamps each batch onto a `SettleWindow`, and a task sleeps to whatever that window says the next decision point is. The policy is `settle.rs`'s two `Duration`s: `LAUNCH_QUIET` (4 s of quiet after the child has printed *something*) and `LAUNCH_GIVE_UP` (30 s absolute). `SettleWindow` is pure — it observes `Instant`s and answers `Clear`/`Wait`/`Done` — so the policy is unit-tested without a PTY.
+
+Four properties the window holds, each of which was once a bug: a child that has printed *nothing* is slow to start, not quiet, so it is never baselined early and its banner cannot land above the baseline; the quiet wait restarts at every batch, so the pause `claude --resume` takes between banner and transcript replay does not end the window; the give-up path *clears* rather than merely stopping, since a child still printing re-marks itself on its next batch whereas a marker left set never retires (only switching away clears one, and `has_activity` is the picker's primary sort key); and a session is baselined exactly once, so real output arriving after it settles is never silently swallowed. `SessionState::mark_user_input` — called from `Workspace::send_to_terminal`, `Workspace::fire_scheduled_send` and the `PromptSubmit` hook — ends the window through `TerminalView::cancel_launch_settle` *without* clearing: once you have given a session work, everything it prints is a response to something you asked for. The window is per terminal, so a project restored mid-run by `Workspace::open_project` gets its own.
 
 **Sort order.** Groups, in order: current project's sessions, other projects' sessions, unadopted sessions (current project first), empty projects, and finally the active session, which always sorts last since you are already there. Within both session groups — this project's and the others' — sessions with activity come first; "where did the work move while I was elsewhere" is mostly a cross-project question. Every sub-group then sorts by `> last=` descending.
 
@@ -229,17 +231,14 @@ highlighted in the `@keyword` color.
 ## Periodic Work
 
 One recurring task, `Workspace::start_schedule_reconcile_loop`, ticks every 2 seconds and
-does three things, none of which touches the filesystem:
+does two things, neither of which touches the filesystem:
 
 1. `Workspace::reconcile_schedules` — arm a timer for every pending `@jc(...)` marker on a
    heading whose session is actually *running*, idempotent through the `armed_schedules` set, which is keyed `(project path, session UUID, fire time)`.
    A marker on a dormant or unbound heading is not dropped: it keeps its pending highlight in
    the file, and adopting the session arms it on the next tick (firing after the catch-up
    grace if its time has passed).
-2. `Workspace::step_activity_baselines` — advance each session's `ActivityBaseline` state
-   machine, discounting the launch banner and transcript replay from the Cmd-P activity
-   marker (see Session Picker).
-3. `ProjectState::sync_sessions_from_todo` on each project — match each TODO entry to a
+2. `ProjectState::sync_sessions_from_todo` on each project — match each TODO entry to a
    running session **by UUID only**, and copy the entry's label onto it, so a heading renamed
    by hand is picked up. There is deliberately no label fallback: labels are not unique, and a
    TODO entry for a session that is not running would otherwise claim a same-labelled running
@@ -247,7 +246,7 @@ does three things, none of which touches the filesystem:
    whether anything changed, and only then does the loop `cx.notify()`. Nothing is re-pointed:
    only the label moved, and the TODO view's highlight keys on the UUID.
 
-All three are in-memory scans: no filesystem access, no git, no subprocesses. Everything else is
+Both are in-memory scans: no filesystem access, no git, no subprocesses. Everything else is
 event-driven — hooks arrive over the hook server's channel, external file changes over the
 per-`CodeView` `notify` watcher, and terminal output over the VTE thread's flume channel.
 
@@ -259,7 +258,7 @@ The terminal emulator (`jc-terminal/`) uses `alacritty_terminal` for VTE parsing
 
 1. **PTY reader thread** — blocking read loop on the PTY fd, 4KB chunks, sends via flume channel
 2. **VTE parser thread** (`std::thread`) — receives bytes, coalesces with visibility-aware caps (64KB visible / 256KB hidden), runs `Processor::advance()` under `Mutex<Term>` lock, bumps `output_batches`, answers `PtyWrite` events, signals main thread
-3. **Main-thread relay** — async task receives notifications and calls `cx.notify()` for GPUI repaint (skipped when hidden)
+3. **Main-thread relay** — async task receives notifications, stamps each batch onto the launch-settle window (see Session Picker), and calls `cx.notify()` for GPUI repaint (skipped when hidden)
 
 ### Render Pipeline (`paint_terminal`)
 

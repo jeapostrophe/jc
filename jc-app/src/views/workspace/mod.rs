@@ -5,9 +5,7 @@ use crate::views::close_confirm::{CloseConfirm, CloseConfirmEvent};
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
-use crate::views::session_state::{
-  ActivityBaseline, Launch, SavedViewState, SessionId, SessionState,
-};
+use crate::views::session_state::{Launch, SavedViewState, SessionId, SessionState};
 use crate::views::todo_view::ScheduledFire;
 use chrono::NaiveDateTime;
 use gpui::*;
@@ -1364,7 +1362,7 @@ impl Workspace {
     } else {
       // Immediate send: mark busy and deliver now.
       if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
-        session.mark_user_input();
+        session.mark_user_input(cx);
       }
       Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
       cx.notify();
@@ -1451,7 +1449,7 @@ impl Workspace {
       ScheduledFire::Deliver(body) => {
         Self::deliver_to_terminal(&claude_terminal, &body, cx);
         if let Some(session) = self.projects[project_idx].sessions.get_mut(&id) {
-          session.mark_user_input();
+          session.mark_user_input(cx);
         }
         cx.notify();
       }
@@ -1520,68 +1518,17 @@ impl Workspace {
     }
   }
 
-  /// Discount the startup output of every session that hasn't been baselined
-  /// yet, so the Cmd-P activity marker means "work happened while you were
-  /// away" rather than "jc launched this".
-  ///
-  /// Driven from the reconcile loop rather than a one-shot startup task, and
-  /// keyed per session rather than per launch, because `Workspace::open_project`
-  /// can restore a whole project's sessions at any point in the run — a
-  /// startup-only pass would mark every session of a later-opened project. A
-  /// session is baselined exactly once and then left alone: re-clearing a
-  /// settled session on later ticks would swallow the real output the marker
-  /// exists to report.
-  fn step_activity_baselines(&mut self, cx: &mut Context<Self>) {
-    /// Consecutive quiet ticks that count as "the child has settled". More than
-    /// one because `claude --resume` pauses between banner and transcript replay.
-    const QUIET_TICKS: usize = 2;
-    /// Stop waiting after this many ticks, so a child that never goes quiet
-    /// isn't tracked for the life of the process.
-    const MAX_TICKS: usize = 15;
-
-    for project in &mut self.projects {
-      for session in project.sessions.values_mut() {
-        let ActivityBaseline::Pending { last_batches, quiet_ticks, ticks } =
-          session.activity_baseline
-        else {
-          continue;
-        };
-        let terminal = session.claude_terminal.read(cx);
-        let batches = terminal.output_batches();
-
-        // A child that has printed nothing yet is not quiet, it is slow to
-        // start; baselining now would let its banner land above the baseline.
-        let quiet = batches > 0 && batches == last_batches;
-        let quiet_ticks = if quiet { quiet_ticks + 1 } else { 0 };
-
-        // Clear on both exits, including the give-up. A child that never
-        // settles is still printing, so it re-marks itself on the next batch;
-        // a marker left set here would never retire (only switching away
-        // clears one) and `has_activity` is the picker's primary sort key, so
-        // the session would outrank genuinely-changed ones forever.
-        if quiet_ticks >= QUIET_TICKS || ticks + 1 >= MAX_TICKS {
-          terminal.clear_output_seen();
-          session.activity_baseline = ActivityBaseline::Taken;
-        } else {
-          session.activity_baseline =
-            ActivityBaseline::Pending { last_batches: batches, quiet_ticks, ticks: ticks + 1 };
-        }
-      }
-    }
-  }
-
   /// Spawn the periodic task that reconciles jc's state against the live TODO
   /// documents: scheduled-send timers (so time edits are picked up without
   /// waiting for the original, possibly later, timer to fire), each running
-  /// session's label (so a heading renamed in TODO.md takes effect), and the
-  /// per-session activity baselines. All in-memory — no I/O.
+  /// session's label (so a heading renamed in TODO.md takes effect). All
+  /// in-memory — no I/O.
   fn start_schedule_reconcile_loop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let task = cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
       loop {
         Timer::after(StdDuration::from_secs(2)).await;
         let stepped = this.update_in(cx, |ws, window, cx| {
           ws.reconcile_schedules(window, cx);
-          ws.step_activity_baselines(cx);
           let mut changed = false;
           for i in 0..ws.projects.len() {
             changed |= ws.projects[i].sync_sessions_from_todo(cx);
@@ -1659,7 +1606,7 @@ impl Workspace {
     // Every remaining event is addressed to a session identified by its UUID.
     // UUIDs are assigned by jc at launch (`--session-id`), so a hook for an
     // unknown UUID belongs to a session jc doesn't manage — ignore it.
-    let Some((project_name, session_label)) = self.apply_hook_to_session(&event) else {
+    let Some((project_name, session_label)) = self.apply_hook_to_session(&event, cx) else {
       cx.notify();
       return;
     };
@@ -1683,7 +1630,7 @@ impl Workspace {
 
   /// Apply a hook event to the session it names. Returns the matched
   /// `(project name, session label)`, or `None` when no session owns the UUID.
-  fn apply_hook_to_session(&mut self, event: &HookEvent) -> Option<(String, String)> {
+  fn apply_hook_to_session(&mut self, event: &HookEvent, cx: &App) -> Option<(String, String)> {
     if event.session_id.is_empty() {
       return None;
     }
@@ -1693,7 +1640,7 @@ impl Workspace {
     })?;
 
     match event.kind {
-      HookEventKind::PromptSubmit => session.mark_user_input(),
+      HookEventKind::PromptSubmit => session.mark_user_input(cx),
       HookEventKind::Stop
       | HookEventKind::StopFailure
       | HookEventKind::PermissionPrompt

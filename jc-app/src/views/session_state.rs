@@ -17,32 +17,6 @@ pub struct SavedViewState {
 
 pub type SessionId = usize;
 
-/// Progress toward taking a session's Cmd-P activity baseline.
-///
-/// A freshly spawned `claude` prints a banner and, when resuming, replays its
-/// transcript. That is jc starting the session, not work that happened while you
-/// were away, so it must not leave the session marked. Each session waits for
-/// its OWN child to settle and is then baselined exactly once — a per-session
-/// state machine rather than a startup-wide one, because projects can be opened
-/// at any time (`Workspace::open_project`) and a session already baselined must
-/// never be silently re-baselined over real activity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivityBaseline {
-  /// Still settling. `last_batches` is the output count at the previous tick,
-  /// `quiet_ticks` how many consecutive ticks it has not moved, and `ticks` the
-  /// total elapsed, so a child that never settles is still bounded.
-  Pending { last_batches: usize, quiet_ticks: usize, ticks: usize },
-  /// Settled (or the session got user input, which ends the startup window
-  /// early). Leave this session's counter alone from now on.
-  Taken,
-}
-
-impl Default for ActivityBaseline {
-  fn default() -> Self {
-    Self::Pending { last_batches: 0, quiet_ticks: 0, ticks: 0 }
-  }
-}
-
 /// How the Claude CLI should attach to a session UUID.
 ///
 /// The two are NOT interchangeable, and picking wrong leaves a dead pane.
@@ -73,8 +47,6 @@ pub struct SessionState {
   pub claude_terminal: Entity<TerminalView>,
   pub general_terminal: Entity<TerminalView>,
   pub code_view: Entity<CodeView>,
-  /// Whether this session's startup output has been discounted yet.
-  pub activity_baseline: ActivityBaseline,
   /// True while Claude is actively working. Set by `UserPromptSubmit` hook and
   /// `send_to_terminal`; cleared by `Stop`/`StopFailure`/`IdlePrompt` hooks.
   pub busy: bool,
@@ -84,15 +56,11 @@ pub struct SessionState {
 impl SessionState {
   /// Note that the user has given this session work.
   ///
-  /// Ends the startup-baseline window WITHOUT clearing the marker: from here on
-  /// everything the child prints is a response to something you asked for, so it
-  /// is activity by definition. Without this, a prompt sent during the settle
-  /// window keeps resetting `quiet_ticks`, and the baseline is finally taken at
-  /// the exact moment Claude finishes — wiping the `*` for the work you were
-  /// waiting on.
-  pub fn mark_user_input(&mut self) {
+  /// Ends the Claude terminal's launch-settle window WITHOUT clearing its
+  /// marker — see [`TerminalView::cancel_launch_settle`].
+  pub fn mark_user_input(&mut self, cx: &App) {
     self.busy = true;
-    self.activity_baseline = ActivityBaseline::Taken;
+    self.claude_terminal.read(cx).cancel_launch_settle();
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -125,6 +93,11 @@ impl SessionState {
 
     let project = project_path.to_path_buf();
     let claude_terminal = cx.new(|cx| TerminalView::new(claude_config, Some(&project), window, cx));
+    // Claude's banner and transcript replay are jc starting the session, not
+    // work done while you were away, so they must not leave the Cmd-P marker
+    // set. Opened here rather than at startup because `Workspace::open_project`
+    // can restore a project's sessions at any point in the run.
+    claude_terminal.update(cx, |terminal, cx| terminal.discount_launch_output(cx));
     let general_terminal =
       cx.new(|cx| TerminalView::new(general_config, Some(&project), window, cx));
     let code_view = cx.new(|cx| CodeView::new(window, cx));
@@ -136,7 +109,6 @@ impl SessionState {
       claude_terminal,
       general_terminal,
       code_view,
-      activity_baseline: ActivityBaseline::default(),
       busy: false,
       saved_view: None,
     }

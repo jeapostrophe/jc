@@ -2,6 +2,7 @@ pub mod colors;
 mod input;
 mod pty;
 mod render;
+mod settle;
 mod terminal;
 mod view;
 
