@@ -1536,7 +1536,7 @@ impl Workspace {
           if changed {
             // Only the label moved: `sync_sessions_from_todo` never rewrites a
             // session's UUID, and the TODO view highlights by UUID, so there is
-            // nothing to re-point â just redraw the label wherever it shows.
+            // nothing to re-point — just redraw the label wherever it shows.
             cx.notify();
           }
         });
@@ -1697,7 +1697,7 @@ impl Workspace {
         let is_active = project.active_session == Some(session.id);
         session.uuid = new_session_id.clone();
         // The TODO view highlights the active session by UUID, so the swap has
-        // to be told to it too â otherwise the active heading's colouring goes
+        // to be told to it too — otherwise the active heading's colouring goes
         // out until the next session switch.
         if is_active {
           todo_view.update(cx, |tv, cx| tv.set_active_uuid(Some(&new_session_id), cx));
