@@ -96,11 +96,10 @@ pub struct Workspace {
   _breadcrumb_observers: Vec<Subscription>,
   /// Periodic task that re-arms scheduled-send timers from the live TODO markers.
   _schedule_reconcile_task: Option<Task<()>>,
-  /// (project path, session label, delivery time) tuples that already have a
-  /// timer armed, so reconciliation doesn't double-arm the same scheduled send.
-  /// Scheduled sends with a live timer, keyed `(project path, session UUID,
-  /// fire time)`. The UUID, not the label: two headings can share a label at
-  /// any instant (see `jc_core::todo::SessionKey`).
+  /// Scheduled sends that already have a timer armed, so reconciliation doesn't
+  /// double-arm the same one. Keyed `(project path, session UUID, delivery
+  /// time)` — the UUID, not the label: two headings can share a label at any
+  /// instant (see `jc_core::todo::SessionKey`).
   armed_schedules: std::collections::HashSet<(PathBuf, String, NaiveDateTime)>,
   global_todo_view: Entity<crate::views::code_view::CodeView>,
   keybinding_help: Option<(AnyView, Subscription)>,
@@ -1097,7 +1096,6 @@ impl Workspace {
     &mut self,
     project_idx: usize,
     key: &jc_core::todo::SessionKey,
-    label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -1110,20 +1108,24 @@ impl Workspace {
     // permanently, since the heading is bound by then.
     let resolved = todo_view.update(cx, |tv, cx| {
       let index = tv.document().index_of(key)?;
-      let uuid = tv.document().sessions[index].uuid.clone();
+      let heading = &tv.document().sessions[index];
+      // The display name comes off the heading we just resolved, never from the
+      // picker snapshot: the two can disagree, and the file is the truth.
+      let label = heading.label.clone();
+      let uuid = heading.uuid.clone();
       if !uuid.is_empty() {
-        return Some((uuid, None));
+        return Some((uuid, label, None));
       }
       let minted = uuid::Uuid::new_v4().to_string();
       tv.update_session_uuid_at(index, &minted, window, cx);
-      Some((minted, Some(Launch::New)))
+      Some((minted, label, Some(Launch::New)))
     });
 
     // Refuse to launch a session whose UUID isn't in the file. It could never
     // be label-synced or disabled afterwards (both key on the UUID), and the
     // still-unbound heading would stay adoptable — so a second press would
     // spawn a second process for the same heading.
-    let Some((uuid, minted_launch)) = resolved else {
+    let Some((uuid, label, minted_launch)) = resolved else {
       eprintln!("adopt: no TODO heading for {key:?}; not launching");
       // The picker already dropped `pre_picker_focus` on the assumption that
       // this call would focus something. It won't, so do it here or the next
@@ -1140,7 +1142,7 @@ impl Workspace {
       .read(cx)
       .document()
       .session_of(&key)
-      .is_some_and(|s| s.status == jc_core::todo::SessionStatus::Disabled);
+      .is_some_and(jc_core::todo::TodoSession::is_disabled);
     todo_view.update(cx, |tv, cx| {
       if is_disabled {
         tv.toggle_session_disabled(&key, window, cx);
@@ -1161,7 +1163,7 @@ impl Workspace {
     let session = SessionState::create(
       id,
       uuid.to_string(),
-      label.to_string(),
+      label,
       &project_path,
       &palette,
       dangerous,
@@ -1183,10 +1185,10 @@ impl Workspace {
   // Session disable toggle
   // ---------------------------------------------------------------------------
 
-  /// Toggle the `[D]` marker on the session owning `uuid`, detaching its
-  /// terminal if it is running and just became disabled. Addressed by UUID
-  /// throughout: with two same-labelled headings a label-keyed toggle marks the
-  /// wrong one and detaches a live session.
+  /// Toggle the `[D]` marker on the heading `key` names, detaching its terminal
+  /// if it is running and just became disabled. Never addressed by label: with
+  /// two same-labelled headings a label-keyed toggle marks the wrong one and
+  /// detaches a live session (see `jc_core::todo::SessionKey`).
   fn toggle_session_disabled(
     &mut self,
     project_idx: usize,
@@ -1198,7 +1200,7 @@ impl Workspace {
     let todo_view = project.todo_view.clone();
 
     // Check if the session is currently adopted (running). An unbound heading
-    // never is, so this is `None` for a `Label` key.
+    // never is, so this is `None` for an `Unbound` key.
     let adopted_id = match key {
       jc_core::todo::SessionKey::Uuid(uuid) => project.session_by_uuid(uuid).map(|(id, _)| id),
       jc_core::todo::SessionKey::Unbound { .. } => None,
@@ -1214,7 +1216,7 @@ impl Workspace {
       .read(cx)
       .document()
       .session_of(key)
-      .is_some_and(|s| s.status == jc_core::todo::SessionStatus::Disabled);
+      .is_some_and(jc_core::todo::TodoSession::is_disabled);
     // Whether control ended up in `switch_to_session`, which focuses the pane it
     // lands on. When it doesn't, nothing else will: the picker's confirm handler
     // has already dropped `pre_picker_focus`, so focus would be stranded on the
@@ -1587,14 +1589,9 @@ impl Workspace {
             changed |= ws.projects[i].sync_sessions_from_todo(cx);
           }
           if changed {
-            // A renamed heading changes the label the TODO view highlights by,
-            // so re-point it — otherwise `apply_session_highlights` matches
-            // nothing and the active session's colouring silently disappears
-            // until the next session switch.
-            let pi = ws.active_project_index;
-            let uuid = ws.projects[pi].active_uuid().map(str::to_string);
-            let todo_view = ws.projects[pi].todo_view.clone();
-            todo_view.update(cx, |tv, cx| tv.set_active_uuid(uuid.as_deref(), cx));
+            // Only the label moved: `sync_sessions_from_todo` never rewrites a
+            // session's UUID, and the TODO view highlights by UUID, so there is
+            // nothing to re-point â just redraw the label wherever it shows.
             cx.notify();
           }
         });
@@ -1752,7 +1749,14 @@ impl Workspace {
       if let Some(project) = self.projects.iter_mut().find(|p| p.path == *project_path)
         && let Some(session) = project.sessions.values_mut().find(|s| s.uuid == old_session_id)
       {
-        session.uuid = new_session_id;
+        let is_active = project.active_session == Some(session.id);
+        session.uuid = new_session_id.clone();
+        // The TODO view highlights the active session by UUID, so the swap has
+        // to be told to it too â otherwise the active heading's colouring goes
+        // out until the next session switch.
+        if is_active {
+          todo_view.update(cx, |tv, cx| tv.set_active_uuid(Some(&new_session_id), cx));
+        }
       }
     } else {
       eprintln!(

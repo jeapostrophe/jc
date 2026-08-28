@@ -86,7 +86,7 @@ impl TodoView {
   }
 
   /// 0-based line of the last line in the WAIT body of the session bound to
-  /// `uuid` -- where the cursor goes so the user can type.
+  /// `uuid` — where the cursor goes so the user can type.
   pub fn wait_line(&self, uuid: &str, cx: &App) -> Option<u32> {
     let wait = self.document.session_by_uuid(uuid)?.wait.as_ref()?;
     Some(wait.body_end_line(&self.editor_text(cx)))

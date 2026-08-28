@@ -35,6 +35,12 @@ pub struct TodoDocument {
 /// and refuses otherwise. That check reads the live document, so it holds
 /// continuously rather than resting on a one-shot repair pass; it is also what
 /// makes the key survive the window between a picker snapshot and its confirm.
+///
+/// So this type is *not* the universal address. An operation that can only act
+/// on a bound heading takes the UUID directly as a `&str`; `SessionKey` exists
+/// for the two picker-originated operations that may name an unbound heading
+/// (`Workspace::adopt_session` and `Workspace::toggle_session_disabled`), and
+/// `Unbound` has no meaning outside them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionKey {
   /// A bound heading, addressed by its (unique) UUID.
@@ -124,6 +130,18 @@ impl TodoWait {
 }
 
 impl TodoSession {
+  /// How to address this heading, given its position in
+  /// [`TodoDocument::sessions`] — its UUID, or that verified position when it is
+  /// unbound. See [`SessionKey`].
+  pub fn key(&self, index: usize) -> SessionKey {
+    SessionKey::new(&self.uuid, index, &self.label)
+  }
+
+  /// Whether the heading carries the `[D]` (disabled/dormant) prefix.
+  pub fn is_disabled(&self) -> bool {
+    self.status == SessionStatus::Disabled
+  }
+
   /// The session's pending scheduled message, if any (a `### Message N`
   /// heading carrying an undelivered `@jc(<datetime>)` marker). At most one
   /// exists at a time — sends are blocked while one is pending.
@@ -184,9 +202,8 @@ impl TodoDocument {
 
   /// Byte offset where the session at `index` ends (the start of the next
   /// session heading, or end of document).
-  fn session_end_offset(&self, index: usize, text_len: usize) -> Option<usize> {
-    self.sessions.get(index)?;
-    Some(self.sessions.get(index + 1).map_or(text_len, |s| s.heading_byte_range.start))
+  fn session_end_offset(&self, index: usize, text_len: usize) -> usize {
+    self.sessions.get(index + 1).map_or(text_len, |s| s.heading_byte_range.start)
   }
 }
 
@@ -506,7 +523,7 @@ pub fn insert_wait_section(text: &str, doc: &TodoDocument, uuid: &str) -> Option
     new_text.push_str(&text[body_start..]);
     return Some(new_text);
   }
-  let end = doc.session_end_offset(index, text.len())?;
+  let end = doc.session_end_offset(index, text.len());
   let mut new_text = String::with_capacity(text.len() + 16);
   new_text.push_str(&text[..end]);
   // Ensure a blank line before the heading.
@@ -589,11 +606,8 @@ pub fn toggle_session_disabled_at(text: &str, doc: &TodoDocument, index: usize) 
   let label = &session.label;
   // Rebuild the heading from the parsed label rather than patching the existing
   // text, so a legacy `## [X] Label` normalises to `## Label` / `## [D] Label`.
-  let new_heading = if session.status == SessionStatus::Disabled {
-    format!("## {label}")
-  } else {
-    format!("## [D] {label}")
-  };
+  let new_heading =
+    if session.is_disabled() { format!("## {label}") } else { format!("## [D] {label}") };
   Some(splice(text, session.heading_byte_range.clone(), &new_heading))
 }
 

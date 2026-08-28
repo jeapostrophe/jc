@@ -113,8 +113,8 @@ impl Workspace {
               SessionPickerResult::Session(pi, id) => {
                 this.switch_to_session(pi, Some(id), window, cx);
               }
-              SessionPickerResult::Adopt(pi, key, label) => {
-                this.adopt_session(pi, &key, &label, window, cx);
+              SessionPickerResult::Adopt(pi, key) => {
+                this.adopt_session(pi, &key, window, cx);
               }
               SessionPickerResult::InitProject(pi) => {
                 this.create_new_session(pi, window, cx);
@@ -212,8 +212,8 @@ impl Workspace {
             this.pre_picker_focus.take();
             this.dismiss_picker();
             match result {
-              ProjectActionsResult::AdoptTodoSession(pi, key, label) => {
-                this.adopt_session(pi, &key, &label, window, cx);
+              ProjectActionsResult::AdoptTodoSession(pi, key) => {
+                this.adopt_session(pi, &key, window, cx);
               }
               ProjectActionsResult::CreateNew => {
                 this.create_new_session(pi, window, cx);
@@ -224,13 +224,12 @@ impl Workspace {
                 // display name, which is harmless: the heading is addressed by
                 // the UUID written with it (see `jc_core::todo::SessionKey`).
                 let todo_view = this.projects[pi].todo_view.clone();
-                let label = summary.clone();
                 todo_view.update(cx, |tv, cx| {
-                  tv.insert_session_heading(&uuid, &label, window, cx);
+                  tv.insert_session_heading(&uuid, &summary, window, cx);
                   tv.save(cx);
                 });
-                let key = jc_core::todo::SessionKey::Uuid(uuid.clone());
-                this.adopt_session(pi, &key, &label, window, cx);
+                let key = jc_core::todo::SessionKey::Uuid(uuid);
+                this.adopt_session(pi, &key, window, cx);
               }
             }
             cx.notify();

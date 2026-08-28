@@ -3,6 +3,7 @@ use gpui_component::ActiveTheme;
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::input::{Input, InputEvent, InputState, Rope};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
+use jc_core::todo::{SessionKey, SessionStatus, TodoDocument};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -713,9 +714,8 @@ struct SessionPickerEntry {
   label: String,
   /// Where this row's TODO.md heading lives. This, not the label, is what
   /// actions carry back to the workspace (see `jc_core::todo::SessionKey`).
-  /// An `EmptyProject` row names no heading, so it gets an empty UUID, which
-  /// resolves to nothing.
-  key: jc_core::todo::SessionKey,
+  /// `None` for an `EmptyProject` row, which names no heading.
+  key: Option<SessionKey>,
   /// Claude has produced terminal output since this session was last on screen.
   has_activity: bool,
   /// Unix timestamp of the last TODO submit (from `> last=`). `0` if unknown.
@@ -726,8 +726,9 @@ struct SessionPickerEntry {
 enum SessionPickerEntryKind {
   /// An adopted session — stores its SessionId.
   Session(SessionId),
-  /// A TODO.md session with no running terminal. The UUID lives on the entry.
-  Unadopted { status: jc_core::todo::SessionStatus },
+  /// A TODO.md session with no running terminal. Its heading address is the
+  /// entry's `key`, which for a legacy unbound heading is not a UUID.
+  Unadopted { status: SessionStatus },
   /// A project with no sessions — selecting it will discover-or-create a session.
   EmptyProject,
 }
@@ -737,12 +738,12 @@ pub enum SessionPickerResult {
   /// Switch to an existing session: (project_index, session_id).
   Session(usize, SessionId),
   /// Adopt a TODO.md session that isn't running yet: (project_index, heading
-  /// address, label).
-  Adopt(usize, jc_core::todo::SessionKey, String),
+  /// address).
+  Adopt(usize, SessionKey),
   /// Initialize a project that has no sessions yet: project_index.
   InitProject(usize),
   /// Toggle disabled state on a session: (project_index, heading address).
-  ToggleDisabled(usize, jc_core::todo::SessionKey),
+  ToggleDisabled(usize, SessionKey),
 }
 
 pub struct SessionPickerDelegate {
@@ -758,7 +759,7 @@ impl SessionPickerDelegate {
   pub fn new(
     projects: &[ProjectState],
     active_project_index: usize,
-    todo_documents: &[&jc_core::todo::TodoDocument],
+    todo_documents: &[&TodoDocument],
     cx: &App,
   ) -> Self {
     let mut entries = Vec::new();
@@ -772,7 +773,7 @@ impl SessionPickerDelegate {
           project_index: pi,
           project_name: project.name.clone(),
           label: String::new(),
-          key: jc_core::todo::SessionKey::Uuid(String::new()),
+          key: None,
           has_activity: false,
           last_active: 0,
         });
@@ -796,7 +797,7 @@ impl SessionPickerDelegate {
           project_name: project.name.clone(),
           label: session.label.clone(),
           // A running session is always bound, so its UUID is a true address.
-          key: jc_core::todo::SessionKey::Uuid(session.uuid.clone()),
+          key: Some(SessionKey::Uuid(session.uuid.clone())),
           // The session on screen is the one you're looking at, so its output
           // is by definition already seen.
           has_activity: !is_active && session.claude_terminal.read(cx).has_unseen_output(),
@@ -817,7 +818,7 @@ impl SessionPickerDelegate {
             label: todo_session.label.clone(),
             // An unbound heading has no UUID to key on; `index` is its address,
             // re-verified against the live document at write time.
-            key: jc_core::todo::SessionKey::new(&todo_session.uuid, index, &todo_session.label),
+            key: Some(todo_session.key(index)),
             has_activity: false,
             last_active: todo_session.last_active.unwrap_or(0),
           });
@@ -901,20 +902,27 @@ impl PickerDelegate for SessionPickerDelegate {
 
   fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
     let e = &self.entries[index];
-    self.result = Some(match &e.kind {
-      SessionPickerEntryKind::Session(id) => SessionPickerResult::Session(e.project_index, *id),
-      SessionPickerEntryKind::Unadopted { .. } => {
-        SessionPickerResult::Adopt(e.project_index, e.key.clone(), e.label.clone())
+    self.result = match &e.kind {
+      SessionPickerEntryKind::Session(id) => {
+        Some(SessionPickerResult::Session(e.project_index, *id))
       }
-      SessionPickerEntryKind::EmptyProject => SessionPickerResult::InitProject(e.project_index),
-    });
+      // `key` is `Some` for every row but `EmptyProject`, so this arm always
+      // yields one; matching rather than unwrapping keeps that structural.
+      SessionPickerEntryKind::Unadopted { .. } => {
+        e.key.clone().map(|key| SessionPickerResult::Adopt(e.project_index, key))
+      }
+      SessionPickerEntryKind::EmptyProject => {
+        Some(SessionPickerResult::InitProject(e.project_index))
+      }
+    };
   }
 
   fn delete(&mut self, index: usize, _window: &mut Window, cx: &mut Context<PickerState<Self>>) {
     let e = &self.entries[index];
     match &e.kind {
       SessionPickerEntryKind::Session(_) | SessionPickerEntryKind::Unadopted { .. } => {
-        self.result = Some(SessionPickerResult::ToggleDisabled(e.project_index, e.key.clone()));
+        let Some(key) = e.key.clone() else { return };
+        self.result = Some(SessionPickerResult::ToggleDisabled(e.project_index, key));
         cx.emit(PickerEvent::Confirmed);
       }
       _ => {}
@@ -934,9 +942,7 @@ impl PickerDelegate for SessionPickerDelegate {
         let color = if selected { theme.accent_foreground } else { theme.blue };
         picker_marker_base().text_color(color).child("+")
       }
-      SessionPickerEntryKind::Unadopted {
-        status: jc_core::todo::SessionStatus::Disabled, ..
-      } => {
+      SessionPickerEntryKind::Unadopted { status: SessionStatus::Disabled, .. } => {
         let color = if selected { theme.accent_foreground } else { theme.muted_foreground };
         picker_marker_base().text_color(color).child("~")
       }
@@ -965,9 +971,9 @@ impl PickerDelegate for SessionPickerDelegate {
     let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
     let right = match &entry.kind {
       SessionPickerEntryKind::EmptyProject => "(no sessions)".to_string(),
-      SessionPickerEntryKind::Unadopted {
-        status: jc_core::todo::SessionStatus::Disabled, ..
-      } => "(disabled)".to_string(),
+      SessionPickerEntryKind::Unadopted { status: SessionStatus::Disabled, .. } => {
+        "(disabled)".to_string()
+      }
       SessionPickerEntryKind::Unadopted { .. } => "(adopt)".to_string(),
       _ => String::new(),
     };
@@ -1007,15 +1013,16 @@ impl PickerDelegate for SessionPickerDelegate {
 
 #[derive(Clone)]
 pub enum ProjectActionsResult {
-  AdoptTodoSession(usize, jc_core::todo::SessionKey, String), // pi, heading address, label
+  AdoptTodoSession(usize, SessionKey), // pi, heading address
   CreateNew,
-  AdoptJsonlSession(String, String), // uuid, label
+  AdoptJsonlSession(String, String), // uuid, summary
 }
 
 enum ProjectActionsEntry {
-  /// A TODO.md session that isn't currently running.
+  /// A TODO.md session that isn't currently running. `label` is for display
+  /// only; `key` is the address (see `jc_core::todo::SessionKey`).
   Dormant {
-    key: jc_core::todo::SessionKey,
+    key: SessionKey,
     label: String,
   },
   NewSession,
@@ -1037,7 +1044,7 @@ impl ProjectActionsPickerDelegate {
   pub fn new(
     projects: &[ProjectState],
     active_project_index: usize,
-    todo_documents: &[&jc_core::todo::TodoDocument],
+    todo_documents: &[&TodoDocument],
     project_path: &Path,
   ) -> Self {
     use std::collections::HashSet;
@@ -1048,12 +1055,11 @@ impl ProjectActionsPickerDelegate {
     // 1. Dormant sessions: in TODO.md but not currently running, sorted by recency.
     {
       let project = &projects[active_project_index];
-      let mut dormant: Vec<(jc_core::todo::SessionKey, String, u64)> = Vec::new();
+      let mut dormant: Vec<(SessionKey, String, u64)> = Vec::new();
       if let Some(doc) = todo_documents.get(active_project_index) {
         for (index, ts) in doc.sessions.iter().enumerate() {
           if !project.is_adopted(&ts.uuid) {
-            let key = jc_core::todo::SessionKey::new(&ts.uuid, index, &ts.label);
-            dormant.push((key, ts.label.clone(), ts.last_active.unwrap_or(0)));
+            dormant.push((ts.key(index), ts.label.clone(), ts.last_active.unwrap_or(0)));
           }
         }
       }
@@ -1125,11 +1131,9 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
   fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
     let entry = &self.entries[index];
     self.result = Some(match entry {
-      ProjectActionsEntry::Dormant { key, label } => ProjectActionsResult::AdoptTodoSession(
-        self.active_project_index,
-        key.clone(),
-        label.clone(),
-      ),
+      ProjectActionsEntry::Dormant { key, .. } => {
+        ProjectActionsResult::AdoptTodoSession(self.active_project_index, key.clone())
+      }
       ProjectActionsEntry::NewSession => ProjectActionsResult::CreateNew,
       ProjectActionsEntry::Unattached { uuid, summary } => {
         ProjectActionsResult::AdoptJsonlSession(uuid.clone(), summary.clone())
