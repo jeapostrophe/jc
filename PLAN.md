@@ -23,20 +23,72 @@
 ### Automation
 - [ ] [D] Auto-creating and running sessions
 
-### Simplification: features removed  ✅ shipped (2026-08-27)
-After long use, a set of features turned out never to be reached for, and each was
-carrying real machinery. Removed wholesale: the problem/priority system (L0–L3, Cmd-;,
-title-bar counts, `status.sh`), the Git Diff view (and Cmd-D), the Cmd-K comment system,
-the Cmd-Shift-K snippet picker, Cmd-Shift-C (copy reply), and Cmd-Shift-E (external
-editor). Desktop notifications narrowed to permission prompts and API errors — the two
-things worth interrupting for. The Cmd-P per-session indicator became a boolean `*`
-("this session's terminal produced output since you last looked at it").
+### Simplification: features removed  ✅ shipped (2026-08-28)
+One item per thing that was asked for, so each can be checked off independently.
+All landed in a single commit (`dadfc34`) rather than one commit each — that was a
+mistake in how the work was sequenced, not a sign the items are entangled; each can
+be reviewed on its own.
 
-Separately, `claude --session-id <uuid>` lets jc *assign* a session's UUID at launch
-instead of detecting it from the first hook, and `claude --resume <uuid>` revives a UUID
-whose transcript Claude has garbage-collected. Together those dissolve the `[X]` expired
-state and the new-session detector. A legacy `## [X] Label` heading is still read, as
-`[D]` (dormant).
+- [x] **[SIMP-01]** Remove problem tracking and navigation entirely. Deleted
+      `jc-core/src/problem.rs` (`ProblemLayer` L0–L3, `ProblemTarget`, `SessionProblem`,
+      `ProjectProblem`, ranks) and `jc-app/src/views/workspace/problems.rs` (the Cmd-;
+      rotation); dropped the `cmd-;` binding, the title-bar problem count and its
+      per-layer tooltip, per-session problem lists, `todo::validate`/`TodoProblem`, and
+      the 2 s poll task that recomputed them.
+- [x] **[SIMP-02]** Keep app notifications for permission prompts and API errors only.
+      `Workspace::handle_hook_event` notifies on `PermissionPrompt` and `StopFailure`
+      and nothing else; `Stop` and `IdlePrompt` still clear `busy` but never interrupt.
+      `notify::notify` lost its `critical` parameter — every surviving notification is.
+- [x] **[SIMP-03]** Remove `status.sh` support. Deleted `jc-core/src/status_script.rs`,
+      `ScriptProblem`, the 10 s run interval, and the repo's own stub `status.sh`.
+      (Answer to a question asked at the time: it existed only to feed the problem list.)
+- [x] **[SIMP-04]** Remove the Git Diff view. Deleted `jc-app/src/views/diff_view.rs`,
+      `PaneContentKind::GitDiff` (`ALL` is 5 wide now), the diff drill-down picker,
+      git-log/commit browsing, and per-file "mark reviewed" (the Diff meaning of Cmd-R;
+      Cmd-R still reloads in the Code view). Dropped the `similar` dependency.
+- [x] **[SIMP-05]** Remove Cmd-D. Went with the diff view — `ToggleCodeDiff` and both its
+      bindings are gone.
+- [x] **[SIMP-06]** Remove the Cmd-K comment system. Deleted
+      `jc-app/src/views/comment_panel.rs`, `CodeView::comment_context`, and
+      `TodoDocument::comment_insert_offset`.
+- [x] **[SIMP-07]** Remove the Cmd-Shift-K snippet picker. Deleted
+      `jc-core/src/snippets.rs`, `SnippetPickerDelegate`, and the `~/.claude/jc.md`
+      watcher.
+- [x] **[SIMP-08]** Remove Cmd-Shift-C (copy Claude's reply). Deleted `CopyReply`, the
+      `/copy` clipboard poll, and the `.jc/replies/` write path. Dropped `arboard`.
+- [x] **[SIMP-09]** Remove Cmd-Shift-E (open in external editor). Deleted
+      `OpenInExternalEditor` and its `zed path:line` spawn.
+- [x] **[SIMP-10]** Cmd-P indicator becomes a boolean `*` for "this session has had
+      activity". Defined as *any terminal output since the session was last on screen*:
+      `TerminalView` counts parsed output batches (`output_batches`) against a baseline
+      (`seen_batches`), `has_unseen_output` compares them, and
+      `Workspace::switch_to_session` rebaselines on switch-**away** so the marker means
+      the same thing however you left. `SessionState::ActivityBaseline` discounts each
+      session's own launch output. The picker sorts activity-first in both the current
+      project and the others.
+- [x] **[SIMP-11]** Assign session UUIDs instead of detecting them. `create_new_session`
+      mints a v4 UUID and spawns `claude --session-id <uuid>`, writing the heading and the
+      UUID together; the "launch bare `claude`, fill the UUID in from the first hook"
+      path and its `cwd`-matched fallback are gone, and `SessionState::uuid` is a plain
+      `String`. `/clear` handling is unchanged (kept deliberately).
+- [x] **[SIMP-12]** Drop the `[X]` expired state. `SessionStatus::Expired`,
+      `todo::mark_session_expired` and the startup expiry pass are gone; a legacy
+      `## [X] Label` heading reads as `[D]` and normalises to `## Label` when re-enabled.
+      **Deviation worth checking:** the premise that `claude --resume` works on a deleted
+      UUID is false — measured 2026-08-27, it prints `No conversation found with session
+      ID: <uuid>` and exits, for a deleted *and* a never-used UUID. What does work is
+      `--session-id` on that same UUID, which starts a fresh conversation under it. So the
+      conclusion holds by a different route: a session whose transcript is gone is
+      *relaunched*, not retired, and `ProjectState::launch_for` picks the flag from
+      transcript presence. The transcript check therefore survives — it chooses a flag
+      instead of deciding a session's fate.
+- [x] **[SIMP-13]** Legacy headings with a blank `> uuid=` (written by the old
+      detect-the-UUID flow) are **not** rewritten at startup: minting there would bind the
+      heading to an empty conversation and orphan whatever real transcript it had. They
+      are listed as adoptable in both pickers, and `adopt_session` mints and records the
+      UUID at that point. Duplicate labels are repaired at startup
+      (`ProjectState::dedupe_labels`), since TODO.md's text operations still address a
+      session by label.
 
 ### Scheduled Messages  ✅ shipped & verified working end-to-end (2026-07-13)
 **Purpose:** auto-resume a session after a Claude usage-limit reset — queue the message
