@@ -97,7 +97,7 @@ impl SessionState {
     // work done while you were away, so they must not leave the Cmd-P marker
     // set. Opened here rather than at startup because `Workspace::open_project`
     // can restore a project's sessions at any point in the run.
-    claude_terminal.update(cx, |terminal, cx| terminal.discount_launch_output(cx));
+    claude_terminal.read(cx).discount_launch_output();
     let general_terminal =
       cx.new(|cx| TerminalView::new(general_config, Some(&project), window, cx));
     let code_view = cx.new(|cx| CodeView::new(window, cx));

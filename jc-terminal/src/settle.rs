@@ -69,8 +69,9 @@ impl SettleWindow {
       return SettleStep::Clear;
     }
     // A child that has printed nothing yet is not quiet, it is slow to start;
-    // baselining now would let its banner land above the baseline. Sleep to the
-    // give-up deadline — the next batch is what reopens the quiet wait.
+    // baselining now would let its banner land above the baseline. There is
+    // nothing to wait *for* but the first batch, which wakes the driver, and
+    // the give-up deadline, which is all this wait has to cover.
     let Some(last_batch) = self.last_batch else {
       return SettleStep::Wait(to_deadline);
     };
@@ -111,16 +112,25 @@ mod tests {
     }
   }
 
-  /// While no batch has arrived, the only thing left to wake for is the give-up
-  /// deadline, so the wait must run exactly to it — never past it.
+  /// The window settles one quiet period after the LAST batch — the give-up
+  /// deadline is a bound, not the normal exit. Settling only at the deadline
+  /// would absorb everything the child printed unprompted in between into the
+  /// baseline, which is exactly the output the marker exists to report.
   #[test]
-  fn wait_before_first_batch_runs_to_the_give_up_deadline() {
+  fn settles_one_quiet_window_after_the_last_batch() {
     let start = Instant::now();
     let mut w = window(start);
+    let printed = start + Duration::from_secs(1);
+    w.note_batch(printed);
     assert_eq!(
-      w.step(start + Duration::from_secs(5)),
-      SettleStep::Wait(GIVE_UP - Duration::from_secs(5)),
-      "with nothing printed yet the next wake must be the give-up deadline"
+      w.step(printed),
+      SettleStep::Wait(QUIET),
+      "the next decision point is one quiet window after the batch, not the give-up deadline"
+    );
+    assert_eq!(
+      w.step(printed + QUIET),
+      SettleStep::Clear,
+      "a full quiet window since the last batch — baseline it here, well before give-up"
     );
   }
 
