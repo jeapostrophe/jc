@@ -2,9 +2,9 @@ use crate::views::code_view::CodeView;
 use chrono::NaiveDateTime;
 use gpui::*;
 use gpui_component::ActiveTheme;
-use gpui_component::input::{InputEvent, Rope, RopeExt as _};
-use jc_core::todo::{self, TodoDocument, TodoProblem};
-use std::path::{Path, PathBuf};
+use gpui_component::input::{InputEvent, RopeExt as _};
+use jc_core::todo::{self, SessionKey, TodoDocument};
+use std::path::PathBuf;
 
 /// Current Unix time in whole seconds, used for `> last=` timestamps.
 fn now_unix_secs() -> u64 {
@@ -26,9 +26,7 @@ pub enum ScheduledFire {
 pub struct TodoView {
   code_view: Entity<CodeView>,
   file_path: PathBuf,
-  project_path: PathBuf,
   document: TodoDocument,
-  problems: Vec<TodoProblem>,
   active_label: Option<String>,
   _editor_subscription: Subscription,
 }
@@ -52,31 +50,15 @@ impl TodoView {
           let text = this.code_view.read(cx).editor_text(cx);
           this.document = todo::parse(&text);
           this.apply_session_highlights(cx);
-          // Skip re-validation on every keystroke (it re-parses the document).
           cx.notify();
         }
       });
 
-    // Initial parse and validate.
+    // Initial parse.
     let text = code_view.read(cx).editor_text(cx);
     let document = todo::parse(&text);
-    let problems = todo::validate(&document, &project_path, &text);
 
-    let mut view = Self {
-      code_view,
-      file_path,
-      project_path,
-      document,
-      problems,
-      active_label: None,
-      _editor_subscription,
-    };
-    view.apply_diagnostics(cx);
-    view
-  }
-
-  pub fn file_path(&self) -> &Path {
-    &self.file_path
+    Self { code_view, file_path, document, active_label: None, _editor_subscription }
   }
 
   pub fn code_view(&self) -> &Entity<super::code_view::CodeView> {
@@ -127,10 +109,6 @@ impl TodoView {
     &self.document
   }
 
-  pub fn problems(&self) -> &[TodoProblem] {
-    &self.problems
-  }
-
   /// Set the active session label. The active session's headings get
   /// highlighted with the `@type` / `@function` theme colors while
   /// other sessions use default markdown heading colors.
@@ -160,47 +138,6 @@ impl TodoView {
     });
     self.revalidate(cx);
     self.save(cx);
-  }
-
-  pub fn insert_at_cursor(&self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-    let insert_text = format!("{text}\n");
-    self.code_view.update(cx, |cv, cx| {
-      cv.editor().update(cx, |state, cx| {
-        state.insert(insert_text, window, cx);
-      });
-    });
-  }
-
-  pub fn insert_comment(
-    &self,
-    session_label: &str,
-    comment: &str,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    let Some(offset) = self.document.comment_insert_offset(session_label) else {
-      return;
-    };
-    self.code_view.update(cx, |cv, cx| {
-      let mut text = cv.editor_text(cx);
-      text.insert_str(offset, comment);
-      cv.editor().update(cx, |state, cx| {
-        state.set_value_preserving_position(text, window, cx);
-      });
-    });
-  }
-
-  /// Mark a session as expired (`[X]`) because its JSONL was garbage-collected.
-  pub fn mark_session_expired(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
-    let text = self.editor_text(cx);
-    if let Some(new_text) = todo::mark_session_expired(&text, &self.document, label) {
-      self.code_view.update(cx, |cv, cx| {
-        cv.editor().update(cx, |state, cx| {
-          state.set_value_preserving_position(new_text, window, cx);
-        });
-      });
-      self.revalidate(cx);
-    }
   }
 
   /// Bound every session's message log to the most recent
@@ -236,15 +173,23 @@ impl TodoView {
     self.set_text_and_save(new_text, window, cx);
   }
 
-  /// Toggle the `[D]` (disabled/dormant) prefix on a session heading.
+  /// Toggle the `[D]` prefix on the heading `key` names.
   pub fn toggle_session_disabled(
     &mut self,
-    label: &str,
+    key: &SessionKey,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    let Some(index) = self.document.index_of(key) else {
+      // Reachable whenever memory and file disagree (a `/clear` whose heading
+      // write missed, a hand-edited `> uuid=`, a heading renamed since the
+      // picker snapshot). Cmd-Shift-Backspace then does nothing at all, so say
+      // why rather than appearing to be ignored.
+      eprintln!("toggle-disabled: no TODO heading for {key:?}");
+      return;
+    };
     let text = self.editor_text(cx);
-    if let Some(new_text) = todo::toggle_session_disabled(&text, &self.document, label) {
+    if let Some(new_text) = todo::toggle_session_disabled_at(&text, &self.document, index) {
       self.code_view.update(cx, |cv, cx| {
         cv.editor().update(cx, |state, cx| {
           state.set_value_preserving_position(new_text, window, cx);
@@ -350,16 +295,18 @@ impl TodoView {
     }
   }
 
-  /// Update a session's UUID in the TODO document text.
-  pub fn update_session_uuid(
+  /// Rename the session at `index`. Positional for the same reason as
+  /// [`Self::update_session_uuid_at`]: the caller is repairing duplicates, so
+  /// the label is exactly what it cannot key on.
+  pub fn rename_session_at(
     &mut self,
-    label: &str,
-    new_uuid: &str,
+    index: usize,
+    new_label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let text = self.editor_text(cx);
-    if let Some(new_text) = todo::update_session_uuid(&text, &self.document, label, new_uuid) {
+    if let Some(new_text) = todo::rename_session_at(&text, &self.document, index, new_label) {
       self.code_view.update(cx, |cv, cx| {
         cv.editor().update(cx, |state, cx| {
           state.set_value_preserving_position(new_text, window, cx);
@@ -369,28 +316,33 @@ impl TodoView {
     }
   }
 
-  /// Re-validate and refresh diagnostics. Call after loading or when the user
-  /// explicitly requests a check (not on every keystroke, since it re-parses).
+  /// Write `new_uuid` onto the session at `index` in the parsed document.
+  /// Positional rather than label-keyed because labels are not unique, and
+  /// because the migration that mints UUIDs has no UUID to key on yet.
+  pub fn update_session_uuid_at(
+    &mut self,
+    index: usize,
+    new_uuid: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let text = self.editor_text(cx);
+    if let Some(new_text) = todo::update_session_uuid_at(&text, &self.document, index, new_uuid) {
+      self.code_view.update(cx, |cv, cx| {
+        cv.editor().update(cx, |state, cx| {
+          state.set_value_preserving_position(new_text, window, cx);
+        });
+      });
+      self.revalidate(cx);
+    }
+  }
+
+  /// Re-parse the document and refresh highlights. Call after loading or after
+  /// any edit jc itself makes (not on every keystroke, since it re-parses).
   pub fn revalidate(&mut self, cx: &mut Context<Self>) {
     let text = self.code_view.read(cx).editor_text(cx);
     self.document = todo::parse(&text);
-    self.problems = todo::validate(&self.document, &self.project_path, &text);
-    self.apply_diagnostics(cx);
     self.apply_session_highlights(cx);
-  }
-
-  /// Push current problems as editor diagnostics.
-  fn apply_diagnostics(&mut self, cx: &mut Context<Self>) {
-    self.code_view.update(cx, |cv, cx| {
-      cv.editor().update(cx, |state, cx| {
-        let rope = Rope::from(state.value().as_ref());
-        if let Some(diag_set) = state.diagnostics_mut() {
-          diag_set.reset(&rope);
-          // No more InvalidSessionSlug diagnostics — validation only checks unsent waits.
-          cx.notify();
-        }
-      });
-    });
   }
 
   /// Apply foreground highlights to the active session's headings.

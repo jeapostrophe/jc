@@ -1,7 +1,6 @@
 use crate::file_watcher::watch_dir;
 use crate::language::Language;
 use crate::outline::{OutlineItem, breadcrumb_at_byte, compute_outline};
-use crate::views::comment_panel::CommentContext;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::path::{Path, PathBuf};
@@ -254,15 +253,6 @@ impl CodeView {
       self.breadcrumb = new_breadcrumb;
       cx.notify();
     }
-  }
-
-  pub fn comment_context(&self, project_path: &Path, cx: &App) -> Option<CommentContext> {
-    let file_path = self.current_file.as_ref()?;
-    let relative = file_path.strip_prefix(project_path).ok().unwrap_or(file_path);
-    let (start, end) = super::selection_line_range(&self.editor, cx);
-    let prefilled =
-      format!("* {}:{} \u{2014} ", relative.display(), super::format_line_range(start, end));
-    Some(CommentContext { prefilled })
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {

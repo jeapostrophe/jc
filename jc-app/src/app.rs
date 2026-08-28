@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use crate::views::close_confirm;
 use crate::views::code_view;
-use crate::views::comment_panel;
-use crate::views::diff_view;
 use crate::views::keybinding_help;
 use crate::views::picker;
 use crate::views::workspace::{self, Workspace};
@@ -178,8 +176,6 @@ pub fn run(state: AppState, config: AppConfig, ipc_rx: flume::Receiver<std::path
     workspace::init(cx);
     picker::init(cx);
     code_view::init(cx);
-    diff_view::init(cx);
-    comment_panel::init(cx);
     keybinding_help::init(cx);
     close_confirm::init(cx);
 

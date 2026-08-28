@@ -1,13 +1,13 @@
 mod pickers;
-mod problems;
 mod render;
 
 use crate::views::close_confirm::{CloseConfirm, CloseConfirmEvent};
-use crate::views::diff_view::DiffViewEvent;
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
-use crate::views::session_state::{PendingEvent, SavedViewState, SessionId, SessionState};
+use crate::views::session_state::{
+  ActivityBaseline, Launch, SavedViewState, SessionId, SessionState,
+};
 use crate::views::todo_view::ScheduledFire;
 use chrono::NaiveDateTime;
 use gpui::*;
@@ -15,13 +15,10 @@ use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
-use jc_core::snippets::{self, SnippetDocument};
 use jc_core::theme::Appearance;
-use jc_terminal::{Palette, TerminalView, TerminalViewEvent};
+use jc_terminal::{Palette, TerminalView};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration as StdDuration;
 
 actions!(
@@ -37,15 +34,10 @@ actions!(
     SetLayoutThree,
     ShowClaudeTerminal,
     ShowGeneralTerminal,
-    ShowGitDiff,
     ShowCodeViewer,
     ShowTodoEditor,
-    OpenInExternalEditor,
-    OpenCommentPanel,
     SaveFile,
     SendToTerminal,
-    CopyReply,
-    NextProblem,
     JumpToWait,
     RotateNextProject,
     ShowKeybindingHelp,
@@ -53,7 +45,6 @@ actions!(
     ScrollOtherDown,
     ScrollOtherPageUp,
     ScrollOtherPageDown,
-    ToggleCodeDiff,
   ]
 );
 
@@ -83,11 +74,6 @@ fn palette_from_window(window: &Window) -> Palette {
   Palette::for_appearance(appearance_from_window(window.appearance()))
 }
 
-/// Read the current clipboard text contents.
-fn clipboard_contents() -> Option<String> {
-  arboard::Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok())
-}
-
 pub struct Workspace {
   panes: Vec<Entity<Pane>>,
   active_pane_index: usize,
@@ -100,39 +86,23 @@ pub struct Workspace {
   active_picker: Option<AnyView>,
   pre_picker_focus: Option<FocusHandle>,
   _picker_subscription: Option<Subscription>,
-  active_comment_panel: Option<AnyView>,
-  pre_comment_focus: Option<FocusHandle>,
-  _comment_subscription: Option<Subscription>,
   split_generation: usize,
   recent_files: Vec<PathBuf>,
   _appearance_subscription: Subscription,
-  _diff_view_subscription: Option<Subscription>,
   _focus_in_subscriptions: Vec<Subscription>,
   _hook_server: Option<HookServer>,
   _hook_poll_task: Option<Task<()>>,
   _ipc_poll_task: Option<Task<()>>,
-  _bell_subscriptions: Vec<Subscription>,
   _breadcrumb_observers: Vec<Subscription>,
-  _problems_poll_task: Option<Task<()>>,
   /// Periodic task that re-arms scheduled-send timers from the live TODO markers.
   _schedule_reconcile_task: Option<Task<()>>,
   /// (project path, session label, delivery time) tuples that already have a
   /// timer armed, so reconciliation doesn't double-arm the same scheduled send.
   armed_schedules: std::collections::HashSet<(PathBuf, String, NaiveDateTime)>,
-  /// Home session before first L0 cross-session jump (project_index, session_id).
-  pre_layer0_home: Option<(usize, SessionId)>,
-  /// Current cycling state within the layered problem rotation.
-  problem_cycle: Option<super::workspace::problems::ProblemCycleState>,
-  snippets: SnippetDocument,
-  _snippet_watcher: Option<notify::RecommendedWatcher>,
   global_todo_view: Entity<crate::views::code_view::CodeView>,
   keybinding_help: Option<(AnyView, Subscription)>,
   pre_help_focus: Option<FocusHandle>,
   window_active: bool,
-  /// Shared flag so the async poll task can check window focus without a main-thread round-trip.
-  window_active_flag: Arc<AtomicBool>,
-  /// Send a project index to trigger an immediate one-shot problems refresh.
-  problems_refresh_tx: flume::Sender<usize>,
   _window_activation_subscription: Subscription,
   _notification_poll_task: Option<Task<()>>,
   close_confirm: Option<(AnyView, Subscription)>,
@@ -199,16 +169,10 @@ impl Workspace {
         this.apply_appearance(appearance_from_window(window.appearance()), window, cx);
       });
 
-    // Track window activation for notification suppression + poll gating.
-    let window_active_flag = Arc::new(AtomicBool::new(true));
-    let window_active_flag_for_sub = window_active_flag.clone();
+    // Track window activation so notifications only fire when jc is in the background.
     let window_activation_subscription =
       cx.observe_window_activation(window, move |this: &mut Self, window, _cx| {
-        let active = window.is_window_active();
-        this.window_active = active;
-        this.window_active_flag.store(active, Ordering::Relaxed);
-        // Wake the poll task so it can adjust its sleep interval.
-        let _ = this.problems_refresh_tx.try_send(usize::MAX);
+        this.window_active = window.is_window_active();
       });
 
     let mut focus_in_subscriptions = Vec::new();
@@ -266,142 +230,6 @@ impl Workspace {
       }
     };
 
-    // Subscribe to bell events from all sessions' claude terminals.
-    let bell_subscriptions = Self::subscribe_bells(&projects, cx);
-
-    // Problem refresh poll task.
-    //
-    // Energy-conscious design:
-    // - Only polls the *active* project (diff + problems) on a 2s timer.
-    // - Inactive projects are refreshed on-demand when a hook event arrives
-    //   (Stop, StopFailure, PermissionPrompt, IdlePrompt) via `problems_refresh_tx`.
-    // - When the window is inactive, polling stops entirely — only hook-signalled
-    //   refreshes are processed (the task blocks on the channel).
-    // - The channel also wakes the task immediately for on-demand refreshes.
-    let (problems_refresh_tx, problems_refresh_rx) = flume::bounded::<usize>(8);
-    let window_active_for_poll = window_active_flag.clone();
-    let problems_poll_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-      use crate::views::diff_view::{DiffSource, generate_commit_diff, generate_diff};
-
-      loop {
-        // Determine which project indices to refresh this cycle.
-        let mut refresh_indices: Vec<usize> = Vec::new();
-        let is_active = window_active_for_poll.load(Ordering::Relaxed);
-
-        // Drain any pending signals (non-blocking).
-        while let Ok(idx) = problems_refresh_rx.try_recv() {
-          if idx != usize::MAX {
-            refresh_indices.push(idx);
-          }
-        }
-
-        // Only include the active project when the window is focused.
-        if is_active {
-          let active_idx = cx
-            .update(|cx: &mut App| this.upgrade().map(|e| e.read(cx).active_project_index))
-            .ok()
-            .flatten();
-          let Some(active_idx) = active_idx else { break };
-          if !refresh_indices.contains(&active_idx) {
-            refresh_indices.push(active_idx);
-          }
-        }
-
-        if !refresh_indices.is_empty() {
-          refresh_indices.sort_unstable();
-          refresh_indices.dedup();
-
-          // 1. Gather stale diff jobs from the main thread (cheap).
-          let diff_jobs: Vec<(usize, PathBuf, DiffSource)> = cx
-            .update(|cx: &mut App| {
-              let Some(entity) = this.upgrade() else { return vec![] };
-              entity
-                .read(cx)
-                .projects
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| refresh_indices.contains(i))
-                .filter_map(|(i, p)| {
-                  if p.diff_view.read(cx).is_stale() {
-                    let (path, source) = p.diff_view.read(cx).diff_job();
-                    Some((i, path, source))
-                  } else {
-                    None
-                  }
-                })
-                .collect()
-            })
-            .unwrap_or_default();
-
-          // 2. Run git diffs on background executor (heavy I/O, off main thread).
-          let mut diff_results: Vec<(usize, String)> = Vec::new();
-          for (idx, path, source) in diff_jobs {
-            let text = cx
-              .background_executor()
-              .spawn(async move {
-                match source {
-                  DiffSource::WorkingTree => generate_diff(&path),
-                  DiffSource::Commit { oid, .. } => generate_commit_diff(&path, oid),
-                }
-              })
-              .await;
-            diff_results.push((idx, text));
-          }
-
-          // 3. Apply results + refresh problems on main thread (cheap).
-          let Ok(should_continue) = cx.update(|cx: &mut App| {
-            let Some(entity) = this.upgrade() else { return false };
-            entity.update(cx, |view, cx| {
-              let mut changed = false;
-              for (idx, diff_text) in diff_results {
-                if idx < view.projects.len() {
-                  let data_changed = view.projects[idx]
-                    .diff_view
-                    .update(cx, |dv, _cx| dv.apply_diff_text(diff_text));
-                  changed |= data_changed;
-                }
-              }
-              for &idx in &refresh_indices {
-                if idx < view.projects.len() {
-                  changed |= view.projects[idx].refresh_problems(cx);
-                }
-              }
-              if changed {
-                let pi = view.active_project_index;
-                let label = view.projects[pi].active_label().map(|s| s.to_string());
-                let todo_view = view.projects[pi].todo_view.clone();
-                todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
-                cx.notify();
-              }
-            });
-            true
-          }) else {
-            break;
-          };
-          if !should_continue {
-            break;
-          }
-        }
-
-        // When active: poll every 2s, waking early for hook signals.
-        // When inactive: block on channel only (no timer-based polling).
-        if is_active {
-          futures_lite::future::or(
-            async {
-              Timer::after(StdDuration::from_secs(2)).await;
-            },
-            async {
-              let _ = problems_refresh_rx.recv_async().await;
-            },
-          )
-          .await;
-        } else {
-          // Sleep until a hook event or window activation wakes us.
-          let _ = problems_refresh_rx.recv_async().await;
-        }
-      }
-    });
-
     // Poll IPC channel for open_project requests from other `jc` invocations.
     let ipc_poll_task =
       cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
@@ -446,11 +274,6 @@ impl Workspace {
         }
       });
 
-    // Load snippets and set up file watcher.
-    snippets::ensure_file_exists();
-    let snippets = snippets::load();
-    let snippet_watcher = Self::setup_snippet_watcher(window, cx);
-
     let mut ws = Self {
       panes,
       active_pane_index: 0,
@@ -462,32 +285,20 @@ impl Workspace {
       active_picker: None,
       pre_picker_focus: None,
       _picker_subscription: None,
-      active_comment_panel: None,
-      pre_comment_focus: None,
-      _comment_subscription: None,
       split_generation: 0,
       recent_files: Vec::new(),
       _appearance_subscription: appearance_subscription,
-      _diff_view_subscription: None,
       _focus_in_subscriptions: focus_in_subscriptions,
       _hook_server: hook_server,
       _hook_poll_task: hook_poll_task,
       _ipc_poll_task: Some(ipc_poll_task),
-      _bell_subscriptions: bell_subscriptions,
       _breadcrumb_observers: Vec::new(),
-      _problems_poll_task: Some(problems_poll_task),
       _schedule_reconcile_task: None,
       armed_schedules: std::collections::HashSet::new(),
-      pre_layer0_home: None,
-      problem_cycle: None,
-      snippets,
-      _snippet_watcher: snippet_watcher,
       global_todo_view,
       keybinding_help: None,
       pre_help_focus: None,
       window_active: true,
-      window_active_flag: window_active_flag_for_sub,
-      problems_refresh_tx,
       _window_activation_subscription: window_activation_subscription,
       _notification_poll_task: Some(notification_poll_task),
       close_confirm: None,
@@ -552,62 +363,8 @@ impl Workspace {
     vec![first, second, third]
   }
 
-  /// Subscribe to bell events from all sessions' claude terminals.
-  fn subscribe_bells(projects: &[ProjectState], cx: &mut Context<Self>) -> Vec<Subscription> {
-    let mut subs = Vec::new();
-    for (pi, project) in projects.iter().enumerate() {
-      for (&id, session) in &project.sessions {
-        subs.push(Self::make_bell_subscription(&session.claude_terminal, pi, id, cx));
-      }
-    }
-    subs
-  }
-
-  /// Subscribe to bell events for a single newly-created session.
-  fn subscribe_session_bell(&mut self, pi: usize, id: SessionId, cx: &mut Context<Self>) {
-    let terminal = &self.projects[pi].sessions[&id].claude_terminal;
-    let sub = Self::make_bell_subscription(terminal, pi, id, cx);
-    self._bell_subscriptions.push(sub);
-  }
-
-  fn make_bell_subscription(
-    terminal: &Entity<TerminalView>,
-    pi: usize,
-    session_id: SessionId,
-    cx: &mut Context<Self>,
-  ) -> Subscription {
-    cx.subscribe(
-      terminal,
-      move |this: &mut Self, _, event: &TerminalViewEvent, cx: &mut Context<Self>| match event {
-        TerminalViewEvent::Bell => {
-          if let Some(session) =
-            this.projects.get_mut(pi).and_then(|p| p.sessions.get_mut(&session_id))
-            && session.pending_events.insert(PendingEvent::TerminalBell)
-          {
-            cx.notify();
-          }
-        }
-      },
-    )
-  }
-
-  /// Subscribe to the active project's diff_view and todo_view events.
-  fn subscribe_active_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    let project = &self.projects[self.active_project_index];
-
-    let active_pi = self.active_project_index;
-    let diff_view = project.diff_view.clone();
-    self._diff_view_subscription = Some(cx.subscribe_in(
-      &diff_view,
-      window,
-      move |this: &mut Self, _, event: &DiffViewEvent, window, cx| match event {
-        DiffViewEvent::Reviewed => {
-          this.projects[active_pi].refresh_problems(cx);
-          this.open_drill_down_picker(&crate::views::picker::DrillDownPicker, window, cx);
-        }
-      },
-    ));
-
+  /// (Re)wire per-project observers after the active project changes.
+  fn subscribe_active_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
     self.refresh_breadcrumb_observers(cx);
   }
 
@@ -858,9 +615,6 @@ impl Workspace {
       PaneContentKind::CodeViewer => {
         project.code_view().map(|cv| OtherPaneScrollable::Editor(cv.read(cx).editor().clone()))
       }
-      PaneContentKind::GitDiff => {
-        Some(OtherPaneScrollable::Editor(project.diff_view.read(cx).editor().clone()))
-      }
       PaneContentKind::TodoEditor => {
         let editor = project.todo_view.read(cx).editor(cx);
         Some(OtherPaneScrollable::Editor(editor))
@@ -981,17 +735,6 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    // Clear bell when user switches to the claude terminal.
-    if kind == PaneContentKind::ClaudeTerminal
-      && let Some(session) = self.projects[self.active_project_index].active_session_mut()
-    {
-      session.pending_events.remove(&PendingEvent::TerminalBell);
-    }
-
-    // Refresh views that need it when actively switched to.
-    if kind == PaneContentKind::GitDiff {
-      self.projects[self.active_project_index].diff_view.update(cx, |v, cx| v.refresh(window, cx));
-    }
     self.set_pane_view(pane_idx, kind, cx);
     self.active_pane_index = pane_idx;
 
@@ -1035,78 +778,12 @@ impl Workspace {
     self.set_active_pane_view(PaneContentKind::GeneralTerminal, window, cx);
   }
 
-  fn show_git_diff(&mut self, _: &ShowGitDiff, window: &mut Window, cx: &mut Context<Self>) {
-    self.set_active_pane_view(PaneContentKind::GitDiff, window, cx);
-  }
-
   fn show_code_viewer(&mut self, _: &ShowCodeViewer, window: &mut Window, cx: &mut Context<Self>) {
     self.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
   }
 
   fn show_todo_editor(&mut self, _: &ShowTodoEditor, window: &mut Window, cx: &mut Context<Self>) {
     self.set_active_pane_view(PaneContentKind::TodoEditor, window, cx);
-  }
-
-  /// Toggle between Code and Diff views for the current file.
-  fn toggle_code_diff(&mut self, _: &ToggleCodeDiff, window: &mut Window, cx: &mut Context<Self>) {
-    use crate::views::diff_view::source_line_to_diff_line;
-
-    let kind = self.active_pane_entity().read(cx).content_kind();
-    let pi = self.active_project_index;
-
-    match kind {
-      Some(PaneContentKind::CodeViewer) => {
-        // Grab relative path and current source line before mutating.
-        let (relative, source_line) = {
-          let project = &self.projects[pi];
-          let rel = project.code_view().and_then(|cv| {
-            let cv = cv.read(cx);
-            cv.file_path().and_then(|p| {
-              p.strip_prefix(&project.path).ok().map(|r| r.to_string_lossy().into_owned())
-            })
-          });
-          let line =
-            project.code_view().map(|cv| cv.read(cx).editor().read(cx).cursor_position().line + 1);
-          (rel, line)
-        };
-        self.set_active_pane_view(PaneContentKind::GitDiff, window, cx);
-        if let Some(name) = relative {
-          let diff_view = self.projects[pi].diff_view.clone();
-          let idx = diff_view.read(cx).file_diffs().iter().position(|fd| fd.name == name);
-          if let Some(idx) = idx {
-            diff_view.update(cx, |v, cx| {
-              v.set_file_index(idx, window, cx);
-              // Scroll diff to the source line.
-              if let Some(src_line) = source_line
-                && let Some(content) = v.current_file_content()
-                && let Some(diff_line) = source_line_to_diff_line(content, src_line)
-              {
-                v.scroll_to_line(diff_line, window, cx);
-              }
-            });
-          }
-        }
-      }
-      Some(PaneContentKind::GitDiff) => {
-        let (file_name, source_line) = {
-          let dv = self.projects[pi].diff_view.read(cx);
-          (dv.current_file_name().map(str::to_string), dv.cursor_source_line(cx))
-        };
-        if let Some(name) = file_name {
-          let full_path = self.projects[pi].path.join(&name);
-          if let Some(cv) = self.projects[pi].code_view().cloned() {
-            cv.update(cx, |v, cx| {
-              v.open_file(full_path, window, cx);
-              if let Some(line) = source_line {
-                v.scroll_to_line(line, window, cx);
-              }
-            });
-          }
-          self.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
-        }
-      }
-      _ => {}
-    }
   }
 
   fn toggle_keybinding_help(
@@ -1135,44 +812,6 @@ impl Workspace {
       view.read(cx).focus_handle(cx).focus(window);
       self.keybinding_help = Some((view.into(), sub));
       cx.notify();
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // External editor
-  // ---------------------------------------------------------------------------
-
-  fn open_in_external_editor(
-    &mut self,
-    _: &OpenInExternalEditor,
-    _window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    let pane = self.active_pane_entity().clone();
-    let kind = pane.read(cx).content_kind();
-    let project = self.active_project();
-    let (file_path, line) = match kind {
-      Some(PaneContentKind::CodeViewer) => {
-        if let Some(cv) = project.code_view() {
-          let cv = cv.read(cx);
-          let path = cv.file_path().map(|p| p.to_path_buf());
-          let line = cv.editor().read(cx).cursor_position().line;
-          (path, line)
-        } else {
-          (None, 0)
-        }
-      }
-      Some(PaneContentKind::TodoEditor) => {
-        let path = project.todo_view.read(cx).file_path().to_path_buf();
-        let line = project.todo_view.read(cx).editor(cx).read(cx).cursor_position().line;
-        (Some(path), line)
-      }
-      _ => (None, 0),
-    };
-    if let Some(path) = file_path {
-      // Use `zed path:line` to open at the cursor position within the project.
-      let arg = format!("{}:{}", path.display(), line + 1);
-      let _ = std::process::Command::new("zed").arg(arg).spawn();
     }
   }
 
@@ -1222,17 +861,6 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    self.switch_to_session_inner(project_idx, session_id, false, window, cx);
-  }
-
-  fn switch_to_session_inner(
-    &mut self,
-    project_idx: usize,
-    session_id: Option<SessionId>,
-    skip_acknowledge: bool,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
     // Save the outgoing session's viewport state.
     let todo_editor = self.projects[self.active_project_index].todo_view.read(cx).editor(cx);
     let todo_cursor = todo_editor.read(cx).cursor_position();
@@ -1250,6 +878,11 @@ impl Workspace {
       });
       session.claude_terminal.read(cx).set_visible(false);
       session.general_terminal.read(cx).set_visible(false);
+      // Everything this session printed while it was on screen has been seen,
+      // so it must not come back marked in the Cmd-P picker. Clearing on the way
+      // OUT rather than on the way in is what makes that true regardless of how
+      // the switch was made (picker, Cmd-`, a notification click).
+      session.claude_terminal.read(cx).clear_output_seen();
     }
 
     let project_changed = project_idx != self.active_project_index;
@@ -1266,13 +899,6 @@ impl Workspace {
         session.general_terminal.read(cx).set_display_offset(saved.general_scroll);
       }
     }
-
-    // Acknowledge pending events unless skipped (e.g. L0 problem jump).
-    if !skip_acknowledge && let Some(session) = self.projects[project_idx].active_session_mut() {
-      session.acknowledge();
-    }
-
-    self.problem_cycle = None;
 
     // Restore incoming session's TODO cursor and scroll position.
     if let Some(saved) =
@@ -1298,9 +924,6 @@ impl Workspace {
       // Breadcrumb observers depend on the active session's code_view.
       self.refresh_breadcrumb_observers(cx);
     }
-
-    // Refresh problems after acknowledge.
-    self.projects[project_idx].refresh_problems(cx);
 
     self.restore_or_default_panes(window, cx);
 
@@ -1377,8 +1000,17 @@ impl Workspace {
       self.split_generation += 1;
       self.panes[self.active_pane_index].read(cx).focus_content(window);
     } else {
-      // First visit: default layout.
-      self.set_pane_view(0, PaneContentKind::ClaudeTerminal, cx);
+      // First visit: default layout. With no active session there is no Claude
+      // terminal to show, and `set_pane_view` would leave pane 0 holding
+      // whatever it had — including the terminal of a session just detached,
+      // which the stale `AnyView` would also keep alive and focusable. Show the
+      // project's TODO instead, which needs no session.
+      let first = if self.active_project().active_session().is_some() {
+        PaneContentKind::ClaudeTerminal
+      } else {
+        PaneContentKind::TodoEditor
+      };
+      self.set_pane_view(0, first, cx);
       self.set_pane_view(1, PaneContentKind::TodoEditor, cx);
       self.set_pane_view(2, PaneContentKind::GlobalTodo, cx);
       self.panes[0].read(cx).focus_content(window);
@@ -1398,10 +1030,6 @@ impl Workspace {
         let focus = s.general_terminal.read(cx).focus_handle(cx);
         (s.general_terminal.clone().into(), focus)
       }),
-      PaneContentKind::GitDiff => {
-        let focus = project.diff_view.read(cx).focus_handle(cx);
-        Some((project.diff_view.clone().into(), focus))
-      }
       PaneContentKind::CodeViewer => project.active_session().map(|s| {
         let focus = s.code_view.read(cx).focus_handle(cx);
         (s.code_view.clone().into(), focus)
@@ -1427,8 +1055,9 @@ impl Workspace {
   // Session creation
   // ---------------------------------------------------------------------------
 
-  /// Launch a brand new Claude session (no --resume), with a blank UUID.
-  /// The UUID will be assigned when the first hook event arrives.
+  /// Launch a brand new Claude session under a UUID jc mints itself, so the
+  /// session is identified from the first instant rather than being detected
+  /// after the fact.
   fn create_new_session(
     &mut self,
     project_idx: usize,
@@ -1442,46 +1071,45 @@ impl Workspace {
     let id = project.next_session_id;
     project.next_session_id += 1;
 
-    let label = "New Session".to_string();
+    // Uniquify. Identity is the UUID, but the TODO.md *text* operations are
+    // still label-keyed — `ensure_wait`, `send_selection`, `has_pending_schedule`
+    // and the `@jc(...)` scheduled-send timers all resolve to the first heading
+    // with a given label — so two `## New Session` headings would silently
+    // redirect a send onto the wrong one.
+    let label = jc_core::todo::unique_label(project.todo_view.read(cx).document(), "New Session");
+    let uuid = uuid::Uuid::new_v4().to_string();
 
     let session = SessionState::create(
       id,
-      None, // no UUID yet — will be assigned on first hook
+      uuid.clone(),
       label.clone(),
       &project_path,
       &palette,
       false,
+      Launch::New,
       window,
       cx,
     );
 
     project.sessions.insert(id, session);
 
-    // Insert TODO heading with blank UUID.
     let todo_view = project.todo_view.clone();
     todo_view.update(cx, |tv, cx| {
-      tv.insert_session_heading("", &label, window, cx);
+      tv.insert_session_heading(&uuid, &label, window, cx);
       tv.save(cx);
     });
 
-    self.subscribe_session_bell(project_idx, id, cx);
     self.switch_to_session(project_idx, Some(id), window, cx);
   }
 
-  /// Activate an empty project by creating a brand new Claude session.
-  fn init_empty_project(
-    &mut self,
-    project_idx: usize,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    self.create_new_session(project_idx, window, cx);
-  }
-
-  /// Adopt a TODO.md session that isn't running yet.
-  /// If it has a UUID, launches `claude --resume <uuid>` (invalid UUIDs just
-  /// show an error in the terminal — jc won't crash). If the UUID is empty,
-  /// launches a fresh `claude` and the first hook event will assign the UUID.
+  /// Adopt a TODO.md session that isn't running yet. The launch flag comes from
+  /// whether the transcript is still on disk (`ProjectState::launch_for`), so a
+  /// session Claude has garbage-collected comes back as a fresh conversation
+  /// under its own UUID instead of a dead pane.
+  ///
+  /// An empty `uuid` is a heading an older jc left unbound. One is minted and
+  /// written here rather than at startup, so binding a legacy heading to a new
+  /// (empty) conversation is something the user chose to do.
   fn adopt_session(
     &mut self,
     project_idx: usize,
@@ -1490,18 +1118,54 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    // If the session is disabled, remove the [D] label before adopting.
+    let key = jc_core::todo::SessionKey::new(uuid, label);
+    // A minted UUID has no conversation *by construction*, so it is `New`
+    // outright — never ask `launch_for`, which answers `Resume` when it cannot
+    // see the filesystem at all (`$HOME` unset) and would spawn
+    // `claude --resume <fresh-uuid>` into a dead pane, permanently, since the
+    // heading is bound by then.
+    let (uuid, minted_launch) = if uuid.is_empty() {
+      let minted = uuid::Uuid::new_v4().to_string();
+      let todo_view = self.projects[project_idx].todo_view.clone();
+      let written = todo_view.update(cx, |tv, cx| {
+        let Some(index) = tv.document().index_of(&key) else { return false };
+        tv.update_session_uuid_at(index, &minted, window, cx);
+        tv.save(cx);
+        true
+      });
+      // Refuse to launch a session whose UUID isn't in the file. It could never
+      // be label-synced or disabled afterwards (both key on the UUID), and the
+      // still-unbound heading would stay adoptable — so a second press would
+      // spawn a second process for the same heading.
+      if !written {
+        eprintln!("adopt: no TODO heading for {key:?}; not launching");
+        // The picker already dropped `pre_picker_focus` on the assumption that
+        // this call would focus something. It won't, so do it here or the next
+        // keystroke goes nowhere.
+        self.panes[self.active_pane_index].read(cx).focus_content(window);
+        return;
+      }
+      (minted, Some(Launch::New))
+    } else {
+      (uuid.to_string(), None)
+    };
+    let uuid = &uuid;
+
+    // Everything below addresses the TODO entry by UUID rather than label:
+    // labels are not unique, and a label lookup resolves to the first heading
+    // that matches, which may be a different session entirely.
     {
       let project = &self.projects[project_idx];
       let todo_view = project.todo_view.clone();
       let is_disabled = todo_view
         .read(cx)
         .document()
-        .session_by_label(label)
+        .session_by_uuid(uuid)
         .is_some_and(|s| s.status == jc_core::todo::SessionStatus::Disabled);
       if is_disabled {
+        let key = jc_core::todo::SessionKey::Uuid(uuid.to_string());
         todo_view.update(cx, |tv, cx| {
-          tv.toggle_session_disabled(label, window, cx);
+          tv.toggle_session_disabled(&key, window, cx);
           tv.save(cx);
         });
       }
@@ -1512,24 +1176,24 @@ impl Workspace {
 
     let project = &mut self.projects[project_idx];
     let dangerous =
-      project.todo_view.read(cx).document().session_by_label(label).is_some_and(|s| s.dangerous);
+      project.todo_view.read(cx).document().session_by_uuid(uuid).is_some_and(|s| s.dangerous);
+    let launch = minted_launch.unwrap_or_else(|| project.launch_for(uuid));
     let id = project.next_session_id;
     project.next_session_id += 1;
 
-    let uuid_opt = if uuid.is_empty() { None } else { Some(uuid.to_string()) };
     let session = SessionState::create(
       id,
-      uuid_opt,
+      uuid.to_string(),
       label.to_string(),
       &project_path,
       &palette,
       dangerous,
+      launch,
       window,
       cx,
     );
 
     project.sessions.insert(id, session);
-    self.subscribe_session_bell(project_idx, id, cx);
     self.switch_to_session(project_idx, Some(id), window, cx);
   }
 
@@ -1539,63 +1203,32 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
-  // Session expiration (GC'd JSONL detection)
-  // ---------------------------------------------------------------------------
-
-  /// Scan all projects for unadopted sessions whose JSONL files no longer exist
-  /// and mark them `[X]` in TODO.md so they don't appear in the picker.
-  fn mark_expired_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    for project in &self.projects {
-      // None when $HOME is unset; we then can't locate any bucket, so skip
-      // expiry rather than marking every live session `[X]`.
-      let Some(session_dirs) = ProjectState::session_dirs(&project.path) else {
-        continue;
-      };
-      let document = project.todo_view.read(cx).document().clone();
-      let adopted_uuids: std::collections::HashSet<&str> =
-        project.sessions.values().filter_map(|s| s.uuid.as_deref()).collect();
-      let expired_labels: Vec<String> = document
-        .sessions
-        .iter()
-        .filter(|s| {
-          !s.uuid.is_empty()
-            && s.status != jc_core::todo::SessionStatus::Expired
-            && !adopted_uuids.contains(s.uuid.as_str())
-            && !jc_core::claude::transcript_in(&session_dirs, &s.uuid)
-        })
-        .map(|s| s.label.clone())
-        .collect();
-      if !expired_labels.is_empty() {
-        let todo_view = project.todo_view.clone();
-        todo_view.update(cx, |tv, cx| {
-          for label in &expired_labels {
-            tv.mark_session_expired(label, window, cx);
-          }
-          tv.save(cx);
-        });
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------------------
   // Session disable toggle
   // ---------------------------------------------------------------------------
 
+  /// Toggle the `[D]` marker on the session owning `uuid`, detaching its
+  /// terminal if it is running and just became disabled. Addressed by UUID
+  /// throughout: with two same-labelled headings a label-keyed toggle marks the
+  /// wrong one and detaches a live session.
   fn toggle_session_disabled(
     &mut self,
     project_idx: usize,
-    label: &str,
+    key: &jc_core::todo::SessionKey,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let project = &mut self.projects[project_idx];
     let todo_view = project.todo_view.clone();
 
-    // Check if the session is currently adopted (running).
-    let adopted_id = project.session_by_label(label).map(|(id, _)| id);
+    // Check if the session is currently adopted (running). An unbound heading
+    // never is, so this is `None` for a `Label` key.
+    let adopted_id = match key {
+      jc_core::todo::SessionKey::Uuid(uuid) => project.session_by_uuid(uuid).map(|(id, _)| id),
+      jc_core::todo::SessionKey::Label(_) => None,
+    };
 
     todo_view.update(cx, |tv, cx| {
-      tv.toggle_session_disabled(label, window, cx);
+      tv.toggle_session_disabled(key, window, cx);
       tv.save(cx);
     });
 
@@ -1603,37 +1236,73 @@ impl Workspace {
     let is_now_disabled = todo_view
       .read(cx)
       .document()
-      .session_by_label(label)
-      .is_some_and(|s| s.status == jc_core::todo::SessionStatus::Disabled);
+      .index_of(key)
+      .and_then(|i| todo_view.read(cx).document().sessions.get(i).map(|s| s.status))
+      .is_some_and(|status| status == jc_core::todo::SessionStatus::Disabled);
+    // Whether control ended up in `switch_to_session`, which focuses the pane it
+    // lands on. When it doesn't, nothing else will: the picker's confirm handler
+    // has already dropped `pre_picker_focus`, so focus would be stranded on the
+    // dismissed picker input and keystrokes would go nowhere.
+    let mut switched = false;
+
     if is_now_disabled && let Some(id) = adopted_id {
+      let on_screen = project_idx == self.active_project_index;
       let project = &mut self.projects[project_idx];
+      let was_project_active = project.active_session == Some(id);
       project.sessions.remove(&id);
 
-      if project.active_session == Some(id) {
-        let next_id = project.sessions.keys().next().copied();
-        project.active_session = next_id;
+      if was_project_active && on_screen {
+        // The session we were sitting on: it needs a replacement view. Note
+        // that `active_session` is deliberately left pointing at the id just
+        // removed — it now resolves to `None`, so `switch_to_session` sees no
+        // outgoing session and skips the save-viewport step. Repointing it
+        // *first* would make the incoming session look like the outgoing one
+        // and overwrite its saved layout, TODO cursor and scroll with the
+        // disabled session's, and clear its activity marker.
+        switched = true;
+        self.detach_active_session(project_idx, window, cx);
+      } else if was_project_active {
+        // Same, but for a project we are not looking at. Repoint it so it still
+        // has a session to show next time, and do NOT switch: disabling a
+        // background session must not yank the user into another project.
+        project.active_session = project.sessions.keys().copied().min();
       }
+    }
 
-      self._bell_subscriptions = Self::subscribe_bells(&self.projects, cx);
-      let active = self.projects[project_idx].active_session;
-      if active.is_some() {
-        // Another session in the same project — switch to it.
-        self.switch_to_session(project_idx, active, window, cx);
-      } else {
-        // Last session in this project was disabled — jump to the next
-        // project that has sessions, falling back to staying put.
-        let next = self
-          .projects
-          .iter()
-          .enumerate()
-          .find(|(pi, p)| *pi != project_idx && !p.sessions.is_empty());
-        if let Some((pi, p)) = next {
-          let sid = p.active_session;
-          self.switch_to_session(pi, sid, window, cx);
-        } else {
-          self.switch_to_session(project_idx, None, window, cx);
-        }
+    if !switched {
+      // Disabling a background session, or re-enabling one: the view didn't
+      // move, so put focus back where it was before the picker opened.
+      self.panes[self.active_pane_index].read(cx).focus_content(window);
+    }
+    cx.notify();
+  }
+
+  /// Pick a new session to show after the active one was detached, preferring
+  /// another session in the same project and falling back to another project.
+  fn detach_active_session(
+    &mut self,
+    project_idx: usize,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    // Lowest id — the earliest-created surviving session — so the same action
+    // in the same state always lands in the same place. `HashMap` iteration
+    // order would not.
+    if let Some(next) = self.projects[project_idx].sessions.keys().copied().min() {
+      // Another session in the same project — switch to it.
+      self.switch_to_session(project_idx, Some(next), window, cx);
+      return;
+    }
+    // Last session in this project is gone — jump to the next project that has
+    // sessions, falling back to staying put with nothing selected.
+    let next =
+      self.projects.iter().enumerate().find(|(pi, p)| *pi != project_idx && !p.sessions.is_empty());
+    match next {
+      Some((pi, p)) => {
+        let sid = p.active_session;
+        self.switch_to_session(pi, sid, window, cx);
       }
+      None => self.switch_to_session(project_idx, None, window, cx),
     }
   }
 
@@ -1724,8 +1393,7 @@ impl Workspace {
     } else {
       // Immediate send: mark busy and deliver now.
       if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
-        session.busy = true;
-        session.has_ever_been_busy = true;
+        session.mark_user_input();
       }
       Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
       cx.notify();
@@ -1781,6 +1449,15 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    // Release the dedup slot up front, on EVERY exit path. `armed_schedules` is
+    // the only thing stopping `reconcile_schedules` from re-arming this marker,
+    // so bailing out below while still holding the slot would strand the send
+    // for the rest of the run — e.g. a session disabled before its `@jc(...)`
+    // time, then re-adopted after it. Releasing here instead means an
+    // undeliverable marker is simply retried on a later tick, and a delivered
+    // one is gone from the file so there is nothing left to re-arm.
+    self.armed_schedules.remove(&(project_path.to_path_buf(), label.to_string(), when));
+
     let Some(project_idx) = self.projects.iter().position(|p| p.path == project_path) else {
       return;
     };
@@ -1788,7 +1465,7 @@ impl Workspace {
     // The target session must still be live to receive the message. Resolve its
     // terminal BEFORE `deliver_scheduled` consumes the marker, so a message is
     // never marked delivered (and lost) when there's nowhere to send it — the
-    // marker stays pending and can re-arm on a later startup.
+    // marker stays pending and re-arms on a later tick.
     let Some((id, claude_terminal)) = self.projects[project_idx]
       .session_by_label(label)
       .map(|(id, s)| (id, s.claude_terminal.clone()))
@@ -1803,8 +1480,7 @@ impl Workspace {
       ScheduledFire::Deliver(body) => {
         Self::deliver_to_terminal(&claude_terminal, &body, cx);
         if let Some(session) = self.projects[project_idx].sessions.get_mut(&id) {
-          session.busy = true;
-          session.has_ever_been_busy = true;
+          session.mark_user_input();
         }
         cx.notify();
       }
@@ -1819,12 +1495,6 @@ impl Workspace {
       }
       ScheduledFire::Cancelled => {}
     }
-
-    // This timer has fired and consumed its slot; drop the dedup entry so a later
-    // schedule that resolves to the same instant (possible within one minute) can
-    // re-arm. Reached only after `deliver_scheduled` ran, so the marker is already
-    // gone/updated and reconcile won't spuriously re-arm this same `when`.
-    self.armed_schedules.remove(&(project_path.to_path_buf(), label.to_string(), when));
   }
 
   /// Arm a timer for a `(path, label, when)` scheduled send unless one is already
@@ -1848,21 +1518,28 @@ impl Workspace {
   /// documents (idempotent via `armed_schedules`). Runs at startup and on a
   /// short interval, so adding/editing/removing a `@jc(...)` time takes effect —
   /// including edits to an *earlier* time, which the fire-time re-check alone
-  /// can't catch. Only Active sessions are adopted, so markers on
-  /// Disabled/Expired sessions (no terminal) are skipped.
+  /// can't catch. Restricted to headings whose session is actually running (see
+  /// the filter below).
   fn reconcile_schedules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let pending: Vec<(PathBuf, String, NaiveDateTime)> = self
       .projects
       .iter()
       .flat_map(|project| {
         let path = project.path.clone();
+        let running_labels: std::collections::HashSet<String> =
+          project.sessions.values().map(|s| s.label.clone()).collect();
         project
           .todo_view
           .read(cx)
           .document()
           .sessions
           .iter()
-          .filter(|s| s.status == jc_core::todo::SessionStatus::Active)
+          // Only headings with a session actually running: delivery needs a
+          // terminal. A marker on a dormant or still-unbound heading is not
+          // dropped — it stays in the file with its pending highlight, and
+          // adopting the session arms it on the next tick (firing immediately,
+          // after the catch-up grace, if its time has already passed).
+          .filter(move |s| running_labels.contains(&s.label))
           .filter_map(move |s| {
             s.pending_scheduled()
               .and_then(|m| m.schedule.map(|dt| (path.clone(), s.label.clone(), dt)))
@@ -1874,14 +1551,85 @@ impl Workspace {
     }
   }
 
-  /// Spawn the periodic task that reconciles scheduled-send timers against the
-  /// live TODO markers, so time edits are picked up without waiting for the
-  /// original (possibly later) timer to fire.
+  /// Discount the startup output of every session that hasn't been baselined
+  /// yet, so the Cmd-P activity marker means "work happened while you were
+  /// away" rather than "jc launched this".
+  ///
+  /// Driven from the reconcile loop rather than a one-shot startup task, and
+  /// keyed per session rather than per launch, because `Workspace::open_project`
+  /// can restore a whole project's sessions at any point in the run — a
+  /// startup-only pass would mark every session of a later-opened project. A
+  /// session is baselined exactly once and then left alone: re-clearing a
+  /// settled session on later ticks would swallow the real output the marker
+  /// exists to report.
+  fn step_activity_baselines(&mut self, cx: &mut Context<Self>) {
+    /// Consecutive quiet ticks that count as "the child has settled". More than
+    /// one because `claude --resume` pauses between banner and transcript replay.
+    const QUIET_TICKS: usize = 2;
+    /// Stop waiting after this many ticks, so a child that never goes quiet
+    /// isn't tracked for the life of the process.
+    const MAX_TICKS: usize = 15;
+
+    for project in &mut self.projects {
+      for session in project.sessions.values_mut() {
+        let ActivityBaseline::Pending { last_batches, quiet_ticks, ticks } =
+          session.activity_baseline
+        else {
+          continue;
+        };
+        let terminal = session.claude_terminal.read(cx);
+        let batches = terminal.output_batches();
+
+        // A child that has printed nothing yet is not quiet, it is slow to
+        // start; baselining now would let its banner land above the baseline.
+        let quiet = batches > 0 && batches == last_batches;
+        let quiet_ticks = if quiet { quiet_ticks + 1 } else { 0 };
+
+        // Clear on both exits, including the give-up. A child that never
+        // settles is still printing, so it re-marks itself on the next batch;
+        // a marker left set here would never retire (only switching away
+        // clears one) and `has_activity` is the picker's primary sort key, so
+        // the session would outrank genuinely-changed ones forever.
+        if quiet_ticks >= QUIET_TICKS || ticks + 1 >= MAX_TICKS {
+          terminal.clear_output_seen();
+          session.activity_baseline = ActivityBaseline::Taken;
+        } else {
+          session.activity_baseline =
+            ActivityBaseline::Pending { last_batches: batches, quiet_ticks, ticks: ticks + 1 };
+        }
+      }
+    }
+  }
+
+  /// Spawn the periodic task that reconciles jc's state against the live TODO
+  /// documents: scheduled-send timers (so time edits are picked up without
+  /// waiting for the original, possibly later, timer to fire), each running
+  /// session's label (so a heading renamed in TODO.md takes effect), and the
+  /// per-session activity baselines. All in-memory — no I/O.
   fn start_schedule_reconcile_loop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let task = cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
       loop {
         Timer::after(StdDuration::from_secs(2)).await;
-        if this.update_in(cx, |ws, window, cx| ws.reconcile_schedules(window, cx)).is_err() {
+        let stepped = this.update_in(cx, |ws, window, cx| {
+          ws.reconcile_schedules(window, cx);
+          ws.step_activity_baselines(cx);
+          let mut changed = false;
+          for i in 0..ws.projects.len() {
+            changed |= ws.projects[i].sync_sessions_from_todo(cx);
+          }
+          if changed {
+            // A renamed heading changes the label the TODO view highlights by,
+            // so re-point it — otherwise `apply_session_highlights` matches
+            // nothing and the active session's colouring silently disappears
+            // until the next session switch.
+            let pi = ws.active_project_index;
+            let label = ws.projects[pi].active_label().map(str::to_string);
+            let todo_view = ws.projects[pi].todo_view.clone();
+            todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
+            cx.notify();
+          }
+        });
+        if stepped.is_err() {
           break; // workspace dropped
         }
       }
@@ -1925,67 +1673,6 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
-  // Copy reply (/copy)
-  // ---------------------------------------------------------------------------
-
-  fn copy_reply(&mut self, _: &CopyReply, window: &mut Window, cx: &mut Context<Self>) {
-    let project = &self.projects[self.active_project_index];
-    let Some(session) = project.active_session() else {
-      return;
-    };
-
-    // Determine file name: use UUID if available, otherwise the label.
-    let filename = session.uuid.as_deref().filter(|u| !u.is_empty()).unwrap_or(&session.label);
-    let reply_dir = project.path.join(".jc/replies");
-    let reply_path = reply_dir.join(format!("{filename}.md"));
-
-    // Send `/copy` to the Claude terminal (paste + delayed Enter).
-    let claude_terminal = session.claude_terminal.clone();
-    Self::deliver_to_terminal(&claude_terminal, "/copy", cx);
-
-    // Read clipboard now, then poll for change.
-    let code_view = session.code_view.clone();
-    cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
-      // Read initial clipboard.
-      let initial = clipboard_contents().unwrap_or_default();
-
-      // Poll for clipboard change (up to 3s, every 200ms).
-      let mut new_content = None;
-      for _ in 0..15 {
-        Timer::after(StdDuration::from_millis(200)).await;
-        if let Some(current) = clipboard_contents()
-          && current != initial
-          && !current.is_empty()
-        {
-          new_content = Some(current);
-          break;
-        }
-      }
-
-      let Some(content) = new_content else {
-        return;
-      };
-
-      // Create directory and write file.
-      let _ = std::fs::create_dir_all(&reply_dir);
-      if let Err(e) = std::fs::write(&reply_path, &content) {
-        eprintln!("failed to write reply file: {e}");
-        return;
-      }
-
-      // Open the file in the code view and switch to it.
-      let _ = this.update_in(cx, |ws, window, cx| {
-        code_view.update(cx, |v, cx| {
-          v.set_language_override("markdown", cx);
-          v.open_file(reply_path, window, cx);
-        });
-        ws.set_active_pane_view(PaneContentKind::CodeViewer, window, cx);
-      });
-    })
-    .detach();
-  }
-
-  // ---------------------------------------------------------------------------
   // Hook events
   // ---------------------------------------------------------------------------
 
@@ -2005,140 +1692,53 @@ impl Workspace {
       return;
     }
 
-    // PromptSubmit just sets busy — it's not a problem/notification.
-    if matches!(event.kind, HookEventKind::PromptSubmit) {
-      let session_uuid = &event.session_id;
-      if !session_uuid.is_empty() {
-        let mut found = false;
-        for project in &mut self.projects {
-          if let Some(session) =
-            project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(session_uuid))
-          {
-            session.busy = true;
-            session.has_ever_been_busy = true;
-            session.pending_events.remove(&PendingEvent::ClaudePermission);
-            found = true;
-            break;
-          }
-        }
-        // If no UUID match, assign to a pending (uuid=None) session in the matching project.
-        if !found {
-          for project in &mut self.projects {
-            if event.project_path.as_deref() != Some(project.path.as_path()) {
-              continue;
-            }
-            if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
-              session.uuid = Some(session_uuid.clone());
-              session.busy = true;
-              session.has_ever_been_busy = true;
-              session.pending_events.remove(&PendingEvent::ClaudePermission);
-              // Update TODO.md with the new UUID.
-              let label = session.label.clone();
-              project.todo_view.update(cx, |tv, cx| {
-                tv.update_session_uuid(&label, session_uuid, &mut *window, cx);
-                tv.save(cx);
-              });
-              break;
-            }
-          }
-        }
-      }
+    // Every remaining event is addressed to a session identified by its UUID.
+    // UUIDs are assigned by jc at launch (`--session-id`), so a hook for an
+    // unknown UUID belongs to a session jc doesn't manage — ignore it.
+    let Some((project_name, session_label)) = self.apply_hook_to_session(&event) else {
       cx.notify();
       return;
-    }
-
-    // Determine the pending event (if any) and whether this clears busy.
-    let (pending, clears_busy) = match event.kind {
-      HookEventKind::Stop => (None, true),
-      HookEventKind::StopFailure => (Some(PendingEvent::ClaudeStopFailure), true),
-      HookEventKind::PermissionPrompt => (Some(PendingEvent::ClaudePermission), true),
-      HookEventKind::IdlePrompt => (None, true),
-      HookEventKind::PromptSubmit | HookEventKind::SessionClear { .. } => unreachable!(),
     };
 
-    // Match by UUID (session_id from hook) across all projects.
-    let mut matched_project: Option<String> = None;
-    let mut matched_label: Option<String> = None;
-    let mut matched_project_idx: Option<usize> = None;
-
-    let session_uuid = &event.session_id;
-    if !session_uuid.is_empty() {
-      let mut found = false;
-      // First pass: find an existing session with this UUID.
-      for (pi, project) in self.projects.iter_mut().enumerate() {
-        if let Some(session) =
-          project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(session_uuid))
-        {
-          if clears_busy {
-            session.busy = false;
-            // Claude has progressed past any permission prompt.
-            session.pending_events.remove(&PendingEvent::ClaudePermission);
-          }
-          if let Some(ref pe) = pending {
-            session.pending_events.insert(pe.clone());
-          }
-          matched_project = Some(project.name.clone());
-          matched_label = Some(session.label.clone());
-          matched_project_idx = Some(pi);
-          found = true;
-          break;
-        }
-      }
-      // Fallback: assign UUID to a pending (uuid=None) session in the matching project.
-      if !found {
-        for (pi, project) in self.projects.iter_mut().enumerate() {
-          if event.project_path.as_deref() != Some(project.path.as_path()) {
-            continue;
-          }
-          if let Some(session) = project.sessions.values_mut().find(|s| s.uuid.is_none()) {
-            session.uuid = Some(session_uuid.clone());
-            if clears_busy {
-              session.busy = false;
-              session.pending_events.remove(&PendingEvent::ClaudePermission);
-            }
-            if let Some(ref pe) = pending {
-              session.pending_events.insert(pe.clone());
-            }
-            // Update TODO.md with the new UUID.
-            let label = session.label.clone();
-            project.todo_view.update(cx, |tv, cx| {
-              tv.update_session_uuid(&label, session_uuid, &mut *window, cx);
-              tv.save(cx);
-            });
-            matched_project = Some(project.name.clone());
-            matched_label = Some(label);
-            matched_project_idx = Some(pi);
-            break;
-          }
-        }
-      }
-    }
-
-    // Signal the problems poll to refresh this project immediately.
-    if let Some(pi) = matched_project_idx {
-      let _ = self.problems_refresh_tx.try_send(pi);
-    }
-
-    // Notify when the window is not active (user is in another app).
-    if let (Some(project_name), Some(session_label)) = (matched_project, matched_label)
+    // Notify when the window is not active (user is in another app). Only a
+    // blocked session is worth interrupting for; Stop/IdlePrompt are ambient.
+    let message = match event.kind {
+      HookEventKind::PermissionPrompt => Some("Permission needed"),
+      HookEventKind::StopFailure => Some("API error"),
+      _ => None,
+    };
+    if let Some(message) = message
       && !self.window_active
     {
-      let critical =
-        matches!(event.kind, HookEventKind::PermissionPrompt | HookEventKind::StopFailure);
       let title = format!("{project_name} > {session_label}");
-      let message = match event.kind {
-        HookEventKind::Stop => "Claude finished",
-        HookEventKind::StopFailure => "API error",
-        HookEventKind::PermissionPrompt => "Permission needed",
-        HookEventKind::IdlePrompt => "Claude is idle",
-        HookEventKind::PromptSubmit | HookEventKind::SessionClear { .. } => unreachable!(),
-      };
       let notify_id =
         if event.session_id.is_empty() { None } else { Some(event.session_id.as_str()) };
-      crate::notify::notify(&title, message, critical, notify_id);
+      crate::notify::notify(&title, message, notify_id);
     }
 
     cx.notify();
+  }
+
+  /// Apply a hook event to the session it names. Returns the matched
+  /// `(project name, session label)`, or `None` when no session owns the UUID.
+  fn apply_hook_to_session(&mut self, event: &HookEvent) -> Option<(String, String)> {
+    if event.session_id.is_empty() {
+      return None;
+    }
+    let project =
+      self.projects.iter_mut().find(|p| p.sessions.values().any(|s| s.uuid == event.session_id))?;
+    let project_name = project.name.clone();
+    let session = project.sessions.values_mut().find(|s| s.uuid == event.session_id)?;
+
+    match event.kind {
+      HookEventKind::PromptSubmit => session.mark_user_input(),
+      HookEventKind::Stop
+      | HookEventKind::StopFailure
+      | HookEventKind::PermissionPrompt
+      | HookEventKind::IdlePrompt => session.busy = false,
+      HookEventKind::SessionClear { .. } => unreachable!("handled before dispatch"),
+    }
+    Some((project_name, session.label.clone()))
   }
 
   /// Handle a `/clear` event: the old session ended and a new one started in
@@ -2154,24 +1754,45 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     let Some(project_path) = project_path else { return };
-    let Some(project) = self.projects.iter_mut().find(|p| p.path == *project_path) else { return };
-    let Some(session) =
-      project.sessions.values_mut().find(|s| s.uuid.as_deref() == Some(old_session_id))
-    else {
+    let Some(project) = self.projects.iter().find(|p| p.path == *project_path) else { return };
+    if !project.sessions.values().any(|s| s.uuid == old_session_id) {
       eprintln!("hook: session-clear for unknown uuid {old_session_id}");
       return;
-    };
+    }
 
     eprintln!("hook: session cleared, uuid {old_session_id} -> {new_session_id}");
-    let label = session.label.clone();
-    session.uuid = Some(new_session_id.to_string());
 
-    // Update TODO.md: change `> uuid=OLD` to `> uuid=NEW`.
+    // Update TODO.md FIRST, and only adopt the new UUID in memory if that
+    // succeeded. The two must not diverge: a session whose in-memory UUID has no
+    // heading stops syncing its label, can't be disabled (both look the heading
+    // up by UUID), and on the next start resumes whatever the file still says —
+    // a wrong conversation, not merely a dead one.
+    //
+    // The heading is located by the OLD uuid, not by label: two headings can
+    // share a label, and writing to the first would point it at this session's
+    // conversation while leaving this one behind.
     let todo_view = project.todo_view.clone();
-    todo_view.update(cx, |tv, cx| {
-      tv.update_session_uuid(&label, new_session_id, window, cx);
+    let old_session_id = old_session_id.to_string();
+    let new_session_id = new_session_id.to_string();
+    let written = todo_view.update(cx, |tv, cx| {
+      let Some(index) = tv.document().index_by_uuid(&old_session_id) else { return false };
+      tv.update_session_uuid_at(index, &new_session_id, window, cx);
       tv.save(cx);
+      true
     });
+
+    if written {
+      if let Some(project) = self.projects.iter_mut().find(|p| p.path == *project_path)
+        && let Some(session) = project.sessions.values_mut().find(|s| s.uuid == old_session_id)
+      {
+        session.uuid = new_session_id;
+      }
+    } else {
+      eprintln!(
+        "hook: session-clear could not find a heading for uuid {old_session_id}; \
+         leaving the session on it so memory and TODO.md stay in step"
+      );
+    }
     cx.notify();
   }
 }
@@ -2203,38 +1824,29 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-1", SetLayoutOne, Some("Workspace")),
     KeyBinding::new("cmd-2", SetLayoutTwo, Some("Workspace")),
     KeyBinding::new("cmd-3", SetLayoutThree, Some("Workspace")),
-    KeyBinding::new("cmd-shift-e", OpenInExternalEditor, Some("Workspace")),
     KeyBinding::new("cmd-p", crate::views::picker::ShowSessionPicker, Some("Workspace")),
-    KeyBinding::new("cmd-k", OpenCommentPanel, Some("Workspace")),
     KeyBinding::new("cmd-s", SaveFile, Some("Workspace")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Workspace")),
-    KeyBinding::new("cmd-;", NextProblem, Some("Workspace")),
     KeyBinding::new("cmd-.", JumpToWait, Some("Workspace")),
-    KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Workspace")),
     KeyBinding::new("cmd-shift-p", crate::views::picker::ProjectActionsPicker, Some("Workspace")),
-    KeyBinding::new("cmd-shift-c", CopyReply, Some("Workspace")),
     KeyBinding::new("cmd-`", RotateNextProject, Some("Workspace")),
     KeyBinding::new("cmd-?", ShowKeybindingHelp, Some("Workspace")),
     KeyBinding::new("cmd-alt-up", ScrollOtherUp, Some("Workspace")),
     KeyBinding::new("cmd-alt-down", ScrollOtherDown, Some("Workspace")),
     KeyBinding::new("cmd-alt-pageup", ScrollOtherPageUp, Some("Workspace")),
     KeyBinding::new("cmd-alt-pagedown", ScrollOtherPageDown, Some("Workspace")),
-    KeyBinding::new("cmd-d", ToggleCodeDiff, Some("Workspace")),
   ]);
 
   cx.bind_keys([
     KeyBinding::new("cmd-[", FocusPrevPane, Some("Input")),
     KeyBinding::new("cmd-]", FocusNextPane, Some("Input")),
-    KeyBinding::new("cmd-k", OpenCommentPanel, Some("Input")),
     KeyBinding::new("cmd-s", SaveFile, Some("Input")),
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Input")),
-    KeyBinding::new("cmd-shift-k", crate::views::picker::ShowSnippetPicker, Some("Input")),
     KeyBinding::new("cmd-.", JumpToWait, Some("Input")),
     KeyBinding::new("cmd-`", RotateNextProject, Some("Input")),
     KeyBinding::new("cmd-alt-up", ScrollOtherUp, Some("Input")),
     KeyBinding::new("cmd-alt-down", ScrollOtherDown, Some("Input")),
     KeyBinding::new("cmd-alt-pageup", ScrollOtherPageUp, Some("Input")),
     KeyBinding::new("cmd-alt-pagedown", ScrollOtherPageDown, Some("Input")),
-    KeyBinding::new("cmd-d", ToggleCodeDiff, Some("Input")),
   ]);
 }

@@ -12,23 +12,26 @@ scripts/
   bundle.sh                         # release build + macOS .app bundle + icon + codesign
   update-outline-queries.sh         # fetch outline.scm files from Zed repo
   update-gpui-component.sh          # re-vendor gpui-component from cargo cache + apply patches
+  backup-todos.sh                   # one-time TODO.md.bak snapshot before the log-bound sweep
 jc-core/                            # data model + config persistence
-  src/lib.rs, config.rs, model.rs, problem.rs, theme.rs, todo.rs,
-      hooks.rs, hooks_settings.rs, snippets.rs, status_script.rs
+  src/lib.rs, claude.rs, config.rs, model.rs, theme.rs, todo.rs,
+      hooks.rs, hooks_settings.rs
 jc-terminal/                        # embedded terminal emulator
   src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
   examples/terminal_window.rs
 jc-app/                             # binary: CLI + GPUI app
   src/main.rs, app.rs, outline.rs, language.rs, ipc.rs, file_watcher.rs, notify.rs
   src/views/
-    workspace/{mod,pickers,problems,render}.rs
+    workspace/{mod,pickers,render}.rs
     pane.rs, picker.rs, project_state.rs, session_state.rs
-    diff_view.rs, code_view.rs, todo_view.rs
-    comment_panel.rs, close_confirm.rs, keybinding_help.rs
+    code_view.rs, todo_view.rs
+    close_confirm.rs, keybinding_help.rs
   src/outline_queries/{rust,markdown,python,go,javascript,typescript}.scm
   examples/basic_window.rs
 vendor/
+  gpui/                             # vendored + patched gpui (InputRateTracker)
   gpui-component/                   # vendored + patched Longbridge GPUI component library
+  patches/                          # patch files re-applied by update-gpui-component.sh
 ```
 
 ## Components
@@ -40,13 +43,11 @@ vendor/
 | Markdown editor | `gpui-component` editor widget + `ropey` + `tree-sitter-md`, custom TODO.md highlight pass |
 | Syntax highlighting | `tree-sitter` 0.25.x + `tree-sitter-highlight` + per-language grammar crates (18 languages) |
 | Symbol navigation | tree-sitter custom `outline.scm` queries (sourced from Zed) |
-| Git diff | `git2` 0.20.x (vendored libgit2) + `similar`/`imara-diff`; diff generation on background thread |
-| Problem tracking | Typed enums per view + wrapper enums at session/project level; push (hooks, BEL) + poll (diff, TODO, status.sh) merged every 2s |
-| Claude reply capture | `/copy` command + clipboard polling (`arboard` crate) → `.jc/replies/<uuid>.md` |
+| Project file listing | `git2` 0.20.x (vendored libgit2) — index + status, read once per Cmd-O picker open |
+| External-edit merge | `diffy` 0.4 three-way merge in `CodeView::try_merge` when a watched file changes under unsaved edits |
+| Session UUIDs | `uuid` v4, minted by jc and passed to the CLI as `--session-id` |
 | IPC | Unix socket (`~/.config/jc/jc.sock`) — multiple `jc .` invocations route to one running instance |
-| File watching | `notify` 7.x with debouncing for TODO.md, code files, snippet file changes |
-| Snippets | `~/.claude/jc.md` parsed into named snippets, insertable via picker |
-| Status scripts | Optional `./status.sh` per project → `ScriptProblem` objects for problem navigation |
+| File watching | `notify` 7.x with debouncing, per open `CodeView` (which is also what backs `TodoView`) |
 | Desktop notifications | macOS native: `UNUserNotificationCenter` banners (bundled .app) + dock bounce fallback |
 | Persistent state | `~/.config/jc/` — project registry, window layout; session state in TODO.md |
 
@@ -56,7 +57,7 @@ vendor/
 
 `Workspace → ProjectState[] → SessionState[]`
 
-Each `ProjectState` owns a TODO view, diff view, code view, and a `HashMap<SessionId, SessionState>` keyed by numeric ID. Each `SessionState` owns a Claude terminal, a general terminal, and an optional UUID.
+Each `ProjectState` owns a TODO view and a `HashMap<SessionId, SessionState>` keyed by numeric ID. Each `SessionState` owns a Claude terminal, a general terminal, a code view, and a UUID (`String`, always present). `ProjectState::code_view` is a convenience accessor for the active session's code view.
 
 The workspace has an active project with an active session. The active session drives which terminals appear in the panes. Switching sessions swaps pane contents without disconnecting terminals.
 
@@ -64,22 +65,51 @@ The workspace has an active project with an active session. The active session d
 
 ### Session Lifecycle
 
-- **Project init:** The app reads TODO.md for session headings and adopts **every** active session (skipping `[D]`/`[X]`/`[DELETED]`), each resumed via `claude --resume <uuid>` (empty-UUID pending sessions launch a plain `claude` and re-acquire a UUID on their first hook). Sessions whose JSONL was GC'd are marked `[X]` first and skipped. The active session is the one with the most recent `> last=` timestamp (ties fall back to document order). If no sessions exist, a plain `claude` instance is launched.
-- **Transcript buckets:** Claude stores each session at `~/.claude/projects/<bucket>/<uuid>.jsonl`, where `<bucket>` is the launch cwd with every non-`[A-Za-z0-9-]` char mapped to `-`. A git worktree at `<root>/.claude/worktrees/<branch>` therefore lands in its **own sibling bucket** `<encoded_root>--claude-worktrees-<branch>`. So a project's sessions can be spread across the root bucket and any worktree buckets. `jc_core::claude` enumerates all of them (`session_dirs`), and JSONL-existence checks (expiry, unattached-session discovery) span the full set — without this a live worktree session's transcript looks GC'd and is wrongly `[X]`-expired on restart.
-- **New session:** From the session picker (Cmd-P), launch a fresh Claude Code instance. The UUID is auto-detected from the first hook event.
-- **UUID assignment:** New sessions start without a UUID. The first hook event carries `session_id`; the app matches it to the pending session by project `cwd` and assigns the UUID. Constraint: one pending (UUID-less) session per project at a time.
-- **`/clear` handling:** `SessionEnd(reason=clear)` is stashed. When `SessionStart(source=clear)` arrives within 10s, the session's UUID is updated in-place. No terminal relaunch needed — the same Claude process continues.
-- **Disable:** Cmd-Shift-Backspace toggles the `[D]` prefix on a session heading. Disabled sessions skip auto-attach on startup but remain in the picker.
-- **Expire:** `[X]` prefix marks sessions whose JSONL was garbage-collected by Claude.
+- **UUID assignment:** jc mints the UUID. `SessionState::create` takes a `Launch` discriminant: `Launch::New` spawns `claude --session-id <uuid>`, `Launch::Resume` spawns `claude --resume <uuid>`. The two are not interchangeable — `--resume` on a UUID with no transcript exits with "No conversation found", and `--session-id` needs the UUID to be free — so every adoption path picks between them with `ProjectState::launch_for`, which tests `jc_core::claude::transcript_in` over the project's buckets. `SessionState::uuid` is therefore always populated — there is no pending, UUID-less state and no `cwd`-based matching of a first hook event. A `> dangerous` metadata line appends `--dangerously-skip-permissions` to either form.
+- **Project init:** `ProjectState::create` bounds every session's message log (`TodoView::truncate_logs`), then adopts **every** `SessionStatus::Active` session in TODO.md, each with the flag `launch_for` picks for it; `[D]` and `[DELETED]` are skipped, as is any heading repeating a `> uuid=` already adopted this pass (a copy-pasted block would otherwise put two `claude` processes on one transcript). The active session is the one with the most recent `> last=` timestamp (ties fall back to document order).
+- **New session:** `Workspace::create_new_session` (Cmd-Shift-P → "New session", or confirming an empty project in Cmd-P) generates a UUID, spawns with `Launch::New`, and writes the heading plus `> uuid=` into TODO.md in the same update. The label comes from `todo::unique_label` — `New Session`, then `New Session 2`, and so on — because TODO.md's *text* operations are label-keyed (see the duplicate-labels bullet below), even though session identity is the UUID.
+- **Legacy blank UUIDs:** an older jc created a heading with an empty `> uuid=` and filled it from the first hook event; if that hook never landed, the heading is unbound while its real conversation lives under a UUID Claude chose. jc does **not** mint one at startup — doing so would bind the heading to an empty conversation and orphan the real one, rewriting the file before the user saw anything. Such headings are simply not launched, and both pickers list them as adoptable; `Workspace::adopt_session` mints and records the UUID at that point, so it is a choice the user made. (The real transcript, if there is one, is still offered separately under "unattached".)
+- **Duplicate labels:** `ProjectState::dedupe_labels` renames any heading whose label repeats an earlier one (`todo::rename_session_at`, preserving `[D]`). TODO.md addresses a session by label nearly everywhere — `ensure_wait`, `send_selection`, the `@jc(...)` scheduled-send timers — and each resolves to the *first* match, so a duplicate silently redirects a send onto the wrong session. Every creation path already routes its label through `todo::unique_label`; this repairs files written before that.
+- **Adopt:** `Workspace::adopt_session` starts a TODO.md session that isn't running, with the flag `launch_for` picks for it. If the heading was `[D]`, the prefix is cleared first.
+- **No expiry.** A session whose transcript Claude has garbage-collected is relaunched, not retired: `launch_for` sees the missing `<uuid>.jsonl` and claims the UUID with `--session-id`, so the heading, message log, and WAIT block stay usable behind a fresh conversation. There is no `SessionStatus::Expired`. The transcript check still exists, but it now only picks a launch flag — a wrong answer costs one bad spawn, not a permanently retired session.
+- **Transcript buckets:** Claude stores each session at `~/.claude/projects/<bucket>/<uuid>.jsonl`, where `<bucket>` is the launch cwd with every non-`[A-Za-z0-9-]` char mapped to `-`. A git worktree at `<root>/.claude/worktrees/<branch>` therefore lands in its **own sibling bucket** `<encoded_root>--claude-worktrees-<branch>`. So a project's sessions can be spread across the root bucket and any worktree buckets. `jc_core::claude::session_dirs` enumerates all of them. Two callers depend on that: the Cmd-Shift-P scan for unattached JSONL sessions (a worktree conversation is invisible there otherwise), and `ProjectState::launch_for`, where missing a bucket makes `transcript_in` answer `false` and jc claims an already-live UUID with `--session-id` — so this is now load-bearing, not just discovery.
+- **`/clear` handling:** `SessionEnd(reason=clear)` is stashed by the hook server. When `SessionStart(source=clear)` arrives within 10s for the same project, the pair is emitted as `HookEventKind::SessionClear` and `Workspace::handle_session_clear` rewrites the session's UUID in memory and in TODO.md. No terminal relaunch — the same Claude process continues. This is the only post-launch UUID change.
+- **Disable:** Cmd-Shift-Backspace in the session picker carries a `todo::SessionKey` through `SessionPickerResult::ToggleDisabled` to `todo::toggle_session_disabled_at`, flipping the `[D]` prefix on that heading. The key is the UUID, or the label for a heading that has none — an empty UUID is not an address, since every unbound heading shares it. Disabled sessions skip auto-attach on startup but remain in the picker.
 - **Delete:** Manually change `[D]` to `[DELETED]` in TODO.md. The parser skips these entirely.
 
 ### Session Picker
 
-Shows all sessions across all projects. Format: `project / label`. Markers: red problem count for sessions with problems, green `>` for active session, blue `+` for empty projects. Title bar shows `project > session` with `!` dirty marker and problem count.
+`SessionPickerDelegate` shows all sessions across all projects as `project / label`.
+
+| Marker | Entry |
+|---|---|
+| red `*` | Running session with unseen Claude terminal output |
+| green `>` | The active session |
+| yellow `~` | In TODO.md but not running — confirming adopts it |
+| grey `~` | Same, but disabled (`[D]`) |
+| blue `+` | Registered project with no sessions |
+
+**Activity marker.** `TerminalView` keeps two `Arc<AtomicUsize>` counters: `output_batches`, bumped by the VTE background thread once per coalesced batch it parses (hidden terminals still parse, so a backgrounded session still records activity), and `seen_batches`, the value `clear_output_seen` snapshotted. `TerminalView::has_unseen_output` is just the two being unequal; `output_batches()` is exposed separately so a caller can tell whether output is *still arriving*. The picker reads it on each session's *Claude* terminal only. `TerminalView::clear_output_seen` is called from two places.
+
+The first is `Workspace::switch_to_session`, on the session being switched *away from*. Clearing on the way out rather than the way in is what makes the marker mean "since you last had it on screen" no matter how the switch was made (picker, Cmd-\`, notification click). The session currently on screen is excluded by the picker itself (`is_active`), since you are looking at it.
+
+The second is the **startup baseline**. A freshly spawned `claude` prints a banner and, when resuming, replays its transcript; that is jc launching the session, not work done while you were away. `Workspace::step_activity_baselines` runs on the 2 s reconcile tick and advances a per-session `ActivityBaseline` state machine: a session is baselined once its child has printed *something* and then held still for two consecutive ticks, or unconditionally after 15 ticks if it never settles. Requiring a non-zero count first keeps a slow-starting child from being baselined before its banner ever appears. The state lives on `SessionState`, not on the workspace, for two reasons: `Workspace::open_project` can restore a project's sessions at any point in the run, so a startup-only pass would mark every session of a later-opened project; and a session is baselined exactly once, so real output arriving after it settles is never silently swallowed.
+
+**Sort order.** Groups, in order: current project's sessions, other projects' sessions, unadopted sessions (current project first), empty projects, and finally the active session, which always sorts last since you are already there. Within both session groups — this project's and the others' — sessions with activity come first; "where did the work move while I was elsewhere" is mostly a cross-project question. Every sub-group then sorts by `> last=` descending.
+
+The title bar shows `project > session` only. Per-pane headers carry the `[+]` dirty marker.
+
+### Project Actions Picker
+
+`ProjectActionsPickerDelegate` (Cmd-Shift-P) is scoped to the active project and lists, in order:
+
+1. **Dormant** (`*`, cyan) — TODO.md sessions that aren't currently running, most recent `> last=` first. Includes headings an older jc left unbound (empty `> uuid=`); adopting one mints and records its UUID.
+2. **New session** (`+`, green) — mint a UUID and launch, under a `todo::unique_label` name.
+3. **Unattached** (`~`, yellow) — `<uuid>.jsonl` files in any of the project's transcript buckets whose UUID appears nowhere in TODO.md, newest mtime first. The label is the first informative user message in the transcript (`extract_first_user_summary`), plus a relative age; adopting one runs that summary through `todo::unique_label`, since two transcripts often open with the same prompt.
 
 ## TODO.md Format
 
-Each project has a single TODO.md. The app is the sole writer; external changes are detected and flagged.
+Each project has a single TODO.md, and jc keeps it open in an editor pane, so you write to it as freely as jc does. External changes are picked up by the `CodeView` file watcher and three-way merged against unsaved edits; `ProjectState::sync_sessions_from_todo` then pulls any renamed label back into the running sessions. It matches on UUID alone, so hand-editing a `> uuid=` line does *not* re-point a running session (see Periodic Work).
 
 ```markdown
 # TODO
@@ -93,9 +123,13 @@ first instruction sent to claude
 ### Message 1
 second instruction
 ### WAIT
-Future notes accumulate here.
-Annotations from diff/terminal/code views are appended.
+The next instruction is drafted here.
 ```
+
+Everything below `### WAIT` is draft, not log: `parse` will not record a `### Message N`
+heading that appears there (the user is quoting an old message). Reading one as a real
+message would make the next send take its index, would let a quoted `@jc(...)` marker
+block sends, and would put draft text inside the range the log truncator may delete.
 
 ### Message Log Bound
 
@@ -125,8 +159,7 @@ block in `make.sh` and `scripts/backup-todos.sh`.
 
 Sessions that have gone quiet are caught by a startup sweep:
 `todo::truncate_all_sessions` runs in `ProjectState::create` immediately after
-the TODO.md buffer is read, before the expiry pass and the session-restore loop,
-and shares their single save. It applies the same bound to every session in the
+the TODO.md buffer is read, before the session-restore loop. It applies the same bound to every session in the
 document and is idempotent. It only reaches sessions the parser sees: `##`
 headings inside the `# Claude` section. A `## [DELETED] …` heading is skipped by
 `parse`, so such a session's log is never bounded and keeps whatever size it had.
@@ -144,8 +177,14 @@ pending schedule stays above the bound until that send fires.
 |---|---|---|
 | `## Label` | Active | Normal session |
 | `## [D] Label` | Disabled | Skipped on startup, visible in picker |
-| `## [X] Label` | Expired | JSONL garbage-collected, not attachable |
 | `## [DELETED] Label` | Deleted | Skipped entirely by parser |
+
+`[X]` was a third prefix, written when Claude had garbage-collected a session's
+transcript. Since such a session is relaunchable under its own UUID with
+`--session-id`, it is merely dormant.
+`parse` still accepts a legacy `## [X] Label` heading and maps it to
+`SessionStatus::Disabled`; `toggle_session_disabled_at` rebuilds the heading from the
+label, so re-enabling one normalises it to `## Label`. jc never writes `[X]`.
 
 ### Session Metadata
 
@@ -153,16 +192,9 @@ Lines starting with `> ` immediately after the `## Label` heading are parsed as 
 
 | Line | Meaning |
 |---|---|
-| `> uuid=<id>` | Claude session UUID. Required for resume; populated by jc on first hook. |
+| `> uuid=<id>` | Claude session UUID. Minted by jc when the session is created and written with the heading; rewritten only by `/clear`. |
 | `> last=<unix-secs>` | Timestamp of the last `Cmd-Enter` send. Used to sort the Cmd-P / Cmd-Shift-P pickers by recency. Updated automatically. |
 | `> dangerous` | When set, jc spawns this session's `claude` process with `--dangerously-skip-permissions`. Add manually; takes effect at next session spawn (relaunch jc, or re-adopt the session via Cmd-Shift-P). |
-
-### Comment Formats
-
-From any view, Cmd-K annotates a selection. Comments are appended below WAIT:
-
-- **From diff or code view:** `* <file>:<start_line>-<end_line> --- Comment text`
-- **From terminal:** `* TERMINAL\n\`\`\`\n[selected content]\n\`\`\`\nComment text`
 
 ### Scheduled Messages
 
@@ -186,12 +218,38 @@ highlighted in the `@keyword` color.
 - **One at a time / all sends blocked.** While a session has a pending scheduled
   message, every Cmd-Enter (immediate or scheduled) is rejected with the system beep.
 - **Cancel** by deleting the `@jc(...)` marker or the whole `### Message N` block.
-  **Reschedule** by editing the datetime — a periodic reconcile (and the startup scan)
-  re-arms timers from the live markers, so edits in either direction take effect.
+  **Reschedule** by editing the datetime — `Workspace::reconcile_schedules` (and the
+  startup scan) re-arms timers from the live markers, so edits in either direction take
+  effect, including edits to an *earlier* time that the fire-time re-check alone can't catch.
 - **Persistence & catch-up.** The marker lives in TODO.md, so timers re-arm on restart;
   a scheduled time that already passed while jc was closed fires immediately (after a
   brief grace so the resumed terminal is ready).
 - `> last=` is stamped at delivery time, not when the message is queued.
+
+## Periodic Work
+
+One recurring task, `Workspace::start_schedule_reconcile_loop`, ticks every 2 seconds and
+does three things, none of which touches the filesystem:
+
+1. `Workspace::reconcile_schedules` — arm a timer for every pending `@jc(...)` marker on a
+   heading whose session is actually *running*, idempotent through the `armed_schedules` set.
+   A marker on a dormant or unbound heading is not dropped: it keeps its pending highlight in
+   the file, and adopting the session arms it on the next tick (firing after the catch-up
+   grace if its time has passed).
+2. `Workspace::step_activity_baselines` — advance each session's `ActivityBaseline` state
+   machine, discounting the launch banner and transcript replay from the Cmd-P activity
+   marker (see Session Picker).
+3. `ProjectState::sync_sessions_from_todo` on each project — match each TODO entry to a
+   running session **by UUID only**, and copy the entry's label onto it, so a heading renamed
+   by hand is picked up. There is deliberately no label fallback: labels are not unique, and a
+   TODO entry for a session that is not running would otherwise claim a same-labelled running
+   session and stamp the wrong UUID onto it, silently breaking every hook for it. Returns
+   whether anything changed, and only then does the loop re-point the TODO view's active
+   label and `cx.notify()`.
+
+All three are in-memory scans: no filesystem access, no git, no subprocesses. Everything else is
+event-driven — hooks arrive over the hook server's channel, external file changes over the
+per-`CodeView` `notify` watcher, and terminal output over the VTE thread's flume channel.
 
 ## Terminal Architecture
 
@@ -200,8 +258,8 @@ The terminal emulator (`jc-terminal/`) uses `alacritty_terminal` for VTE parsing
 ### Data Flow (3-Thread Pipeline)
 
 1. **PTY reader thread** — blocking read loop on the PTY fd, 4KB chunks, sends via flume channel
-2. **VTE parser thread** (`std::thread`) — receives bytes, coalesces with visibility-aware caps (64KB visible / 256KB hidden), runs `Processor::advance()` under `Mutex<Term>` lock, signals main thread
-3. **Main-thread relay** — async task receives notifications, emits Bell events, calls `cx.notify()` for GPUI repaint (skipped when hidden)
+2. **VTE parser thread** (`std::thread`) — receives bytes, coalesces with visibility-aware caps (64KB visible / 256KB hidden), runs `Processor::advance()` under `Mutex<Term>` lock, bumps `output_batches`, answers `PtyWrite` events, signals main thread
+3. **Main-thread relay** — async task receives notifications and calls `cx.notify()` for GPUI repaint (skipped when hidden)
 
 ### Render Pipeline (`paint_terminal`)
 
@@ -217,80 +275,6 @@ The terminal emulator (`jc-terminal/`) uses `alacritty_terminal` for VTE parsing
 - **Row-based shaping:** gpui's `LineLayoutCache` caches shaped lines across frames; unchanged rows are free.
 - **Adaptive coalescing:** 64KB cap visible, 256KB hidden — prevents frame stalls while minimizing CPU for background terminals.
 
-## Problem System
-
-### Problem Sources
-
-**Session-level** (owned by `SessionState`):
-
-| Source | Problem | Layer | Trigger | Resolution |
-|---|---|---|---|---|
-| Claude terminal | `ClaudeProblem::Permission` | L0 | Hook: permission prompt | User interacts with session |
-| Claude terminal | `ClaudeProblem::StopFailure` | L0 | Hook: API error | User interacts with session |
-| General terminal | `TerminalProblem::Bell` | L1 | BEL character | User focuses terminal |
-| TODO view | `AppTodoProblem::UnsentWait` | L2 | Content below WAIT | Content sent or removed |
-| Session state | *(synthetic)* | L3 | Idle + has_ever_been_busy | User starts new work |
-
-**Project-level** (owned by `ProjectState`):
-
-| Source | Problem | Layer | Trigger | Resolution |
-|---|---|---|---|---|
-| Diff view | `DiffProblem::UnreviewedFile` | L1 | Dirty working tree | File marked reviewed |
-| Script | `ScriptProblem` | L1 | `./status.sh` output | Script stops reporting |
-
-### Type Design
-
-```rust
-// Per-view leaf enums (jc-core/src/problem.rs)
-enum ClaudeProblem { Permission, StopFailure }
-enum TerminalProblem { Bell }
-enum DiffProblem { UnreviewedFile(PathBuf) }
-enum AppTodoProblem { UnsentWait { label } }
-struct ScriptProblem { rank: Option<i8>, file: PathBuf, line: Option<usize>, message: String }
-
-// Wrapper enums
-enum SessionProblem { Claude(ClaudeProblem), Terminal(TerminalProblem), Todo(AppTodoProblem) }
-enum ProjectProblem { Diff(DiffProblem), Script(ScriptProblem) }
-enum ProblemLayer { L0, L1, L2, L3 }
-```
-
-### Cmd-; Behavior
-
-1. If L0 problems exist anywhere, jump to them (cross-session). Stores "home session" on first L0 jump.
-2. When all L0 cleared, return to home session and cycle L1/L2/L3.
-3. Within a layer, cycle individual problems; when exhausted, advance to next layer.
-4. L2 is suppressed when Claude is busy or L1 problems exist (review before sending).
-
-### Refresh Model
-
-Problems are recomputed on a unified 2-second cycle:
-
-- **Push sources** (hooks, BEL): Write into `pending_events: HashSet<PendingEvent>` on the session. Events persist until resolved.
-- **Poll sources** (diff, TODO, status.sh): Computed fresh each cycle. Diff generation runs on a background thread.
-- `refresh_problems()` merges both, replaces the full list, and only triggers `cx.notify()` when the count changes.
-
-**Resolution:**
-- *Implicit:* Condition no longer holds on next poll (diff clean, WAIT empty, script quiet).
-- *Acknowledgment:* User switches to a session → `acknowledge()` clears pending events. Switching to Claude terminal specifically clears `TerminalBell`.
-
-### Display
-
-- **Title bar:** `! Project > Session` with problem count
-- **Session picker:** Red count replaces green `>` marker for sessions with problems
-- **Corner indicator:** Per-layer counts (e.g., `1 / 3 / 0 / 2`) with layer-specific colors
-
-### Script Problems (`status.sh`)
-
-Optional per-project script. The app runs it periodically and parses stdout:
-
-```
-file:line - message
-file - message
-3:file:line - message          # leading number = rank (lower = more important)
-```
-
-Runs with project root as cwd. Non-zero exit = no problems. Stderr ignored.
-
 ## Hook Server
 
 Lightweight HTTP server on a random localhost port. Claude Code POSTs to `/jc-hook/<event>`:
@@ -305,16 +289,31 @@ Lightweight HTTP server on a random localhost port. Claude Code POSTs to `/jc-ho
 | `session-start` | Session started (source: clear/startup/resume/compact) |
 | `session-end` | Session ended (reason: clear/logout/prompt_input_exit) |
 
-The server correlates `SessionEnd(clear)` + `SessionStart(clear)` events within a 10-second window to emit a unified `SessionClear` event.
+Of the `notification` payloads, only `idle_prompt` and `permission_prompt` become events; `auth_success` and `elicitation_dialog` are dropped. The server correlates `SessionEnd(clear)` + `SessionStart(clear)` events within a 10-second window to emit a unified `SessionClear` event; all other `session-start`/`session-end` routes are ignored.
 
-Project matching: hook payload includes `cwd`, matched against configured project paths. Session matching: `session_id` in payload matched against session UUIDs.
+Project matching: hook payload includes `cwd`, matched against configured project paths. Session matching: `session_id` in the payload is matched against session UUIDs — and since jc assigns those UUIDs, an event naming an unknown one belongs to a session jc doesn't manage and is discarded.
+
+### Effect of Each Event
+
+`Workspace::apply_hook_to_session` maps every non-`SessionClear` event onto the owning session's `busy` flag: `PromptSubmit` sets `busy`; `Stop`, `StopFailure`, `PermissionPrompt`, and `IdlePrompt` clear it. `SessionClear` is handled before dispatch, in `Workspace::handle_session_clear`.
 
 ## Notifications
 
+A desktop notification fires only for a session that is **blocked on you**, and only when the jc window is inactive (`Workspace::window_active`):
+
+| Event | Notification |
+|---|---|
+| `PermissionPrompt` | "Permission needed" |
+| `StopFailure` | "API error" |
+
+`Stop` and `IdlePrompt` are ambient — they update `busy` and nothing else. What moved while you were away is reported by the session picker's activity marker instead, which costs no interruption.
+
 macOS native via `objc2`:
 
-- **Banners:** `UNUserNotificationCenter` with sound. Requires bundled `.app` with bundle ID. Click routes to session via `session_id` in userInfo.
-- **Dock bounce:** `NSApplication::requestUserAttention` as fallback for unbundled builds. Critical events (permission prompts) bounce repeatedly.
+- **Banners:** `UNUserNotificationCenter` with sound. Requires bundled `.app` with bundle ID. Click routes to the session via `session_id` in userInfo (`Workspace::switch_to_session_id`).
+- **Dock bounce:** every notification also issues `NSApplication::requestUserAttention(CriticalRequest)`, before the authorization check — so unbundled builds, where banners are unavailable, still get the bounce. Since jc only notifies for a blocked session, a critical request is always the right level.
+
+`notify::beep` is separate: the system alert sound as invalid-action feedback, e.g. a Cmd-Enter rejected because a scheduled send is pending.
 
 ## IPC
 

@@ -7,9 +7,9 @@
 //! `<root>/.claude/worktrees/<branch>`, which encodes to
 //! `<encoded_root>--claude-worktrees-<branch>`. A project's live sessions can thus
 //! be spread across the root bucket and any number of worktree buckets, so a
-//! liveness/discovery check that looks only at the root bucket wrongly concludes a
-//! worktree session's transcript is gone. These helpers enumerate all of a
-//! project's buckets.
+//! discovery pass that looks only at the root bucket misses every session that
+//! was launched inside a worktree. These helpers enumerate all of a project's
+//! buckets.
 
 use std::path::{Path, PathBuf};
 
@@ -67,6 +67,13 @@ fn session_dirs_in(projects_root: &Path, project_path: &Path) -> Vec<PathBuf> {
 }
 
 /// Does a `<uuid>.jsonl` transcript exist in any of `dirs`?
+///
+/// This is the question that decides `--resume` vs `--session-id`: measured
+/// 2026-08-27, `claude --resume <uuid>` on a UUID with no transcript prints
+/// "No conversation found with session ID: <uuid>" and exits, whether the
+/// transcript was garbage-collected or never written. `--session-id <uuid>` on
+/// that same UUID starts a fresh conversation under it, so a session whose
+/// transcript is gone is revived rather than retired.
 pub fn transcript_in(dirs: &[PathBuf], uuid: &str) -> bool {
   let file = format!("{uuid}.jsonl");
   dirs.iter().any(|dir| dir.join(&file).exists())
@@ -134,14 +141,6 @@ mod tests {
   }
 
   #[test]
-  fn session_dirs_in_returns_root_when_projects_root_missing() {
-    let projects_root = std::env::temp_dir().join(format!("jc-missing-{}", std::process::id()));
-    std::fs::remove_dir_all(&projects_root).ok();
-    let dirs = session_dirs_in(&projects_root, Path::new("/Users/jay/Dev/pgm"));
-    assert_eq!(dirs, vec![projects_root.join("-Users-jay-Dev-pgm")]);
-  }
-
-  #[test]
   fn transcript_in_finds_uuid_in_worktree_bucket() {
     let home = std::env::temp_dir().join(format!("jc-txtest-{}", std::process::id()));
     std::fs::remove_dir_all(&home).ok();
@@ -155,5 +154,13 @@ mod tests {
     assert!(!transcript_in(&dirs, "00000000-0000-0000-0000-000000000000"));
 
     std::fs::remove_dir_all(&home).ok();
+  }
+
+  #[test]
+  fn session_dirs_in_returns_root_when_projects_root_missing() {
+    let projects_root = std::env::temp_dir().join(format!("jc-missing-{}", std::process::id()));
+    std::fs::remove_dir_all(&projects_root).ok();
+    let dirs = session_dirs_in(&projects_root, Path::new("/Users/jay/Dev/pgm"));
+    assert_eq!(dirs, vec![projects_root.join("-Users-jay-Dev-pgm")]);
   }
 }

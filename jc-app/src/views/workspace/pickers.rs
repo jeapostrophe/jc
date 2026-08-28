@@ -1,39 +1,15 @@
-use crate::file_watcher::watch_dir;
-use crate::views::comment_panel::{CommentPanel, CommentPanelEvent};
 use crate::views::pane::PaneContentKind;
 use crate::views::picker::{
-  CodeSymbolPickerDelegate, DiffDrillDownPickerDelegate, DrillDownPicker, LineSearchPickerDelegate,
-  OpenPicker, OpenPickerDelegate, OpenPickerResult, PickerEvent, PickerState, ProjectActionsPicker,
+  CodeSymbolPickerDelegate, DrillDownPicker, LineSearchPickerDelegate, OpenPicker,
+  OpenPickerDelegate, OpenPickerResult, PickerEvent, PickerState, ProjectActionsPicker,
   ProjectActionsPickerDelegate, ProjectActionsResult, SearchLines, SessionPickerDelegate,
-  SessionPickerResult, ShowSessionPicker, ShowSnippetPicker, SnippetPickerDelegate, SnippetTarget,
-  TodoHeaderPickerDelegate,
+  SessionPickerResult, ShowSessionPicker, TodoHeaderPickerDelegate,
 };
 use gpui::*;
-use jc_core::snippets;
 
-use super::{OpenCommentPanel, Workspace};
+use super::Workspace;
 
 impl Workspace {
-  pub(super) fn setup_snippet_watcher(
-    window: &Window,
-    cx: &mut Context<Self>,
-  ) -> Option<notify::RecommendedWatcher> {
-    let path = snippets::snippet_file_path();
-    let watched_file = path.file_name()?.to_os_string();
-    let parent = path.parent()?.to_path_buf();
-
-    watch_dir(
-      &parent,
-      move |p| p.ends_with(&watched_file),
-      None,
-      |view, _window, _cx| {
-        view.snippets = snippets::load();
-      },
-      window,
-      cx,
-    )
-  }
-
   pub(super) fn open_picker(
     &mut self,
     _: &OpenPicker,
@@ -109,11 +85,8 @@ impl Workspace {
       return;
     }
 
-    // Check for sessions whose JSONL files have been garbage-collected and mark them [X].
-    self.mark_expired_sessions(window, cx);
-
     let docs = self.todo_documents(cx);
-    let delegate = SessionPickerDelegate::new(&self.projects, self.active_project_index, &docs);
+    let delegate = SessionPickerDelegate::new(&self.projects, self.active_project_index, &docs, cx);
     self.show_session_picker(delegate, window, cx);
   }
 
@@ -144,10 +117,10 @@ impl Workspace {
                 this.adopt_session(pi, &uuid, &label, window, cx);
               }
               SessionPickerResult::InitProject(pi) => {
-                this.init_empty_project(pi, window, cx);
+                this.create_new_session(pi, window, cx);
               }
-              SessionPickerResult::ToggleDisabled(pi, label) => {
-                this.toggle_session_disabled(pi, &label, window, cx);
+              SessionPickerResult::ToggleDisabled(pi, key) => {
+                this.toggle_session_disabled(pi, &key, window, cx);
               }
             }
             cx.notify();
@@ -187,10 +160,6 @@ impl Workspace {
     let project = self.active_project();
 
     match kind {
-      Some(PaneContentKind::GitDiff) => {
-        let delegate = DiffDrillDownPickerDelegate::new(project.diff_view.clone(), cx);
-        self.show_picker(delegate, window, cx);
-      }
       Some(PaneContentKind::TodoEditor) => {
         let delegate = TodoHeaderPickerDelegate::new(project.todo_view.clone(), cx);
         self.show_picker(delegate, window, cx);
@@ -243,20 +212,18 @@ impl Workspace {
             this.pre_picker_focus.take();
             this.dismiss_picker();
             match result {
-              ProjectActionsResult::SwitchToSession(pi, id) => {
-                this.switch_to_session(pi, Some(id), window, cx);
-              }
               ProjectActionsResult::AdoptTodoSession(pi, uuid, label) => {
                 this.adopt_session(pi, &uuid, &label, window, cx);
-              }
-              ProjectActionsResult::InitProject(pi) => {
-                this.init_empty_project(pi, window, cx);
               }
               ProjectActionsResult::CreateNew => {
                 this.create_new_session(pi, window, cx);
               }
-              ProjectActionsResult::AdoptJsonlSession(uuid, label) => {
+              ProjectActionsResult::AdoptJsonlSession(uuid, summary) => {
+                // The summary is the transcript's first user message, so two
+                // sessions that opened with the same prompt would otherwise
+                // produce two identically-named headings.
                 let todo_view = this.projects[pi].todo_view.clone();
+                let label = jc_core::todo::unique_label(todo_view.read(cx).document(), &summary);
                 todo_view.update(cx, |tv, cx| {
                   tv.insert_session_heading(&uuid, &label, window, cx);
                   tv.save(cx);
@@ -306,18 +273,13 @@ impl Workspace {
         let delegate = LineSearchPickerDelegate::for_view(&project.todo_view, cx);
         self.show_picker(delegate, window, cx);
       }
-      Some(PaneContentKind::GitDiff) => {
-        let delegate = LineSearchPickerDelegate::for_view(&project.diff_view, cx);
-        self.show_picker(delegate, window, cx);
-      }
       _ => {}
     }
   }
 
-  fn show_picker_with_confirm<D: crate::views::picker::PickerDelegate>(
+  fn show_picker<D: crate::views::picker::PickerDelegate>(
     &mut self,
     delegate: D,
-    switch_pane: Option<PaneContentKind>,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -336,10 +298,7 @@ impl Workspace {
             this.recent_files.insert(0, path);
             this.recent_files.truncate(50);
           }
-          if let Some(kind) = switch_pane {
-            this.pre_picker_focus.take();
-            this.set_active_pane_view(kind, window, cx);
-          } else if let Some(focus) = this.pre_picker_focus.take() {
+          if let Some(focus) = this.pre_picker_focus.take() {
             focus.focus(window);
           }
           this.dismiss_picker();
@@ -361,117 +320,8 @@ impl Workspace {
     cx.notify();
   }
 
-  fn show_picker<D: crate::views::picker::PickerDelegate>(
-    &mut self,
-    delegate: D,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    self.show_picker_with_confirm(delegate, None, window, cx);
-  }
-
   pub(super) fn dismiss_picker(&mut self) {
     self.active_picker = None;
     self._picker_subscription = None;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Comment panel
-  // ---------------------------------------------------------------------------
-
-  pub(super) fn open_comment_panel(
-    &mut self,
-    _: &OpenCommentPanel,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_comment_panel.is_some() || self.active_picker.is_some() {
-      return;
-    }
-
-    let kind = self.active_pane_entity().read(cx).content_kind();
-    let project = self.active_project();
-
-    let context = match kind {
-      Some(PaneContentKind::CodeViewer) => {
-        project.code_view().and_then(|cv| cv.read(cx).comment_context(&project.path, cx))
-      }
-      Some(PaneContentKind::GitDiff) => project.diff_view.read(cx).comment_context(cx),
-      _ => None,
-    };
-
-    let Some(context) = context else { return };
-
-    // Save focus before creating the panel — CommentPanel::new calls
-    // set_cursor_position which steals focus to the panel's input.
-    self.pre_comment_focus = window.focused(cx);
-    let panel = cx.new(|cx| CommentPanel::new(context, window, cx));
-
-    let subscription = cx.subscribe_in(&panel, window, |this: &mut Self, _, event, window, cx| {
-      if let CommentPanelEvent::Confirmed(text) = event {
-        // Insert comment into active session's WAIT section.
-        let project = &this.projects[this.active_project_index];
-        if let Some(session) = project.active_session() {
-          let comment = format!("{text}\n");
-          let label = session.label.clone();
-          project.todo_view.update(cx, |tv, cx| {
-            tv.insert_comment(&label, &comment, window, cx);
-            tv.save(cx);
-          });
-        }
-      }
-      if let Some(focus) = this.pre_comment_focus.take() {
-        focus.focus(window);
-      }
-      this.dismiss_comment_panel();
-      cx.notify();
-    });
-
-    self.active_comment_panel = Some(panel.clone().into());
-    self._comment_subscription = Some(subscription);
-
-    panel.read(cx).input_focus_handle(cx).focus(window);
-    cx.notify();
-  }
-
-  fn dismiss_comment_panel(&mut self) {
-    self.active_comment_panel = None;
-    self._comment_subscription = None;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Snippet picker
-  // ---------------------------------------------------------------------------
-
-  pub(super) fn show_snippet_picker(
-    &mut self,
-    _: &ShowSnippetPicker,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    if self.active_picker.is_some() || self.snippets.items.is_empty() {
-      return;
-    }
-
-    let kind = self.active_pane_entity().read(cx).content_kind();
-    let project = self.active_project();
-
-    let insert_target = match kind {
-      Some(PaneContentKind::TodoEditor) => SnippetTarget::TodoCursor,
-      Some(PaneContentKind::ClaudeTerminal) => SnippetTarget::ClaudeTerminal,
-      _ => SnippetTarget::TodoWait,
-    };
-
-    let active_label = project.active_label().map(str::to_string);
-    let claude_terminal = project.active_session().map(|s| s.claude_terminal.clone());
-
-    let delegate = SnippetPickerDelegate::new(
-      self.snippets.items.clone(),
-      project.todo_view.clone(),
-      active_label,
-      claude_terminal,
-      insert_target,
-    );
-    self.show_picker(delegate, window, cx);
   }
 }

@@ -5,17 +5,15 @@ use gpui_component::ActiveTheme;
 pub enum PaneContentKind {
   ClaudeTerminal,
   GeneralTerminal,
-  GitDiff,
   CodeViewer,
   TodoEditor,
   GlobalTodo,
 }
 
 impl PaneContentKind {
-  pub const ALL: [PaneContentKind; 6] = [
+  pub const ALL: [PaneContentKind; 5] = [
     Self::ClaudeTerminal,
     Self::GeneralTerminal,
-    Self::GitDiff,
     Self::CodeViewer,
     Self::TodoEditor,
     Self::GlobalTodo,
@@ -25,7 +23,6 @@ impl PaneContentKind {
     match self {
       Self::ClaudeTerminal => "Claude",
       Self::GeneralTerminal => "Terminal",
-      Self::GitDiff => "Diff",
       Self::CodeViewer => "Code",
       Self::TodoEditor => "TODO",
       Self::GlobalTodo => "Global TODO",

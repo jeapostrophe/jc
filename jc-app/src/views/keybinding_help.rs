@@ -27,16 +27,12 @@ const SECTIONS: &[Section] = &[
       ("Cmd-P", "Session picker"),
       ("Cmd-Shift-P", "Project actions"),
       ("Cmd-F", "Search lines"),
-      ("Cmd-K", "Comment panel"),
-      ("Cmd-Shift-K", "Snippet picker"),
       ("Cmd-S", "Save file"),
       ("Cmd-Enter", "Send to terminal"),
-      ("Cmd-;", "Next problem"),
       ("Cmd-.", "Jump to WAIT"),
-      ("Cmd-Shift-C", "Copy reply (/copy)"),
+      ("Cmd-Alt-\u{2191}/\u{2193}", "Scroll other pane"),
+      ("Cmd-Alt-PgUp/PgDn", "Page other pane"),
       ("Cmd-?", "Keybinding help"),
-      ("Cmd-D", "Toggle Code/Diff for file"),
-      ("Cmd-Shift-E", "Open in external editor"),
       ("Cmd-W", "Close window"),
       ("Cmd-M", "Minimize window"),
       ("Cmd-Q", "Quit"),
@@ -45,7 +41,7 @@ const SECTIONS: &[Section] = &[
   Section {
     title: "View-Specific",
     bindings: &[
-      ("Cmd-R", "Reload / Mark reviewed (Code/Diff)"),
+      ("Cmd-R", "Reload from disk (Code)"),
       ("Cmd-C", "Copy selection (Terminal)"),
       ("Cmd-V", "Paste (Terminal)"),
       ("Cmd-=/+", "Increase font size (Terminal)"),
@@ -57,15 +53,12 @@ const SECTIONS: &[Section] = &[
     title: "Picker",
     bindings: &[
       ("Enter", "Confirm"),
-      ("Escape", "Cancel"),
+      ("Escape / Ctrl-C", "Cancel"),
       ("Down / Ctrl-N", "Next item"),
       ("Up / Ctrl-P", "Previous item"),
-      ("Cmd-Shift-Bksp", "Remove session"),
+      ("PgDn / PgUp", "Next / previous page"),
+      ("Cmd-Shift-Bksp", "Toggle session disabled"),
     ],
-  },
-  Section {
-    title: "Comment Panel",
-    bindings: &[("Cmd-Enter", "Submit comment"), ("Escape", "Dismiss")],
   },
 ];
 

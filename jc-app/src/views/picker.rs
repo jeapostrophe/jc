@@ -11,12 +11,9 @@ use std::rc::Rc;
 use crate::language::Language;
 use crate::outline::{OutlineItem, compute_outline};
 use crate::views::code_view::CodeView;
-use crate::views::diff_view::{DiffSource, DiffView, GitLogEntry, git_log};
 use crate::views::project_state::ProjectState;
 use crate::views::session_state::SessionId;
 use crate::views::todo_view::TodoView;
-use jc_core::snippets::Snippet;
-use jc_terminal::TerminalView;
 
 actions!(
   picker,
@@ -33,7 +30,6 @@ actions!(
     ProjectActionsPicker,
     ShowSessionPicker,
     SearchLines,
-    ShowSnippetPicker,
   ]
 );
 
@@ -500,128 +496,6 @@ impl PickerDelegate for OpenPickerDelegate {
 }
 
 // ---------------------------------------------------------------------------
-// DiffDrillDownPickerDelegate (replaces DiffFilePickerDelegate + GitLogPickerDelegate)
-// ---------------------------------------------------------------------------
-
-enum DiffDrillDownEntry {
-  File { name: String, reviewed: bool },
-  Commit { entry: GitLogEntry },
-  WorkingTree,
-}
-
-pub struct DiffDrillDownPickerDelegate {
-  labels: Vec<String>,
-  entries: Vec<DiffDrillDownEntry>,
-  diff_view: Entity<DiffView>,
-}
-
-impl DiffDrillDownPickerDelegate {
-  pub fn new(diff_view: Entity<DiffView>, cx: &App) -> Self {
-    let dv = diff_view.read(cx);
-    let mut labels = Vec::new();
-    let mut entries = Vec::new();
-
-    // 1. Diff files.
-    for fd in dv.file_diffs() {
-      let reviewed = dv.is_reviewed(&fd.name);
-      labels.push(fd.name.clone());
-      entries.push(DiffDrillDownEntry::File { name: fd.name.clone(), reviewed });
-    }
-
-    // 2. Git log entries prefixed with `@`.
-    // Working tree first.
-    labels.push("@* Working tree".to_string());
-    entries.push(DiffDrillDownEntry::WorkingTree);
-
-    // Then commits.
-    let path = dv.project_path().to_path_buf();
-    let log_entries = git_log(&path);
-    for e in log_entries {
-      labels.push(format!("@{} {}", e.short_hash, e.summary));
-      entries.push(DiffDrillDownEntry::Commit { entry: e });
-    }
-
-    Self { labels, entries, diff_view }
-  }
-}
-
-impl PickerDelegate for DiffDrillDownPickerDelegate {
-  fn items(&self) -> &[String] {
-    &self.labels
-  }
-
-  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
-    match &self.entries[index] {
-      DiffDrillDownEntry::File { name, .. } => {
-        // Find the file index in the diff view's file list.
-        let file_idx = {
-          let dv = self.diff_view.read(cx);
-          dv.file_diffs().iter().position(|fd| fd.name == *name)
-        };
-        if let Some(idx) = file_idx {
-          self.diff_view.update(cx, |v, cx| v.set_file_index(idx, window, cx));
-        }
-      }
-      DiffDrillDownEntry::WorkingTree => {
-        self.diff_view.update(cx, |v, cx| v.set_source(DiffSource::WorkingTree, window, cx));
-      }
-      DiffDrillDownEntry::Commit { entry, .. } => {
-        let source = DiffSource::Commit { oid: entry.oid, summary: entry.summary.clone() };
-        self.diff_view.update(cx, |v, cx| v.set_source(source, window, cx));
-      }
-    }
-  }
-
-  fn filter(&self, query_lower: &[char]) -> Vec<FilteredItem> {
-    let mut result = Vec::new();
-    for (index, item) in self.labels.iter().enumerate() {
-      if let Some(score) = fuzzy_match(query_lower, item) {
-        let bias = match &self.entries[index] {
-          DiffDrillDownEntry::File { reviewed: true, .. } => -10000,
-          DiffDrillDownEntry::WorkingTree | DiffDrillDownEntry::Commit { .. } => -5000,
-          DiffDrillDownEntry::File { reviewed: false, .. } => 0,
-        };
-        result.push(FilteredItem { index, score: score + bias });
-      }
-    }
-    result
-  }
-
-  fn render_item(&self, index: usize, selected: bool, cx: &App) -> Div {
-    let theme = cx.theme();
-    let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
-    let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
-
-    match &self.entries[index] {
-      DiffDrillDownEntry::File { name, reviewed } => {
-        if *reviewed {
-          let marker_color = if selected { theme.accent_foreground } else { theme.green };
-          row
-            .child(
-              div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("✓"),
-            )
-            .child(name.clone())
-        } else {
-          row.child(div().text_xs().w(px(10.0))).child(name.clone())
-        }
-      }
-      DiffDrillDownEntry::WorkingTree => {
-        let marker_color = if selected { theme.accent_foreground } else { theme.yellow };
-        row
-          .child(div().text_xs().text_color(marker_color).font_weight(FontWeight::BOLD).child("*"))
-          .child("Working tree".to_string())
-      }
-      DiffDrillDownEntry::Commit { entry, .. } => {
-        let hash_color = if selected { theme.accent_foreground } else { theme.blue };
-        row
-          .child(div().text_xs().text_color(hash_color).child(entry.short_hash.clone()))
-          .child(entry.summary.clone())
-      }
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
 // TodoHeaderPickerDelegate
 // ---------------------------------------------------------------------------
 
@@ -837,12 +711,11 @@ struct SessionPickerEntry {
   project_index: usize,
   project_name: String,
   label: String,
-  /// Whether this label appears on more than one session (needing disambiguation).
-  ambiguous_label: bool,
-  /// Total problem count (session + project).
-  problems: usize,
-  /// Minimum problem rank (lower = more urgent). `i8::MAX` if no problems.
-  min_rank: i8,
+  /// The session's Claude UUID; empty only for an `EmptyProject` row. This, not
+  /// the label, is what actions carry back to the workspace.
+  uuid: String,
+  /// Claude has produced terminal output since this session was last on screen.
+  has_activity: bool,
   /// Unix timestamp of the last TODO submit (from `> last=`). `0` if unknown.
   last_active: u64,
 }
@@ -865,8 +738,8 @@ pub enum SessionPickerResult {
   Adopt(usize, String, String),
   /// Initialize a project that has no sessions yet: project_index.
   InitProject(usize),
-  /// Toggle disabled state on a session: (project_index, label).
-  ToggleDisabled(usize, String),
+  /// Toggle disabled state on a session: (project_index, heading address).
+  ToggleDisabled(usize, jc_core::todo::SessionKey),
 }
 
 pub struct SessionPickerDelegate {
@@ -883,8 +756,9 @@ impl SessionPickerDelegate {
     projects: &[ProjectState],
     active_project_index: usize,
     todo_documents: &[&jc_core::todo::TodoDocument],
+    cx: &App,
   ) -> Self {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     let mut entries = Vec::new();
     let mut active_entry = None;
@@ -892,23 +766,17 @@ impl SessionPickerDelegate {
     for (pi, project) in projects.iter().enumerate() {
       // Collect UUIDs already adopted into running sessions.
       let adopted_uuids: HashSet<&str> =
-        project.sessions.values().filter_map(|s| s.uuid.as_deref()).collect();
+        project.sessions.values().map(|s| s.uuid.as_str()).collect();
 
-      let has_adoptable = todo_documents.get(pi).is_some_and(|d| {
-        d.sessions
-          .iter()
-          .any(|s| !s.uuid.is_empty() && s.status != jc_core::todo::SessionStatus::Expired)
-      });
+      let has_adoptable = todo_documents.get(pi).is_some_and(|d| !d.sessions.is_empty());
       if project.sessions.is_empty() && !has_adoptable {
-        let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);
         entries.push(SessionPickerEntry {
           kind: SessionPickerEntryKind::EmptyProject,
           project_index: pi,
           project_name: project.name.clone(),
           label: String::new(),
-          ambiguous_label: false,
-          problems: project.problems.len(),
-          min_rank,
+          uuid: String::new(),
+          has_activity: false,
           last_active: 0,
         });
         continue;
@@ -920,16 +788,9 @@ impl SessionPickerDelegate {
         if is_active {
           active_entry = Some(entries.len());
         }
-        let min_rank = session
-          .problems
-          .iter()
-          .map(|p| p.rank())
-          .chain(project.problems.iter().map(|p| p.rank()))
-          .min()
-          .unwrap_or(i8::MAX);
         let last_active = todo_documents
           .get(pi)
-          .and_then(|d| d.session_by_label(&session.label))
+          .and_then(|d| d.session_by_uuid(&session.uuid))
           .and_then(|ts| ts.last_active)
           .unwrap_or(0);
         entries.push(SessionPickerEntry {
@@ -937,30 +798,27 @@ impl SessionPickerDelegate {
           project_index: pi,
           project_name: project.name.clone(),
           label: session.label.clone(),
-          ambiguous_label: false, // computed below
-          problems: session.problems.len() + project.problems.len(),
-          min_rank,
+          uuid: session.uuid.clone(),
+          // The session on screen is the one you're looking at, so its output
+          // is by definition already seen.
+          has_activity: !is_active && session.claude_terminal.read(cx).has_unseen_output(),
           last_active,
         });
       }
 
       // Unadopted TODO.md sessions: in TODO but no running SessionState.
-      let adopted_labels: HashSet<&str> =
-        project.sessions.values().map(|s| s.label.as_str()).collect();
+      // Adoption is decided by UUID alone. A label test would also hide a
+      // distinct session that merely shares a name with a running one, leaving
+      // it impossible to adopt or re-enable from anywhere in the UI.
       if let Some(doc) = todo_documents.get(pi) {
         for todo_session in &doc.sessions {
-          let uuid_adopted =
-            !todo_session.uuid.is_empty() && adopted_uuids.contains(todo_session.uuid.as_str());
-          let label_adopted = adopted_labels.contains(todo_session.label.as_str());
-          // Skip sessions with no UUID — nothing to adopt/resume.
-          if todo_session.uuid.is_empty() {
+          // A blank `> uuid=` is adoptable too: jc mints the UUID at adopt time
+          // rather than at startup, so the user chooses when a legacy heading
+          // gets bound to a new (empty) conversation.
+          if !todo_session.uuid.is_empty() && adopted_uuids.contains(todo_session.uuid.as_str()) {
             continue;
           }
-          // Skip expired sessions — JSONL was garbage-collected.
-          if todo_session.status == jc_core::todo::SessionStatus::Expired {
-            continue;
-          }
-          if !uuid_adopted && !label_adopted {
+          {
             entries.push(SessionPickerEntry {
               kind: SessionPickerEntryKind::Unadopted {
                 uuid: todo_session.uuid.clone(),
@@ -969,9 +827,8 @@ impl SessionPickerDelegate {
               project_index: pi,
               project_name: project.name.clone(),
               label: todo_session.label.clone(),
-              ambiguous_label: false,
-              problems: 0,
-              min_rank: i8::MAX,
+              uuid: todo_session.uuid.clone(),
+              has_activity: false,
               last_active: todo_session.last_active.unwrap_or(0),
             });
           }
@@ -979,22 +836,9 @@ impl SessionPickerDelegate {
       }
     }
 
-    // Detect ambiguous labels.
-    let mut label_counts: HashMap<String, usize> = HashMap::default();
-    for e in &entries {
-      if !matches!(e.kind, SessionPickerEntryKind::EmptyProject) {
-        *label_counts.entry(e.label.clone()).or_default() += 1;
-      }
-    }
-    for e in &mut entries {
-      if !matches!(e.kind, SessionPickerEntryKind::EmptyProject) {
-        e.ambiguous_label = label_counts.get(&e.label).copied().unwrap_or(0) > 1;
-      }
-    }
-
     // Sort into groups (lower = higher in picker):
-    //   0: this project, sessions (problems first, then recency DESC)
-    //   1: other projects, sessions (recency DESC)
+    //   0: this project, sessions (activity first, then recency DESC)
+    //   1: other projects, sessions (activity first, then recency DESC)
     //   2: unadopted sessions (this project first, then recency DESC)
     //   3: empty projects
     //   4: current active session (always last)
@@ -1018,10 +862,12 @@ impl SessionPickerDelegate {
       let gb = sort_group(eb, b);
       ga.cmp(&gb)
         .then_with(|| {
-          // Within group 0 (this project): problems first, then recency DESC.
-          if ga == 0 {
-            let pa = if ea.problems > 0 { 0u8 } else { 1 };
-            let pb = if eb.problems > 0 { 0u8 } else { 1 };
+          // Within the two session groups: activity first, then recency DESC.
+          // Applied to other projects too — "where did the work move while I was
+          // elsewhere" is mostly a cross-project question.
+          if ga == 0 || ga == 1 {
+            let pa = if ea.has_activity { 0u8 } else { 1 };
+            let pb = if eb.has_activity { 0u8 } else { 1 };
             pa.cmp(&pb)
           } else if ga == 2 {
             // Unadopted: this project before others.
@@ -1054,40 +900,6 @@ impl SessionPickerDelegate {
     Self { labels, entries: sorted_entries, active_entry, result: None }
   }
 
-  /// Like `new()` but sorted by urgency: sessions with problems first (lowest rank = most urgent).
-  /// The first entry is pre-selected so Enter immediately confirms the neediest session.
-  #[allow(dead_code)]
-  pub fn new_urgency_sorted(
-    projects: &[ProjectState],
-    active_project_index: usize,
-    todo_documents: &[&jc_core::todo::TodoDocument],
-  ) -> Self {
-    let mut delegate = Self::new(projects, active_project_index, todo_documents);
-
-    // Build a permutation sorted by urgency.
-    let mut indices: Vec<usize> = (0..delegate.entries.len()).collect();
-    indices.sort_by(|&a, &b| {
-      let ea = &delegate.entries[a];
-      let eb = &delegate.entries[b];
-      // Primary: has_problems DESC (problems first).
-      let pa = if ea.problems > 0 { 0 } else { 1 };
-      let pb = if eb.problems > 0 { 0 } else { 1 };
-      pa.cmp(&pb)
-        // Secondary: min_rank ASC (most severe first).
-        .then(ea.min_rank.cmp(&eb.min_rank))
-        // Tertiary: original order.
-        .then(a.cmp(&b))
-    });
-
-    let sorted_entries: Vec<_> = indices.iter().map(|&i| delegate.entries[i].clone()).collect();
-    let sorted_labels: Vec<_> = indices.iter().map(|&i| delegate.labels[i].clone()).collect();
-
-    delegate.entries = sorted_entries;
-    delegate.labels = sorted_labels;
-    delegate.active_entry = Some(0);
-    delegate
-  }
-
   pub fn confirmed_entry(&self) -> Option<SessionPickerResult> {
     self.result.clone()
   }
@@ -1113,7 +925,10 @@ impl PickerDelegate for SessionPickerDelegate {
     let e = &self.entries[index];
     match &e.kind {
       SessionPickerEntryKind::Session(_) | SessionPickerEntryKind::Unadopted { .. } => {
-        self.result = Some(SessionPickerResult::ToggleDisabled(e.project_index, e.label.clone()));
+        self.result = Some(SessionPickerResult::ToggleDisabled(
+          e.project_index,
+          jc_core::todo::SessionKey::new(&e.uuid, &e.label),
+        ));
         cx.emit(PickerEvent::Confirmed);
       }
       _ => {}
@@ -1124,7 +939,6 @@ impl PickerDelegate for SessionPickerDelegate {
     let theme = cx.theme();
     let entry = &self.entries[index];
     let is_active = self.active_entry == Some(index);
-    let has_problems = entry.problems > 0;
 
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
@@ -1144,9 +958,9 @@ impl PickerDelegate for SessionPickerDelegate {
         let color = if selected { theme.accent_foreground } else { theme.yellow };
         picker_marker_base().text_color(color).child("~")
       }
-      SessionPickerEntryKind::Session(_) if has_problems => {
+      SessionPickerEntryKind::Session(_) if entry.has_activity => {
         let color = if selected { theme.accent_foreground } else { theme.red };
-        picker_marker_base().text_color(color).child(format!("{}", entry.problems))
+        picker_marker_base().text_color(color).child("*")
       }
       SessionPickerEntryKind::Session(_) if is_active => {
         let color = if selected { theme.accent_foreground } else { theme.green };
@@ -1190,6 +1004,7 @@ impl PickerDelegate for SessionPickerDelegate {
         .text_xs()
         .text_color(muted)
         .children([
+          legend_item("*", theme.red, "activity", muted),
           legend_item(">", theme.green, "active", muted),
           legend_item("~", theme.yellow, "adopt", muted),
           legend_item("~", theme.muted_foreground, "disabled", muted),
@@ -1206,23 +1021,12 @@ impl PickerDelegate for SessionPickerDelegate {
 
 #[derive(Clone)]
 pub enum ProjectActionsResult {
-  SwitchToSession(usize, SessionId),
   AdoptTodoSession(usize, String, String), // pi, uuid, label
-  InitProject(usize),
   CreateNew,
   AdoptJsonlSession(String, String), // uuid, label
 }
 
 enum ProjectActionsEntry {
-  Problem {
-    pi: usize,
-    kind: SessionPickerEntryKind,
-    project_name: String,
-    label: String,
-    problems: usize,
-    #[allow(dead_code)]
-    min_rank: i8,
-  },
   /// A TODO.md session that isn't currently running.
   Dormant {
     uuid: String,
@@ -1255,106 +1059,17 @@ impl ProjectActionsPickerDelegate {
     let mut labels = Vec::new();
     let mut entries = Vec::new();
 
-    // 1. Problem entries: sessions with problems, sorted by urgency.
+    // 1. Dormant sessions: in TODO.md but not currently running, sorted by recency.
     {
-      struct ProblemCandidate {
-        pi: usize,
-        kind: SessionPickerEntryKind,
-        project_name: String,
-        label: String,
-        problems: usize,
-        min_rank: i8,
-        last_active: u64,
-      }
-
-      let mut candidates: Vec<ProblemCandidate> = Vec::new();
-      let pi = active_project_index;
-      let project = &projects[pi];
-
-      if project.sessions.is_empty() && todo_documents.get(pi).is_none_or(|d| d.sessions.is_empty())
-      {
-        if !project.problems.is_empty() {
-          let min_rank = project.problems.iter().map(|p| p.rank()).min().unwrap_or(i8::MAX);
-          candidates.push(ProblemCandidate {
-            pi,
-            kind: SessionPickerEntryKind::EmptyProject,
-            project_name: project.name.clone(),
-            label: String::new(),
-            problems: project.problems.len(),
-            min_rank,
-            last_active: 0,
-          });
-        }
-      } else {
-        // Adopted sessions with problems.
-        for (&id, session) in &project.sessions {
-          let total_problems = session.problems.len() + project.problems.len();
-          if total_problems > 0 {
-            let min_rank = session
-              .problems
-              .iter()
-              .map(|p| p.rank())
-              .chain(project.problems.iter().map(|p| p.rank()))
-              .min()
-              .unwrap_or(i8::MAX);
-            let last_active = todo_documents
-              .get(pi)
-              .and_then(|d| d.session_by_label(&session.label))
-              .and_then(|ts| ts.last_active)
-              .unwrap_or(0);
-            candidates.push(ProblemCandidate {
-              pi,
-              kind: SessionPickerEntryKind::Session(id),
-              project_name: project.name.clone(),
-              label: session.label.clone(),
-              problems: total_problems,
-              min_rank,
-              last_active,
-            });
-          }
-        }
-      }
-
-      // Sort by urgency (min_rank ASC), then recency DESC.
-      candidates
-        .sort_by(|a, b| a.min_rank.cmp(&b.min_rank).then(b.last_active.cmp(&a.last_active)));
-
-      for c in candidates {
-        let label_text = match &c.kind {
-          SessionPickerEntryKind::EmptyProject => format!("! {}", c.project_name),
-          _ => format!("! {}", c.label),
-        };
-        labels.push(label_text);
-        entries.push(ProjectActionsEntry::Problem {
-          pi: c.pi,
-          kind: c.kind,
-          project_name: c.project_name,
-          label: c.label,
-          problems: c.problems,
-          min_rank: c.min_rank,
-        });
-      }
-    }
-
-    // 2. Dormant sessions: in TODO.md but not currently running, sorted by recency.
-    {
-      let adopted_uuids: HashSet<&str> = projects[active_project_index]
-        .sessions
-        .values()
-        .filter_map(|s| s.uuid.as_deref())
-        .collect();
-      let adopted_labels: HashSet<&str> =
-        projects[active_project_index].sessions.values().map(|s| s.label.as_str()).collect();
+      // Adoption is decided by UUID alone; see the note in SessionPickerDelegate.
+      let adopted_uuids: HashSet<&str> =
+        projects[active_project_index].sessions.values().map(|s| s.uuid.as_str()).collect();
 
       let mut dormant: Vec<(String, String, u64)> = Vec::new();
       if let Some(doc) = todo_documents.get(active_project_index) {
         for ts in &doc.sessions {
-          if ts.uuid.is_empty() || ts.status == jc_core::todo::SessionStatus::Expired {
-            continue;
-          }
-          let uuid_adopted = adopted_uuids.contains(ts.uuid.as_str());
-          let label_adopted = adopted_labels.contains(ts.label.as_str());
-          if !uuid_adopted && !label_adopted {
+          // Blank-UUID headings are listed too; adopting mints their UUID.
+          if ts.uuid.is_empty() || !adopted_uuids.contains(ts.uuid.as_str()) {
             dormant.push((ts.uuid.clone(), ts.label.clone(), ts.last_active.unwrap_or(0)));
           }
         }
@@ -1367,11 +1082,11 @@ impl ProjectActionsPickerDelegate {
       }
     }
 
-    // 3. New session.
+    // 2. New session.
     labels.push("+ New session".to_string());
     entries.push(ProjectActionsEntry::NewSession);
 
-    // 4. Unattached JSONL sessions for current project (not in TODO.md). A
+    // 3. Unattached JSONL sessions for current project (not in TODO.md). A
     //    project's transcripts live in its root bucket plus any git-worktree
     //    buckets (each transcript in exactly one bucket), so scan them all.
     {
@@ -1427,13 +1142,6 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
   fn confirm(&mut self, index: usize, _window: &mut Window, _cx: &mut Context<PickerState<Self>>) {
     let entry = &self.entries[index];
     self.result = Some(match entry {
-      ProjectActionsEntry::Problem { pi, kind, label, .. } => match kind {
-        SessionPickerEntryKind::Session(id) => ProjectActionsResult::SwitchToSession(*pi, *id),
-        SessionPickerEntryKind::Unadopted { uuid, .. } => {
-          ProjectActionsResult::AdoptTodoSession(*pi, uuid.clone(), label.clone())
-        }
-        SessionPickerEntryKind::EmptyProject => ProjectActionsResult::InitProject(*pi),
-      },
       ProjectActionsEntry::Dormant { uuid, label } => ProjectActionsResult::AdoptTodoSession(
         self.active_project_index,
         uuid.clone(),
@@ -1452,18 +1160,6 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
     match &self.entries[index] {
-      ProjectActionsEntry::Problem { project_name, label, problems, kind, .. } => {
-        let marker_color = if selected { theme.accent_foreground } else { theme.red };
-        let marker = picker_marker_base().text_color(marker_color).child("!");
-        let main_text = match kind {
-          SessionPickerEntryKind::EmptyProject => project_name.clone(),
-          _ => label.clone(),
-        };
-        let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
-        let right_el =
-          div().ml_auto().text_xs().text_color(muted_color).child(format!("{problems}"));
-        row.child(marker).child(main_text).child(right_el)
-      }
       ProjectActionsEntry::Dormant { label, .. } => {
         let marker_color = if selected { theme.accent_foreground } else { theme.cyan };
         let marker = picker_marker_base().text_color(marker_color).child("*");
@@ -1496,7 +1192,6 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
         .text_xs()
         .text_color(muted)
         .children([
-          legend_item("!", theme.red, "problem", muted),
           legend_item("*", theme.cyan, "dormant", muted),
           legend_item("+", theme.green, "new", muted),
           legend_item("~", theme.yellow, "unattached", muted),
@@ -1625,76 +1320,6 @@ impl PickerDelegate for LineSearchPickerDelegate {
   }
 }
 
-// ---------------------------------------------------------------------------
-// SnippetPickerDelegate
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnippetTarget {
-  TodoCursor,
-  TodoWait,
-  ClaudeTerminal,
-}
-
-pub struct SnippetPickerDelegate {
-  items: Vec<String>,
-  snippets: Vec<Snippet>,
-  todo_view: Entity<TodoView>,
-  active_label: Option<String>,
-  claude_terminal: Option<Entity<TerminalView>>,
-  insert_target: SnippetTarget,
-}
-
-impl SnippetPickerDelegate {
-  pub fn new(
-    snippets: Vec<Snippet>,
-    todo_view: Entity<TodoView>,
-    active_label: Option<String>,
-    claude_terminal: Option<Entity<TerminalView>>,
-    insert_target: SnippetTarget,
-  ) -> Self {
-    let items: Vec<String> = snippets.iter().map(|s| s.heading.clone()).collect();
-    Self { items, snippets, todo_view, active_label, claude_terminal, insert_target }
-  }
-}
-
-impl PickerDelegate for SnippetPickerDelegate {
-  fn items(&self) -> &[String] {
-    &self.items
-  }
-
-  fn confirm(&mut self, index: usize, window: &mut Window, cx: &mut Context<PickerState<Self>>) {
-    let snippet = &self.snippets[index];
-    let text = &snippet.content;
-    if text.is_empty() {
-      return;
-    }
-
-    match self.insert_target {
-      SnippetTarget::TodoCursor => {
-        self.todo_view.update(cx, |tv, cx| {
-          tv.insert_at_cursor(text, window, cx);
-        });
-      }
-      SnippetTarget::TodoWait => {
-        if let Some(label) = &self.active_label {
-          let comment = format!("{text}\n");
-          self.todo_view.update(cx, |tv, cx| {
-            tv.insert_comment(label, &comment, window, cx);
-          });
-        }
-      }
-      SnippetTarget::ClaudeTerminal => {
-        if let Some(terminal) = &self.claude_terminal {
-          terminal.read(cx).write_text(text);
-        }
-      }
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Helper functions
 // ---------------------------------------------------------------------------
 
 /// Extract a short summary from a JSONL file (first informative user message).

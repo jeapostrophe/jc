@@ -8,15 +8,15 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::TermMode;
 use gpui::{
-  App, AsyncApp, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
-  InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-  MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
-  Styled, Subscription, Timer, WeakEntity, Window, actions, canvas, div, px,
+  App, AsyncApp, Bounds, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
+  IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+  ParentElement, Pixels, Render, ScrollWheelEvent, SharedString, Styled, Subscription, Timer,
+  WeakEntity, Window, actions, canvas, div, px,
 };
 use parking_lot::Mutex;
 use std::io::Read;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -105,14 +105,6 @@ fn pixel_to_grid(
   (Point::new(Line(row as i32), Column(col)), side)
 }
 
-/// Events emitted by [`TerminalView`] for the host application.
-#[derive(Debug, Clone)]
-pub enum TerminalViewEvent {
-  Bell,
-}
-
-impl EventEmitter<TerminalViewEvent> for TerminalView {}
-
 /// GPUI view that embeds a terminal emulator.
 pub struct TerminalView {
   state: TerminalState,
@@ -131,6 +123,14 @@ pub struct TerminalView {
   /// Shared flag: when false, the background processing thread batches more
   /// aggressively and the notification relay skips `cx.notify()`.
   visible: Arc<AtomicBool>,
+  /// Batches of child output parsed so far, bumped by the VTE thread. Compared
+  /// against `seen_batches` to answer "did anything happen since you last
+  /// looked?" without any per-chunk main-thread work. A monotonic counter
+  /// rather than a flag so a caller can also tell whether output is *still*
+  /// arriving (see [`TerminalView::output_batches`]).
+  output_batches: Arc<AtomicUsize>,
+  /// Value of `output_batches` at the last [`TerminalView::clear_output_seen`].
+  seen_batches: Arc<AtomicUsize>,
   _subscriptions: Vec<Subscription>,
   /// Cursor blink task — only runs while focused.
   _blink_task: Option<gpui::Task<()>>,
@@ -181,7 +181,9 @@ impl TerminalView {
     let pty_for_write = pty.clone();
     let visible = Arc::new(AtomicBool::new(true));
     let visible_for_bg = visible.clone();
-    let (notify_tx, notify_rx) = flume::unbounded::<bool>(); // true = has bell
+    let (notify_tx, notify_rx) = flume::unbounded::<()>(); // one signal per parsed batch
+    let output_batches = Arc::new(AtomicUsize::new(0));
+    let output_batches_for_bg = output_batches.clone();
     std::thread::spawn(move || {
       let mut processor = alacritty_terminal::vte::ansi::Processor::<
         alacritty_terminal::vte::ansi::StdSyncHandler,
@@ -203,34 +205,24 @@ impl TerminalView {
           let mut term = term_handle.lock();
           processor.advance(&mut *term, &all_bytes);
         }
-        // Handle terminal events — PtyWrite directly, Bell via main thread.
-        let mut has_bell = false;
+        output_batches_for_bg.fetch_add(1, Ordering::Relaxed);
+        // Handle terminal events. PtyWrite is answered here on the VTE thread;
+        // the rest only matter as "something changed, repaint".
         while let Ok(event) = event_rx.try_recv() {
-          match event {
-            TerminalEvent::PtyWrite(s) => {
-              let _ = pty_for_write.write_all(s.as_bytes());
-            }
-            TerminalEvent::Bell => has_bell = true,
-            _ => {}
+          if let TerminalEvent::PtyWrite(s) = event {
+            let _ = pty_for_write.write_all(s.as_bytes());
           }
         }
-        if notify_tx.send(has_bell).is_err() {
+        if notify_tx.send(()).is_err() {
           break;
         }
       }
     });
 
-    // Lightweight main-thread relay: emit bells and notify GPUI for repaint.
+    // Lightweight main-thread relay: notify GPUI for repaint.
     let visible_for_relay = visible.clone();
     cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
-      while let Ok(has_bell) = notify_rx.recv_async().await {
-        if has_bell {
-          let _ = cx.update(|cx: &mut App| {
-            if let Some(entity) = this.upgrade() {
-              entity.update(cx, |_view, cx| cx.emit(TerminalViewEvent::Bell));
-            }
-          });
-        }
+      while notify_rx.recv_async().await.is_ok() {
         // Skip repaint for hidden terminals — no point rendering offscreen content.
         if visible_for_relay.load(Ordering::Relaxed) {
           let _ = cx.update(|cx: &mut App| {
@@ -266,6 +258,8 @@ impl TerminalView {
       cached_layout: None,
       canvas_origin: Arc::new(Mutex::new(gpui::Point::default())),
       visible,
+      output_batches,
+      seen_batches: Arc::new(AtomicUsize::new(0)),
       _subscriptions,
       _blink_task: None,
     }
@@ -274,6 +268,22 @@ impl TerminalView {
   /// Update the terminal color palette at runtime.
   pub fn set_palette(&mut self, palette: Palette) {
     self.palette = palette;
+  }
+
+  /// Has the child written anything since the last [`Self::clear_output_seen`]?
+  pub fn has_unseen_output(&self) -> bool {
+    self.output_batches.load(Ordering::Relaxed) != self.seen_batches.load(Ordering::Relaxed)
+  }
+
+  /// Count of output batches parsed since this terminal started. Monotonic;
+  /// two equal readings a moment apart mean the child has gone quiet.
+  pub fn output_batches(&self) -> usize {
+    self.output_batches.load(Ordering::Relaxed)
+  }
+
+  /// Take everything printed so far as seen — the user is looking at it now.
+  pub fn clear_output_seen(&self) {
+    self.seen_batches.store(self.output_batches.load(Ordering::Relaxed), Ordering::Relaxed);
   }
 
   /// Mark this terminal as visible or hidden.  Hidden terminals still process

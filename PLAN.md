@@ -2,15 +2,11 @@
 
 > **Labels:** **[T]** Trivial, **[E]** Easy, **[H]** Hard (own Claude session), **[D]** Design (needs human input)
 
-### Git Diff View
-- [ ] [H] Word-level inline highlighting via `similar`
-
 ### Window & Pane Management
 - [ ] [H] Multi-window with shared session state
 
 ### Remote Workflow (CLI & Hooks)
-- [ ] [H] `jc status` — JSON projects/sessions/problems
-- [ ] [H] `jc problems` — JSON problem list with ranks
+- [ ] [H] `jc status` — JSON projects/sessions
 - [ ] [E] `jc note` — append text below WAIT
 - [ ] [E] External notification hook (ntfy/Pushover)
 
@@ -26,6 +22,21 @@
 
 ### Automation
 - [ ] [D] Auto-creating and running sessions
+
+### Simplification: features removed  ✅ shipped (2026-08-27)
+After long use, a set of features turned out never to be reached for, and each was
+carrying real machinery. Removed wholesale: the problem/priority system (L0–L3, Cmd-;,
+title-bar counts, `status.sh`), the Git Diff view (and Cmd-D), the Cmd-K comment system,
+the Cmd-Shift-K snippet picker, Cmd-Shift-C (copy reply), and Cmd-Shift-E (external
+editor). Desktop notifications narrowed to permission prompts and API errors — the two
+things worth interrupting for. The Cmd-P per-session indicator became a boolean `*`
+("this session's terminal produced output since you last looked at it").
+
+Separately, `claude --session-id <uuid>` lets jc *assign* a session's UUID at launch
+instead of detecting it from the first hook, and `claude --resume <uuid>` revives a UUID
+whose transcript Claude has garbage-collected. Together those dissolve the `[X]` expired
+state and the new-session detector. A legacy `## [X] Label` heading is still read, as
+`[D]` (dormant).
 
 ### Scheduled Messages  ✅ shipped & verified working end-to-end (2026-07-13)
 **Purpose:** auto-resume a session after a Claude usage-limit reset — queue the message
@@ -127,14 +138,14 @@ Restore ALL active sessions per project, not just one. Root cause: `ProjectState
       so out-of-tree `git worktree add ../elsewhere` buckets are not covered — see below.
 - [ ] [E] Out-of-tree worktree buckets: `git worktree add ../pgm-feat` produces an
       unrelated-looking bucket (`-Users-jay-Dev-pgm-feat`) the prefix-scan can't associate with
-      the project. If needed, enumerate real worktree paths via `git worktree list --porcelain`
-      (off the main thread) and add their encoded buckets to `session_dirs`.
-- [ ] [H] Move session-bucket scanning off the main thread + scan once. `session_dirs` does a
-      synchronous `read_dir` of `~/.claude/projects` (pre-existing `.exists()` checks at these
-      sites already blocked the main thread; the worktree fix broadened them to a directory
-      scan). `ProjectState::new_project` and `mark_expired_sessions` call it during init/refresh;
-      per the gpui rule this should run on `cx.background_executor()`. Also: `mark_expired_sessions`
-      re-scans the shared `~/.claude/projects` once **per open project** on every picker open —
-      hoist to one scan and filter the in-memory listing per project (e.g. a `jc_core::claude`
-      `all_project_dirs()` + pure `session_dirs_from(&entries, path)`). Requires threading the
-      result back into the synchronous constructor/refresh paths.
+      the project. Harm is now narrower than when this was filed — expiry is gone, so the only
+      loss is that such a session is not offered for adoption in the Cmd-Shift-P picker. If
+      needed, enumerate real worktree paths via `git worktree list --porcelain` (off the main
+      thread) and add their encoded buckets to `session_dirs`.
+- [ ] [E] Move session-bucket scanning off the main thread. `session_dirs` does a synchronous
+      `read_dir` of `~/.claude/projects`, which grows a bucket per project ever opened. Callers:
+      `ProjectState::create` (once per project, at startup and on `open_project`),
+      `ProjectState::launch_for` (only when a transcript is *missing* from the cached bucket list
+      — the common path is a few `stat`s), and `ProjectActionsPickerDelegate::new` (one scan per
+      Cmd-Shift-P press). Per the gpui rule all three should run on `cx.background_executor()`;
+      the picker is the easiest and the constructor the hardest, since it is synchronous.

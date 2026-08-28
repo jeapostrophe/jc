@@ -9,7 +9,6 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
   Wakeup,
-  Bell,
   Title,
   Exit,
   ChildExit,
@@ -32,7 +31,6 @@ impl EventListener for EventProxy {
   fn send_event(&self, event: Event) {
     let terminal_event = match event {
       Event::Wakeup => TerminalEvent::Wakeup,
-      Event::Bell => TerminalEvent::Bell,
       Event::Title(_) => TerminalEvent::Title,
       Event::Exit => TerminalEvent::Exit,
       Event::ChildExit(_) => TerminalEvent::ChildExit,

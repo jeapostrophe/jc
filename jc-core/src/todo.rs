@@ -3,7 +3,6 @@ use chrono::NaiveDate;
 use chrono::{NaiveDateTime, NaiveTime, Timelike};
 use std::borrow::Cow;
 use std::ops::Range;
-use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -15,6 +14,27 @@ pub struct TodoDocument {
   pub sessions: Vec<TodoSession>,
 }
 
+/// How to locate a session's heading in TODO.md.
+///
+/// A heading normally carries a UUID, which is a true unique address. A heading
+/// an older jc created but never bound has an empty `> uuid=`, and an empty
+/// string is *not* an address — every unbound heading shares it, so keying on it
+/// silently resolves to the first one. Those fall back to the label, which
+/// `unique_label` and `ProjectState::dedupe_labels` between them keep unique.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionKey {
+  Uuid(String),
+  Label(String),
+}
+
+impl SessionKey {
+  /// The best available address for a heading: its UUID, or its label when the
+  /// heading is unbound.
+  pub fn new(uuid: &str, label: &str) -> Self {
+    if uuid.is_empty() { Self::Label(label.to_string()) } else { Self::Uuid(uuid.to_string()) }
+  }
+}
+
 /// Session lifecycle state as marked in TODO.md headings.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -23,8 +43,6 @@ pub enum SessionStatus {
   Active,
   /// Disabled/dormant — `[D]` prefix. Present but should not auto-attach.
   Disabled,
-  /// Expired — `[X]` prefix. JSONL was garbage-collected by Claude.
-  Expired,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -84,11 +102,6 @@ impl TodoWait {
   }
 }
 
-#[derive(Debug, Clone)]
-pub enum TodoProblem {
-  UnsentWait { label: String },
-}
-
 impl TodoSession {
   /// The session's pending scheduled message, if any (a `### Message N`
   /// heading carrying an undelivered `@jc(<datetime>)` marker). At most one
@@ -109,6 +122,28 @@ impl TodoDocument {
 
   pub fn session_by_uuid(&self, uuid: &str) -> Option<&TodoSession> {
     self.sessions.iter().find(|s| s.uuid == uuid)
+  }
+
+  /// Position of the session owning `uuid` in [`Self::sessions`], for the
+  /// `*_at` writers. UUIDs are unique where labels are not, so anything
+  /// rewriting one specific session should address it this way.
+  ///
+  /// An empty `uuid` is not an address — several legacy headings can share it —
+  /// so it never matches. Use [`Self::index_of`] with a [`SessionKey`] when the
+  /// heading may be unbound.
+  pub fn index_by_uuid(&self, uuid: &str) -> Option<usize> {
+    if uuid.is_empty() {
+      return None;
+    }
+    self.sessions.iter().position(|s| s.uuid == uuid)
+  }
+
+  /// Position of the session `key` names.
+  pub fn index_of(&self, key: &SessionKey) -> Option<usize> {
+    match key {
+      SessionKey::Uuid(uuid) => self.index_by_uuid(uuid),
+      SessionKey::Label(label) => self.sessions.iter().position(|s| s.label == *label),
+    }
   }
 
   pub fn session_by_label(&self, label: &str) -> Option<&TodoSession> {
@@ -132,15 +167,6 @@ impl TodoDocument {
     // Otherwise, place on the last non-empty line of the body.
     let last_line = wait.line + body_lines.max(1);
     Some(last_line)
-  }
-
-  /// Returns the byte offset at the end of the WAIT body for the given
-  /// session (by label). This is where comments should be inserted.
-  /// If the session has no WAIT, returns `None`.
-  pub fn comment_insert_offset(&self, label: &str) -> Option<usize> {
-    let session = self.session_by_label(label)?;
-    let wait = session.wait.as_ref()?;
-    Some(wait.body_byte_range.end)
   }
 
   /// Returns the byte offset where a session's content ends (the start of the
@@ -331,13 +357,14 @@ pub fn parse(text: &str) -> TodoDocument {
       } else if after_h2.starts_with("[DELETED] ") {
         // Skip sessions marked as [DELETED].
       } else if !after_h2.is_empty() {
-        // Check for [D] (disabled) or [X] (expired/GC'd) prefix.
-        let (label, status) = if let Some(rest) = after_h2.strip_prefix("[D] ") {
-          (rest.to_string(), SessionStatus::Disabled)
-        } else if let Some(rest) = after_h2.strip_prefix("[X] ") {
-          (rest.to_string(), SessionStatus::Expired)
-        } else {
-          (after_h2.to_string(), SessionStatus::Active)
+        // `[D]` marks a dormant session. `[X]` is a retired marker jc used to
+        // write when Claude garbage-collected a transcript; `--resume` revives
+        // such a UUID, so those sessions are merely dormant, not gone. Read the
+        // legacy marker as `[D]` and never write it again.
+        let (label, status) = match after_h2.strip_prefix("[D] ").or(after_h2.strip_prefix("[X] "))
+        {
+          Some(rest) => (rest.to_string(), SessionStatus::Disabled),
+          None => (after_h2.to_string(), SessionStatus::Active),
         };
         expecting_uuid_for = Some(TodoSession {
           label,
@@ -478,9 +505,28 @@ pub fn insert_wait_section(text: &str, doc: &TodoDocument, label: &str) -> Optio
 // Session heading insertion
 // ---------------------------------------------------------------------------
 
+/// A label not already used by any session in `doc`: `base`, else `base 2`,
+/// `base 3`, ...
+///
+/// A session's *identity* is its UUID, but TODO.md's text operations are keyed
+/// on the label — `insert_wait_section`, `send_from_wait`, `TodoDocument::wait_line`
+/// and the `@jc(...)` scheduled-send timers all resolve to the FIRST heading
+/// with a given label. So two identically-named sessions silently redirect a
+/// send, or a scheduled delivery, onto the wrong one. Uniquifying at creation is
+/// what keeps the label usable as an address; [`rename_session_at`] repairs a
+/// file written before that.
+pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
+  if doc.session_by_label(base).is_none() {
+    return base.to_string();
+  }
+  (2..).map(|n| format!("{base} {n}")).find(|c| doc.session_by_label(c).is_none()).unwrap()
+}
+
 /// Build new text with a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading inserted.
 /// If a `# Claude` section exists, the heading goes right after it. Otherwise
 /// a `# Claude` section is appended at the end of the text.
+///
+/// Does NOT uniquify `label`; pass it through [`unique_label`] first.
 pub fn insert_session_heading(text: &str, doc: &TodoDocument, uuid: &str, label: &str) -> String {
   let heading = format!("## {label}\n> uuid={uuid}\n\n### WAIT\n");
 
@@ -522,44 +568,45 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, uuid: &str, label:
 }
 
 // ---------------------------------------------------------------------------
-// Session deletion marking
+// Session disable toggle
 // ---------------------------------------------------------------------------
 
-/// Mark a session as expired (`[X]` prefix) because its JSONL was garbage-collected.
-/// Returns the modified text, or `None` if the label was not found or already expired.
-pub fn mark_session_expired(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
-  let session = doc.session_by_label(label)?;
-  if session.status == SessionStatus::Expired {
-    return None; // already marked
-  }
+/// Rewrite the label of the session at `index`, preserving its `[D]` prefix.
+///
+/// TODO.md addresses a session by label almost everywhere — the WAIT block, the
+/// scheduled-send timers, `ensure_wait`, `send_selection` — and every one of
+/// those resolves to the FIRST heading with a given label. So a duplicate label
+/// does not merely confuse the reader: it silently redirects a send or a
+/// scheduled delivery onto the wrong session. jc keeps labels unique at every
+/// creation point; this is how it repairs a file written before it did.
+pub fn rename_session_at(
+  text: &str,
+  doc: &TodoDocument,
+  index: usize,
+  new_label: &str,
+) -> Option<String> {
+  let session = doc.sessions.get(index)?;
   let range = session.heading_byte_range.clone();
-  let heading = &text[range.clone()];
-  // Remove [D] if present, then add [X].
-  let new_heading = match session.status {
-    SessionStatus::Disabled => {
-      heading.replacen(&format!("## [D] {label}"), &format!("## [X] {label}"), 1)
-    }
-    _ => heading.replacen(&format!("## {label}"), &format!("## [X] {label}"), 1),
-  };
-  let mut new_text = String::with_capacity(text.len() + 4);
+  let prefix = if session.status == SessionStatus::Disabled { "[D] " } else { "" };
+  let mut new_text = String::with_capacity(text.len() + new_label.len());
   new_text.push_str(&text[..range.start]);
-  new_text.push_str(&new_heading);
+  new_text.push_str(&format!("## {prefix}{new_label}"));
   new_text.push_str(&text[range.end..]);
   Some(new_text)
 }
 
-/// Toggle the `[D]` (disabled/dormant) prefix on a session heading.
-/// Returns the modified text, or `None` if the label was not found.
-pub fn toggle_session_disabled(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
-  let session = doc.session_by_label(label)?;
+/// Toggle the `[D]` (disabled/dormant) prefix on the session at `index`.
+/// Returns the modified text, or `None` if the index is out of range.
+pub fn toggle_session_disabled_at(text: &str, doc: &TodoDocument, index: usize) -> Option<String> {
+  let session = doc.sessions.get(index)?;
+  let label = &session.label;
   let range = session.heading_byte_range.clone();
-  let heading = &text[range.clone()];
+  // Rebuild the heading from the parsed label rather than patching the existing
+  // text, so a legacy `## [X] Label` normalises to `## Label` / `## [D] Label`.
   let new_heading = if session.status == SessionStatus::Disabled {
-    // Remove [D] prefix: `## [D] Label` → `## Label`
-    heading.replacen(&format!("## [D] {label}"), &format!("## {label}"), 1)
+    format!("## {label}")
   } else {
-    // Add [D] prefix: `## Label` → `## [D] Label`
-    heading.replacen(&format!("## {label}"), &format!("## [D] {label}"), 1)
+    format!("## [D] {label}")
   };
   let mut new_text = String::with_capacity(text.len() + 4);
   new_text.push_str(&text[..range.start]);
@@ -572,22 +619,34 @@ pub fn toggle_session_disabled(text: &str, doc: &TodoDocument, label: &str) -> O
 // UUID update
 // ---------------------------------------------------------------------------
 
-/// Update a session's UUID in the document text. Returns the modified text,
-/// or `None` if the session is not found.
-pub fn update_session_uuid(
+/// Write `new_uuid` onto the session at `index` in `doc.sessions`.
+///
+/// Positional, never label-keyed: labels are not unique — an older jc wrote
+/// every new session as `## New Session` — so a label-keyed write always lands
+/// on the *first* heading with that label, giving it both UUIDs and stranding
+/// the second heading, which then `--resume`s the same transcript.
+/// Callers holding a UUID should resolve it with [`TodoDocument::index_by_uuid`].
+pub fn update_session_uuid_at(
   text: &str,
   doc: &TodoDocument,
-  label: &str,
+  index: usize,
   new_uuid: &str,
 ) -> Option<String> {
-  let session = doc.session_by_label(label)?;
-  if session.uuid_byte_range == (0..0) {
-    return None;
+  let session = doc.sessions.get(index)?;
+  // A hand-written heading may have no `> uuid=` line at all; give it one
+  // directly below the heading rather than dropping the UUID on the floor.
+  let (range, insert) = if session.uuid_byte_range == (0..0) {
+    (session.heading_byte_range.end..session.heading_byte_range.end, true)
+  } else {
+    (session.uuid_byte_range.clone(), false)
+  };
+  let mut new_text = String::with_capacity(text.len() + new_uuid.len() + 10);
+  new_text.push_str(&text[..range.start]);
+  if insert {
+    new_text.push_str("\n> uuid=");
   }
-  let mut new_text = String::with_capacity(text.len() + new_uuid.len());
-  new_text.push_str(&text[..session.uuid_byte_range.start]);
   new_text.push_str(new_uuid);
-  new_text.push_str(&text[session.uuid_byte_range.end..]);
+  new_text.push_str(&text[range.end..]);
   Some(new_text)
 }
 
@@ -880,25 +939,6 @@ pub fn update_last_active(text: &str, session: &TodoSession, timestamp: u64) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
-
-pub fn validate(doc: &TodoDocument, _project_path: &Path, text: &str) -> Vec<TodoProblem> {
-  let mut problems = Vec::default();
-
-  for session in &doc.sessions {
-    if let Some(wait) = &session.wait {
-      let body = &text[wait.body_byte_range.clone()];
-      if !body.trim().is_empty() {
-        problems.push(TodoProblem::UnsentWait { label: session.label.clone() });
-      }
-    }
-  }
-
-  problems
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1045,30 +1085,6 @@ some wait body
   }
 
   #[test]
-  fn comment_insert_offset_returns_correct_byte_offset() {
-    let text = "\
-# Claude
-## Test Session
-> uuid=test
-
-### WAIT
-draft body
-";
-    let doc = parse(text);
-
-    let offset = doc.comment_insert_offset("Test Session").unwrap();
-    // The offset should be at the end of the WAIT body, which is the end of
-    // the document.
-    assert_eq!(offset, text.len());
-
-    // Verify the body range content.
-    let session = doc.session_by_label("Test Session").unwrap();
-    let wait = session.wait.as_ref().unwrap();
-    let body = &text[wait.body_byte_range.clone()];
-    assert!(body.contains("draft body"));
-  }
-
-  #[test]
   fn session_by_uuid_and_session_uuids() {
     let text = "\
 # Claude
@@ -1108,20 +1124,6 @@ body
     let first = doc.first_session().unwrap();
     assert_eq!(first.uuid, "first");
     assert_eq!(first.label, "The First");
-  }
-
-  #[test]
-  fn comment_insert_offset_none_without_wait() {
-    let text = "\
-# Claude
-## No Wait
-> uuid=no-wait
-
-### Message 0
-body
-";
-    let doc = parse(text);
-    assert!(doc.comment_insert_offset("No Wait").is_none());
   }
 
   #[test]
@@ -1709,7 +1711,7 @@ quoted
   fn stale_log_span_ignores_messages_below_wait() {
     let mut session = TodoSession { label: "S".into(), ..Default::default() };
     let mut at = 0;
-    let mut push = |session: &mut TodoSession, at: &mut usize| {
+    let push = |session: &mut TodoSession, at: &mut usize| {
       session.messages.push(TodoMessage {
         index: session.messages.len(),
         heading_byte_range: *at..*at + 10,
@@ -2139,18 +2141,80 @@ quoted
     assert_ne!(doc.sessions[0].status, SessionStatus::Disabled);
 
     // Disable it.
-    let disabled_text = toggle_session_disabled(text, &doc, "My Session").unwrap();
+    let disabled_text = toggle_session_disabled_at(text, &doc, 0).unwrap();
     assert!(disabled_text.contains("## [D] My Session"));
     let doc2 = parse(&disabled_text);
     assert_eq!(doc2.sessions[0].label, "My Session");
     assert!(doc2.sessions[0].status == SessionStatus::Disabled);
 
     // Re-enable it.
-    let enabled_text = toggle_session_disabled(&disabled_text, &doc2, "My Session").unwrap();
+    let enabled_text = toggle_session_disabled_at(&disabled_text, &doc2, 0).unwrap();
     assert!(enabled_text.contains("## My Session"));
     assert!(!enabled_text.contains("[D]"));
     let doc3 = parse(&enabled_text);
     assert_ne!(doc3.sessions[0].status, SessionStatus::Disabled);
+  }
+
+  #[test]
+  fn toggle_session_disabled_at_targets_the_right_duplicate_label() {
+    // Two running sessions an older jc left identically labelled. Disabling the
+    // second must not mark the first — a label-keyed toggle would, taking down a
+    // live session and leaving the intended one impossible to disable.
+    let text = "\
+# Claude
+## New Session
+> uuid=first
+## New Session
+> uuid=second
+";
+    let doc = parse(text);
+    let toggled = toggle_session_disabled_at(text, &doc, 1).unwrap();
+    let after = parse(&toggled);
+    assert_eq!(after.sessions[0].uuid, "first");
+    assert_eq!(after.sessions[0].status, SessionStatus::Active, "first session untouched");
+    assert_eq!(after.sessions[1].uuid, "second");
+    assert_eq!(after.sessions[1].status, SessionStatus::Disabled, "second session disabled");
+  }
+
+  #[test]
+  fn empty_uuid_is_not_an_address() {
+    // Two legacy headings an older jc never bound. Keying on their (shared)
+    // empty UUID must not silently resolve to the first one; the label must.
+    let text = "\
+# Claude
+## First
+
+### WAIT
+## Second
+
+### WAIT
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions.len(), 2);
+    assert!(doc.sessions.iter().all(|s| s.uuid.is_empty()), "both headings unbound");
+    assert_eq!(doc.index_by_uuid(""), None, "an empty uuid names no session");
+    assert_eq!(doc.index_of(&SessionKey::new("", "Second")), Some(1));
+    assert_eq!(doc.index_of(&SessionKey::new("", "First")), Some(0));
+    assert_eq!(doc.index_of(&SessionKey::new("", "Nope")), None);
+  }
+
+  #[test]
+  fn rename_session_at_disambiguates_and_keeps_the_disabled_prefix() {
+    let text = "\
+# Claude
+## New Session
+> uuid=first
+## [D] New Session
+> uuid=second
+";
+    let doc = parse(text);
+    // Second heading is the duplicate; rename it the way startup repair does.
+    let fixed = rename_session_at(text, &doc, 1, &unique_label(&doc, "New Session")).unwrap();
+    let after = parse(&fixed);
+    assert_eq!(after.sessions[0].label, "New Session");
+    assert_eq!(after.sessions[1].label, "New Session 2");
+    assert_eq!(after.sessions[1].uuid, "second", "renamed the right heading");
+    assert_eq!(after.sessions[1].status, SessionStatus::Disabled, "[D] survives the rename");
   }
 
   #[test]
@@ -2191,7 +2255,7 @@ stale draft
   }
 
   #[test]
-  fn expired_sessions_are_parsed_with_flag() {
+  fn legacy_expired_marker_reads_as_disabled() {
     let text = "\
 # Claude
 ## [X] GC'd Session
@@ -2202,47 +2266,25 @@ stale draft
     let doc = parse(text);
     assert_eq!(doc.sessions.len(), 2);
     assert_eq!(doc.sessions[0].label, "GC'd Session");
-    assert_eq!(doc.sessions[0].status, SessionStatus::Expired);
+    assert_eq!(doc.sessions[0].status, SessionStatus::Disabled);
     assert_eq!(doc.sessions[1].label, "Active Session");
     assert_eq!(doc.sessions[1].status, SessionStatus::Active);
   }
 
   #[test]
-  fn mark_session_expired_adds_prefix() {
+  fn enabling_a_legacy_expired_session_normalises_its_heading() {
     let text = "\
 # Claude
-## My Session
-> uuid=my-uuid
-### WAIT
+## [X] GC'd Session
+> uuid=gone
 ";
     let doc = parse(text);
-    assert_eq!(doc.sessions[0].status, SessionStatus::Active);
-
-    let expired_text = mark_session_expired(text, &doc, "My Session").unwrap();
-    assert!(expired_text.contains("## [X] My Session"));
-    let doc2 = parse(&expired_text);
-    assert_eq!(doc2.sessions[0].status, SessionStatus::Expired);
-    assert_eq!(doc2.sessions[0].label, "My Session");
-
-    // Already expired — returns None.
-    assert!(mark_session_expired(&expired_text, &doc2, "My Session").is_none());
-  }
-
-  #[test]
-  fn mark_disabled_session_expired_replaces_prefix() {
-    let text = "\
-# Claude
-## [D] Dormant Session
-> uuid=old-uuid
-";
-    let doc = parse(text);
-    assert_eq!(doc.sessions[0].status, SessionStatus::Disabled);
-
-    let expired_text = mark_session_expired(text, &doc, "Dormant Session").unwrap();
-    assert!(expired_text.contains("## [X] Dormant Session"));
-    assert!(!expired_text.contains("[D]"));
-    let doc2 = parse(&expired_text);
-    assert_eq!(doc2.sessions[0].status, SessionStatus::Expired);
+    let enabled = toggle_session_disabled_at(text, &doc, 0).unwrap();
+    assert!(enabled.contains("## GC'd Session"));
+    assert!(!enabled.contains("[X]"));
+    let doc2 = parse(&enabled);
+    assert_eq!(doc2.sessions[0].status, SessionStatus::Active);
+    assert_eq!(doc2.sessions[0].label, "GC'd Session");
   }
 
   #[test]
@@ -2290,9 +2332,86 @@ draft
 ### WAIT
 ";
     let doc = parse(text);
-    let updated = update_session_uuid(text, &doc, "My Session", "new-uuid").unwrap();
+    let updated = update_session_uuid_at(text, &doc, 0, "new-uuid").unwrap();
     assert!(updated.contains("> uuid=new-uuid"));
     let new_doc = parse(&updated);
     assert_eq!(new_doc.sessions[0].uuid, "new-uuid");
+  }
+
+  #[test]
+  fn update_session_uuid_adds_a_missing_uuid_line() {
+    // A hand-written heading with no `> uuid=` line: the UUID must land on the
+    // session rather than being silently dropped.
+    let text = "\
+# Claude
+## My Session
+
+### WAIT
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions[0].uuid, "");
+    let updated = update_session_uuid_at(text, &doc, 0, "fresh-uuid").unwrap();
+    let new_doc = parse(&updated);
+    assert_eq!(new_doc.sessions.len(), 1);
+    assert_eq!(new_doc.sessions[0].label, "My Session");
+    assert_eq!(new_doc.sessions[0].uuid, "fresh-uuid");
+    assert!(new_doc.sessions[0].wait.is_some(), "WAIT survived the insert");
+  }
+
+  #[test]
+  fn update_session_uuid_at_targets_the_right_duplicate_label() {
+    // Two sessions an older jc wrote with the same auto-label and no UUID yet.
+    // A label-keyed write hits the first heading twice and strands the second;
+    // the index-keyed write must give each its own UUID.
+    let text = "\
+# Claude
+## New Session
+> uuid=
+## New Session
+> uuid=
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions.len(), 2);
+
+    let once = update_session_uuid_at(text, &doc, 0, "uuid-a").unwrap();
+    let doc = parse(&once);
+    let twice = update_session_uuid_at(&once, &doc, 1, "uuid-b").unwrap();
+
+    let final_doc = parse(&twice);
+    let uuids: Vec<&str> = final_doc.sessions.iter().map(|s| s.uuid.as_str()).collect();
+    assert_eq!(uuids, vec!["uuid-a", "uuid-b"], "each session keeps its own UUID");
+  }
+
+  #[test]
+  fn unique_label_suffixes_only_on_collision() {
+    let text = "\
+# Claude
+## New Session
+> uuid=a
+## New Session 2
+> uuid=b
+## Other
+> uuid=c
+";
+    let doc = parse(text);
+    assert_eq!(unique_label(&doc, "Fresh"), "Fresh");
+    // `New Session` and `New Session 2` are taken, so the next free one is 3.
+    assert_eq!(unique_label(&doc, "New Session"), "New Session 3");
+    assert_eq!(unique_label(&doc, "Other"), "Other 2");
+  }
+
+  #[test]
+  fn update_session_uuid_fills_a_blank_uuid_value() {
+    let text = "\
+# Claude
+## My Session
+> uuid=
+
+### WAIT
+";
+    let doc = parse(text);
+    assert_eq!(doc.sessions[0].uuid, "");
+    let updated = update_session_uuid_at(text, &doc, 0, "fresh-uuid").unwrap();
+    assert_eq!(parse(&updated).sessions[0].uuid, "fresh-uuid");
   }
 }

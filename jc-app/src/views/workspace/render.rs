@@ -4,7 +4,6 @@ use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::TitleBar;
 use gpui_component::resizable::{h_resizable, resizable_panel};
-use gpui_component::tooltip::Tooltip;
 
 use super::Workspace;
 
@@ -83,18 +82,6 @@ impl Workspace {
         let breadcrumbs = tv.code_view().read(cx).breadcrumb().to_vec();
         PaneHeader { title, breadcrumbs }
       }
-      Some(PaneContentKind::GitDiff) => {
-        let dv = project.diff_view.read(cx);
-        let reviewed = dv.reviewed_count();
-        let total = dv.file_count();
-        let source_label = dv.source().label();
-        let title = if let Some(name) = dv.current_file_name() {
-          format!("Diff [{source_label}]: {name} ({reviewed}/{total})")
-        } else {
-          format!("Diff [{source_label}] ({reviewed}/{total})")
-        };
-        PaneHeader { title, breadcrumbs: Vec::new() }
-      }
       Some(PaneContentKind::GlobalTodo) => {
         let cv = self.global_todo_view.read(cx);
         let dirty = if cv.is_dirty(cx) { " [+]" } else { "" };
@@ -115,116 +102,14 @@ impl Workspace {
       title = format!("{} > {}", title, session.label);
     }
 
-    let project_problem_count = project.problems.len();
-    let current_total =
-      project.active_session().map(|s| s.problems.len()).unwrap_or(0) + project_problem_count;
-
-    // Collect active-session + project problems for the title tooltip.
-    let active_session_problems: Vec<String> = project
-      .active_session()
-      .map(|s| s.problems.iter().map(|p| p.description()).collect())
-      .unwrap_or_default();
-    let active_project_problems: Vec<String> =
-      project.problems.iter().map(|p| p.description()).collect();
-
-    // Per-layer session labels for corner indicator.
-    let layer_sessions = self.layer_problem_sessions(cx);
-
-    let title_el = {
-      let el =
-        div().id("title-problems").flex().items_center().text_sm().text_color(theme.foreground);
-      if current_total > 0 {
-        el.child(div().mr_1().text_xs().text_color(theme.red).child("!")).child(title).child(
-          div()
-            .id("title-problem-count")
-            .ml_1()
-            .text_xs()
-            .text_color(theme.red)
-            .child(current_total.to_string())
-            .tooltip(move |window, cx| {
-              let session_problems = active_session_problems.clone();
-              let project_problems = active_project_problems.clone();
-              Tooltip::element(move |_window, cx| {
-                let theme = cx.theme();
-                let fg = theme.foreground;
-                let dim = theme.muted_foreground;
-                let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
-                let all_descs: Vec<&String> =
-                  session_problems.iter().chain(project_problems.iter()).collect();
-                let total = all_descs.len();
-                let limit = 10;
-                for desc in all_descs.iter().take(limit) {
-                  col = col.child(div().text_color(fg).child((*desc).clone()));
-                }
-                if total > limit {
-                  col =
-                    col.child(div().text_color(dim).child(format!("…and {} more", total - limit)));
-                }
-                col
-              })
-              .build(window, cx)
-            }),
-        )
-      } else {
-        el.child(title)
-      }
-    };
-
-    let right_el = {
-      let mut el = div().flex().items_center().ml_auto().gap_2();
-      let has_any = layer_sessions.iter().any(|s| !s.is_empty());
-      if has_any {
-        let layer_colors = [theme.red, theme.yellow, theme.blue, theme.muted_foreground];
-        let mut segments = div().id("global-problems").flex().items_center().gap_0p5().text_xs();
-        let mut first = true;
-        for (i, sessions) in layer_sessions.iter().enumerate() {
-          if sessions.is_empty() {
-            continue;
-          }
-          if !first {
-            segments = segments.child(div().text_color(theme.muted_foreground).child(" / "));
-          }
-          first = false;
-          segments =
-            segments.child(div().text_color(layer_colors[i]).child(sessions.len().to_string()));
-        }
-
-        let sessions_for_tooltip = layer_sessions.clone();
-        segments = segments.tooltip(move |window, cx| {
-          let sessions = sessions_for_tooltip.clone();
-          Tooltip::element(move |_window, cx| {
-            let theme = cx.theme();
-            let layer_colors = [theme.red, theme.yellow, theme.blue, theme.muted_foreground];
-            let layer_labels = ["L0: blocked/error", "L1: review", "L2: send", "L3: idle"];
-            let mut col = div().font_family("Lilex").flex().flex_col().gap_1().text_xs();
-            for (i, layer) in sessions.iter().enumerate() {
-              if layer.is_empty() {
-                continue;
-              }
-              col = col.child(
-                div()
-                  .text_color(layer_colors[i])
-                  .font_weight(FontWeight::SEMIBOLD)
-                  .child(format!("{}:", layer_labels[i])),
-              );
-              for name in layer {
-                col = col.child(div().text_color(layer_colors[i]).pl_2().child(name.clone()));
-              }
-            }
-            col
-          })
-          .build(window, cx)
-        });
-
-        el = el.child(segments);
-      }
-      el.mr_2()
-    };
-
-    TitleBar::new()
-      .font_family("Lilex")
-      .child(div().flex().items_center().gap_1().mr_auto().child(title_el))
-      .child(right_el)
+    TitleBar::new().font_family("Lilex").child(
+      div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .mr_auto()
+        .child(div().flex().items_center().text_sm().text_color(theme.foreground).child(title)),
+    )
   }
 }
 
@@ -316,25 +201,18 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::set_layout_three))
       .on_action(cx.listener(Self::show_claude_terminal))
       .on_action(cx.listener(Self::show_general_terminal))
-      .on_action(cx.listener(Self::show_git_diff))
       .on_action(cx.listener(Self::show_code_viewer))
       .on_action(cx.listener(Self::show_todo_editor))
-      .on_action(cx.listener(Self::toggle_code_diff))
-      .on_action(cx.listener(Self::open_in_external_editor))
       .on_action(cx.listener(Self::open_picker))
       .on_action(cx.listener(Self::open_drill_down_picker))
       .on_action(cx.listener(Self::open_project_actions_picker))
       .on_action(cx.listener(Self::open_session_picker))
       .on_action(cx.listener(Self::search_lines))
-      .on_action(cx.listener(Self::open_comment_panel))
       .on_action(cx.listener(Self::save_file))
       .on_action(cx.listener(Self::send_to_terminal))
-      .on_action(cx.listener(Self::copy_reply))
       .on_action(cx.listener(Self::jump_to_wait))
-      .on_action(cx.listener(Self::next_problem))
       .on_action(cx.listener(Self::rotate_next_project))
       .on_action(cx.listener(Self::toggle_keybinding_help))
-      .on_action(cx.listener(Self::show_snippet_picker))
       .on_action(cx.listener(Self::scroll_other_up))
       .on_action(cx.listener(Self::scroll_other_down))
       .on_action(cx.listener(Self::scroll_other_page_up))
@@ -342,7 +220,6 @@ impl Render for Workspace {
       .child(self.render_title_bar(cx))
       .child(pane_area)
       .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
-      .when_some(self.active_comment_panel.as_ref(), |el, v| el.child(modal_overlay(v)))
       .when_some(self.keybinding_help.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))
       .when_some(self.close_confirm.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))
   }

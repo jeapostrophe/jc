@@ -63,9 +63,12 @@ pub fn init() {
 }
 
 /// Post a notification. Falls back to dock bounce if banners aren't authorized.
-pub fn notify(title: &str, message: &str, critical: bool, session_id: Option<&str>) {
+///
+/// jc only notifies for a session Claude has stopped on (permission prompt, API
+/// error), so every notification is a critical attention request.
+pub fn notify(title: &str, message: &str, session_id: Option<&str>) {
   eprintln!("notify: {title} — {message}");
-  bounce_dock_icon(critical);
+  bounce_dock_icon();
 
   if !AUTHORIZED.load(Ordering::Relaxed) {
     return;
@@ -136,15 +139,10 @@ unsafe fn post_notification(title: &str, message: &str, session_id: Option<&str>
   ];
 }
 
-fn bounce_dock_icon(critical: bool) {
-  let attention_type = if critical {
-    NSRequestUserAttentionType::CriticalRequest
-  } else {
-    NSRequestUserAttentionType::InformationalRequest
-  };
+fn bounce_dock_icon() {
   if let Some(mtm) = MainThreadMarker::new() {
     let app = NSApplication::sharedApplication(mtm);
-    app.requestUserAttention(attention_type);
+    app.requestUserAttention(NSRequestUserAttentionType::CriticalRequest);
   }
 }
 
