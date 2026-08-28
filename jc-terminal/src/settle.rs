@@ -90,8 +90,10 @@ impl SettleWindow {
 mod tests {
   use super::*;
 
-  const QUIET: Duration = Duration::from_secs(4);
-  const GIVE_UP: Duration = Duration::from_secs(30);
+  // Aliases, never copies: a hand-retyped 4s/30s here would keep passing while
+  // the shipped policy drifted away from the one under test.
+  const QUIET: Duration = LAUNCH_QUIET;
+  const GIVE_UP: Duration = LAUNCH_GIVE_UP;
 
   fn window(start: Instant) -> SettleWindow {
     SettleWindow::new(QUIET, GIVE_UP, start)

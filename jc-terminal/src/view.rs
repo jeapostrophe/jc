@@ -127,20 +127,17 @@ enum Wake {
 /// unregisters its hook on drop (and hands the wakeup to another receiver if it
 /// had already been signalled), so a batch racing the deadline stays queued and
 /// is delivered on the next call rather than being swallowed here.
-async fn recv_or_deadline<T, F: Future<Output = Instant>>(
-  rx: &flume::Receiver<T>,
-  deadline: Option<F>,
-) -> Wake {
-  let Some(deadline) = deadline else {
-    return if rx.recv_async().await.is_ok() { Wake::Batch } else { Wake::Closed };
-  };
+async fn recv_or_deadline<T, F: Future>(rx: &flume::Receiver<T>, deadline: Option<F>) -> Wake {
   let mut recv = std::pin::pin!(rx.recv_async());
   let mut deadline = std::pin::pin!(deadline);
   std::future::poll_fn(move |cx| {
     if let Poll::Ready(result) = recv.as_mut().poll(cx) {
       return Poll::Ready(if result.is_ok() { Wake::Batch } else { Wake::Closed });
     }
-    if deadline.as_mut().poll(cx).is_ready() {
+    // No deadline means no window is open: wait on the batch alone.
+    if let Some(deadline) = deadline.as_mut().as_pin_mut()
+      && deadline.poll(cx).is_ready()
+    {
       return Poll::Ready(Wake::Deadline);
     }
     Poll::Pending
@@ -376,10 +373,8 @@ impl TerminalView {
   /// session restored mid-run gets its own.
   ///
   /// The baseline is taken once the child has printed something and then held
-  /// still for [`LAUNCH_QUIET`], or unconditionally at [`LAUNCH_GIVE_UP`]. Both
-  /// exits clear: a child that never settles is still printing and re-marks
-  /// itself on its next batch, whereas a marker left set here would never
-  /// retire (only switching away clears one).
+  /// still for [`LAUNCH_QUIET`], or unconditionally at [`LAUNCH_GIVE_UP`]; both
+  /// exits clear, for the reason recorded on `SettleWindow::step`.
   ///
   /// No task of its own: the notification relay started in [`Self::new`] is
   /// already woken by every parsed batch, so it drives the window it finds
