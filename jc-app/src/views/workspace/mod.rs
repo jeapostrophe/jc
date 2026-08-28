@@ -16,6 +16,7 @@ use gpui_component::theme::Theme;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
 use jc_core::theme::Appearance;
+use jc_core::todo::{SessionKey, TodoDocument, TodoSession};
 use jc_terminal::{Palette, TerminalView};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
@@ -99,7 +100,7 @@ pub struct Workspace {
   /// Scheduled sends that already have a timer armed, so reconciliation doesn't
   /// double-arm the same one. Keyed `(project path, session UUID, delivery
   /// time)` — the UUID, not the label: two headings can share a label at any
-  /// instant (see `jc_core::todo::SessionKey`).
+  /// instant (see `SessionKey`).
   armed_schedules: std::collections::HashSet<(PathBuf, String, NaiveDateTime)>,
   global_todo_view: Entity<crate::views::code_view::CodeView>,
   keybinding_help: Option<(AnyView, Subscription)>,
@@ -1054,7 +1055,7 @@ impl Workspace {
     let id = project.next_session_id;
     project.next_session_id += 1;
 
-    // A label is a display name, not an address — see `jc_core::todo::SessionKey`.
+    // A label is a display name, not an address — see `SessionKey`.
     let label = "New Session".to_string();
     let uuid = uuid::Uuid::new_v4().to_string();
 
@@ -1095,7 +1096,7 @@ impl Workspace {
   fn adopt_session(
     &mut self,
     project_idx: usize,
-    key: &jc_core::todo::SessionKey,
+    key: &SessionKey,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -1137,12 +1138,9 @@ impl Workspace {
 
     // Clear `[D]` if the heading was dormant, then save once for both edits —
     // each save is a full-document copy and a blocking write on the main thread.
-    let key = jc_core::todo::SessionKey::Uuid(uuid.clone());
-    let is_disabled = todo_view
-      .read(cx)
-      .document()
-      .session_of(&key)
-      .is_some_and(jc_core::todo::TodoSession::is_disabled);
+    let key = SessionKey::Uuid(uuid.clone());
+    let is_disabled =
+      todo_view.read(cx).document().session_of(&key).is_some_and(TodoSession::is_disabled);
     todo_view.update(cx, |tv, cx| {
       if is_disabled {
         tv.toggle_session_disabled(&key, window, cx);
@@ -1177,7 +1175,7 @@ impl Workspace {
   }
 
   /// Collect TodoDocument references from each project's todo_view.
-  fn todo_documents<'a>(&'a self, cx: &'a App) -> Vec<&'a jc_core::todo::TodoDocument> {
+  fn todo_documents<'a>(&'a self, cx: &'a App) -> Vec<&'a TodoDocument> {
     self.projects.iter().map(|p| p.todo_view.read(cx).document()).collect()
   }
 
@@ -1188,11 +1186,11 @@ impl Workspace {
   /// Toggle the `[D]` marker on the heading `key` names, detaching its terminal
   /// if it is running and just became disabled. Never addressed by label: with
   /// two same-labelled headings a label-keyed toggle marks the wrong one and
-  /// detaches a live session (see `jc_core::todo::SessionKey`).
+  /// detaches a live session (see `SessionKey`).
   fn toggle_session_disabled(
     &mut self,
     project_idx: usize,
-    key: &jc_core::todo::SessionKey,
+    key: &SessionKey,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -1202,8 +1200,8 @@ impl Workspace {
     // Check if the session is currently adopted (running). An unbound heading
     // never is, so this is `None` for an `Unbound` key.
     let adopted_id = match key {
-      jc_core::todo::SessionKey::Uuid(uuid) => project.session_by_uuid(uuid).map(|(id, _)| id),
-      jc_core::todo::SessionKey::Unbound { .. } => None,
+      SessionKey::Uuid(uuid) => project.session_by_uuid(uuid).map(|(id, _)| id),
+      SessionKey::Unbound { .. } => None,
     };
 
     todo_view.update(cx, |tv, cx| {
@@ -1212,11 +1210,8 @@ impl Workspace {
     });
 
     // If the session was adopted and is now being disabled, detach it.
-    let is_now_disabled = todo_view
-      .read(cx)
-      .document()
-      .session_of(key)
-      .is_some_and(jc_core::todo::TodoSession::is_disabled);
+    let is_now_disabled =
+      todo_view.read(cx).document().session_of(key).is_some_and(TodoSession::is_disabled);
     // Whether control ended up in `switch_to_session`, which focuses the pane it
     // lands on. When it doesn't, nothing else will: the picker's confirm handler
     // has already dropped `pre_picker_focus`, so focus would be stranded on the

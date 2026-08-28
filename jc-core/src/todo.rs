@@ -137,7 +137,9 @@ impl TodoSession {
     SessionKey::new(&self.uuid, index, &self.label)
   }
 
-  /// Whether the heading carries the `[D]` (disabled/dormant) prefix.
+  /// Whether the heading carries the `[D]` (disabled/dormant) prefix — or the
+  /// legacy `[X]`, which [`parse`] reads as the same state and
+  /// [`toggle_session_disabled_at`] normalises away on the next toggle.
   pub fn is_disabled(&self) -> bool {
     self.status == SessionStatus::Disabled
   }

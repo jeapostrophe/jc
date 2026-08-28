@@ -104,6 +104,14 @@ impl Workspace {
         match event {
           PickerEvent::Confirmed => {
             let Some(result) = picker_entity.read(cx).delegate().confirmed_entry() else {
+              // The row produced no action (an `EmptyProject` row has no heading
+              // to address). Close out as a dismissal rather than returning with
+              // the picker still up and focus stranded on its input.
+              if let Some(focus) = this.pre_picker_focus.take() {
+                focus.focus(window);
+              }
+              this.dismiss_picker();
+              cx.notify();
               return;
             };
             // switch_to_session / init both set focus; drop stale pre_picker_focus.
