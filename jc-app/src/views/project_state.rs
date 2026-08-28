@@ -14,6 +14,16 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
   std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
 }
 
+/// The launch flag for `uuid` given `dirs`, the project's transcript buckets.
+/// `None` dirs means `$HOME` is unset, so nothing can be located at all; assume
+/// the common case and resume.
+fn launch_from(dirs: Option<&[PathBuf]>, uuid: &str) -> Launch {
+  match dirs {
+    Some(dirs) if !jc_core::claude::transcript_in(dirs, uuid) => Launch::New,
+    _ => Launch::Resume,
+  }
+}
+
 pub struct SavedPaneLayout {
   pub pane_kinds: [Option<PaneContentKind>; 3],
   pub active_pane_index: usize,
@@ -45,7 +55,7 @@ impl ProjectState {
     // below sees the bounded document.
     todo_view.update(cx, |tv, cx| tv.truncate_logs(window, cx));
 
-    Self::dedupe_labels(&todo_view, window, cx);
+    todo_view.update(cx, |tv, cx| tv.dedupe_labels(window, cx));
 
     // Adopt every active TODO session so the full set of open sessions is
     // restored, not just one. A session whose transcript Claude has since
@@ -64,17 +74,12 @@ impl ProjectState {
     let session_dirs = Self::session_dirs(&path);
 
     // Two headings can carry the same `> uuid=` if a session block was
-    // copy-pasted. Adopting both would run two `claude --resume <same-uuid>`
-    // against one transcript and make hook routing depend on HashMap iteration
-    // order, so only the first is adopted.
-    //
-    // The later duplicates are then *unreachable*, not merely dormant: both
-    // pickers hide a heading whose UUID is already adopted, and `SessionKey`
-    // resolves a UUID to the first match, so they cannot be adopted, disabled,
-    // or renamed from the UI. `dedupe_labels` does not repair this the way it
-    // repairs duplicate labels — the only non-destructive repair would be
-    // minting a new UUID, which orphans whatever conversation the block was
-    // copied from. Editing the `> uuid=` by hand is the fix.
+    // copy-pasted; adopting both would put two `claude --resume <same-uuid>` on
+    // one transcript, so only the first is adopted. The later duplicates are
+    // then *unreachable* rather than dormant — every lookup resolves a UUID to
+    // the first match — and jc does not repair them: the only non-destructive
+    // repair would mint a new UUID, orphaning whatever conversation the block
+    // was copied from. Editing the `> uuid=` by hand is the fix.
     let mut adopted_uuids: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for todo_session in document
@@ -100,10 +105,7 @@ impl ProjectState {
         &path,
         palette,
         todo_session.dangerous,
-        match session_dirs.as_deref() {
-          Some(dirs) if !jc_core::claude::transcript_in(dirs, &todo_session.uuid) => Launch::New,
-          _ => Launch::Resume,
-        },
+        launch_from(session_dirs.as_deref(), &todo_session.uuid),
         window,
         cx,
       );
@@ -127,44 +129,6 @@ impl ProjectState {
     Self { path, name, sessions, active_session, next_session_id, todo_view, session_dirs }
   }
 
-  /// Rename any heading whose label duplicates an earlier one, so the label is
-  /// a real address again. Startup only, deliberately: renaming a heading the
-  /// user is in the middle of typing would be worse than the ambiguity, and
-  /// every path that jc itself creates a label through already uses
-  /// `todo::unique_label`.
-  ///
-  /// jc keeps labels unique at every creation point, but a file written by an
-  /// older jc typically has several `## New Session` headings — and TODO.md
-  /// addresses a session by label almost everywhere (`ensure_wait`,
-  /// `send_selection`, the `@jc(...)` scheduled-send timers), each resolving to
-  /// the FIRST match. Left alone, a Cmd-Enter or a scheduled delivery aimed at
-  /// the second session silently lands on the first, or is dropped.
-  fn dedupe_labels(todo_view: &Entity<TodoView>, window: &mut Window, cx: &mut App) {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let duplicates: Vec<usize> = todo_view
-      .read(cx)
-      .document()
-      .sessions
-      .iter()
-      .enumerate()
-      .filter(|(_, s)| !seen.insert(s.label.clone()))
-      .map(|(i, _)| i)
-      .collect();
-    if duplicates.is_empty() {
-      return;
-    }
-    todo_view.update(cx, |tv, cx| {
-      for index in duplicates {
-        let Some(base) = tv.document().sessions.get(index).map(|s| s.label.clone()) else {
-          continue;
-        };
-        let fresh = jc_core::todo::unique_label(tv.document(), &base);
-        tv.rename_session_at(index, &fresh, window, cx);
-      }
-      tv.save(cx);
-    });
-  }
-
   /// Attach to `uuid` the only way that works: `--resume` needs the transcript
   /// to exist, and `--session-id` needs it not to (see [`Launch`]).
   ///
@@ -179,15 +143,11 @@ impl ProjectState {
   /// With `$HOME` unset no bucket can be located at all; assume the common case
   /// and resume.
   pub fn launch_for(&mut self, uuid: &str) -> Launch {
-    let Some(dirs) = self.session_dirs.as_deref() else { return Launch::Resume };
-    if jc_core::claude::transcript_in(dirs, uuid) {
+    if launch_from(self.session_dirs.as_deref(), uuid) == Launch::Resume {
       return Launch::Resume;
     }
     self.session_dirs = Self::session_dirs(&self.path);
-    match self.session_dirs.as_deref() {
-      Some(dirs) if !jc_core::claude::transcript_in(dirs, uuid) => Launch::New,
-      _ => Launch::Resume,
-    }
+    launch_from(self.session_dirs.as_deref(), uuid)
   }
 
   /// All of Claude's JSONL session buckets for this project (root + worktrees),
@@ -195,6 +155,21 @@ impl ProjectState {
   /// bucket.
   pub fn session_dirs(project_path: &Path) -> Option<Vec<PathBuf>> {
     home_dir().map(|home| jc_core::claude::session_dirs(&home, project_path))
+  }
+
+  /// Is this heading's session already running? Both pickers ask this to decide
+  /// what to list as adoptable, so the rule lives here, once: a bound UUID is
+  /// adopted if a session carries it; an unbound heading (empty UUID) is never
+  /// adopted, because that empty string names no session.
+  pub fn is_adopted(&self, uuid: &str) -> bool {
+    !uuid.is_empty() && self.sessions.values().any(|s| s.uuid == uuid)
+  }
+
+  /// The earliest-created running session, or `None` if the project has none.
+  /// Lowest id rather than `HashMap` order, so the same action in the same state
+  /// always lands in the same place.
+  pub fn first_session(&self) -> Option<SessionId> {
+    self.sessions.keys().copied().min()
   }
 
   pub fn active_session(&self) -> Option<&SessionState> {
@@ -217,42 +192,24 @@ impl ProjectState {
   /// Re-sync each running session's label from the TODO document, so a heading
   /// renamed in TODO.md is picked up. Returns `true` if anything changed.
   pub fn sync_sessions_from_todo(&mut self, cx: &App) -> bool {
-    // Only the (uuid, label) pairs are needed, so lift those out rather than
-    // cloning the whole document every tick.
-    let entries: Vec<(String, String)> = self
-      .todo_view
-      .read(cx)
-      .document()
-      .sessions
-      .iter()
-      .filter(|s| !s.uuid.is_empty())
-      .map(|s| (s.uuid.clone(), s.label.clone()))
-      .collect();
+    let todo_view = self.todo_view.clone();
+    let document = todo_view.read(cx).document();
     let mut changed = false;
 
-    // Match on UUID and nothing else. The UUID is now the session's identity —
-    // assigned at launch, rewritten only by `/clear` — so it is the one key that
-    // survives a rename, which is the whole reason this sync exists. A label
-    // fallback looks tempting but is actively harmful: a TODO entry for a
-    // session that ISN'T running (disabled, never adopted) matches no UUID, and
-    // would then claim a running session that happens to share its label,
-    // stamping the wrong UUID onto it and silently breaking every hook for that
-    // session. Labels are not unique, so there is no safe version of that.
-    // First heading per UUID wins, the same rule `create` applies when adopting.
-    // Two headings can share a `> uuid=` (a copy-pasted block), and without this
-    // the running session would take the LAST duplicate's label — which is a
-    // dormant heading, so every label-keyed TODO operation (`ensure_wait`,
-    // `send_selection`, `wait_line`) would then file work under the wrong block.
-    // It would also make `changed` true on every tick, forever.
-    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (uuid, label) in entries {
-      if !claimed.insert(uuid.clone()) {
-        continue;
-      }
-      if let Some(session) = self.sessions.values_mut().find(|s| s.uuid == uuid)
-        && session.label != label
+    // Match on UUID and nothing else. A label fallback looks tempting but is
+    // actively harmful: a heading for a session that ISN'T running matches no
+    // UUID, and would then claim a running session sharing its label, stamping
+    // the wrong UUID onto it and breaking every hook for it.
+    //
+    // Driven from the running sessions (a handful) rather than the headings
+    // (all of them), so the steady state allocates nothing. `find` takes the
+    // first heading with a matching UUID — the same first-wins rule `create`
+    // applies, for the same copy-pasted-block case.
+    for session in self.sessions.values_mut() {
+      if let Some(heading) = document.sessions.iter().find(|s| s.uuid == session.uuid)
+        && session.label != heading.label
       {
-        session.label = label;
+        session.label = heading.label.clone();
         changed = true;
       }
     }

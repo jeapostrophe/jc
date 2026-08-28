@@ -724,8 +724,8 @@ struct SessionPickerEntry {
 enum SessionPickerEntryKind {
   /// An adopted session — stores its SessionId.
   Session(SessionId),
-  /// A TODO.md session not yet adopted (has uuid + label but no running terminal).
-  Unadopted { uuid: String, status: jc_core::todo::SessionStatus },
+  /// A TODO.md session with no running terminal. The UUID lives on the entry.
+  Unadopted { status: jc_core::todo::SessionStatus },
   /// A project with no sessions — selecting it will discover-or-create a session.
   EmptyProject,
 }
@@ -758,16 +758,10 @@ impl SessionPickerDelegate {
     todo_documents: &[&jc_core::todo::TodoDocument],
     cx: &App,
   ) -> Self {
-    use std::collections::HashSet;
-
     let mut entries = Vec::new();
     let mut active_entry = None;
 
     for (pi, project) in projects.iter().enumerate() {
-      // Collect UUIDs already adopted into running sessions.
-      let adopted_uuids: HashSet<&str> =
-        project.sessions.values().map(|s| s.uuid.as_str()).collect();
-
       let has_adoptable = todo_documents.get(pi).is_some_and(|d| !d.sessions.is_empty());
       if project.sessions.is_empty() && !has_adoptable {
         entries.push(SessionPickerEntry {
@@ -806,32 +800,21 @@ impl SessionPickerDelegate {
         });
       }
 
-      // Unadopted TODO.md sessions: in TODO but no running SessionState.
-      // Adoption is decided by UUID alone. A label test would also hide a
-      // distinct session that merely shares a name with a running one, leaving
-      // it impossible to adopt or re-enable from anywhere in the UI.
+      // TODO.md sessions with no running terminal (see `ProjectState::is_adopted`).
       if let Some(doc) = todo_documents.get(pi) {
         for todo_session in &doc.sessions {
-          // A blank `> uuid=` is adoptable too: jc mints the UUID at adopt time
-          // rather than at startup, so the user chooses when a legacy heading
-          // gets bound to a new (empty) conversation.
-          if !todo_session.uuid.is_empty() && adopted_uuids.contains(todo_session.uuid.as_str()) {
+          if project.is_adopted(&todo_session.uuid) {
             continue;
           }
-          {
-            entries.push(SessionPickerEntry {
-              kind: SessionPickerEntryKind::Unadopted {
-                uuid: todo_session.uuid.clone(),
-                status: todo_session.status,
-              },
-              project_index: pi,
-              project_name: project.name.clone(),
-              label: todo_session.label.clone(),
-              uuid: todo_session.uuid.clone(),
-              has_activity: false,
-              last_active: todo_session.last_active.unwrap_or(0),
-            });
-          }
+          entries.push(SessionPickerEntry {
+            kind: SessionPickerEntryKind::Unadopted { status: todo_session.status },
+            project_index: pi,
+            project_name: project.name.clone(),
+            label: todo_session.label.clone(),
+            uuid: todo_session.uuid.clone(),
+            has_activity: false,
+            last_active: todo_session.last_active.unwrap_or(0),
+          });
         }
       }
     }
@@ -914,8 +897,8 @@ impl PickerDelegate for SessionPickerDelegate {
     let e = &self.entries[index];
     self.result = Some(match &e.kind {
       SessionPickerEntryKind::Session(id) => SessionPickerResult::Session(e.project_index, *id),
-      SessionPickerEntryKind::Unadopted { uuid, .. } => {
-        SessionPickerResult::Adopt(e.project_index, uuid.clone(), e.label.clone())
+      SessionPickerEntryKind::Unadopted { .. } => {
+        SessionPickerResult::Adopt(e.project_index, e.uuid.clone(), e.label.clone())
       }
       SessionPickerEntryKind::EmptyProject => SessionPickerResult::InitProject(e.project_index),
     });
@@ -1061,15 +1044,11 @@ impl ProjectActionsPickerDelegate {
 
     // 1. Dormant sessions: in TODO.md but not currently running, sorted by recency.
     {
-      // Adoption is decided by UUID alone; see the note in SessionPickerDelegate.
-      let adopted_uuids: HashSet<&str> =
-        projects[active_project_index].sessions.values().map(|s| s.uuid.as_str()).collect();
-
+      let project = &projects[active_project_index];
       let mut dormant: Vec<(String, String, u64)> = Vec::new();
       if let Some(doc) = todo_documents.get(active_project_index) {
         for ts in &doc.sessions {
-          // Blank-UUID headings are listed too; adopting mints their UUID.
-          if ts.uuid.is_empty() || !adopted_uuids.contains(ts.uuid.as_str()) {
+          if !project.is_adopted(&ts.uuid) {
             dormant.push((ts.uuid.clone(), ts.label.clone(), ts.last_active.unwrap_or(0)));
           }
         }

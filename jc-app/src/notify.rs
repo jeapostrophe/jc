@@ -66,7 +66,7 @@ pub fn init() {
 ///
 /// jc only notifies for a session Claude has stopped on (permission prompt, API
 /// error), so every notification is a critical attention request.
-pub fn notify(title: &str, message: &str, session_id: Option<&str>) {
+pub fn notify(title: &str, message: &str, session_id: &str) {
   eprintln!("notify: {title} — {message}");
   bounce_dock_icon();
 
@@ -76,16 +76,16 @@ pub fn notify(title: &str, message: &str, session_id: Option<&str>) {
 
   let title = title.to_string();
   let message = message.to_string();
-  let session_id = session_id.map(str::to_string);
+  let session_id = session_id.to_string();
 
   // Post from a background thread to avoid blocking the UI.
   std::thread::spawn(move || {
     // SAFETY: All ObjC calls here create new objects; no shared mutable state.
-    unsafe { post_notification(&title, &message, session_id.as_deref()) };
+    unsafe { post_notification(&title, &message, &session_id) };
   });
 }
 
-unsafe fn post_notification(title: &str, message: &str, session_id: Option<&str>) {
+unsafe fn post_notification(title: &str, message: &str, session_id: &str) {
   let content: Retained<AnyObject> =
     msg_send![AnyClass::get(c"UNMutableNotificationContent").unwrap(), new];
 
@@ -100,20 +100,18 @@ unsafe fn post_notification(title: &str, message: &str, session_id: Option<&str>
   let () = msg_send![&*content, setSound: &*sound];
 
   // Thread identifier groups notifications by session.
-  if let Some(session_id) = session_id {
-    let thread_id = NSString::from_str(session_id);
-    let () = msg_send![&*content, setThreadIdentifier: &*thread_id];
+  let thread_id = NSString::from_str(session_id);
+  let () = msg_send![&*content, setThreadIdentifier: &*thread_id];
 
-    // Store session_id in userInfo so the click handler can route to the session.
-    let key = NSString::from_str("session_id");
-    let val = NSString::from_str(session_id);
-    let user_info: Retained<AnyObject> = msg_send![
-      AnyClass::get(c"NSDictionary").unwrap(),
-      dictionaryWithObject: &*val,
-      forKey: &*key
-    ];
-    let () = msg_send![&*content, setUserInfo: &*user_info];
-  }
+  // Store session_id in userInfo so the click handler can route to the session.
+  let key = NSString::from_str("session_id");
+  let val = NSString::from_str(session_id);
+  let user_info: Retained<AnyObject> = msg_send![
+    AnyClass::get(c"NSDictionary").unwrap(),
+    dictionaryWithObject: &*val,
+    forKey: &*key
+  ];
+  let () = msg_send![&*content, setUserInfo: &*user_info];
 
   // Unique request identifier.
   let ts = std::time::SystemTime::now()

@@ -120,8 +120,7 @@ impl TodoView {
     }
   }
 
-  /// Insert a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading into the TODO.md,
-  /// save, and revalidate.
+  /// Insert a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading and save.
   pub fn insert_session_heading(
     &mut self,
     uuid: &str,
@@ -131,13 +130,7 @@ impl TodoView {
   ) {
     let text = self.code_view.read(cx).editor_text(cx);
     let new_text = todo::insert_session_heading(&text, &self.document, uuid, label);
-    self.code_view.update(cx, |cv, cx| {
-      cv.editor().update(cx, |state, cx| {
-        state.set_value_preserving_position(new_text, window, cx);
-      });
-    });
-    self.revalidate(cx);
-    self.save(cx);
+    self.set_text_and_save(new_text, window, cx);
   }
 
   /// Bound every session's message log to the most recent
@@ -190,12 +183,7 @@ impl TodoView {
     };
     let text = self.editor_text(cx);
     if let Some(new_text) = todo::toggle_session_disabled_at(&text, &self.document, index) {
-      self.code_view.update(cx, |cv, cx| {
-        cv.editor().update(cx, |state, cx| {
-          state.set_value_preserving_position(new_text, window, cx);
-        });
-      });
-      self.revalidate(cx);
+      self.set_text(new_text, window, cx);
     }
   }
 
@@ -225,7 +213,7 @@ impl TodoView {
         state.set_cursor_position(pos, window, cx);
       });
     });
-    self.revalidate(cx);
+    self.reparse(cx);
     self.save(cx);
     Some((result.message_text, result.schedule))
   }
@@ -265,15 +253,21 @@ impl TodoView {
     }
   }
 
-  /// Replace the editor contents (preserving cursor position), then revalidate
+  /// Replace the editor contents (preserving cursor position), then re-parse
   /// and save.
-  fn set_text_and_save(&mut self, new_text: String, window: &mut Window, cx: &mut Context<Self>) {
+  /// Replace the buffer's text and re-parse. Every jc-authored edit goes
+  /// through here, so there is one place to change how edits are applied.
+  fn set_text(&mut self, new_text: String, window: &mut Window, cx: &mut Context<Self>) {
     self.code_view.update(cx, |cv, cx| {
       cv.editor().update(cx, |state, cx| {
         state.set_value_preserving_position(new_text, window, cx);
       });
     });
-    self.revalidate(cx);
+    self.reparse(cx);
+  }
+
+  fn set_text_and_save(&mut self, new_text: String, window: &mut Window, cx: &mut Context<Self>) {
+    self.set_text(new_text, window, cx);
     self.save(cx);
   }
 
@@ -282,12 +276,7 @@ impl TodoView {
   pub fn ensure_wait(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
     let text = self.editor_text(cx);
     if let Some(new_text) = todo::insert_wait_section(&text, &self.document, label) {
-      self.code_view.update(cx, |cv, cx| {
-        cv.editor().update(cx, |state, cx| {
-          state.set_value_preserving_position(new_text, window, cx);
-        });
-      });
-      self.revalidate(cx);
+      self.set_text(new_text, window, cx);
       self.save(cx);
       true
     } else {
@@ -295,30 +284,16 @@ impl TodoView {
     }
   }
 
-  /// Rename the session at `index`. Positional for the same reason as
-  /// [`Self::update_session_uuid_at`]: the caller is repairing duplicates, so
-  /// the label is exactly what it cannot key on.
-  pub fn rename_session_at(
-    &mut self,
-    index: usize,
-    new_label: &str,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
+  /// Repair duplicate labels in one rewrite. Returns whether anything changed.
+  pub fn dedupe_labels(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
     let text = self.editor_text(cx);
-    if let Some(new_text) = todo::rename_session_at(&text, &self.document, index, new_label) {
-      self.code_view.update(cx, |cv, cx| {
-        cv.editor().update(cx, |state, cx| {
-          state.set_value_preserving_position(new_text, window, cx);
-        });
-      });
-      self.revalidate(cx);
-    }
+    let Some(new_text) = todo::dedupe_labels(&text, &self.document) else { return false };
+    self.set_text_and_save(new_text, window, cx);
+    true
   }
 
   /// Write `new_uuid` onto the session at `index` in the parsed document.
-  /// Positional rather than label-keyed because labels are not unique, and
-  /// because the migration that mints UUIDs has no UUID to key on yet.
+  /// Positional because the caller minting a UUID has no UUID to key on yet.
   pub fn update_session_uuid_at(
     &mut self,
     index: usize,
@@ -328,18 +303,13 @@ impl TodoView {
   ) {
     let text = self.editor_text(cx);
     if let Some(new_text) = todo::update_session_uuid_at(&text, &self.document, index, new_uuid) {
-      self.code_view.update(cx, |cv, cx| {
-        cv.editor().update(cx, |state, cx| {
-          state.set_value_preserving_position(new_text, window, cx);
-        });
-      });
-      self.revalidate(cx);
+      self.set_text(new_text, window, cx);
     }
   }
 
-  /// Re-parse the document and refresh highlights. Call after loading or after
-  /// any edit jc itself makes (not on every keystroke, since it re-parses).
-  pub fn revalidate(&mut self, cx: &mut Context<Self>) {
+  /// Re-parse the document and refresh highlights. Called by [`Self::set_text`]
+  /// after every jc-authored edit; not run on every keystroke, since it re-parses.
+  pub fn reparse(&mut self, cx: &mut Context<Self>) {
     let text = self.code_view.read(cx).editor_text(cx);
     self.document = todo::parse(&text);
     self.apply_session_highlights(cx);

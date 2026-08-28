@@ -130,7 +130,9 @@ pub struct TerminalView {
   /// arriving (see [`TerminalView::output_batches`]).
   output_batches: Arc<AtomicUsize>,
   /// Value of `output_batches` at the last [`TerminalView::clear_output_seen`].
-  seen_batches: Arc<AtomicUsize>,
+  /// Main-thread only — the VTE thread never reads or writes it, so this is a
+  /// plain atomic for `&self` interior mutability, not shared state.
+  seen_batches: AtomicUsize,
   _subscriptions: Vec<Subscription>,
   /// Cursor blink task — only runs while focused.
   _blink_task: Option<gpui::Task<()>>,
@@ -259,7 +261,7 @@ impl TerminalView {
       canvas_origin: Arc::new(Mutex::new(gpui::Point::default())),
       visible,
       output_batches,
-      seen_batches: Arc::new(AtomicUsize::new(0)),
+      seen_batches: AtomicUsize::new(0),
       _subscriptions,
       _blink_task: None,
     }

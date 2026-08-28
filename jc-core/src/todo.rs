@@ -16,11 +16,22 @@ pub struct TodoDocument {
 
 /// How to locate a session's heading in TODO.md.
 ///
+/// **This is the canonical note on session addressing; other sites point here.**
+///
 /// A heading normally carries a UUID, which is a true unique address. A heading
 /// an older jc created but never bound has an empty `> uuid=`, and an empty
 /// string is *not* an address — every unbound heading shares it, so keying on it
-/// silently resolves to the first one. Those fall back to the label, which
-/// `unique_label` and `ProjectState::dedupe_labels` between them keep unique.
+/// silently resolves to the first one. Those fall back to the label.
+///
+/// The label is only usable as an address because jc keeps labels unique:
+/// [`unique_label`] at every creation point and [`rename_session_at`] (via
+/// `ProjectState::dedupe_labels`) to repair older files. That matters well
+/// beyond this type — TODO.md's *text* operations (`insert_wait_section`,
+/// `send_from_wait`, `TodoDocument::wait_line`, the `@jc(...)` scheduled-send
+/// timers) all resolve a session by label, and every one of them takes the FIRST
+/// heading that matches. A duplicate label therefore does not merely confuse a
+/// reader: it silently redirects a send, or a scheduled delivery, to the wrong
+/// session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionKey {
   Uuid(String),
@@ -144,6 +155,11 @@ impl TodoDocument {
       SessionKey::Uuid(uuid) => self.index_by_uuid(uuid),
       SessionKey::Label(label) => self.sessions.iter().position(|s| s.label == *label),
     }
+  }
+
+  /// The session `key` names.
+  pub fn session_of(&self, key: &SessionKey) -> Option<&TodoSession> {
+    self.sessions.get(self.index_of(key)?)
   }
 
   pub fn session_by_label(&self, label: &str) -> Option<&TodoSession> {
@@ -506,15 +522,8 @@ pub fn insert_wait_section(text: &str, doc: &TodoDocument, label: &str) -> Optio
 // ---------------------------------------------------------------------------
 
 /// A label not already used by any session in `doc`: `base`, else `base 2`,
-/// `base 3`, ...
-///
-/// A session's *identity* is its UUID, but TODO.md's text operations are keyed
-/// on the label — `insert_wait_section`, `send_from_wait`, `TodoDocument::wait_line`
-/// and the `@jc(...)` scheduled-send timers all resolve to the FIRST heading
-/// with a given label. So two identically-named sessions silently redirect a
-/// send, or a scheduled delivery, onto the wrong one. Uniquifying at creation is
-/// what keeps the label usable as an address; [`rename_session_at`] repairs a
-/// file written before that.
+/// `base 3`, ... Every path that creates a heading routes its label through
+/// this, so the label stays usable as an address (see [`SessionKey`]).
 pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
   if doc.session_by_label(base).is_none() {
     return base.to_string();
@@ -571,14 +580,54 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, uuid: &str, label:
 // Session disable toggle
 // ---------------------------------------------------------------------------
 
-/// Rewrite the label of the session at `index`, preserving its `[D]` prefix.
+/// `text` with `range` replaced by `replacement`.
+fn splice(text: &str, range: Range<usize>, replacement: &str) -> String {
+  let mut out = text.to_string();
+  out.replace_range(range, replacement);
+  out
+}
+
+/// Give every heading whose label repeats an earlier one a fresh unique label,
+/// in a single rewrite. `None` if there were no duplicates.
 ///
-/// TODO.md addresses a session by label almost everywhere — the WAIT block, the
-/// scheduled-send timers, `ensure_wait`, `send_selection` — and every one of
-/// those resolves to the FIRST heading with a given label. So a duplicate label
-/// does not merely confuse the reader: it silently redirects a send or a
-/// scheduled delivery onto the wrong session. jc keeps labels unique at every
-/// creation point; this is how it repairs a file written before it did.
+/// Renames back-to-front so each splice leaves earlier byte ranges valid, which
+/// is what lets the whole repair happen in one pass instead of one re-parse per
+/// duplicate.
+pub fn dedupe_labels(text: &str, doc: &TodoDocument) -> Option<String> {
+  let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+  let mut taken: Vec<String> = Vec::new();
+  let mut renames: Vec<(usize, String)> = Vec::new();
+  for (index, session) in doc.sessions.iter().enumerate() {
+    if seen.insert(session.label.as_str()) {
+      continue;
+    }
+    // `unique_label` only sees the document as parsed, so names handed out
+    // earlier in this same pass have to be excluded too.
+    let mut candidate = unique_label(doc, &session.label);
+    let mut n = 2;
+    while taken.contains(&candidate) {
+      n += 1;
+      candidate = format!("{} {n}", session.label);
+    }
+    taken.push(candidate.clone());
+    renames.push((index, candidate));
+  }
+  if renames.is_empty() {
+    return None;
+  }
+  // Back to front, so each rewrite only disturbs bytes after the ranges the
+  // remaining ones still need — which is what lets every rename reuse the
+  // single parse in `doc`.
+  let mut out = text.to_string();
+  for (index, label) in renames.into_iter().rev() {
+    out = rename_session_at(&out, doc, index, &label)?;
+  }
+  Some(out)
+}
+
+/// Rewrite the label of the session at `index`, preserving its `[D]` prefix.
+/// Used to repair duplicate labels in a file written before [`unique_label`]
+/// existed — see [`SessionKey`] for why duplicates are harmful.
 pub fn rename_session_at(
   text: &str,
   doc: &TodoDocument,
@@ -586,13 +635,8 @@ pub fn rename_session_at(
   new_label: &str,
 ) -> Option<String> {
   let session = doc.sessions.get(index)?;
-  let range = session.heading_byte_range.clone();
   let prefix = if session.status == SessionStatus::Disabled { "[D] " } else { "" };
-  let mut new_text = String::with_capacity(text.len() + new_label.len());
-  new_text.push_str(&text[..range.start]);
-  new_text.push_str(&format!("## {prefix}{new_label}"));
-  new_text.push_str(&text[range.end..]);
-  Some(new_text)
+  Some(splice(text, session.heading_byte_range.clone(), &format!("## {prefix}{new_label}")))
 }
 
 /// Toggle the `[D]` (disabled/dormant) prefix on the session at `index`.
@@ -600,7 +644,6 @@ pub fn rename_session_at(
 pub fn toggle_session_disabled_at(text: &str, doc: &TodoDocument, index: usize) -> Option<String> {
   let session = doc.sessions.get(index)?;
   let label = &session.label;
-  let range = session.heading_byte_range.clone();
   // Rebuild the heading from the parsed label rather than patching the existing
   // text, so a legacy `## [X] Label` normalises to `## Label` / `## [D] Label`.
   let new_heading = if session.status == SessionStatus::Disabled {
@@ -608,24 +651,16 @@ pub fn toggle_session_disabled_at(text: &str, doc: &TodoDocument, index: usize) 
   } else {
     format!("## [D] {label}")
   };
-  let mut new_text = String::with_capacity(text.len() + 4);
-  new_text.push_str(&text[..range.start]);
-  new_text.push_str(&new_heading);
-  new_text.push_str(&text[range.end..]);
-  Some(new_text)
+  Some(splice(text, session.heading_byte_range.clone(), &new_heading))
 }
 
 // ---------------------------------------------------------------------------
 // UUID update
 // ---------------------------------------------------------------------------
 
-/// Write `new_uuid` onto the session at `index` in `doc.sessions`.
-///
-/// Positional, never label-keyed: labels are not unique — an older jc wrote
-/// every new session as `## New Session` — so a label-keyed write always lands
-/// on the *first* heading with that label, giving it both UUIDs and stranding
-/// the second heading, which then `--resume`s the same transcript.
-/// Callers holding a UUID should resolve it with [`TodoDocument::index_by_uuid`].
+/// Write `new_uuid` onto the session at `index` in `doc.sessions`. Positional
+/// rather than label-keyed — see [`SessionKey`]. Callers holding a UUID resolve
+/// it with [`TodoDocument::index_by_uuid`].
 pub fn update_session_uuid_at(
   text: &str,
   doc: &TodoDocument,
@@ -635,19 +670,11 @@ pub fn update_session_uuid_at(
   let session = doc.sessions.get(index)?;
   // A hand-written heading may have no `> uuid=` line at all; give it one
   // directly below the heading rather than dropping the UUID on the floor.
-  let (range, insert) = if session.uuid_byte_range == (0..0) {
-    (session.heading_byte_range.end..session.heading_byte_range.end, true)
-  } else {
-    (session.uuid_byte_range.clone(), false)
-  };
-  let mut new_text = String::with_capacity(text.len() + new_uuid.len() + 10);
-  new_text.push_str(&text[..range.start]);
-  if insert {
-    new_text.push_str("\n> uuid=");
+  if session.uuid_byte_range == (0..0) {
+    let at = session.heading_byte_range.end;
+    return Some(splice(text, at..at, &format!("\n> uuid={new_uuid}")));
   }
-  new_text.push_str(new_uuid);
-  new_text.push_str(&text[range.end..]);
-  Some(new_text)
+  Some(splice(text, session.uuid_byte_range.clone(), new_uuid))
 }
 
 // ---------------------------------------------------------------------------
@@ -2196,6 +2223,32 @@ quoted
     assert_eq!(doc.index_of(&SessionKey::new("", "Second")), Some(1));
     assert_eq!(doc.index_of(&SessionKey::new("", "First")), Some(0));
     assert_eq!(doc.index_of(&SessionKey::new("", "Nope")), None);
+  }
+
+  #[test]
+  fn dedupe_labels_repairs_every_duplicate_in_one_pass() {
+    let text = "\
+# Claude
+## New Session
+> uuid=a
+## [D] New Session
+> uuid=b
+## Other
+> uuid=c
+## New Session
+> uuid=d
+";
+    let doc = parse(text);
+    let fixed = dedupe_labels(text, &doc).unwrap();
+    let after = parse(&fixed);
+    let labels: Vec<&str> = after.sessions.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, vec!["New Session", "New Session 2", "Other", "New Session 3"]);
+    // UUIDs must not have moved: each rename hit its own heading.
+    let uuids: Vec<&str> = after.sessions.iter().map(|s| s.uuid.as_str()).collect();
+    assert_eq!(uuids, vec!["a", "b", "c", "d"]);
+    assert_eq!(after.sessions[1].status, SessionStatus::Disabled, "[D] survives");
+    // Idempotent: a clean document needs no rewrite.
+    assert!(dedupe_labels(&fixed, &after).is_none());
   }
 
   #[test]

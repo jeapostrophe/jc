@@ -306,7 +306,7 @@ impl Workspace {
       close_confirm_is_quit: false,
     };
 
-    ws.subscribe_active_project(window, cx);
+    ws.refresh_breadcrumb_observers(cx);
     ws.reconcile_schedules(window, cx);
     ws.start_schedule_reconcile_loop(window, cx);
 
@@ -361,11 +361,6 @@ impl Workspace {
     };
 
     vec![first, second, third]
-  }
-
-  /// (Re)wire per-project observers after the active project changes.
-  fn subscribe_active_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-    self.refresh_breadcrumb_observers(cx);
   }
 
   /// Observe CodeView entities so the pane header re-renders when breadcrumbs change.
@@ -885,8 +880,6 @@ impl Workspace {
       session.claude_terminal.read(cx).clear_output_seen();
     }
 
-    let project_changed = project_idx != self.active_project_index;
-
     self.active_project_index = project_idx;
     self.projects[project_idx].active_session = session_id;
 
@@ -918,12 +911,8 @@ impl Workspace {
     let todo_view = self.projects[project_idx].todo_view.clone();
     todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
 
-    if project_changed {
-      self.subscribe_active_project(window, cx);
-    } else {
-      // Breadcrumb observers depend on the active session's code_view.
-      self.refresh_breadcrumb_observers(cx);
-    }
+    // Breadcrumb observers depend on the active session's code_view.
+    self.refresh_breadcrumb_observers(cx);
 
     self.restore_or_default_panes(window, cx);
 
@@ -960,24 +949,21 @@ impl Workspace {
     self.switch_to_session(next_pi, next_sid, window, cx);
   }
 
-  /// Find a session by ID across all projects and switch to it.
-  /// Used by notification click handler which passes session UUIDs.
+  /// Switch to the session a clicked notification names. Notifications always
+  /// carry the session UUID.
   fn switch_to_session_id(
     &mut self,
     session_id: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    for (pi, project) in self.projects.iter().enumerate() {
-      if let Some((id, _)) = project.session_by_uuid(session_id) {
-        self.switch_to_session(pi, Some(id), window, cx);
-        return;
-      }
-      // Fall back to label match for older notifications.
-      if let Some((id, _)) = project.session_by_label(session_id) {
-        self.switch_to_session(pi, Some(id), window, cx);
-        return;
-      }
+    let found = self
+      .projects
+      .iter()
+      .enumerate()
+      .find_map(|(pi, p)| p.session_by_uuid(session_id).map(|(id, _)| (pi, id)));
+    if let Some((pi, id)) = found {
+      self.switch_to_session(pi, Some(id), window, cx);
     }
   }
 
@@ -1071,11 +1057,8 @@ impl Workspace {
     let id = project.next_session_id;
     project.next_session_id += 1;
 
-    // Uniquify. Identity is the UUID, but the TODO.md *text* operations are
-    // still label-keyed — `ensure_wait`, `send_selection`, `has_pending_schedule`
-    // and the `@jc(...)` scheduled-send timers all resolve to the first heading
-    // with a given label — so two `## New Session` headings would silently
-    // redirect a send onto the wrong one.
+    // Uniquify — see `jc_core::todo::SessionKey` for why a duplicate label
+    // silently misroutes a send.
     let label = jc_core::todo::unique_label(project.todo_view.read(cx).document(), "New Session");
     let uuid = uuid::Uuid::new_v4().to_string();
 
@@ -1118,19 +1101,19 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let key = jc_core::todo::SessionKey::new(uuid, label);
-    // A minted UUID has no conversation *by construction*, so it is `New`
-    // outright — never ask `launch_for`, which answers `Resume` when it cannot
-    // see the filesystem at all (`$HOME` unset) and would spawn
-    // `claude --resume <fresh-uuid>` into a dead pane, permanently, since the
-    // heading is bound by then.
+    let todo_view = self.projects[project_idx].todo_view.clone();
+
+    // Bind an unbound heading now, in one write. A minted UUID has no
+    // conversation *by construction*, so it is `Launch::New` outright — asking
+    // `launch_for` would get `Resume` when the filesystem can't be seen at all
+    // (`$HOME` unset) and spawn `claude --resume <fresh-uuid>` into a dead pane,
+    // permanently, since the heading is bound by then.
     let (uuid, minted_launch) = if uuid.is_empty() {
       let minted = uuid::Uuid::new_v4().to_string();
-      let todo_view = self.projects[project_idx].todo_view.clone();
+      let key = jc_core::todo::SessionKey::Label(label.to_string());
       let written = todo_view.update(cx, |tv, cx| {
         let Some(index) = tv.document().index_of(&key) else { return false };
         tv.update_session_uuid_at(index, &minted, window, cx);
-        tv.save(cx);
         true
       });
       // Refuse to launch a session whose UUID isn't in the file. It could never
@@ -1138,7 +1121,7 @@ impl Workspace {
       // still-unbound heading would stay adoptable — so a second press would
       // spawn a second process for the same heading.
       if !written {
-        eprintln!("adopt: no TODO heading for {key:?}; not launching");
+        eprintln!("adopt: no TODO heading labelled {label:?}; not launching");
         // The picker already dropped `pre_picker_focus` on the assumption that
         // this call would focus something. It won't, so do it here or the next
         // keystroke goes nowhere.
@@ -1151,25 +1134,20 @@ impl Workspace {
     };
     let uuid = &uuid;
 
-    // Everything below addresses the TODO entry by UUID rather than label:
-    // labels are not unique, and a label lookup resolves to the first heading
-    // that matches, which may be a different session entirely.
-    {
-      let project = &self.projects[project_idx];
-      let todo_view = project.todo_view.clone();
-      let is_disabled = todo_view
-        .read(cx)
-        .document()
-        .session_by_uuid(uuid)
-        .is_some_and(|s| s.status == jc_core::todo::SessionStatus::Disabled);
+    // Clear `[D]` if the heading was dormant, then save once for both edits —
+    // each save is a full-document copy and a blocking write on the main thread.
+    let key = jc_core::todo::SessionKey::Uuid(uuid.clone());
+    let is_disabled = todo_view
+      .read(cx)
+      .document()
+      .session_of(&key)
+      .is_some_and(|s| s.status == jc_core::todo::SessionStatus::Disabled);
+    todo_view.update(cx, |tv, cx| {
       if is_disabled {
-        let key = jc_core::todo::SessionKey::Uuid(uuid.to_string());
-        todo_view.update(cx, |tv, cx| {
-          tv.toggle_session_disabled(&key, window, cx);
-          tv.save(cx);
-        });
+        tv.toggle_session_disabled(&key, window, cx);
       }
-    }
+      tv.save(cx);
+    });
 
     let project_path = self.projects[project_idx].path.clone();
     let palette = palette_from_window(window);
@@ -1236,9 +1214,8 @@ impl Workspace {
     let is_now_disabled = todo_view
       .read(cx)
       .document()
-      .index_of(key)
-      .and_then(|i| todo_view.read(cx).document().sessions.get(i).map(|s| s.status))
-      .is_some_and(|status| status == jc_core::todo::SessionStatus::Disabled);
+      .session_of(key)
+      .is_some_and(|s| s.status == jc_core::todo::SessionStatus::Disabled);
     // Whether control ended up in `switch_to_session`, which focuses the pane it
     // lands on. When it doesn't, nothing else will: the picker's confirm handler
     // has already dropped `pre_picker_focus`, so focus would be stranded on the
@@ -1265,7 +1242,7 @@ impl Workspace {
         // Same, but for a project we are not looking at. Repoint it so it still
         // has a session to show next time, and do NOT switch: disabling a
         // background session must not yank the user into another project.
-        project.active_session = project.sessions.keys().copied().min();
+        project.active_session = project.first_session();
       }
     }
 
@@ -1285,10 +1262,7 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    // Lowest id — the earliest-created surviving session — so the same action
-    // in the same state always lands in the same place. `HashMap` iteration
-    // order would not.
-    if let Some(next) = self.projects[project_idx].sessions.keys().copied().min() {
+    if let Some(next) = self.projects[project_idx].first_session() {
       // Another session in the same project — switch to it.
       self.switch_to_session(project_idx, Some(next), window, cx);
       return;
@@ -1526,8 +1500,6 @@ impl Workspace {
       .iter()
       .flat_map(|project| {
         let path = project.path.clone();
-        let running_labels: std::collections::HashSet<String> =
-          project.sessions.values().map(|s| s.label.clone()).collect();
         project
           .todo_view
           .read(cx)
@@ -1539,7 +1511,7 @@ impl Workspace {
           // dropped — it stays in the file with its pending highlight, and
           // adopting the session arms it on the next tick (firing immediately,
           // after the catch-up grace, if its time has already passed).
-          .filter(move |s| running_labels.contains(&s.label))
+          .filter(|s| project.sessions.values().any(|r| r.label == s.label))
           .filter_map(move |s| {
             s.pending_scheduled()
               .and_then(|m| m.schedule.map(|dt| (path.clone(), s.label.clone(), dt)))
@@ -1711,9 +1683,7 @@ impl Workspace {
       && !self.window_active
     {
       let title = format!("{project_name} > {session_label}");
-      let notify_id =
-        if event.session_id.is_empty() { None } else { Some(event.session_id.as_str()) };
-      crate::notify::notify(&title, message, notify_id);
+      crate::notify::notify(&title, message, &event.session_id);
     }
 
     cx.notify();
@@ -1725,10 +1695,10 @@ impl Workspace {
     if event.session_id.is_empty() {
       return None;
     }
-    let project =
-      self.projects.iter_mut().find(|p| p.sessions.values().any(|s| s.uuid == event.session_id))?;
-    let project_name = project.name.clone();
-    let session = project.sessions.values_mut().find(|s| s.uuid == event.session_id)?;
+    let (project_name, session) = self.projects.iter_mut().find_map(|p| {
+      let name = p.name.clone();
+      p.sessions.values_mut().find(|s| s.uuid == event.session_id).map(|s| (name, s))
+    })?;
 
     match event.kind {
       HookEventKind::PromptSubmit => session.mark_user_input(),
