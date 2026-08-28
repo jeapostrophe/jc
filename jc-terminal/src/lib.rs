@@ -7,4 +7,5 @@ mod terminal;
 mod view;
 
 pub use colors::Palette;
+pub use settle::LaunchSettle;
 pub use view::{TerminalConfig, TerminalView, init};

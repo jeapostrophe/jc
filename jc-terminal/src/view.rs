@@ -2,24 +2,22 @@ use crate::colors::Palette;
 use crate::input::keystroke_to_bytes;
 use crate::pty::PtyHandle;
 use crate::render::{CellLayout, TerminalRenderState, measure_cell, paint_terminal};
-use crate::settle::{LAUNCH_GIVE_UP, LAUNCH_QUIET, SettleStep, SettleWindow};
+use crate::settle::{LaunchSettle, SettleStep, SettleWindow};
 use crate::terminal::{TerminalEvent, TerminalState};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::TermMode;
 use gpui::{
-  App, AsyncApp, Bounds, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement,
-  IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-  ParentElement, Pixels, Render, ScrollWheelEvent, SharedString, Styled, Subscription, Timer,
-  WeakEntity, Window, actions, canvas, div, px,
+  App, AsyncApp, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FutureExt,
+  InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+  MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
+  Styled, Subscription, Timer, WeakEntity, Window, actions, canvas, div, px,
 };
 use parking_lot::Mutex;
-use std::future::Future;
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -71,6 +69,17 @@ pub struct TerminalConfig {
   /// When set, the terminal spawns this command (e.g. `"claude"`)
   /// rather than the user's login shell.
   pub command: Option<String>,
+  /// Discount this child's launch output from [`TerminalView::has_unseen_output`],
+  /// so the flag means "it printed something while you were away" rather than
+  /// "jc started it".
+  ///
+  /// `None` (the default) counts every batch from the moment the child starts.
+  /// `Some(policy)` opens a launch-settle window: the baseline is taken once
+  /// the child has printed something and then held still for `policy.quiet`, or
+  /// unconditionally at `policy.give_up`. Both exits clear, for the reason
+  /// recorded on `SettleWindow::step`. The caller supplies the durations
+  /// because what counts as settled is a fact about the child being run.
+  pub launch_settle: Option<LaunchSettle>,
 }
 
 impl Default for TerminalConfig {
@@ -83,6 +92,7 @@ impl Default for TerminalConfig {
       initial_rows: 24,
       palette: None,
       command: None,
+      launch_settle: None,
     }
   }
 }
@@ -106,43 +116,6 @@ fn pixel_to_grid(
   let side = if cell_x > layout.width / 2.0 { Side::Right } else { Side::Left };
 
   (Point::new(Line(row as i32), Column(col)), side)
-}
-
-/// Why the notification relay woke up.
-#[derive(Debug, PartialEq, Eq)]
-enum Wake {
-  /// A batch was parsed.
-  Batch,
-  /// The deadline elapsed before any batch arrived.
-  Deadline,
-  /// The sending half is gone.
-  Closed,
-}
-
-/// Wait for the next value on `rx`, or for `deadline` to complete if one is
-/// given — whichever happens first. A ready batch always wins a tie, since
-/// dropping it on the floor would lose a wake.
-///
-/// Dropping the half-finished receive future is safe: flume's `RecvFut` only
-/// unregisters its hook on drop (and hands the wakeup to another receiver if it
-/// had already been signalled), so a batch racing the deadline stays queued and
-/// is delivered on the next call rather than being swallowed here.
-async fn recv_or_deadline<T, F: Future>(rx: &flume::Receiver<T>, deadline: Option<F>) -> Wake {
-  let mut recv = std::pin::pin!(rx.recv_async());
-  let mut deadline = std::pin::pin!(deadline);
-  std::future::poll_fn(move |cx| {
-    if let Poll::Ready(result) = recv.as_mut().poll(cx) {
-      return Poll::Ready(if result.is_ok() { Wake::Batch } else { Wake::Closed });
-    }
-    // No deadline means no window is open: wait on the batch alone.
-    if let Some(deadline) = deadline.as_mut().as_pin_mut()
-      && deadline.poll(cx).is_ready()
-    {
-      return Poll::Ready(Wake::Deadline);
-    }
-    Poll::Pending
-  })
-  .await
 }
 
 /// GPUI view that embeds a terminal emulator.
@@ -171,10 +144,14 @@ pub struct TerminalView {
   /// Main-thread only — the VTE thread never reads or writes it, so this is a
   /// plain atomic for `&self` interior mutability, not shared state.
   seen_batches: AtomicUsize,
-  /// Launch-settle window (see [`TerminalView::discount_launch_output`]), or
-  /// `None` when none is open — which is the case before one is opened and
-  /// again once the notification relay, which both stamps batches onto it and
-  /// drives it, has seen it through to its end.
+  /// Launch-settle window, opened from `TerminalConfig::launch_settle`, or
+  /// `None` when none is open — the case for a terminal that asked for no
+  /// window, and again once the notification relay (which both stamps batches
+  /// onto it and drives it) has seen one through to its end.
+  ///
+  /// Main-thread only, like `seen_batches`: the VTE thread never touches it,
+  /// and the relay runs on the foreground executor. The lock is for `&self`
+  /// interior mutability across two owners, not for cross-thread contention.
   settle: Arc<Mutex<Option<SettleWindow>>>,
   _subscriptions: Vec<Subscription>,
   /// Cursor blink task — only runs while focused.
@@ -265,26 +242,35 @@ impl TerminalView {
     });
 
     // Lightweight main-thread relay: notify GPUI for repaint, and drive the
-    // launch-settle window (see `discount_launch_output`) off the same batch
-    // signal. One task, two wake sources — the batch that would reset a
-    // debounce is exactly the batch this loop already waits on.
+    // launch-settle window off the same batch signal. One task, two wake
+    // sources — the batch that would reset a debounce is exactly the batch this
+    // loop already waits on.
+    //
+    // The window is installed HERE, before the relay exists, rather than being
+    // poked in afterwards: a window that arrived after the relay had already
+    // parked on an unbounded receive would never be serviced, and a child that
+    // then went quiet would leave the marker set for the life of the process.
     let visible_for_relay = visible.clone();
-    let settle = Arc::new(Mutex::new(None::<SettleWindow>));
+    let settle = Arc::new(Mutex::new(
+      config.launch_settle.map(|policy| SettleWindow::new(policy, Instant::now())),
+    ));
     let settle_for_relay = settle.clone();
     cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
       loop {
         // Service the settle window first: it either wants the baseline taken
-        // now, or says how long this loop may sleep before it needs asking
+        // now, or says how long this loop may wait before it needs asking
         // again. With no window open there is nothing to time out on.
+        //
+        // `finished` is what makes "baselined exactly once" a property of the
+        // tested type; dropping the window here is the cheap consequence, so
+        // the steady state stops stepping entirely.
         let step = settle_for_relay.lock().as_mut().map(|window| window.step(Instant::now()));
         let deadline = match step {
           Some(SettleStep::Wait(duration)) => Some(duration),
           Some(SettleStep::Clear) => {
-            let _ = cx.update(|cx: &mut App| {
-              if let Some(entity) = this.upgrade() {
-                entity.read(cx).clear_output_seen();
-              }
-            });
+            if this.update(cx, |view, _| view.clear_output_seen()).is_err() {
+              break; // view dropped
+            }
             *settle_for_relay.lock() = None;
             None
           }
@@ -295,11 +281,20 @@ impl TerminalView {
           None => None,
         };
 
-        match recv_or_deadline(&notify_rx, deadline.map(Timer::after)).await {
+        // A ready batch beats a ready deadline (`WithTimeout` polls the inner
+        // future first), so a wake is never dropped in the tie.
+        let woke = match deadline {
+          Some(duration) => {
+            notify_rx.recv_async().with_timeout(duration, cx.background_executor()).await
+          }
+          None => Ok(notify_rx.recv_async().await),
+        };
+
+        match woke {
           // The child printed. Restart the quiet wait — even while hidden,
           // since a backgrounded session's child is still settling and the
           // marker it feeds is read from the picker.
-          Wake::Batch => {
+          Ok(Ok(())) => {
             if let Some(window) = settle_for_relay.lock().as_mut() {
               window.note_batch(Instant::now());
             }
@@ -313,9 +308,9 @@ impl TerminalView {
             }
           }
           // The settle window's next decision point came first — go ask it.
-          Wake::Deadline => {}
+          Err(_) => {}
           // The VTE thread is gone: the child has exited.
-          Wake::Closed => break,
+          Ok(Err(_)) => break,
         }
       }
     })
@@ -365,22 +360,6 @@ impl TerminalView {
   /// Take everything printed so far as seen — the user is looking at it now.
   pub fn clear_output_seen(&self) {
     self.seen_batches.store(self.output_batches.load(Ordering::Relaxed), Ordering::Relaxed);
-  }
-
-  /// Discount this child's launch output, so [`Self::has_unseen_output`] means
-  /// "the child printed something while you were away" rather than "jc started
-  /// it". Call once, just after spawning; the window is per terminal, so a
-  /// session restored mid-run gets its own.
-  ///
-  /// The baseline is taken once the child has printed something and then held
-  /// still for [`LAUNCH_QUIET`], or unconditionally at [`LAUNCH_GIVE_UP`]; both
-  /// exits clear, for the reason recorded on `SettleWindow::step`.
-  ///
-  /// No task of its own: the notification relay started in [`Self::new`] is
-  /// already woken by every parsed batch, so it drives the window it finds
-  /// here.
-  pub fn discount_launch_output(&self) {
-    *self.settle.lock() = Some(SettleWindow::new(LAUNCH_QUIET, LAUNCH_GIVE_UP, Instant::now()));
   }
 
   /// End the launch-settle window WITHOUT clearing, because the user has given
@@ -898,75 +877,5 @@ impl Render for TerminalView {
         )
         .size_full(),
       )
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use std::pin::pin;
-  use std::task::{Context as TaskContext, Waker};
-
-  /// Run a future that is expected to finish on its first poll. No executor is
-  /// involved, so parking is a test failure rather than a wait.
-  fn drive<F: Future>(future: F) -> F::Output {
-    let mut future = pin!(future);
-    let waker = Waker::noop();
-    match future.as_mut().poll(&mut TaskContext::from_waker(waker)) {
-      Poll::Ready(value) => value,
-      Poll::Pending => panic!("future parked with nothing to wake it"),
-    }
-  }
-
-  /// A deadline that has already come due.
-  fn elapsed() -> impl Future<Output = Instant> {
-    std::future::ready(Instant::now())
-  }
-
-  /// A batch and the deadline coming due at the same moment must resolve as the
-  /// batch. Preferring the deadline would drop that wake, and the settle window
-  /// would never learn the child had printed.
-  #[test]
-  fn a_batch_wins_a_tie_with_the_deadline() {
-    let (tx, rx) = flume::unbounded::<()>();
-    tx.send(()).unwrap();
-    assert_eq!(
-      drive(recv_or_deadline(&rx, Some(elapsed()))),
-      Wake::Batch,
-      "a parsed batch must not be lost to a deadline that came due at the same time"
-    );
-  }
-
-  /// With nothing to receive, the deadline is what wakes the relay — that is
-  /// how the settle window's own timing gets serviced at all.
-  #[test]
-  fn the_deadline_wakes_the_relay_when_no_batch_arrives() {
-    let (_tx, rx) = flume::unbounded::<()>();
-    assert_eq!(drive(recv_or_deadline(&rx, Some(elapsed()))), Wake::Deadline);
-  }
-
-  /// Losing the race must not lose the message: the receive future is dropped
-  /// when the deadline wins, and a batch sent just after it must still be
-  /// delivered on the next call. This is what lets the relay re-arm its wait
-  /// after every settle step without swallowing output.
-  #[test]
-  fn a_batch_sent_around_the_deadline_survives_the_dropped_receive() {
-    let (tx, rx) = flume::unbounded::<()>();
-    assert_eq!(drive(recv_or_deadline(&rx, Some(elapsed()))), Wake::Deadline);
-    tx.send(()).unwrap();
-    assert_eq!(
-      drive(recv_or_deadline(&rx, Some(elapsed()))),
-      Wake::Batch,
-      "the batch queued after the deadline won must survive the dropped receive future"
-    );
-  }
-
-  /// A dead child ends the relay rather than leaving it waiting on a channel
-  /// nothing can send to.
-  #[test]
-  fn a_closed_channel_reports_closed() {
-    let (tx, rx) = flume::unbounded::<()>();
-    drop(tx);
-    assert_eq!(drive(recv_or_deadline(&rx, Some(elapsed()))), Wake::Closed);
   }
 }

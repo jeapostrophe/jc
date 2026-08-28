@@ -2,8 +2,9 @@ use crate::views::code_view::CodeView;
 use crate::views::project_state::SavedPaneLayout;
 use gpui::*;
 use gpui_component::input::Position;
-use jc_terminal::{Palette, TerminalConfig, TerminalView};
+use jc_terminal::{LaunchSettle, Palette, TerminalConfig, TerminalView};
 use std::path::Path;
+use std::time::Duration;
 
 /// Snapshot of per-session viewport state, saved on switch-away and restored on switch-back.
 pub struct SavedViewState {
@@ -16,6 +17,19 @@ pub struct SavedViewState {
 }
 
 pub type SessionId = usize;
+
+/// Discounts `claude`'s own startup output from the Cmd-P activity marker: its
+/// banner, and the transcript replay on `--resume`, are jc launching the
+/// session rather than work done while you were away.
+///
+/// `quiet` is longer than a moment because `claude --resume` pauses between
+/// printing the banner and replaying a long transcript, and that pause must not
+/// end the window. `give_up` bounds it, so a child that never goes quiet is
+/// baselined anyway rather than tracked for the life of the process. These are
+/// facts about the Claude CLI, which is why they live here and not in the
+/// terminal crate.
+const CLAUDE_LAUNCH_SETTLE: LaunchSettle =
+  LaunchSettle { quiet: Duration::from_secs(4), give_up: Duration::from_secs(30) };
 
 /// How the Claude CLI should attach to a session UUID.
 ///
@@ -87,17 +101,13 @@ impl SessionState {
     let claude_config = TerminalConfig {
       command: Some(command),
       palette: Some(palette.clone()),
+      launch_settle: Some(CLAUDE_LAUNCH_SETTLE),
       ..Default::default()
     };
     let general_config = TerminalConfig { palette: Some(palette.clone()), ..Default::default() };
 
     let project = project_path.to_path_buf();
     let claude_terminal = cx.new(|cx| TerminalView::new(claude_config, Some(&project), window, cx));
-    // Claude's banner and transcript replay are jc starting the session, not
-    // work done while you were away, so they must not leave the Cmd-P marker
-    // set. Opened here rather than at startup because `Workspace::open_project`
-    // can restore a project's sessions at any point in the run.
-    claude_terminal.read(cx).discount_launch_output();
     let general_terminal =
       cx.new(|cx| TerminalView::new(general_config, Some(&project), window, cx));
     let code_view = cx.new(|cx| CodeView::new(window, cx));

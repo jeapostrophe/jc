@@ -1,20 +1,24 @@
 //! Launch-settle policy: when a freshly spawned child's startup output is over.
 //!
 //! Pure — it observes `Instant`s and answers with a decision — so the policy is
-//! testable without a live PTY. `TerminalView::discount_launch_output` drives it
-//! from the relay that already sees every parsed batch.
+//! testable without a live PTY. `TerminalView`'s notification relay drives it
+//! from the batch signal it already waits on.
+//!
+//! The two durations are the caller's ([`LaunchSettle`], set on
+//! `TerminalConfig`): what counts as "settled" is a fact about the child being
+//! run, not about terminal emulation.
 
 use std::time::{Duration, Instant};
 
-/// How long a child must be quiet before its launch output is discounted.
-/// Longer than a moment because `claude --resume` pauses between printing its
-/// banner and replaying a long transcript, and that pause must not end the
-/// window.
-pub(crate) const LAUNCH_QUIET: Duration = Duration::from_secs(4);
-
-/// Absolute bound on the window. A child that never goes quiet is baselined
-/// anyway rather than being tracked for the life of the process.
-pub(crate) const LAUNCH_GIVE_UP: Duration = Duration::from_secs(30);
+/// How long a child must be quiet for its launch output to count as over, and
+/// how long to wait for that before giving up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchSettle {
+  /// Quiet stretch that ends the launch burst.
+  pub quiet: Duration,
+  /// Absolute bound on the whole window.
+  pub give_up: Duration,
+}
 
 /// What the driver should do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,8 +45,8 @@ pub(crate) struct SettleWindow {
 }
 
 impl SettleWindow {
-  pub(crate) fn new(quiet: Duration, give_up: Duration, now: Instant) -> Self {
-    Self { quiet, deadline: now + give_up, last_batch: None, finished: false }
+  pub(crate) fn new(policy: LaunchSettle, now: Instant) -> Self {
+    Self { quiet: policy.quiet, deadline: now + policy.give_up, last_batch: None, finished: false }
   }
 
   /// Note that the child printed something at `now`, restarting the quiet wait.
@@ -90,13 +94,14 @@ impl SettleWindow {
 mod tests {
   use super::*;
 
-  // Aliases, never copies: a hand-retyped 4s/30s here would keep passing while
-  // the shipped policy drifted away from the one under test.
-  const QUIET: Duration = LAUNCH_QUIET;
-  const GIVE_UP: Duration = LAUNCH_GIVE_UP;
+  // Fixture values, deliberately NOT the shipped ones: these tests pin the
+  // window's behaviour for any policy, so copying jc-app's numbers here would
+  // only create a second place for them to drift.
+  const QUIET: Duration = Duration::from_secs(5);
+  const GIVE_UP: Duration = Duration::from_secs(60);
 
   fn window(start: Instant) -> SettleWindow {
-    SettleWindow::new(QUIET, GIVE_UP, start)
+    SettleWindow::new(LaunchSettle { quiet: QUIET, give_up: GIVE_UP }, start)
   }
 
   /// A child that has printed NOTHING is slow to start, not quiet. Baselining
@@ -142,17 +147,21 @@ mod tests {
   fn quiet_window_restarts_on_each_batch() {
     let start = Instant::now();
     let mut w = window(start);
-    w.note_batch(start + Duration::from_secs(1));
-    w.note_batch(start + Duration::from_secs(3));
+    let banner = start + Duration::from_secs(1);
+    // The replay lands after a pause SHORTER than the quiet window, so it must
+    // restart the wait rather than arriving too late to matter.
+    let replay = banner + QUIET - Duration::from_secs(1);
+    w.note_batch(banner);
+    w.note_batch(replay);
 
     assert!(
-      matches!(w.step(start + Duration::from_secs(6)), SettleStep::Wait(_)),
-      "only 3s of quiet since the last batch — the window must still be open"
+      matches!(w.step(banner + QUIET), SettleStep::Wait(_)),
+      "a quiet window has passed since the BANNER, but not since the replay — still open"
     );
     assert_eq!(
-      w.step(start + Duration::from_secs(7)),
+      w.step(replay + QUIET),
       SettleStep::Clear,
-      "4s of quiet since the last batch — the child has settled"
+      "a full quiet window since the last batch — the child has settled"
     );
   }
 
@@ -162,10 +171,11 @@ mod tests {
   fn clears_exactly_once() {
     let start = Instant::now();
     let mut w = window(start);
-    w.note_batch(start + Duration::from_secs(1));
-    assert_eq!(w.step(start + Duration::from_secs(5)), SettleStep::Clear);
+    let printed = start + Duration::from_secs(1);
+    w.note_batch(printed);
+    assert_eq!(w.step(printed + QUIET), SettleStep::Clear);
     assert_eq!(
-      w.step(start + Duration::from_secs(6)),
+      w.step(printed + QUIET + Duration::from_secs(1)),
       SettleStep::Done,
       "a settled session must be baselined exactly once"
     );
