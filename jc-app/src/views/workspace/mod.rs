@@ -1056,7 +1056,10 @@ impl Workspace {
     project.next_session_id += 1;
 
     // A label is a display name, not an address — see `SessionKey`.
-    let label = "New Session".to_string();
+    // Cosmetic only — nothing addresses a session by label (see
+    // `jc_core::todo::SessionKey`); this just stops the picker showing
+    // several identical rows.
+    let label = jc_core::todo::unique_label(project.todo_view.read(cx).document(), "New Session");
     let uuid = uuid::Uuid::new_v4().to_string();
 
     let session = SessionState::create(

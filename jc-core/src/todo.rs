@@ -544,6 +544,21 @@ pub fn insert_wait_section(text: &str, doc: &TodoDocument, uuid: &str) -> Option
 // Session heading insertion
 // ---------------------------------------------------------------------------
 
+/// A display name not already used by any session in `doc`: `base`, else
+/// `base 2`, `base 3`, ...
+///
+/// **Cosmetic only.** Nothing addresses a session by label (see [`SessionKey`]),
+/// so a duplicate is harmless to correctness — this exists so the session picker
+/// doesn't show several identical rows. Never reintroduce an invariant that
+/// depends on it.
+pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
+  let taken = |candidate: &str| doc.sessions.iter().any(|s| s.label == candidate);
+  if !taken(base) {
+    return base.to_string();
+  }
+  (2..).map(|n| format!("{base} {n}")).find(|c| !taken(c)).unwrap()
+}
+
 /// Build new text with a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading inserted.
 /// If a `# Claude` section exists, the heading goes right after it. Otherwise
 /// a `# Claude` section is appended at the end of the text.
@@ -2163,6 +2178,21 @@ quoted
     assert_eq!(after.sessions[0].status, SessionStatus::Active, "first session untouched");
     assert_eq!(after.sessions[1].uuid, "second");
     assert_eq!(after.sessions[1].status, SessionStatus::Disabled, "second session disabled");
+  }
+
+  #[test]
+  fn unique_label_suffixes_only_on_collision() {
+    let text = "\
+# Claude
+## New Session
+> uuid=a
+## New Session 2
+> uuid=b
+";
+    let doc = parse(text);
+    assert_eq!(unique_label(&doc, "Fresh"), "Fresh");
+    // `New Session` and `New Session 2` are taken, so the next free one is 3.
+    assert_eq!(unique_label(&doc, "New Session"), "New Session 3");
   }
 
   #[test]
