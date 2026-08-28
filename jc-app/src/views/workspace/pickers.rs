@@ -113,8 +113,8 @@ impl Workspace {
               SessionPickerResult::Session(pi, id) => {
                 this.switch_to_session(pi, Some(id), window, cx);
               }
-              SessionPickerResult::Adopt(pi, uuid, label) => {
-                this.adopt_session(pi, &uuid, &label, window, cx);
+              SessionPickerResult::Adopt(pi, key, label) => {
+                this.adopt_session(pi, &key, &label, window, cx);
               }
               SessionPickerResult::InitProject(pi) => {
                 this.create_new_session(pi, window, cx);
@@ -212,23 +212,25 @@ impl Workspace {
             this.pre_picker_focus.take();
             this.dismiss_picker();
             match result {
-              ProjectActionsResult::AdoptTodoSession(pi, uuid, label) => {
-                this.adopt_session(pi, &uuid, &label, window, cx);
+              ProjectActionsResult::AdoptTodoSession(pi, key, label) => {
+                this.adopt_session(pi, &key, &label, window, cx);
               }
               ProjectActionsResult::CreateNew => {
                 this.create_new_session(pi, window, cx);
               }
               ProjectActionsResult::AdoptJsonlSession(uuid, summary) => {
-                // The summary is the transcript's first user message, so two
-                // sessions that opened with the same prompt would otherwise
-                // produce two identically-named headings.
+                // The summary is the transcript's first user message. Two
+                // sessions that opened with the same prompt get the same
+                // display name, which is harmless: the heading is addressed by
+                // the UUID written with it (see `jc_core::todo::SessionKey`).
                 let todo_view = this.projects[pi].todo_view.clone();
-                let label = jc_core::todo::unique_label(todo_view.read(cx).document(), &summary);
+                let label = summary.clone();
                 todo_view.update(cx, |tv, cx| {
                   tv.insert_session_heading(&uuid, &label, window, cx);
                   tv.save(cx);
                 });
-                this.adopt_session(pi, &uuid, &label, window, cx);
+                let key = jc_core::todo::SessionKey::Uuid(uuid.clone());
+                this.adopt_session(pi, &key, &label, window, cx);
               }
             }
             cx.notify();

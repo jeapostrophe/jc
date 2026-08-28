@@ -27,7 +27,7 @@ pub struct TodoView {
   code_view: Entity<CodeView>,
   file_path: PathBuf,
   document: TodoDocument,
-  active_label: Option<String>,
+  active_uuid: Option<String>,
   _editor_subscription: Subscription,
 }
 
@@ -58,7 +58,7 @@ impl TodoView {
     let text = code_view.read(cx).editor_text(cx);
     let document = todo::parse(&text);
 
-    Self { code_view, file_path, document, active_label: None, _editor_subscription }
+    Self { code_view, file_path, document, active_uuid: None, _editor_subscription }
   }
 
   pub fn code_view(&self) -> &Entity<super::code_view::CodeView> {
@@ -85,9 +85,10 @@ impl TodoView {
     self.code_view.update(cx, |cv, cx| cv.scroll_to_line(line, window, cx));
   }
 
-  /// Return the line number of the last line in the WAIT body for `label`.
-  pub fn wait_line(&self, label: &str, cx: &App) -> Option<u32> {
-    let wait = self.document.session_by_label(label)?.wait.as_ref()?;
+  /// 0-based line of the last line in the WAIT body of the session bound to
+  /// `uuid` -- where the cursor goes so the user can type.
+  pub fn wait_line(&self, uuid: &str, cx: &App) -> Option<u32> {
+    let wait = self.document.session_by_uuid(uuid)?.wait.as_ref()?;
     Some(wait.body_end_line(&self.editor_text(cx)))
   }
 }
@@ -109,12 +110,12 @@ impl TodoView {
     &self.document
   }
 
-  /// Set the active session label. The active session's headings get
-  /// highlighted with the `@type` / `@function` theme colors while
-  /// other sessions use default markdown heading colors.
-  pub fn set_active_label(&mut self, label: Option<&str>, cx: &mut Context<Self>) {
-    let changed = self.active_label.as_deref() != label;
-    self.active_label = label.map(|s| s.to_string());
+  /// Set the active session's UUID. Its headings get highlighted with the
+  /// `@type` / `@function` theme colors while other sessions use default
+  /// markdown heading colors.
+  pub fn set_active_uuid(&mut self, uuid: Option<&str>, cx: &mut Context<Self>) {
+    let changed = self.active_uuid.as_deref() != uuid;
+    self.active_uuid = uuid.map(|s| s.to_string());
     if changed {
       self.apply_session_highlights(cx);
     }
@@ -195,13 +196,13 @@ impl TodoView {
   /// immediately).
   pub fn send_selection(
     &mut self,
-    label: &str,
+    uuid: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> Option<(String, Option<NaiveDateTime>)> {
     let text = self.editor_text(cx);
     let selection = self.code_view.read(cx).editor().read(cx).selection_byte_range();
-    let session = self.document.session_by_label(label)?;
+    let session = self.document.session_by_uuid(uuid)?;
     let now = now_unix_secs();
     let now_local = chrono::Local::now().naive_local();
     let result = todo::send_from_wait(&text, session, selection, Some(now), now_local)?;
@@ -218,27 +219,27 @@ impl TodoView {
     Some((result.message_text, result.schedule))
   }
 
-  /// Whether `label` currently has a pending scheduled `### Message N @jc(...)`
-  /// marker. Reads the cached `self.document`, which is re-parsed on every
+  /// Whether the session bound to `uuid` currently has a pending scheduled
+  /// `### Message N @jc(...)` marker. Reads the cached `self.document`, which is re-parsed on every
   /// editor change, so a marker the user just added or removed is already
   /// reflected — no re-parse needed on this per-send hot path.
-  pub fn has_pending_schedule(&self, label: &str) -> bool {
-    self.document.session_by_label(label).and_then(|s| s.pending_scheduled()).is_some()
+  pub fn has_pending_schedule(&self, uuid: &str) -> bool {
+    self.document.session_by_uuid(uuid).and_then(|s| s.pending_scheduled()).is_some()
   }
 
-  /// Fire a scheduled send for `label`. jc-core [`todo::fire_scheduled`] owns the
+  /// Fire a scheduled send for the session bound to `uuid`. jc-core [`todo::fire_scheduled`] owns the
   /// policy (has the time arrived? cancelled? rescheduled?) and text rewrite;
   /// this only applies the rewritten text and maps to a [`ScheduledFire`] for the
   /// workspace to act on.
   pub fn deliver_scheduled(
     &mut self,
-    label: &str,
+    uuid: &str,
     now_local: NaiveDateTime,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> ScheduledFire {
     let text = self.editor_text(cx);
-    match todo::fire_scheduled(&text, label, now_local, now_unix_secs()) {
+    match todo::fire_scheduled(&text, uuid, now_local, now_unix_secs()) {
       todo::FireOutcome::Deliver { new_text, body } => {
         self.set_text_and_save(new_text, window, cx);
         ScheduledFire::Deliver(body)
@@ -273,23 +274,15 @@ impl TodoView {
 
   /// Ensure the session has a WAIT section, inserting one if missing.
   /// Returns true if a WAIT section was added.
-  pub fn ensure_wait(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+  pub fn ensure_wait(&mut self, uuid: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
     let text = self.editor_text(cx);
-    if let Some(new_text) = todo::insert_wait_section(&text, &self.document, label) {
+    if let Some(new_text) = todo::insert_wait_section(&text, &self.document, uuid) {
       self.set_text(new_text, window, cx);
       self.save(cx);
       true
     } else {
       false
     }
-  }
-
-  /// Repair duplicate labels in one rewrite. Returns whether anything changed.
-  pub fn dedupe_labels(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-    let text = self.editor_text(cx);
-    let Some(new_text) = todo::dedupe_labels(&text, &self.document) else { return false };
-    self.set_text_and_save(new_text, window, cx);
-    true
   }
 
   /// Write `new_uuid` onto the session at `index` in the parsed document.
@@ -320,8 +313,7 @@ impl TodoView {
   /// color, except a pending scheduled `### Message N @jc(...)` heading → `@keyword`
   /// color so it stands out as not-yet-delivered.
   fn apply_session_highlights(&self, cx: &mut Context<Self>) {
-    let session =
-      self.active_label.as_deref().and_then(|label| self.document.session_by_label(label));
+    let session = self.active_uuid.as_deref().and_then(|uuid| self.document.session_by_uuid(uuid));
 
     let Some(session) = session else {
       self.code_view.update(cx, |cv, cx| {

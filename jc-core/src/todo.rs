@@ -18,31 +18,41 @@ pub struct TodoDocument {
 ///
 /// **This is the canonical note on session addressing; other sites point here.**
 ///
-/// A heading normally carries a UUID, which is a true unique address. A heading
-/// an older jc created but never bound has an empty `> uuid=`, and an empty
-/// string is *not* an address — every unbound heading shares it, so keying on it
-/// silently resolves to the first one. Those fall back to the label.
+/// **A label is never an address.** TODO.md is a file the user edits by hand, so
+/// two headings can share a label at any instant — paste a second
+/// `## New Session` block and nothing has run in between. Every label lookup
+/// takes the FIRST heading that matches, so keying a *write* on one silently
+/// redirects a send, or a scheduled `@jc(...)` delivery, to the wrong session.
+/// Every text operation ([`insert_wait_section`], [`fire_scheduled`],
+/// the WAIT-cursor, highlight and send paths in the app) therefore keys on the
+/// UUID, which is unique.
 ///
-/// The label is only usable as an address because jc keeps labels unique:
-/// [`unique_label`] at every creation point and [`rename_session_at`] (via
-/// `ProjectState::dedupe_labels`) to repair older files. That matters well
-/// beyond this type — TODO.md's *text* operations (`insert_wait_section`,
-/// `send_from_wait`, `TodoDocument::wait_line`, the `@jc(...)` scheduled-send
-/// timers) all resolve a session by label, and every one of them takes the FIRST
-/// heading that matches. A duplicate label therefore does not merely confuse a
-/// reader: it silently redirects a send, or a scheduled delivery, to the wrong
-/// session.
+/// The one heading a UUID cannot address is one an older jc created and never
+/// bound: its `> uuid=` is empty, and the empty string names every such heading
+/// at once. That case is addressed by POSITION, and the position is *verified*
+/// at write time — [`TodoDocument::index_of`] re-checks that the heading at that
+/// index is still unbound and still carries the label the key was taken with,
+/// and refuses otherwise. That check reads the live document, so it holds
+/// continuously rather than resting on a one-shot repair pass; it is also what
+/// makes the key survive the window between a picker snapshot and its confirm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionKey {
+  /// A bound heading, addressed by its (unique) UUID.
   Uuid(String),
-  Label(String),
+  /// A heading with an empty `> uuid=`, addressed by its position in
+  /// [`TodoDocument::sessions`] plus the label it carried when the key was taken.
+  Unbound { index: usize, label: String },
 }
 
 impl SessionKey {
-  /// The best available address for a heading: its UUID, or its label when the
-  /// heading is unbound.
-  pub fn new(uuid: &str, label: &str) -> Self {
-    if uuid.is_empty() { Self::Label(label.to_string()) } else { Self::Uuid(uuid.to_string()) }
+  /// The address of the heading at `index`: its UUID, or its verified position
+  /// when the heading is unbound.
+  pub fn new(uuid: &str, index: usize, label: &str) -> Self {
+    if uuid.is_empty() {
+      Self::Unbound { index, label: label.to_string() }
+    } else {
+      Self::Uuid(uuid.to_string())
+    }
   }
 }
 
@@ -131,8 +141,10 @@ impl TodoDocument {
     self.sessions.first()
   }
 
+  /// The session bound to `uuid`. An empty `uuid` names no session — see
+  /// [`SessionKey`].
   pub fn session_by_uuid(&self, uuid: &str) -> Option<&TodoSession> {
-    self.sessions.iter().find(|s| s.uuid == uuid)
+    self.sessions.get(self.index_by_uuid(uuid)?)
   }
 
   /// Position of the session owning `uuid` in [`Self::sessions`], for the
@@ -149,11 +161,15 @@ impl TodoDocument {
     self.sessions.iter().position(|s| s.uuid == uuid)
   }
 
-  /// Position of the session `key` names.
+  /// Position of the session `key` names, or `None` if the document has moved
+  /// out from under an [`SessionKey::Unbound`] key — see [`SessionKey`].
   pub fn index_of(&self, key: &SessionKey) -> Option<usize> {
     match key {
       SessionKey::Uuid(uuid) => self.index_by_uuid(uuid),
-      SessionKey::Label(label) => self.sessions.iter().position(|s| s.label == *label),
+      SessionKey::Unbound { index, label } => {
+        let session = self.sessions.get(*index)?;
+        (session.uuid.is_empty() && session.label == *label).then_some(*index)
+      }
     }
   }
 
@@ -162,38 +178,25 @@ impl TodoDocument {
     self.sessions.get(self.index_of(key)?)
   }
 
-  pub fn session_by_label(&self, label: &str) -> Option<&TodoSession> {
-    self.sessions.iter().find(|s| s.label == label)
-  }
-
   pub fn session_uuids(&self) -> Vec<&str> {
     self.sessions.iter().map(|s| s.uuid.as_str()).collect()
   }
 
-  /// Returns the 1-based line number of the last line of the WAIT body for the
-  /// given session (by label). This is the line where a user would type new content.
-  /// If the WAIT body is empty, returns the line right after the heading.
-  pub fn wait_body_end_line(&self, label: &str, text: &str) -> Option<u32> {
-    let wait = self.session_by_label(label)?.wait.as_ref()?;
-    let body = &text[wait.body_byte_range.clone()];
-    // Count newlines in the body to find how many lines it spans.
-    let body_lines = body.chars().filter(|&c| c == '\n').count() as u32;
-    // The body starts on the line after the WAIT heading.
-    // If body is empty or only whitespace, place cursor on the line after heading.
-    // Otherwise, place on the last non-empty line of the body.
-    let last_line = wait.line + body_lines.max(1);
-    Some(last_line)
+  /// Byte offset where the session at `index` ends (the start of the next
+  /// session heading, or end of document).
+  fn session_end_offset(&self, index: usize, text_len: usize) -> Option<usize> {
+    self.sessions.get(index)?;
+    Some(self.sessions.get(index + 1).map_or(text_len, |s| s.heading_byte_range.start))
   }
+}
 
-  /// Returns the byte offset where a session's content ends (the start of the
-  /// next session heading, or end of document).
-  pub fn session_end_offset(&self, label: &str, text_len: usize) -> Option<usize> {
-    let idx = self.sessions.iter().position(|s| s.label == label)?;
-    if idx + 1 < self.sessions.len() {
-      Some(self.sessions[idx + 1].heading_byte_range.start)
-    } else {
-      Some(text_len)
-    }
+/// Fixture lookup for tests. **Not an address** — two headings can share a label
+/// and this takes the first (see [`SessionKey`]); production code keys on the
+/// UUID.
+#[cfg(test)]
+impl TodoDocument {
+  pub fn session_by_label(&self, label: &str) -> Option<&TodoSession> {
+    self.sessions.iter().find(|s| s.label == label)
   }
 }
 
@@ -476,8 +479,9 @@ fn finalize_wait_body(session: &mut TodoSession, boundary: usize) {
 
 /// Insert a `### WAIT\n` heading at the end of a session that lacks one.
 /// Returns the new document text, or `None` if the session already has a WAIT.
-pub fn insert_wait_section(text: &str, doc: &TodoDocument, label: &str) -> Option<String> {
-  let session = doc.session_by_label(label)?;
+pub fn insert_wait_section(text: &str, doc: &TodoDocument, uuid: &str) -> Option<String> {
+  let index = doc.index_by_uuid(uuid)?;
+  let session = &doc.sessions[index];
   if let Some(wait) = &session.wait {
     // WAIT exists — ensure there is a blank line after the heading so the
     // cursor has somewhere to land.  If the body is empty and the next
@@ -502,7 +506,7 @@ pub fn insert_wait_section(text: &str, doc: &TodoDocument, label: &str) -> Optio
     new_text.push_str(&text[body_start..]);
     return Some(new_text);
   }
-  let end = doc.session_end_offset(label, text.len())?;
+  let end = doc.session_end_offset(index, text.len())?;
   let mut new_text = String::with_capacity(text.len() + 16);
   new_text.push_str(&text[..end]);
   // Ensure a blank line before the heading.
@@ -521,21 +525,12 @@ pub fn insert_wait_section(text: &str, doc: &TodoDocument, label: &str) -> Optio
 // Session heading insertion
 // ---------------------------------------------------------------------------
 
-/// A label not already used by any session in `doc`: `base`, else `base 2`,
-/// `base 3`, ... Every path that creates a heading routes its label through
-/// this, so the label stays usable as an address (see [`SessionKey`]).
-pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
-  if doc.session_by_label(base).is_none() {
-    return base.to_string();
-  }
-  (2..).map(|n| format!("{base} {n}")).find(|c| doc.session_by_label(c).is_none()).unwrap()
-}
-
 /// Build new text with a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading inserted.
 /// If a `# Claude` section exists, the heading goes right after it. Otherwise
 /// a `# Claude` section is appended at the end of the text.
 ///
-/// Does NOT uniquify `label`; pass it through [`unique_label`] first.
+/// `label` need not be unique: it is a display name, not an address (see
+/// [`SessionKey`]).
 pub fn insert_session_heading(text: &str, doc: &TodoDocument, uuid: &str, label: &str) -> String {
   let heading = format!("## {label}\n> uuid={uuid}\n\n### WAIT\n");
 
@@ -585,58 +580,6 @@ fn splice(text: &str, range: Range<usize>, replacement: &str) -> String {
   let mut out = text.to_string();
   out.replace_range(range, replacement);
   out
-}
-
-/// Give every heading whose label repeats an earlier one a fresh unique label,
-/// in a single rewrite. `None` if there were no duplicates.
-///
-/// Renames back-to-front so each splice leaves earlier byte ranges valid, which
-/// is what lets the whole repair happen in one pass instead of one re-parse per
-/// duplicate.
-pub fn dedupe_labels(text: &str, doc: &TodoDocument) -> Option<String> {
-  let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-  let mut taken: Vec<String> = Vec::new();
-  let mut renames: Vec<(usize, String)> = Vec::new();
-  for (index, session) in doc.sessions.iter().enumerate() {
-    if seen.insert(session.label.as_str()) {
-      continue;
-    }
-    // `unique_label` only sees the document as parsed, so names handed out
-    // earlier in this same pass have to be excluded too.
-    let mut candidate = unique_label(doc, &session.label);
-    let mut n = 2;
-    while taken.contains(&candidate) {
-      n += 1;
-      candidate = format!("{} {n}", session.label);
-    }
-    taken.push(candidate.clone());
-    renames.push((index, candidate));
-  }
-  if renames.is_empty() {
-    return None;
-  }
-  // Back to front, so each rewrite only disturbs bytes after the ranges the
-  // remaining ones still need — which is what lets every rename reuse the
-  // single parse in `doc`.
-  let mut out = text.to_string();
-  for (index, label) in renames.into_iter().rev() {
-    out = rename_session_at(&out, doc, index, &label)?;
-  }
-  Some(out)
-}
-
-/// Rewrite the label of the session at `index`, preserving its `[D]` prefix.
-/// Used to repair duplicate labels in a file written before [`unique_label`]
-/// existed — see [`SessionKey`] for why duplicates are harmful.
-pub fn rename_session_at(
-  text: &str,
-  doc: &TodoDocument,
-  index: usize,
-  new_label: &str,
-) -> Option<String> {
-  let session = doc.sessions.get(index)?;
-  let prefix = if session.status == SessionStatus::Disabled { "[D] " } else { "" };
-  Some(splice(text, session.heading_byte_range.clone(), &format!("## {prefix}{new_label}")))
 }
 
 /// Toggle the `[D]` (disabled/dormant) prefix on the session at `index`.
@@ -891,18 +834,18 @@ pub enum FireOutcome {
   Cancelled { new_text: Option<String> },
 }
 
-/// Evaluate `label`'s pending scheduled send against `now_local`, producing the
-/// rewritten document text and what the caller should do. Pure: parses `text`
-/// once and owns the marker-drop + `> last=` stamp so callers never reason about
-/// byte-range validity across intermediate strings.
+/// Evaluate the pending scheduled send of the session bound to `uuid` against
+/// `now_local`, producing the rewritten document text and what the caller should
+/// do. Pure: parses `text` once and owns the marker-drop + `> last=` stamp so
+/// callers never reason about byte-range validity across intermediate strings.
 pub fn fire_scheduled(
   text: &str,
-  label: &str,
+  uuid: &str,
   now_local: NaiveDateTime,
   now_secs: u64,
 ) -> FireOutcome {
   let doc = parse(text);
-  let Some(session) = doc.session_by_label(label) else {
+  let Some(session) = doc.session_by_uuid(uuid) else {
     return FireOutcome::Cancelled { new_text: None };
   };
   let Some(pending) = session.pending_scheduled() else {
@@ -2059,7 +2002,7 @@ quoted
   fn fire_scheduled_delivers_when_due() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-13 07:30)\nfix the parser\n### WAIT\n";
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 31, 0).unwrap();
-    match fire_scheduled(text, "S", now, 1700000000) {
+    match fire_scheduled(text, "abc", now, 1700000000) {
       FireOutcome::Deliver { new_text, body } => {
         assert_eq!(body, "fix the parser");
         assert!(new_text.contains("### Message 0\n")); // marker dropped
@@ -2075,7 +2018,7 @@ quoted
     let text =
       "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-13 09:00)\nbody\n### WAIT\n";
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 0, 0).unwrap();
-    match fire_scheduled(text, "S", now, 1) {
+    match fire_scheduled(text, "abc", now, 1) {
       FireOutcome::Reschedule(when) => {
         assert_eq!(
           when,
@@ -2090,7 +2033,7 @@ quoted
   fn fire_scheduled_empty_body_cancels_but_drops_marker() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-13 07:30)\n\n### WAIT\n";
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 31, 0).unwrap();
-    match fire_scheduled(text, "S", now, 1) {
+    match fire_scheduled(text, "abc", now, 1) {
       FireOutcome::Cancelled { new_text: Some(nt) } => {
         assert!(!nt.contains("@jc(")); // marker dropped so session isn't locked
         assert!(!nt.contains("> last=")); // nothing delivered → no stamp
@@ -2103,7 +2046,10 @@ quoted
   fn fire_scheduled_no_marker_is_noop() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0\nbody\n### WAIT\n";
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 31, 0).unwrap();
-    assert!(matches!(fire_scheduled(text, "S", now, 1), FireOutcome::Cancelled { new_text: None }));
+    assert!(matches!(
+      fire_scheduled(text, "abc", now, 1),
+      FireOutcome::Cancelled { new_text: None }
+    ));
   }
 
   #[test]
@@ -2205,14 +2151,14 @@ quoted
 
   #[test]
   fn empty_uuid_is_not_an_address() {
-    // Two legacy headings an older jc never bound. Keying on their (shared)
-    // empty UUID must not silently resolve to the first one; the label must.
+    // Two legacy headings an older jc never bound, sharing a label. Neither the
+    // empty UUID nor the label distinguishes them, so only position can.
     let text = "\
 # Claude
-## First
+## S
 
 ### WAIT
-## Second
+## S
 
 ### WAIT
 ";
@@ -2220,54 +2166,119 @@ quoted
     assert_eq!(doc.sessions.len(), 2);
     assert!(doc.sessions.iter().all(|s| s.uuid.is_empty()), "both headings unbound");
     assert_eq!(doc.index_by_uuid(""), None, "an empty uuid names no session");
-    assert_eq!(doc.index_of(&SessionKey::new("", "Second")), Some(1));
-    assert_eq!(doc.index_of(&SessionKey::new("", "First")), Some(0));
-    assert_eq!(doc.index_of(&SessionKey::new("", "Nope")), None);
+
+    let second = SessionKey::new("", 1, &doc.sessions[1].label);
+    assert_eq!(doc.index_of(&second), Some(1), "an unbound heading is addressed by position");
+
+    // The document moved under the key: refuse rather than write to whatever
+    // now sits at that index. Each case re-parses a document the user could
+    // have produced between a picker snapshot and its confirm.
+    let renamed = parse("# Claude\n## S\n\n### WAIT\n## T\n\n### WAIT\n");
+    assert_eq!(renamed.index_of(&second), None, "the label at index 1 changed");
+    let bound = parse("# Claude\n## S\n\n### WAIT\n## S\n> uuid=bbb\n\n### WAIT\n");
+    assert_eq!(bound.index_of(&second), None, "the heading at index 1 is bound now");
+    let shorter = parse("# Claude\n## S\n\n### WAIT\n");
+    assert_eq!(shorter.index_of(&second), None, "index 1 no longer exists");
+  }
+
+  // Two headings sharing a label is a shape a hand-edit produces at any instant
+  // -- paste a `## New Session` block mid-run and every text operation on that
+  // label resolves to the first heading until the next restart. The three tests
+  // below pin each such operation to the UUID instead.
+
+  /// Fixture: two `## S` headings, the second bound to `bbb`.
+  fn two_same_labelled_headings() -> &'static str {
+    "\
+# Claude
+## S
+> uuid=aaa
+
+### WAIT
+one
+## S
+> uuid=bbb
+
+### WAIT
+two
+three
+"
   }
 
   #[test]
-  fn dedupe_labels_repairs_every_duplicate_in_one_pass() {
+  fn fire_scheduled_addresses_the_second_of_two_same_labelled_headings() {
     let text = "\
 # Claude
-## New Session
-> uuid=a
-## [D] New Session
-> uuid=b
-## Other
-> uuid=c
-## New Session
-> uuid=d
+## S
+> uuid=aaa
+
+### WAIT
+## S
+> uuid=bbb
+
+### Message 0 @jc(2026-07-13 08:00)
+hello
+
+### WAIT
 ";
     let doc = parse(text);
-    let fixed = dedupe_labels(text, &doc).unwrap();
-    let after = parse(&fixed);
-    let labels: Vec<&str> = after.sessions.iter().map(|s| s.label.as_str()).collect();
-    assert_eq!(labels, vec!["New Session", "New Session 2", "Other", "New Session 3"]);
-    // UUIDs must not have moved: each rename hit its own heading.
-    let uuids: Vec<&str> = after.sessions.iter().map(|s| s.uuid.as_str()).collect();
-    assert_eq!(uuids, vec!["a", "b", "c", "d"]);
-    assert_eq!(after.sessions[1].status, SessionStatus::Disabled, "[D] survives");
-    // Idempotent: a clean document needs no rewrite.
-    assert!(dedupe_labels(&fixed, &after).is_none());
+    assert!(doc.sessions[0].pending_scheduled().is_none(), "no marker on the first heading");
+    assert!(doc.sessions[1].pending_scheduled().is_some(), "the marker is on the second");
+    match fire_scheduled(text, &doc.sessions[1].uuid, test_now(), 1700000000) {
+      FireOutcome::Deliver { body, .. } => assert_eq!(body, "hello"),
+      _ => panic!("the second heading's scheduled send was not delivered"),
+    }
   }
 
   #[test]
-  fn rename_session_at_disambiguates_and_keeps_the_disabled_prefix() {
+  fn insert_wait_section_addresses_the_second_of_two_same_labelled_headings() {
     let text = "\
 # Claude
-## New Session
-> uuid=first
-## [D] New Session
-> uuid=second
+## S
+> uuid=aaa
+
+### WAIT
+one
+## S
+> uuid=bbb
 ";
     let doc = parse(text);
-    // Second heading is the duplicate; rename it the way startup repair does.
-    let fixed = rename_session_at(text, &doc, 1, &unique_label(&doc, "New Session")).unwrap();
-    let after = parse(&fixed);
-    assert_eq!(after.sessions[0].label, "New Session");
-    assert_eq!(after.sessions[1].label, "New Session 2");
-    assert_eq!(after.sessions[1].uuid, "second", "renamed the right heading");
-    assert_eq!(after.sessions[1].status, SessionStatus::Disabled, "[D] survives the rename");
+    assert!(doc.sessions[0].wait.is_some(), "the first heading already has a WAIT");
+    assert!(doc.sessions[1].wait.is_none(), "only the second heading lacks one");
+
+    let new_text = insert_wait_section(text, &doc, &doc.sessions[1].uuid)
+      .expect("the second heading needs a WAIT inserted");
+    let after = parse(&new_text);
+    assert!(after.sessions[1].wait.is_some(), "the second heading got a WAIT");
+    // Everything above the second heading must be byte-identical: both spans are
+    // taken from the parse, so nothing here restates how the insert works.
+    assert_eq!(
+      &new_text[..after.sessions[1].heading_byte_range.start],
+      &text[..doc.sessions[1].heading_byte_range.start],
+      "the write landed on the first heading",
+    );
+  }
+
+  #[test]
+  fn wait_cursor_addresses_the_second_of_two_same_labelled_headings() {
+    let text = two_same_labelled_headings();
+    let doc = parse(text);
+    // `TodoView::wait_line` is exactly this composition: resolve the session by
+    // UUID, then ask its WAIT where the body ends.
+    let wait = doc
+      .session_by_uuid(&doc.sessions[1].uuid)
+      .expect("the second heading is bound")
+      .wait
+      .as_ref()
+      .expect("the second heading has a WAIT");
+    let line = wait.body_end_line(text);
+    // The expected line is derived from the parsed second body, not counted by
+    // hand: the cursor must land on that body's last non-blank line.
+    let last = text[wait.body_byte_range.clone()].lines().rfind(|l| !l.trim().is_empty());
+    assert_eq!(
+      text.lines().nth(line as usize),
+      last,
+      "the cursor landed outside the second heading's WAIT body",
+    );
   }
 
   #[test]
@@ -2433,24 +2444,6 @@ draft
     let final_doc = parse(&twice);
     let uuids: Vec<&str> = final_doc.sessions.iter().map(|s| s.uuid.as_str()).collect();
     assert_eq!(uuids, vec!["uuid-a", "uuid-b"], "each session keeps its own UUID");
-  }
-
-  #[test]
-  fn unique_label_suffixes_only_on_collision() {
-    let text = "\
-# Claude
-## New Session
-> uuid=a
-## New Session 2
-> uuid=b
-## Other
-> uuid=c
-";
-    let doc = parse(text);
-    assert_eq!(unique_label(&doc, "Fresh"), "Fresh");
-    // `New Session` and `New Session 2` are taken, so the next free one is 3.
-    assert_eq!(unique_label(&doc, "New Session"), "New Session 3");
-    assert_eq!(unique_label(&doc, "Other"), "Other 2");
   }
 
   #[test]

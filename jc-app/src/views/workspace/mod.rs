@@ -98,6 +98,9 @@ pub struct Workspace {
   _schedule_reconcile_task: Option<Task<()>>,
   /// (project path, session label, delivery time) tuples that already have a
   /// timer armed, so reconciliation doesn't double-arm the same scheduled send.
+  /// Scheduled sends with a live timer, keyed `(project path, session UUID,
+  /// fire time)`. The UUID, not the label: two headings can share a label at
+  /// any instant (see `jc_core::todo::SessionKey`).
   armed_schedules: std::collections::HashSet<(PathBuf, String, NaiveDateTime)>,
   global_todo_view: Entity<crate::views::code_view::CodeView>,
   keybinding_help: Option<(AnyView, Subscription)>,
@@ -736,16 +739,11 @@ impl Workspace {
     // When switching to the TODO editor, ensure a WAIT section exists and scroll to it.
     if kind == PaneContentKind::TodoEditor {
       let project = &self.projects[self.active_project_index];
-      if let Some(label) = project.active_label() {
+      if let Some(uuid) = project.active_uuid().map(str::to_string) {
         let todo_view = project.todo_view.clone();
-        todo_view.update(cx, |tv, cx| tv.ensure_wait(label, window, cx));
-        let project = &self.projects[self.active_project_index];
-        let tv = project.todo_view.read(cx);
-        let text = tv.editor_text(cx);
-        if let Some(wait_line) = tv.document().wait_body_end_line(label, &text) {
-          let wait_line_0 = wait_line.saturating_sub(1);
-          let _ = tv;
-          project.todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line_0, window, cx));
+        todo_view.update(cx, |tv, cx| tv.ensure_wait(&uuid, window, cx));
+        if let Some(wait_line) = todo_view.read(cx).wait_line(&uuid, cx) {
+          todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line, window, cx));
         }
       }
     }
@@ -907,9 +905,9 @@ impl Workspace {
     }
 
     // Update the TODO view's active session highlight.
-    let label = self.projects[project_idx].active_label().map(|s| s.to_string());
+    let uuid = self.projects[project_idx].active_uuid().map(|s| s.to_string());
     let todo_view = self.projects[project_idx].todo_view.clone();
-    todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
+    todo_view.update(cx, |tv, cx| tv.set_active_uuid(uuid.as_deref(), cx));
 
     // Breadcrumb observers depend on the active session's code_view.
     self.refresh_breadcrumb_observers(cx);
@@ -1057,9 +1055,8 @@ impl Workspace {
     let id = project.next_session_id;
     project.next_session_id += 1;
 
-    // Uniquify — see `jc_core::todo::SessionKey` for why a duplicate label
-    // silently misroutes a send.
-    let label = jc_core::todo::unique_label(project.todo_view.read(cx).document(), "New Session");
+    // A label is a display name, not an address — see `jc_core::todo::SessionKey`.
+    let label = "New Session".to_string();
     let uuid = uuid::Uuid::new_v4().to_string();
 
     let session = SessionState::create(
@@ -1090,13 +1087,16 @@ impl Workspace {
   /// session Claude has garbage-collected comes back as a fresh conversation
   /// under its own UUID instead of a dead pane.
   ///
-  /// An empty `uuid` is a heading an older jc left unbound. One is minted and
-  /// written here rather than at startup, so binding a legacy heading to a new
-  /// (empty) conversation is something the user chose to do.
+  /// `key` may be a `SessionKey::Unbound` — a heading an older jc left with a
+  /// blank `> uuid=`. Adoption is the one operation that mints a UUID, and it
+  /// happens here rather than at startup so binding a legacy heading to a new
+  /// (empty) conversation is something the user chose to do. The heading is
+  /// re-resolved against the *live* document, so a key taken from a picker
+  /// snapshot cannot write to a heading that has moved since.
   fn adopt_session(
     &mut self,
     project_idx: usize,
-    uuid: &str,
+    key: &jc_core::todo::SessionKey,
     label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
@@ -1108,29 +1108,28 @@ impl Workspace {
     // `launch_for` would get `Resume` when the filesystem can't be seen at all
     // (`$HOME` unset) and spawn `claude --resume <fresh-uuid>` into a dead pane,
     // permanently, since the heading is bound by then.
-    let (uuid, minted_launch) = if uuid.is_empty() {
-      let minted = uuid::Uuid::new_v4().to_string();
-      let key = jc_core::todo::SessionKey::Label(label.to_string());
-      let written = todo_view.update(cx, |tv, cx| {
-        let Some(index) = tv.document().index_of(&key) else { return false };
-        tv.update_session_uuid_at(index, &minted, window, cx);
-        true
-      });
-      // Refuse to launch a session whose UUID isn't in the file. It could never
-      // be label-synced or disabled afterwards (both key on the UUID), and the
-      // still-unbound heading would stay adoptable — so a second press would
-      // spawn a second process for the same heading.
-      if !written {
-        eprintln!("adopt: no TODO heading labelled {label:?}; not launching");
-        // The picker already dropped `pre_picker_focus` on the assumption that
-        // this call would focus something. It won't, so do it here or the next
-        // keystroke goes nowhere.
-        self.panes[self.active_pane_index].read(cx).focus_content(window);
-        return;
+    let resolved = todo_view.update(cx, |tv, cx| {
+      let index = tv.document().index_of(key)?;
+      let uuid = tv.document().sessions[index].uuid.clone();
+      if !uuid.is_empty() {
+        return Some((uuid, None));
       }
-      (minted, Some(Launch::New))
-    } else {
-      (uuid.to_string(), None)
+      let minted = uuid::Uuid::new_v4().to_string();
+      tv.update_session_uuid_at(index, &minted, window, cx);
+      Some((minted, Some(Launch::New)))
+    });
+
+    // Refuse to launch a session whose UUID isn't in the file. It could never
+    // be label-synced or disabled afterwards (both key on the UUID), and the
+    // still-unbound heading would stay adoptable — so a second press would
+    // spawn a second process for the same heading.
+    let Some((uuid, minted_launch)) = resolved else {
+      eprintln!("adopt: no TODO heading for {key:?}; not launching");
+      // The picker already dropped `pre_picker_focus` on the assumption that
+      // this call would focus something. It won't, so do it here or the next
+      // keystroke goes nowhere.
+      self.panes[self.active_pane_index].read(cx).focus_content(window);
+      return;
     };
     let uuid = &uuid;
 
@@ -1202,7 +1201,7 @@ impl Workspace {
     // never is, so this is `None` for a `Label` key.
     let adopted_id = match key {
       jc_core::todo::SessionKey::Uuid(uuid) => project.session_by_uuid(uuid).map(|(id, _)| id),
-      jc_core::todo::SessionKey::Label(_) => None,
+      jc_core::todo::SessionKey::Unbound { .. } => None,
     };
 
     todo_view.update(cx, |tv, cx| {
@@ -1320,41 +1319,39 @@ impl Workspace {
     }
 
     let project = &self.projects[self.active_project_index];
-    let Some(label) = project.active_label().map(str::to_string) else {
-      return;
-    };
     let Some(session) = project.active_session() else {
       return;
     };
+    let uuid = session.uuid.clone();
     let claude_terminal = session.claude_terminal.clone();
     let todo_view = project.todo_view.clone();
 
     // Block all sends while a scheduled message is pending on this session — a
     // second queued send to the same Claude is undefined. Beep like a rejected
     // keystroke and no-op; the user cancels by editing out the `@jc(...)` marker.
-    if todo_view.read(cx).has_pending_schedule(&label) {
+    if todo_view.read(cx).has_pending_schedule(&uuid) {
       crate::notify::beep();
       return;
     }
 
     // Insert a WAIT section if the session doesn't have one.
     todo_view.update(cx, |tv, cx| {
-      tv.ensure_wait(&label, window, cx);
+      tv.ensure_wait(&uuid, window, cx);
     });
 
     let Some((message_text, schedule)) =
-      todo_view.update(cx, |tv, cx| tv.send_selection(&label, window, cx))
+      todo_view.update(cx, |tv, cx| tv.send_selection(&uuid, window, cx))
     else {
       return;
     };
 
     // Re-run ensure_wait so the empty WAIT body gets a blank line for typing.
     todo_view.update(cx, |tv, cx| {
-      tv.ensure_wait(&label, window, cx);
+      tv.ensure_wait(&uuid, window, cx);
     });
 
     // Scroll to the WAIT section so the user sees their new typing area.
-    if let Some(wait_line) = todo_view.read(cx).wait_line(&label, cx) {
+    if let Some(wait_line) = todo_view.read(cx).wait_line(&uuid, cx) {
       todo_view.update(cx, |tv, cx| tv.scroll_to_line(wait_line, window, cx));
     }
 
@@ -1363,7 +1360,7 @@ impl Workspace {
       // fire time (see `fire_scheduled_send`), not now. No workspace state
       // changed here (the TodoView mutated itself and notified), so we don't.
       let project_path = self.projects[self.active_project_index].path.clone();
-      self.ensure_scheduled_armed(project_path, label, when, window, cx);
+      self.ensure_scheduled_armed(project_path, uuid, when, window, cx);
     } else {
       // Immediate send: mark busy and deliver now.
       if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
@@ -1393,7 +1390,7 @@ impl Workspace {
   fn arm_scheduled_send(
     &mut self,
     project_path: PathBuf,
-    label: String,
+    uuid: String,
     when: NaiveDateTime,
     window: &mut Window,
     cx: &mut Context<Self>,
@@ -1407,7 +1404,7 @@ impl Workspace {
     cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
       Timer::after(delay).await;
       let _ = this.update_in(cx, |ws, window, cx| {
-        ws.fire_scheduled_send(&project_path, &label, when, window, cx);
+        ws.fire_scheduled_send(&project_path, &uuid, when, window, cx);
       });
     })
     .detach();
@@ -1418,7 +1415,7 @@ impl Workspace {
   fn fire_scheduled_send(
     &mut self,
     project_path: &Path,
-    label: &str,
+    uuid: &str,
     when: NaiveDateTime,
     window: &mut Window,
     cx: &mut Context<Self>,
@@ -1430,7 +1427,7 @@ impl Workspace {
     // time, then re-adopted after it. Releasing here instead means an
     // undeliverable marker is simply retried on a later tick, and a delivered
     // one is gone from the file so there is nothing left to re-arm.
-    self.armed_schedules.remove(&(project_path.to_path_buf(), label.to_string(), when));
+    self.armed_schedules.remove(&(project_path.to_path_buf(), uuid.to_string(), when));
 
     let Some(project_idx) = self.projects.iter().position(|p| p.path == project_path) else {
       return;
@@ -1441,7 +1438,7 @@ impl Workspace {
     // never marked delivered (and lost) when there's nowhere to send it — the
     // marker stays pending and re-arms on a later tick.
     let Some((id, claude_terminal)) = self.projects[project_idx]
-      .session_by_label(label)
+      .session_by_uuid(uuid)
       .map(|(id, s)| (id, s.claude_terminal.clone()))
     else {
       return;
@@ -1450,7 +1447,7 @@ impl Workspace {
     let todo_view = self.projects[project_idx].todo_view.clone();
     let now = chrono::Local::now().naive_local();
 
-    match todo_view.update(cx, |tv, cx| tv.deliver_scheduled(label, now, window, cx)) {
+    match todo_view.update(cx, |tv, cx| tv.deliver_scheduled(uuid, now, window, cx)) {
       ScheduledFire::Deliver(body) => {
         Self::deliver_to_terminal(&claude_terminal, &body, cx);
         if let Some(session) = self.projects[project_idx].sessions.get_mut(&id) {
@@ -1461,7 +1458,7 @@ impl Workspace {
       ScheduledFire::Reschedule(new_when) => {
         self.ensure_scheduled_armed(
           project_path.to_path_buf(),
-          label.to_string(),
+          uuid.to_string(),
           new_when,
           window,
           cx,
@@ -1471,20 +1468,20 @@ impl Workspace {
     }
   }
 
-  /// Arm a timer for a `(path, label, when)` scheduled send unless one is already
+  /// Arm a timer for a `(path, uuid, when)` scheduled send unless one is already
   /// armed for that exact tuple. Editing a marker's time yields a new `when`, so
   /// the edited instant gets its own timer (and the stale one harmlessly no-ops
   /// at fire, since `deliver_scheduled` re-reads the live marker).
   fn ensure_scheduled_armed(
     &mut self,
     project_path: PathBuf,
-    label: String,
+    uuid: String,
     when: NaiveDateTime,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    if self.armed_schedules.insert((project_path.clone(), label.clone(), when)) {
-      self.arm_scheduled_send(project_path, label, when, window, cx);
+    if self.armed_schedules.insert((project_path.clone(), uuid.clone(), when)) {
+      self.arm_scheduled_send(project_path, uuid, when, window, cx);
     }
   }
 
@@ -1511,15 +1508,15 @@ impl Workspace {
           // dropped — it stays in the file with its pending highlight, and
           // adopting the session arms it on the next tick (firing immediately,
           // after the catch-up grace, if its time has already passed).
-          .filter(|s| project.sessions.values().any(|r| r.label == s.label))
+          .filter(|s| project.sessions.values().any(|r| r.uuid == s.uuid))
           .filter_map(move |s| {
             s.pending_scheduled()
-              .and_then(|m| m.schedule.map(|dt| (path.clone(), s.label.clone(), dt)))
+              .and_then(|m| m.schedule.map(|dt| (path.clone(), s.uuid.clone(), dt)))
           })
       })
       .collect();
-    for (path, label, when) in pending {
-      self.ensure_scheduled_armed(path, label, when, window, cx);
+    for (path, uuid, when) in pending {
+      self.ensure_scheduled_armed(path, uuid, when, window, cx);
     }
   }
 
@@ -1595,9 +1592,9 @@ impl Workspace {
             // nothing and the active session's colouring silently disappears
             // until the next session switch.
             let pi = ws.active_project_index;
-            let label = ws.projects[pi].active_label().map(str::to_string);
+            let uuid = ws.projects[pi].active_uuid().map(str::to_string);
             let todo_view = ws.projects[pi].todo_view.clone();
-            todo_view.update(cx, |tv, cx| tv.set_active_label(label.as_deref(), cx));
+            todo_view.update(cx, |tv, cx| tv.set_active_uuid(uuid.as_deref(), cx));
             cx.notify();
           }
         });
@@ -1615,17 +1612,17 @@ impl Workspace {
 
   fn jump_to_wait(&mut self, _: &JumpToWait, window: &mut Window, cx: &mut Context<Self>) {
     let project = &self.projects[self.active_project_index];
-    let Some(label) = project.active_label().map(str::to_string) else {
+    let Some(uuid) = project.active_uuid().map(str::to_string) else {
       return;
     };
     let todo_view = project.todo_view.clone();
 
     // Insert a WAIT section if the session doesn't have one.
     todo_view.update(cx, |tv, cx| {
-      tv.ensure_wait(&label, window, cx);
+      tv.ensure_wait(&uuid, window, cx);
     });
 
-    let Some(wait_line) = todo_view.read(cx).wait_line(&label, cx) else {
+    let Some(wait_line) = todo_view.read(cx).wait_line(&uuid, cx) else {
       return;
     };
 

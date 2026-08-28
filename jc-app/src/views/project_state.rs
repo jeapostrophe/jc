@@ -55,8 +55,6 @@ impl ProjectState {
     // below sees the bounded document.
     todo_view.update(cx, |tv, cx| tv.truncate_logs(window, cx));
 
-    todo_view.update(cx, |tv, cx| tv.dedupe_labels(window, cx));
-
     // Adopt every active TODO session so the full set of open sessions is
     // restored, not just one. A session whose transcript Claude has since
     // garbage-collected is revived rather than retired: `launch_for` sees the
@@ -123,7 +121,7 @@ impl ProjectState {
     if let Some(id) = active_session
       && let Some(session) = sessions.get(&id)
     {
-      todo_view.update(cx, |tv, cx| tv.set_active_label(Some(&session.label), cx));
+      todo_view.update(cx, |tv, cx| tv.set_active_uuid(Some(&session.uuid), cx));
     }
 
     Self { path, name, sessions, active_session, next_session_id, todo_view, session_dirs }
@@ -180,8 +178,12 @@ impl ProjectState {
     self.active_session.and_then(|id| self.sessions.get_mut(&id))
   }
 
-  pub fn active_label(&self) -> Option<&str> {
-    self.active_session().map(|s| s.label.as_str())
+  /// The active session's UUID — the address every TODO.md text operation keys
+  /// on (see `jc_core::todo::SessionKey`). Always non-empty for a running
+  /// session: `ProjectState::create` skips unbound headings and
+  /// `Workspace::adopt_session` mints one before launching.
+  pub fn active_uuid(&self) -> Option<&str> {
+    self.active_session().map(|s| s.uuid.as_str())
   }
 
   /// Convenience: the active session's code view.
@@ -214,11 +216,6 @@ impl ProjectState {
       }
     }
     changed
-  }
-
-  /// Find a session by its label.
-  pub fn session_by_label(&self, label: &str) -> Option<(SessionId, &SessionState)> {
-    self.sessions.iter().find(|(_, s)| s.label == label).map(|(&id, s)| (id, s))
   }
 
   /// Find a session by UUID.
