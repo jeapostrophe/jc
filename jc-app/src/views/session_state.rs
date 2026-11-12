@@ -3,10 +3,12 @@ use crate::views::project_state::SavedPaneLayout;
 use gpui::*;
 use gpui_component::input::Position;
 use jc_core::background::{self, Claude};
+use jc_core::cira::{self, HookState, Marker};
+use jc_core::hooks::HookEventKind;
 use jc_core::todo::{IdKind, SessionKey};
-use jc_terminal::{ChildSpec, LaunchSettle, Palette, TerminalConfig, TerminalView};
+use jc_terminal::{ChildSpec, Palette, TerminalConfig, TerminalView};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Snapshot of per-session viewport state, saved on switch-away and restored on switch-back.
 pub struct SavedViewState {
@@ -19,20 +21,6 @@ pub struct SavedViewState {
 }
 
 pub type SessionId = usize;
-
-/// Discounts an attach's own startup output from the Cmd-P activity marker:
-/// `claude attach` repaints the whole screen when it connects, which is jc
-/// attaching rather than work done while you were away. The window reopens at
-/// every re-attach.
-///
-/// `quiet` is longer than a moment because a resuming session pauses between
-/// its first frame and replaying a long transcript, and that pause must not
-/// end the window. `give_up` bounds it, so a child that never goes quiet is
-/// baselined anyway rather than tracked for the life of the process. These are
-/// facts about the Claude CLI, which is why they live here and not in the
-/// terminal crate.
-const CLAUDE_LAUNCH_SETTLE: LaunchSettle =
-  LaunchSettle { quiet: Duration::from_secs(4), give_up: Duration::from_secs(30) };
 
 pub struct SessionState {
   pub id: SessionId,
@@ -80,6 +68,14 @@ pub struct SessionState {
   /// The `> dangerous` value a failed change targeted, so it is not retried
   /// every reconcile tick. Cleared when the heading changes again.
   pub refused_dangerous: Option<bool>,
+  /// Cira's state for this session and since when, from the last `cira
+  /// status --json`; `None` while Cira is unreachable or does not know it.
+  pub cira_state: Option<(cira::State, Option<SystemTime>)>,
+  /// The state jc's own hooks last reported, and when it changed to it.
+  pub hook_state: Option<(HookState, SystemTime)>,
+  /// When the session was last on screen: set as jc switches away from it.
+  /// `None` until then, and the marker falls back to `> last=`.
+  pub seen: Option<SystemTime>,
   pub label: String,
   pub claude_terminal: Entity<TerminalView>,
   pub general_terminal: Entity<TerminalView>,
@@ -117,11 +113,23 @@ impl Heading {
 }
 
 impl SessionState {
-  /// The user has given this session work: everything it prints from here on
-  /// answers it, so end the Claude terminal's launch-settle window WITHOUT
-  /// clearing its marker — see [`TerminalView::cancel_launch_settle`].
-  pub fn end_launch_settle(&self, cx: &App) {
-    self.claude_terminal.read(cx).cancel_launch_settle();
+  /// Record what a hook says about the session's state, if it says anything
+  /// and it is a change: the time kept is when the state began.
+  pub fn note_hook(&mut self, kind: &HookEventKind, now: SystemTime) {
+    if let Some(next) = HookState::from_hook(kind)
+      && self.hook_state.is_none_or(|(state, _)| state != next)
+    {
+      self.hook_state = Some((next, now));
+    }
+  }
+
+  /// The Cmd-P picker's marker (`jc_core::cira::marker`). `last_active` is the
+  /// heading's `> last=`, the last send: the session was on screen then, which
+  /// is the best jc knows before it has switched away from it.
+  pub fn marker(&self, last_active: u64) -> Option<Marker> {
+    let last_send =
+      (last_active > 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(last_active));
+    cira::marker(self.cira_state, self.hook_state, self.seen.or(last_send))
   }
 
   /// Does a hook naming conversation `hook_session` come from this session?
@@ -143,7 +151,6 @@ impl SessionState {
       child: None,
       respawn: true,
       palette: Some(palette.clone()),
-      launch_settle: Some(CLAUDE_LAUNCH_SETTLE),
       ..Default::default()
     };
     // The shell pane is JC's own (Cira Q-33); it carries the stable id too.
@@ -173,6 +180,9 @@ impl SessionState {
       unbound_key: None,
       adopting: None,
       refused_dangerous: None,
+      cira_state: None,
+      hook_state: None,
+      seen: None,
       label,
       claude_terminal,
       general_terminal,

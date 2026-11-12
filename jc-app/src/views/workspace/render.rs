@@ -78,7 +78,8 @@ impl Workspace {
       Some(PaneContentKind::TodoEditor) => {
         let tv = project.todo_view.read(cx);
         let dirty = if tv.is_dirty(cx) { " [+]" } else { "" };
-        let title = format!("TODO{dirty}");
+        let blocks = jc_core::cira::blocks_suffix(project.cira_open);
+        let title = format!("TODO{blocks}{dirty}");
         let breadcrumbs = tv.code_view().read(cx).breadcrumb().to_vec();
         PaneHeader { title, breadcrumbs }
       }

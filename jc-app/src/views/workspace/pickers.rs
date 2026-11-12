@@ -86,7 +86,7 @@ impl Workspace {
     }
 
     let docs = self.todo_documents(cx);
-    let delegate = SessionPickerDelegate::new(&self.projects, self.active_project_index, &docs, cx);
+    let delegate = SessionPickerDelegate::new(&self.projects, self.active_project_index, &docs);
     self.show_session_picker(delegate, window, cx);
   }
 

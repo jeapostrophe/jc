@@ -3,6 +3,7 @@ use gpui_component::ActiveTheme;
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::input::{Input, InputEvent, InputState, Rope};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
+use jc_core::cira::{self, Marker};
 use jc_core::todo::{SessionKey, SessionStatus, TodoDocument};
 use std::collections::HashSet;
 use std::ops::Range;
@@ -716,8 +717,11 @@ struct SessionPickerEntry {
   /// actions carry back to the workspace (see `jc_core::todo::SessionKey`).
   /// `None` for an `EmptyProject` row, which names no heading.
   key: Option<SessionKey>,
-  /// Claude has produced terminal output since this session was last on screen.
-  has_activity: bool,
+  /// The session's state mark (Cira PLAN TMUX-06); `None` for rows that are
+  /// not running sessions.
+  marker: Option<Marker>,
+  /// The project's open Cira blocks (`4 blocks`), empty when none.
+  blocks: String,
   /// Unix timestamp of the last TODO submit (from `> last=`). `0` if unknown.
   last_active: u64,
 }
@@ -760,12 +764,12 @@ impl SessionPickerDelegate {
     projects: &[ProjectState],
     active_project_index: usize,
     todo_documents: &[&TodoDocument],
-    cx: &App,
   ) -> Self {
     let mut entries = Vec::new();
     let mut active_entry = None;
 
     for (pi, project) in projects.iter().enumerate() {
+      let blocks = cira::blocks_label(project.cira_open);
       let has_adoptable = todo_documents.get(pi).is_some_and(|d| !d.sessions.is_empty());
       if project.sessions.is_empty() && !has_adoptable {
         entries.push(SessionPickerEntry {
@@ -774,7 +778,8 @@ impl SessionPickerDelegate {
           project_name: project.name.clone(),
           label: String::new(),
           key: None,
-          has_activity: false,
+          marker: None,
+          blocks: blocks.clone(),
           last_active: 0,
         });
         continue;
@@ -799,9 +804,10 @@ impl SessionPickerDelegate {
           // A running session's heading id is a true address; one still
           // starting has no heading yet.
           key: (!session.key.is_empty()).then(|| SessionKey::Id(session.key.clone())),
-          // The session on screen is the one you're looking at, so its output
-          // is by definition already seen.
-          has_activity: !is_active && session.claude_terminal.read(cx).has_unseen_output(),
+          // The session on screen is the one you're looking at: only a dialog,
+          // which needs you whether seen or not, marks it.
+          marker: session.marker(last_active).filter(|m| !is_active || *m == Marker::Dialog),
+          blocks: blocks.clone(),
           last_active,
         });
       }
@@ -820,57 +826,24 @@ impl SessionPickerDelegate {
             // An unbound heading has no id to key on; `index` is its address,
             // re-verified against the live document at write time.
             key: Some(todo_session.key(index)),
-            has_activity: false,
+            marker: None,
+            blocks: blocks.clone(),
             last_active: todo_session.last_active.unwrap_or(0),
           });
         }
       }
     }
 
-    // Sort into groups (lower = higher in picker):
-    //   0: this project, sessions (activity first, then recency DESC)
-    //   1: other projects, sessions (activity first, then recency DESC)
-    //   2: unadopted sessions (this project first, then recency DESC)
-    //   3: empty projects
-    //   4: current active session (always last)
-    let sort_group = |e: &SessionPickerEntry, idx: usize| -> u8 {
-      let is_this = e.project_index == active_project_index;
-      let is_active = active_entry == Some(idx);
-      match &e.kind {
-        _ if is_active => 4,
-        SessionPickerEntryKind::Session(_) if is_this => 0,
-        SessionPickerEntryKind::Session(_) => 1,
-        SessionPickerEntryKind::Unadopted { .. } => 2,
-        SessionPickerEntryKind::EmptyProject => 3,
-      }
-    };
-
     let mut indices: Vec<usize> = (0..entries.len()).collect();
-    indices.sort_by(|&a, &b| {
-      let ea = &entries[a];
-      let eb = &entries[b];
-      let ga = sort_group(ea, a);
-      let gb = sort_group(eb, b);
-      ga.cmp(&gb)
-        .then_with(|| {
-          // Within the two session groups: activity first, then recency DESC.
-          // Applied to other projects too — "where did the work move while I was
-          // elsewhere" is mostly a cross-project question.
-          if ga == 0 || ga == 1 {
-            let pa = if ea.has_activity { 0u8 } else { 1 };
-            let pb = if eb.has_activity { 0u8 } else { 1 };
-            pa.cmp(&pb)
-          } else if ga == 2 {
-            // Unadopted: this project before others.
-            let ta = if ea.project_index == active_project_index { 0u8 } else { 1 };
-            let tb = if eb.project_index == active_project_index { 0u8 } else { 1 };
-            ta.cmp(&tb)
-          } else {
-            std::cmp::Ordering::Equal
-          }
-        })
-        // Within each sub-group, most recent first.
-        .then(eb.last_active.cmp(&ea.last_active))
+    indices.sort_by_key(|&i| {
+      let e = &entries[i];
+      let row = match &e.kind {
+        SessionPickerEntryKind::Session(_) => Row::Session(e.marker),
+        SessionPickerEntryKind::Unadopted { .. } => Row::Unadopted,
+        SessionPickerEntryKind::EmptyProject => Row::EmptyProject,
+      };
+      let is_this = e.project_index == active_project_index;
+      (sort_rank(row, is_this, active_entry == Some(i)), std::cmp::Reverse(e.last_active))
     });
 
     let sorted_entries: Vec<_> = indices.iter().map(|&i| entries[i].clone()).collect();
@@ -938,28 +911,34 @@ impl PickerDelegate for SessionPickerDelegate {
     let row = div().px_2().py(px(3.0)).text_sm().font_family("Lilex").flex().items_center().gap_1();
     let row = if selected { row.bg(theme.accent).text_color(theme.accent_foreground) } else { row };
 
-    let marker = match &entry.kind {
-      SessionPickerEntryKind::EmptyProject => {
+    let marker = match (&entry.kind, entry.marker) {
+      (SessionPickerEntryKind::EmptyProject, _) => {
         let color = if selected { theme.accent_foreground } else { theme.blue };
         picker_marker_base().text_color(color).child("+")
       }
-      SessionPickerEntryKind::Unadopted { status: SessionStatus::Disabled, .. } => {
+      (SessionPickerEntryKind::Unadopted { status: SessionStatus::Disabled, .. }, _) => {
         let color = if selected { theme.accent_foreground } else { theme.muted_foreground };
         picker_marker_base().text_color(color).child("~")
       }
-      SessionPickerEntryKind::Unadopted { .. } => {
+      (SessionPickerEntryKind::Unadopted { .. }, _) => {
         let color = if selected { theme.accent_foreground } else { theme.yellow };
         picker_marker_base().text_color(color).child("~")
       }
-      SessionPickerEntryKind::Session(_) if entry.has_activity => {
-        let color = if selected { theme.accent_foreground } else { theme.red };
-        picker_marker_base().text_color(color).child("*")
+      (SessionPickerEntryKind::Session(_), Some(marker)) => {
+        let color = match marker {
+          _ if selected => theme.accent_foreground,
+          Marker::Dialog | Marker::Finished => theme.red,
+          Marker::Waiting | Marker::Gone => theme.muted_foreground,
+        };
+        let base = picker_marker_base().text_color(color);
+        let base = if marker == Marker::Dialog { base.font_weight(FontWeight::BOLD) } else { base };
+        base.child(marker.glyph())
       }
-      SessionPickerEntryKind::Session(_) if is_active => {
+      (SessionPickerEntryKind::Session(_), None) if is_active => {
         let color = if selected { theme.accent_foreground } else { theme.green };
         picker_marker_base().text_color(color).child(">")
       }
-      SessionPickerEntryKind::Session(_) => picker_marker_base(),
+      (SessionPickerEntryKind::Session(_), None) => picker_marker_base(),
     };
 
     let main_text = match &entry.kind {
@@ -970,14 +949,17 @@ impl PickerDelegate for SessionPickerDelegate {
     };
 
     let muted_color = if selected { theme.accent_foreground } else { theme.muted_foreground };
-    let right = match &entry.kind {
-      SessionPickerEntryKind::EmptyProject => "(no sessions)".to_string(),
-      SessionPickerEntryKind::Unadopted { status: SessionStatus::Disabled, .. } => {
-        "(disabled)".to_string()
-      }
-      SessionPickerEntryKind::Unadopted { .. } => "(adopt)".to_string(),
-      _ => String::new(),
+    let state = match &entry.kind {
+      SessionPickerEntryKind::EmptyProject => "(no sessions)",
+      SessionPickerEntryKind::Unadopted { status: SessionStatus::Disabled, .. } => "(disabled)",
+      SessionPickerEntryKind::Unadopted { .. } => "(adopt)",
+      _ => "",
     };
+    let right = [entry.blocks.as_str(), state]
+      .into_iter()
+      .filter(|s| !s.is_empty())
+      .collect::<Vec<_>>()
+      .join("  ");
     let right_el = div().ml_auto().text_xs().text_color(muted_color).child(right);
 
     row.child(marker).child(main_text).child(right_el)
@@ -997,7 +979,10 @@ impl PickerDelegate for SessionPickerDelegate {
         .text_xs()
         .text_color(muted)
         .children([
-          legend_item("*", theme.red, "activity", muted),
+          legend_item("!", theme.red, "permission", muted),
+          legend_item("*", theme.red, "finished", muted),
+          legend_item("~", muted, "agents", muted),
+          legend_item("x", muted, "gone", muted),
           legend_item(">", theme.green, "active", muted),
           legend_item("~", theme.yellow, "adopt", muted),
           legend_item("~", theme.muted_foreground, "disabled", muted),
@@ -1005,6 +990,34 @@ impl PickerDelegate for SessionPickerDelegate {
           div().child("Cmd-Shift-Bksp: toggle disable"),
         ]),
     )
+  }
+}
+
+/// What a session-picker row is, for [`sort_rank`].
+#[derive(Clone, Copy)]
+enum Row {
+  Session(Option<Marker>),
+  Unadopted,
+  EmptyProject,
+}
+
+/// A session-picker row's place (lower is higher), before `> last=`
+/// descending:
+///   - a session showing a permission dialog, any project (it is waiting on you);
+///   - this project's sessions, then other projects': each finished-since-seen
+///     first ("where did the work move while I was elsewhere" is mostly a
+///     cross-project question);
+///   - sessions in TODO.md that are not running, this project's first;
+///   - empty projects;
+///   - the active session, always last: you are already there.
+fn sort_rank(row: Row, is_this: bool, is_active: bool) -> (u8, u8) {
+  let other = u8::from(!is_this);
+  match row {
+    _ if is_active => (5, 0),
+    Row::Session(Some(Marker::Dialog)) => (0, 0),
+    Row::Session(marker) => (1 + other, u8::from(marker != Some(Marker::Finished))),
+    Row::Unadopted => (3, other),
+    Row::EmptyProject => (4, 0),
   }
 }
 
@@ -1387,5 +1400,45 @@ fn format_relative_time(time: std::time::SystemTime) -> String {
     60..3600 => format!("{}m ago", secs / 60),
     3600..86400 => format!("{}h ago", secs / 3600),
     _ => format!("{}d ago", secs / 86400),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{Row, sort_rank};
+  use jc_core::cira::Marker;
+
+  #[test]
+  fn a_dialog_sorts_first_then_finished_sessions() {
+    // (name, row, in this project, active), deliberately in the wrong order.
+    let rows = [
+      ("active", Row::Session(Some(Marker::Dialog)), true, true),
+      ("empty", Row::EmptyProject, false, false),
+      ("adopt-other", Row::Unadopted, false, false),
+      ("adopt-this", Row::Unadopted, true, false),
+      ("other-plain", Row::Session(None), false, false),
+      ("other-finished", Row::Session(Some(Marker::Finished)), false, false),
+      ("this-gone", Row::Session(Some(Marker::Gone)), true, false),
+      ("this-waiting", Row::Session(Some(Marker::Waiting)), true, false),
+      ("this-finished", Row::Session(Some(Marker::Finished)), true, false),
+      ("other-dialog", Row::Session(Some(Marker::Dialog)), false, false),
+    ];
+    let mut sorted = rows.to_vec();
+    sorted.sort_by_key(|&(_, row, this, active)| sort_rank(row, this, active));
+    let names: Vec<_> = sorted.iter().map(|r| r.0).collect();
+    assert_eq!(names[..2], ["other-dialog", "this-finished"]);
+    assert_eq!(
+      names[4..],
+      ["other-finished", "other-plain", "adopt-this", "adopt-other", "empty", "active"]
+    );
+    // Waiting and gone are marks, not priorities: they keep `> last=` order.
+    assert_eq!(
+      sort_rank(Row::Session(Some(Marker::Waiting)), true, false),
+      sort_rank(Row::Session(None), true, false)
+    );
+    assert_eq!(
+      sort_rank(Row::Session(Some(Marker::Gone)), true, false),
+      sort_rank(Row::Session(None), true, false)
+    );
   }
 }

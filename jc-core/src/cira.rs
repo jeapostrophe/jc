@@ -11,6 +11,7 @@
 //! Cira is unreachable, for a session started without a `CIRA_SESSION`, and
 //! for an API-error stop, which Cira has no state for.
 
+use crate::hooks::HookEventKind;
 use serde::Deserialize;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -208,6 +209,24 @@ pub fn marker(
     },
     (None, Some(h)) => from_hook(h),
     (None, None) => None,
+  }
+}
+
+impl HookState {
+  /// The state a jc hook reports, if it reports one.
+  pub fn from_hook(kind: &HookEventKind) -> Option<Self> {
+    match kind {
+      HookEventKind::PromptSubmit => Some(HookState::Working),
+      HookEventKind::Stop => Some(HookState::Idle),
+      HookEventKind::PermissionPrompt => Some(HookState::Dialog),
+      HookEventKind::StopFailure => Some(HookState::Failed),
+      // A start or `/clear` is jc attaching or the user resetting, not a turn
+      // ending; `idle_prompt` repeats a `Stop` a minute later, and taking it
+      // as one would mark a session finished that finished long ago.
+      HookEventKind::SessionStart
+      | HookEventKind::SessionClear { .. }
+      | HookEventKind::IdlePrompt => None,
+    }
   }
 }
 
@@ -439,8 +458,21 @@ mod tests {
   }
 
   #[test]
+  fn only_turn_changes_set_the_hook_state() {
+    let state = |k| HookState::from_hook(&k);
+    assert_eq!(state(HookEventKind::PromptSubmit), Some(HookState::Working));
+    assert_eq!(state(HookEventKind::Stop), Some(HookState::Idle));
+    assert_eq!(state(HookEventKind::PermissionPrompt), Some(HookState::Dialog));
+    assert_eq!(state(HookEventKind::StopFailure), Some(HookState::Failed));
+    // An attach resuming the session, or the reminder a minute after a stop,
+    // is not a turn that finished.
+    assert_eq!(state(HookEventKind::SessionStart), None);
+    assert_eq!(state(HookEventKind::IdlePrompt), None);
+  }
+
+  #[test]
   fn dialog_sorts_before_finished_before_the_rest() {
-    let mut marks = vec![Marker::Gone, Marker::Waiting, Marker::Finished, Marker::Dialog];
+    let mut marks = [Marker::Gone, Marker::Waiting, Marker::Finished, Marker::Dialog];
     marks.sort();
     assert_eq!(marks[..2], [Marker::Dialog, Marker::Finished]);
   }

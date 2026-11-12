@@ -21,7 +21,7 @@ use std::collections::{HashSet, VecDeque};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 actions!(
   workspace,
@@ -125,6 +125,8 @@ pub struct Workspace {
   last_agents_refresh: Option<Instant>,
   /// Short ids of `[DELETED]` headings jc has already stopped and removed.
   removed_shorts: HashSet<String>,
+  /// Receives each `cira status --json` read by the Cira poll thread.
+  _cira_poll_task: Task<()>,
 }
 
 /// Unmatched hooks kept for re-dispatch; older ones are dropped.
@@ -132,6 +134,8 @@ const UNMATCHED_HOOKS_MAX: usize = 32;
 /// The shortest gap between two `claude agents --json` refreshes for
 /// unmatched hooks.
 const AGENTS_REFRESH_GAP: StdDuration = StdDuration::from_secs(30);
+/// The pause between two reads of `cira status --json`.
+const CIRA_POLL: StdDuration = StdDuration::from_secs(2);
 
 impl Workspace {
   pub fn new(
@@ -297,6 +301,24 @@ impl Workspace {
         }
       });
 
+    // Cira's pending counts and session states (Cira PLAN TMUX-05/06), read on
+    // the poll's own thread; only applying a read runs here.
+    let cira = jc_core::cira::Cira::default();
+    let cira_rx = jc_core::cira::poll(CIRA_POLL, move || cira.status());
+    let cira_poll_task =
+      cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+        while let Ok(status) = cira_rx.recv_async().await {
+          let applied = this.update(cx, |ws, cx| {
+            if ws.apply_cira(status.as_ref()) {
+              cx.notify();
+            }
+          });
+          if applied.is_err() {
+            break; // workspace dropped; dropping the receiver ends the poll thread
+          }
+        }
+      });
+
     let mut ws = Self {
       panes,
       active_pane_index: 0,
@@ -332,6 +354,7 @@ impl Workspace {
       refreshing_agents: false,
       last_agents_refresh: None,
       removed_shorts: HashSet::new(),
+      _cira_poll_task: cira_poll_task,
     };
 
     for pi in 0..ws.projects.len() {
@@ -897,11 +920,11 @@ impl Workspace {
       });
       session.claude_terminal.read(cx).set_visible(false);
       session.general_terminal.read(cx).set_visible(false);
-      // Everything this session printed while it was on screen has been seen,
-      // so it must not come back marked in the Cmd-P picker. Clearing on the way
-      // OUT rather than on the way in is what makes that true regardless of how
-      // the switch was made (picker, Cmd-`, a notification click).
-      session.claude_terminal.read(cx).clear_output_seen();
+      // Whatever this session finished while it was on screen has been seen,
+      // so it must not come back marked in the Cmd-P picker. Stamping on the
+      // way OUT rather than on the way in is what makes that true regardless
+      // of how the switch was made (picker, Cmd-`, a notification click).
+      session.seen = Some(SystemTime::now());
     }
 
     self.active_project_index = project_idx;
@@ -1898,8 +1921,7 @@ impl Workspace {
       if let Some(session) = self.projects[self.active_project_index].active_session() {
         session.status("the message is sent once the session is up", cx);
       }
-    } else if let Some(session) = self.projects[self.active_project_index].active_session() {
-      session.end_launch_settle(cx);
+    } else {
       Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
       cx.notify();
     }
@@ -1975,10 +1997,10 @@ impl Workspace {
     // terminal BEFORE `deliver_scheduled` consumes the marker, so a message is
     // never marked delivered (and lost) when there's nowhere to send it — the
     // marker stays pending and re-arms on a later tick.
-    let Some((id, claude_terminal)) = self.projects[project_idx]
+    let Some(claude_terminal) = self.projects[project_idx]
       .session_by_key(uuid)
       .filter(|(_, s)| Self::ready_for_input(s, cx))
-      .map(|(id, s)| (id, s.claude_terminal.clone()))
+      .map(|(_, s)| s.claude_terminal.clone())
     else {
       return;
     };
@@ -1989,9 +2011,6 @@ impl Workspace {
     match todo_view.update(cx, |tv, cx| tv.deliver_scheduled(uuid, now, window, cx)) {
       ScheduledFire::Deliver(body) => {
         Self::deliver_to_terminal(&claude_terminal, &body, cx);
-        if let Some(session) = self.projects[project_idx].sessions.get_mut(&id) {
-          session.end_launch_settle(cx);
-        }
         cx.notify();
       }
       ScheduledFire::Reschedule(new_when) => {
@@ -2143,7 +2162,7 @@ impl Workspace {
       return;
     }
 
-    let Some((project_name, session_label)) = self.apply_hook_to_session(&event, cx) else {
+    let Some((project_name, session_label)) = self.apply_hook_to_session(&event) else {
       // From a project jc has open but no session it knows: most likely one of
       // its own whose uuid changed while jc was not looking (a `/clear` in
       // another attach). Ask `claude agents --json`, then try again.
@@ -2177,7 +2196,7 @@ impl Workspace {
   /// [`background::hook_matches`]): the session is live, and the uuid is
   /// learned. Returns the matched `(project name, session label)`, or `None` when no
   /// session owns it.
-  fn apply_hook_to_session(&mut self, event: &HookEvent, cx: &App) -> Option<(String, String)> {
+  fn apply_hook_to_session(&mut self, event: &HookEvent) -> Option<(String, String)> {
     let (pi, sid) = self.session_for_hook(&event.session_id)?;
     let project = &mut self.projects[pi];
     let project_name = project.name.clone();
@@ -2185,10 +2204,18 @@ impl Workspace {
 
     session.uuid = event.session_id.clone();
     session.live = true;
-    if let HookEventKind::PromptSubmit = event.kind {
-      session.end_launch_settle(cx);
-    }
+    session.note_hook(&event.kind, SystemTime::now());
     Some((project_name, session.label.clone()))
+  }
+
+  /// Apply a `cira status --json` read (`None`: Cira is unreachable) to every
+  /// project. Returns whether anything shown changed.
+  fn apply_cira(&mut self, status: Option<&jc_core::cira::Status>) -> bool {
+    let mut changed = false;
+    for project in &mut self.projects {
+      changed |= project.apply_cira(status);
+    }
+    changed
   }
 
   /// The `(project index, session)` a hook naming `hook_session` comes from.

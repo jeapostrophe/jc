@@ -3,6 +3,7 @@ use crate::views::pane::PaneContentKind;
 use crate::views::session_state::{Heading, SessionId, SessionState};
 use crate::views::todo_view::TodoView;
 use gpui::*;
+use jc_core::cira::{OpenCounts, Status};
 use jc_terminal::Palette;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,10 @@ pub struct ProjectState {
   pub active_session: Option<SessionId>,
   pub next_session_id: SessionId,
   pub todo_view: Entity<TodoView>,
+  /// What waits on Jay in the Cira project this one belongs to, from the last
+  /// `cira status --json`; `None` while Cira is unreachable or has no project
+  /// containing this one.
+  pub cira_open: Option<OpenCounts>,
 }
 
 impl ProjectState {
@@ -108,7 +113,7 @@ impl ProjectState {
       todo_view.update(cx, |tv, cx| tv.set_active_key(Some(&session.key), cx));
     }
 
-    Self { path, name, sessions, active_session, next_session_id, todo_view }
+    Self { path, name, sessions, active_session, next_session_id, todo_view, cira_open: None }
   }
 
   /// All of Claude's JSONL session buckets for this project (root + worktrees),
@@ -184,6 +189,21 @@ impl ProjectState {
         session.label = heading.label.clone();
         changed = true;
       }
+    }
+    changed
+  }
+
+  /// Take this project's counts and its sessions' states from a `cira status
+  /// --json` (`None`: Cira is unreachable). Returns whether anything changed.
+  pub fn apply_cira(&mut self, status: Option<&Status>) -> bool {
+    let project = status.and_then(|s| s.project_for(&self.path));
+    let open = project.map(|p| p.open);
+    let mut changed = std::mem::replace(&mut self.cira_open, open) != open;
+    for session in self.sessions.values_mut() {
+      let state = project
+        .and_then(|p| p.session(session.cira.as_deref(), &session.bg, &session.uuid))
+        .map(|s| (s.state, s.since()));
+      changed |= std::mem::replace(&mut session.cira_state, state) != state;
     }
     changed
   }
