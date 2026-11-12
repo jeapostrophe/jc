@@ -302,10 +302,16 @@ impl TerminalView {
   /// Hang up the child and run nothing until the next [`Self::spawn`].
   pub fn stop_child(&mut self, cx: &mut Context<Self>) {
     self.config.child = None;
+    self.hang_up();
+    cx.notify();
+  }
+
+  /// Drop the current child (hanging it up), any pending respawn, and any exit
+  /// it has yet to report.
+  fn hang_up(&mut self) {
     self.generation += 1;
     self.pty = None;
     self._respawn_task = None;
-    cx.notify();
   }
 
   /// Has the current child printed anything yet?
@@ -327,9 +333,7 @@ impl TerminalView {
 
   /// Start `config.child`, replacing (and hanging up) any current child.
   fn start_child(&mut self, cx: &mut Context<Self>) {
-    self.generation += 1;
-    self.pty = None;
-    self._respawn_task = None;
+    self.hang_up();
     let generation = self.generation;
     let Some(spec) = self.config.child.clone() else { return };
 
@@ -484,7 +488,7 @@ impl TerminalView {
     self.pty = None;
     cx.emit(ChildEvent::Exited { code });
     let code = code.map_or("unknown".to_string(), |c| c.to_string());
-    if !self.config.respawn || self.config.child.is_none() {
+    if !self.config.respawn {
       self.show_status(&format!("exited (code {code})"), cx);
       return;
     }
@@ -534,11 +538,6 @@ impl TerminalView {
   /// aggressively and skip `cx.notify()` to reduce main-thread overhead.
   pub fn set_visible(&self, is_visible: bool) {
     self.visible.store(is_visible, Ordering::Relaxed);
-  }
-
-  /// Write raw bytes to the terminal's PTY; dropped while no child runs.
-  pub fn write_bytes_to_pty(&self, bytes: &[u8]) {
-    self.write_pty(bytes);
   }
 
   fn write_pty(&self, bytes: &[u8]) {

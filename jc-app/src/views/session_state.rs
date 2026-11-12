@@ -2,8 +2,8 @@ use crate::views::code_view::CodeView;
 use crate::views::project_state::SavedPaneLayout;
 use gpui::*;
 use gpui_component::input::Position;
-use jc_core::background::Claude;
-use jc_core::todo::SessionKey;
+use jc_core::background::{self, Claude};
+use jc_core::todo::{IdKind, SessionKey};
 use jc_terminal::{ChildSpec, LaunchSettle, Palette, TerminalConfig, TerminalView};
 use std::path::Path;
 use std::time::Duration;
@@ -48,11 +48,11 @@ pub struct SessionState {
   /// starts with `bg`), a `/clear` pair, or `claude agents --json`. Empty until
   /// learned. Never written to TODO.md.
   pub uuid: String,
-  /// The stable id (`> cira=`), passed as `CIRA_SESSION`.
+  /// The stable id (`> cira=`), passed as `CIRA_SESSION`. Minted at creation
+  /// for a heading jc will start a session for (see [`Heading::new`]), so the
+  /// shell pane has it from the start; written to the heading when the
+  /// session is bound.
   pub cira: Option<String>,
-  /// The shell pane was started with `CIRA_SESSION` (see
-  /// [`Self::export_cira_to_shell`]).
-  shell_has_cira: bool,
   /// Whether the background session runs with `--dangerously-skip-permissions`
   /// — the mode it was started with, compared against the heading's
   /// `> dangerous` to notice a change.
@@ -63,14 +63,22 @@ pub struct SessionState {
   pub live: bool,
   /// A Cmd-Enter message waiting for `live` (see `Workspace::flush_pending_send`).
   pub pending_send: Option<String>,
-  /// A start, migration or `> dangerous` change is in flight.
+  /// A start, migration or `> dangerous` change is in flight. A session that
+  /// is changing is never removed: its completion still has to bind the
+  /// heading to whatever job it started.
   pub changing: bool,
+  /// Its start failed or was refused; the pane says why. It no longer counts
+  /// as adopted, so the pickers offer the heading again.
+  pub failed: bool,
   /// A `claude agents --json` poll for `live` is in flight.
   pub watching_live: bool,
   /// For a session adopted from a heading an older jc left unbound: that
   /// heading's verified-position address, used to write its `> bg=` line once
   /// the session has started.
   pub unbound_key: Option<SessionKey>,
+  /// For a session continuing a transcript no heading names: that
+  /// conversation's uuid, while its start is in flight.
+  pub adopting: Option<String>,
   /// The `> dangerous` value a failed change targeted, so it is not retried
   /// every reconcile tick. Cleared when the heading changes again.
   pub refused_dangerous: Option<bool>,
@@ -80,36 +88,61 @@ pub struct SessionState {
   pub code_view: Entity<CodeView>,
   pub saved_view: Option<SavedViewState>,
   /// The Claude pane's child events, observed by the workspace.
-  pub _claude_child: Option<Subscription>,
+  pub claude_child_events: Option<Subscription>,
 }
 
-impl SessionState {
-  /// Note that the user has given this session work.
-  ///
-  /// Ends the Claude terminal's launch-settle window WITHOUT clearing its
-  /// marker — see [`TerminalView::cancel_launch_settle`].
-  pub fn mark_user_input(&self, cx: &App) {
-    self.claude_terminal.read(cx).cancel_launch_settle();
-  }
+/// What a session is created from: its heading's id (empty for a session whose
+/// heading is written once it has started), label, stable id and mode.
+pub struct Heading {
+  pub key: String,
+  pub label: String,
+  pub cira: Option<String>,
+  pub dangerous: bool,
+}
 
-  /// A session whose Claude pane attaches to `bg`, or — with `bg` empty —
-  /// waits for [`Self::attach`] once its background session is known.
-  #[allow(clippy::too_many_arguments)]
-  pub fn create(
-    id: SessionId,
+impl Heading {
+  /// `cira` is minted here when jc is about to start a session for the
+  /// heading (a legacy `> uuid=`, an unbound or a new heading) and it has
+  /// none. A `> bg=` heading without one is left alone: its running session
+  /// was started without a `CIRA_SESSION`, and claiming one would be false.
+  pub fn new(
     key: String,
-    bg: String,
+    kind: IdKind,
     label: String,
     cira: Option<String>,
     dangerous: bool,
-    claude: &Claude,
+  ) -> Self {
+    let starts = key.is_empty() || kind == IdKind::Uuid;
+    let cira = cira.or_else(|| starts.then(|| uuid::Uuid::new_v4().to_string()));
+    Self { key, label, cira, dangerous }
+  }
+}
+
+impl SessionState {
+  /// The user has given this session work: everything it prints from here on
+  /// answers it, so end the Claude terminal's launch-settle window WITHOUT
+  /// clearing its marker — see [`TerminalView::cancel_launch_settle`].
+  pub fn end_launch_settle(&self, cx: &App) {
+    self.claude_terminal.read(cx).cancel_launch_settle();
+  }
+
+  /// Does a hook naming conversation `hook_session` come from this session?
+  pub fn owns_hook(&self, hook_session: &str) -> bool {
+    background::hook_matches(&self.bg, &self.uuid, hook_session)
+  }
+
+  /// A session whose Claude pane waits for [`Self::attach`].
+  pub fn create(
+    id: SessionId,
+    heading: Heading,
     project_path: &Path,
     palette: &Palette,
     window: &mut Window,
     cx: &mut App,
   ) -> Self {
+    let Heading { key, label, cira, dangerous } = heading;
     let claude_config = TerminalConfig {
-      child: (!bg.is_empty()).then(|| ChildSpec::Command(claude.attach_argv(&bg))),
+      child: None,
       respawn: true,
       palette: Some(palette.clone()),
       launch_settle: Some(CLAUDE_LAUNCH_SETTLE),
@@ -131,46 +164,40 @@ impl SessionState {
     Self {
       id,
       key,
-      bg,
+      bg: String::new(),
       uuid: String::new(),
-      shell_has_cira: cira.is_some(),
       cira,
       dangerous,
       live: false,
       pending_send: None,
       changing: false,
+      failed: false,
       watching_live: false,
       unbound_key: None,
+      adopting: None,
       refused_dangerous: None,
       label,
       claude_terminal,
       general_terminal,
       code_view,
       saved_view: None,
-      _claude_child: None,
+      claude_child_events: None,
     }
   }
 
   /// Attach the Claude pane to background session `short`, which is now this
   /// session's address.
+  ///
+  /// The pane re-attaches whenever the client exits, and attaching resumes a
+  /// stopped job. So anything that stops or replaces the job must detach first
+  /// (drop the session, or `TerminalView::stop_child`), or the pane brings the
+  /// job straight back.
   pub fn attach(&mut self, short: &str, claude: &Claude, cx: &mut App) {
     self.key = short.to_string();
     self.bg = short.to_string();
     self.live = false;
     let argv = claude.attach_argv(short);
     self.claude_terminal.update(cx, |t, cx| t.spawn(ChildSpec::Command(argv), cx));
-  }
-
-  /// Restart the shell pane with `CIRA_SESSION` when its stable id was minted
-  /// after the shell started (a migrated or new session). Only ever happens
-  /// while the session is first being started, seconds after the shell opened.
-  pub fn export_cira_to_shell(&mut self, cx: &mut App) {
-    let Some(cira) = self.cira.clone().filter(|_| !self.shell_has_cira) else { return };
-    self.shell_has_cira = true;
-    self.general_terminal.update(cx, |t, cx| {
-      t.set_env(vec![("CIRA_SESSION".to_string(), cira)]);
-      t.spawn(ChildSpec::Shell, cx);
-    });
   }
 
   /// Print a `[jc]` status line in the Claude pane.

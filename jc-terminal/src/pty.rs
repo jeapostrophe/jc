@@ -22,6 +22,11 @@ pub struct PtyHandle {
   master: Mutex<Box<dyn MasterPty + Send>>,
   writer: Arc<Mutex<Box<dyn Write + Send>>>,
   killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+  /// Set by the reader thread at EOF, under this lock, before it reaps the
+  /// child. Once set the pid may be freed and reused, so `Drop` must not
+  /// signal it; until then an exited child is an unreaped zombie and keeps
+  /// its pid.
+  closed: Arc<Mutex<bool>>,
 }
 
 /// A child running in a PTY: the handle, the bytes it prints, and its exit.
@@ -74,10 +79,12 @@ impl PtyChild {
 
     let mut reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
+    let closed = Arc::new(Mutex::new(false));
     let handle = Arc::new(PtyHandle {
       master: Mutex::new(pair.master),
       writer: Arc::new(Mutex::new(writer)),
       killer: Mutex::new(killer),
+      closed: closed.clone(),
     });
 
     let (bytes_tx, bytes) = flume::unbounded::<Vec<u8>>();
@@ -96,6 +103,7 @@ impl PtyChild {
         }
       }
       drop(bytes_tx);
+      *closed.lock() = true;
       let code = child.wait().ok().map(|s| s.exit_code());
       let _ = exit_tx.send(code);
     });
@@ -130,7 +138,10 @@ impl Drop for PtyHandle {
   /// The reader thread holds its own dup of the master, so dropping the master
   /// alone does not hang up the child. Signal it explicitly.
   fn drop(&mut self) {
-    let _ = self.killer.lock().kill();
+    let closed = self.closed.lock();
+    if !*closed {
+      let _ = self.killer.lock().kill();
+    }
   }
 }
 
@@ -202,6 +213,14 @@ mod tests {
     let code = child.exited.recv_timeout(Duration::from_secs(10)).expect("exit reported");
     assert_eq!(code, Some(3));
     assert_eq!(ps_state(pid), "", "the child must not linger as a zombie");
+  }
+
+  #[test]
+  fn a_reaped_child_is_not_signalled_on_drop() {
+    // Its pid may belong to another process by then.
+    let child = PtyChild::spawn(&sh("exit 0"), &[], 80, 24, None).unwrap();
+    child.exited.recv_timeout(Duration::from_secs(10)).expect("exit reported");
+    assert!(*child.handle.closed.lock(), "drop must see the child as gone");
   }
 
   #[test]

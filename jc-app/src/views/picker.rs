@@ -1081,18 +1081,22 @@ impl ProjectActionsPickerDelegate {
     //    buckets (each transcript in exactly one bucket), so scan them all.
     {
       // A transcript is known when a heading names it (`> uuid=`), a running
-      // session is on it (its uuid after a `/clear`), or it was created by a
-      // heading's background session (its uuid starts with the `> bg=` short
-      // id).
+      // session is on it (its uuid after a `/clear`) or is being started on it,
+      // or it was created by a heading's background session (its uuid starts
+      // with the `> bg=` short id).
       let doc = todo_documents.get(active_project_index);
       let ids: HashSet<&str> =
         doc.map(|doc| doc.sessions.iter().map(|s| s.id.as_str()).collect()).unwrap_or_default();
-      let running: HashSet<&str> =
-        projects[active_project_index].sessions.values().map(|s| s.uuid.as_str()).collect();
+      let running: HashSet<&str> = projects[active_project_index]
+        .sessions
+        .values()
+        .flat_map(|s| [Some(s.uuid.as_str()), s.adopting.as_deref()])
+        .flatten()
+        .collect();
       let known = |uuid: &str| {
         ids.contains(uuid)
           || running.contains(uuid)
-          || uuid.split_once('-').is_some_and(|(short, _)| ids.contains(short))
+          || jc_core::background::short_of(uuid).is_some_and(|short| ids.contains(short))
       };
 
       let mut discovered: Vec<(String, String, std::time::SystemTime)> = Vec::new();

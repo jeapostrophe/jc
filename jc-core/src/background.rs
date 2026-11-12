@@ -79,17 +79,14 @@ pub fn parse_backgrounded(stdout: &str) -> Option<String> {
 #[serde(rename_all = "camelCase")]
 pub struct Agent {
   pub id: Option<String>,
-  pub cwd: Option<String>,
   pub kind: Option<String>,
   /// The conversation uuid. Current for a live session; may be the creation
   /// uuid of a stopped one after a `/clear`.
   pub session_id: Option<String>,
-  pub name: Option<String>,
   /// `blocked`, `working`, `stopped`, `failed`, … (the agent-view summary).
   pub state: Option<String>,
   /// `idle`, `busy` or `waiting` — present only while the process runs.
   pub status: Option<String>,
-  pub pid: Option<u32>,
 }
 
 impl Agent {
@@ -112,7 +109,8 @@ pub fn find<'a>(agents: &'a [Agent], short: &str) -> Option<&'a Agent> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchPlan {
   /// `claude attach <short>`. Attach also resumes a stopped or retired job.
-  Attach(String),
+  /// `uuid` is the job's conversation as `claude agents` reports it.
+  Attach { short: String, uuid: Option<String> },
   /// `claude --bg`, continuing `resume` when given, then attach.
   Start { resume: Option<String> },
   /// A legacy uuid held by a running interactive `claude`: `--bg --resume`
@@ -135,29 +133,34 @@ pub fn plan_launch(
   agents: &[Agent],
   transcript_exists: bool,
 ) -> LaunchPlan {
+  let attach = |a: &Agent| LaunchPlan::Attach {
+    short: a.id.clone().unwrap_or_default(),
+    uuid: a.session_id.clone(),
+  };
   match kind {
-    IdKind::Bg => match find(agents, id) {
-      Some(_) => LaunchPlan::Attach(id.to_string()),
-      None => LaunchPlan::Start { resume: None },
-    },
+    IdKind::Bg => find(agents, id).map_or(LaunchPlan::Start { resume: None }, attach),
     IdKind::Uuid => {
-      let on_it = || agents.iter().filter(|a| a.session_id.as_deref() == Some(id));
-      // A live background job first, then any (attach resumes a stopped one).
-      let job = on_it()
-        .filter(|a| a.is_background())
-        .max_by_key(|a| a.is_live())
-        .and_then(|a| a.id.clone());
-      if let Some(short) = job {
-        LaunchPlan::Attach(short)
-      } else if on_it().any(Agent::is_live) {
-        LaunchPlan::Blocked
-      } else if transcript_exists {
-        LaunchPlan::Start { resume: Some(id.to_string()) }
-      } else {
-        LaunchPlan::Start { resume: None }
+      let on_it: Vec<&Agent> =
+        agents.iter().filter(|a| a.session_id.as_deref() == Some(id)).collect();
+      let job = on_it.iter().filter(|a| a.is_background()).max_by_key(|a| a.is_live());
+      let held_elsewhere = on_it.iter().any(|a| !a.is_background() && a.is_live());
+      match job {
+        // A live job is the conversation's holder; attaching to it forks nothing.
+        Some(job) if job.is_live() => attach(job),
+        // Attaching resumes a stopped job, which would fork a copy of a
+        // conversation an interactive `claude` holds.
+        _ if held_elsewhere => LaunchPlan::Blocked,
+        Some(job) => attach(job),
+        None if transcript_exists => LaunchPlan::Start { resume: Some(id.to_string()) },
+        None => LaunchPlan::Start { resume: None },
       }
     }
   }
+}
+
+/// The short id a background session's uuid starts with (its first segment).
+pub fn short_of(uuid: &str) -> Option<&str> {
+  uuid.split_once('-').map(|(short, _)| short)
 }
 
 /// Does a hook whose `session_id` is `hook_session` belong to the background
@@ -170,9 +173,7 @@ pub fn hook_matches(short: &str, uuid: &str, hook_session: &str) -> bool {
   if hook_session.is_empty() {
     return false;
   }
-  hook_session == uuid
-    || (!short.is_empty()
-      && hook_session.strip_prefix(short).is_some_and(|rest| rest.starts_with('-')))
+  hook_session == uuid || (!short.is_empty() && short_of(hook_session) == Some(short))
 }
 
 /// The [`StartSpec`] that recreates a session with `> dangerous` set to
@@ -192,6 +193,19 @@ pub fn toggle_spec(
     // a prompt) settles failed: "source session … not found".
     resume: uuid.filter(|_| transcript_exists).map(str::to_string),
   }
+}
+
+/// What became of a job [`Claude::wait_settled`] watched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Settled {
+  /// Its process runs.
+  Live(Agent),
+  /// It settled `failed`.
+  Failed,
+  /// Claude Code does not list it at all: removed.
+  Gone,
+  /// Still neither live nor failed when the poll gave up.
+  TimedOut,
 }
 
 /// How often and how long to poll `claude agents --json`.
@@ -215,7 +229,7 @@ pub struct Claude {
 }
 
 impl Default for Claude {
-  /// `claude` from `PATH`, as the Claude pane always ran it.
+  /// `claude` from `PATH`.
   fn default() -> Self {
     Self { program: PathBuf::from("claude") }
   }
@@ -224,10 +238,6 @@ impl Default for Claude {
 impl Claude {
   pub fn new(program: impl Into<PathBuf>) -> Self {
     Self { program: program.into() }
-  }
-
-  pub fn program(&self) -> &Path {
-    &self.program
   }
 
   /// `claude attach <short>`, as the argument vector the Claude pane runs.
@@ -286,22 +296,31 @@ impl Claude {
     self.run_ok(&["rm".into(), short.into()]).map(drop)
   }
 
-  /// Poll until `short` is live (`Ok(Some(entry))`), has settled `failed`
-  /// (`Ok(None)`), or `poll.timeout` passes (`Ok(Some(default))` — the caller
-  /// attaches anyway, and attach shows whatever there is).
-  pub fn wait_settled(&self, short: &str, poll: Poll) -> Result<Option<Agent>> {
+  /// Poll `claude agents --json --all` until `short` is live, has settled
+  /// `failed`, is not listed at all, or `poll.timeout` passes.
+  pub fn wait_settled(&self, short: &str, poll: Poll) -> Result<Settled> {
     let deadline = Instant::now() + poll.timeout;
     loop {
       let agents = self.agents()?;
       match find(&agents, short) {
-        Some(a) if a.is_live() => return Ok(Some(a.clone())),
-        Some(a) if a.state.as_deref() == Some("failed") => return Ok(None),
-        _ => {}
+        None => return Ok(Settled::Gone),
+        Some(a) if a.is_live() => return Ok(Settled::Live(a.clone())),
+        Some(a) if a.state.as_deref() == Some("failed") => return Ok(Settled::Failed),
+        Some(_) => {}
       }
       if Instant::now() >= deadline {
-        return Ok(Some(Agent::default()));
+        return Ok(Settled::TimedOut);
       }
       std::thread::sleep(poll.interval);
+    }
+  }
+
+  /// `claude stop` then `claude rm`, logging failures (a stopped job refuses
+  /// `stop`; `rm` is what matters).
+  pub fn remove(&self, short: &str) {
+    let _ = self.stop(short);
+    if let Err(e) = self.rm(short) {
+      eprintln!("claude rm {short}: {e:#}");
     }
   }
 
@@ -309,8 +328,10 @@ impl Claude {
   /// the first start settles `failed` (seen at high load: SIGKILL before init).
   /// The failed job is removed before the retry.
   pub fn start(&self, spec: &StartSpec, cwd: &Path, poll: Poll) -> Result<String> {
+    // A timeout counts as started: attach shows whatever there is.
+    let started = |s: &Settled| matches!(s, Settled::Live(_) | Settled::TimedOut);
     let first = self.start_once(spec, cwd)?;
-    if self.wait_settled(&first, poll)?.is_some() {
+    if started(&self.wait_settled(&first, poll)?) {
       return Ok(first);
     }
     eprintln!("claude --bg: {first} settled failed; removing it and retrying once");
@@ -319,8 +340,8 @@ impl Claude {
     }
     let second = self.start_once(spec, cwd)?;
     match self.wait_settled(&second, poll)? {
-      Some(_) => Ok(second),
-      None => {
+      s if started(&s) => Ok(second),
+      _ => {
         if let Err(e) = self.rm(&second) {
           eprintln!("claude rm {second}: {e:#}");
         }
@@ -344,7 +365,11 @@ impl Claude {
   ) -> Result<String> {
     self.stop(short)?;
     let new_short = self.start(spec, cwd, poll)?;
-    if let Err(e) = self.rm(short) {
+    // With flags equal to the job's saved ones, `--resume` continues the job
+    // itself under the same short id.
+    if new_short != short
+      && let Err(e) = self.rm(short)
+    {
       eprintln!("claude rm {short} after toggling dangerous: {e:#}");
     }
     Ok(new_short)
@@ -516,7 +541,6 @@ esac
       session_id: Some(uuid.into()),
       status: live.then(|| "idle".into()),
       state: Some(if live { "blocked" } else { "stopped" }.into()),
-      ..Default::default()
     }
   }
 
@@ -525,7 +549,6 @@ esac
       kind: Some("interactive".into()),
       session_id: Some(uuid.into()),
       status: Some("idle".into()),
-      pid: Some(1),
       ..Default::default()
     }
   }
@@ -537,7 +560,7 @@ esac
     let agents = [bg("335b461a", U, false)];
     assert_eq!(
       plan_launch("335b461a", IdKind::Bg, &agents, false),
-      LaunchPlan::Attach("335b461a".into())
+      LaunchPlan::Attach { short: "335b461a".into(), uuid: Some(U.into()) }
     );
     assert_eq!(
       plan_launch("deadbeef", IdKind::Bg, &agents, true),
@@ -561,7 +584,7 @@ esac
     // hand): attach to it rather than forking.
     assert_eq!(
       plan_launch(U, IdKind::Uuid, &[bg("335b461a", U, true)], true),
-      LaunchPlan::Attach("335b461a".into())
+      LaunchPlan::Attach { short: "335b461a".into(), uuid: Some(U.into()) }
     );
   }
 
@@ -662,5 +685,61 @@ esac
     assert_eq!(spec.resume.as_deref(), Some(U));
     assert_eq!(spec.permissions, Permissions::ForceDefault, "turning bypass off must say so");
     assert_eq!(spec.cira.as_deref(), Some("c-1"));
+  }
+
+  // ---- review round (2026-11-12) ----
+
+  #[test]
+  fn a_job_claude_no_longer_lists_is_gone_not_pending() {
+    // A pane whose job was removed elsewhere must stop polling and re-plan.
+    let fake = Fake::new(&[], &[r#"[{"id":"other111","kind":"background","status":"idle"}]"#]);
+    assert_eq!(fake.claude().wait_settled("aaaa1111", FAST).unwrap(), Settled::Gone);
+    let fake = Fake::new(&[], &[r#"[{"id":"aaaa1111","kind":"background","state":"failed"}]"#]);
+    assert_eq!(fake.claude().wait_settled("aaaa1111", FAST).unwrap(), Settled::Failed);
+    let fake = Fake::new(
+      &[],
+      &[r#"[{"id":"aaaa1111","kind":"background","state":"working","sessionId":"u"}]"#],
+    );
+    let slow = Poll { interval: Duration::from_millis(1), timeout: Duration::from_millis(20) };
+    assert_eq!(fake.claude().wait_settled("aaaa1111", slow).unwrap(), Settled::TimedOut);
+  }
+
+  #[test]
+  fn a_toggle_that_continues_the_same_job_does_not_remove_it() {
+    // `--bg --resume U` with flags equal to the saved ones continues the job
+    // itself (same short id); removing "the old job" would remove the new one.
+    let live = r#"[{"id":"335b461a","kind":"background","status":"idle"}]"#;
+    let fake = Fake::new(&["335b461a"], &[live]);
+    let spec = toggle_spec("L", None, true, Some(U), true);
+    let short =
+      fake.claude().toggle_dangerous("335b461a", &spec, &std::env::temp_dir(), FAST).unwrap();
+    assert_eq!(short, "335b461a");
+    assert!(!fake.calls().iter().any(|c| c[0] == "rm"), "{:?}", fake.calls());
+  }
+
+  #[test]
+  fn a_stopped_job_is_not_attached_while_an_interactive_claude_holds_its_uuid() {
+    let agents = [bg("335b461a", U, false), interactive(U)];
+    assert_eq!(plan_launch(U, IdKind::Uuid, &agents, true), LaunchPlan::Blocked);
+    let agents = [bg("335b461a", U, true), interactive(U)];
+    assert!(matches!(plan_launch(U, IdKind::Uuid, &agents, true), LaunchPlan::Attach { .. }));
+  }
+
+  #[test]
+  fn an_attach_plan_carries_the_jobs_current_uuid() {
+    let agents = [bg("335b461a", "6955c2a6-aaaa-bbbb-cccc-dddddddddddd", true)];
+    assert_eq!(
+      plan_launch("335b461a", IdKind::Bg, &agents, false),
+      LaunchPlan::Attach {
+        short: "335b461a".into(),
+        uuid: Some("6955c2a6-aaaa-bbbb-cccc-dddddddddddd".into())
+      }
+    );
+  }
+
+  #[test]
+  fn short_of_is_the_first_uuid_segment() {
+    assert_eq!(short_of(U), Some("335b461a"));
+    assert_eq!(short_of("nodash"), None);
   }
 }

@@ -5,22 +5,23 @@ use crate::views::close_confirm::{CloseConfirm, CloseConfirmEvent};
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
-use crate::views::session_state::{SavedViewState, SessionId, SessionState};
+use crate::views::session_state::{Heading, SavedViewState, SessionId, SessionState};
 use crate::views::todo_view::ScheduledFire;
 use chrono::NaiveDateTime;
 use gpui::*;
 use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
-use jc_core::background::{self, Claude, LaunchPlan, Permissions, Poll, StartSpec};
+use jc_core::background::{self, Claude, LaunchPlan, Permissions, Poll, Settled, StartSpec};
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
 use jc_core::theme::Appearance;
 use jc_core::todo::{IdKind, SessionKey, TodoDocument, TodoSession};
 use jc_terminal::{ChildEvent, Palette, TerminalView};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
+use std::time::Instant;
 
 actions!(
   workspace,
@@ -116,24 +117,21 @@ pub struct Workspace {
   claude: Claude,
   /// Hooks from a known project that matched no session, kept until the next
   /// `claude agents --json` refresh teaches jc the uuid they carry.
-  unmatched_hooks: Vec<HookEvent>,
+  unmatched_hooks: VecDeque<HookEvent>,
   /// A `claude agents --json` refresh for unmatched hooks is in flight.
   refreshing_agents: bool,
+  /// When the last such refresh started. Hooks from a `claude` jc does not
+  /// manage also match nothing, so refreshes are rate-limited.
+  last_agents_refresh: Option<Instant>,
   /// Short ids of `[DELETED]` headings jc has already stopped and removed.
   removed_shorts: HashSet<String>,
 }
 
-/// What a session about to wait for its background session starts from: its
-/// heading's id (empty for one not written yet), label, stable id and mode.
-struct PendingHeading {
-  key: String,
-  label: String,
-  cira: Option<String>,
-  dangerous: bool,
-}
-
 /// Unmatched hooks kept for re-dispatch; older ones are dropped.
 const UNMATCHED_HOOKS_MAX: usize = 32;
+/// The shortest gap between two `claude agents --json` refreshes for
+/// unmatched hooks.
+const AGENTS_REFRESH_GAP: StdDuration = StdDuration::from_secs(30);
 
 impl Workspace {
   pub fn new(
@@ -153,7 +151,6 @@ impl Workspace {
         project.path.clone(),
         project.name(),
         &palette,
-        &claude,
         window,
         cx,
       ));
@@ -166,7 +163,7 @@ impl Workspace {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".into());
-      projects.push(ProjectState::create(path, name, &palette, &claude, window, cx));
+      projects.push(ProjectState::create(path, name, &palette, window, cx));
     }
 
     // Create global TODO view (~/.claude/TODO.md) as a read-only CodeView.
@@ -331,8 +328,9 @@ impl Workspace {
       pre_close_confirm_focus: None,
       close_confirm_is_quit: false,
       claude,
-      unmatched_hooks: Vec::new(),
+      unmatched_hooks: VecDeque::new(),
       refreshing_agents: false,
+      last_agents_refresh: None,
       removed_shorts: HashSet::new(),
     };
 
@@ -855,7 +853,7 @@ impl Workspace {
       .map(|n| n.to_string_lossy().into_owned())
       .unwrap_or_else(|| "unknown".into());
 
-    let project = ProjectState::create(canonical.clone(), name, &palette, &self.claude, window, cx);
+    let project = ProjectState::create(canonical.clone(), name, &palette, window, cx);
     self.projects.push(project);
 
     let project_idx = self.projects.len() - 1;
@@ -983,13 +981,7 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let found = self.projects.iter().enumerate().find_map(|(pi, p)| {
-      p.sessions
-        .iter()
-        .find(|(_, s)| background::hook_matches(&s.bg, &s.uuid, session_id))
-        .map(|(&id, _)| (pi, id))
-    });
-    if let Some((pi, id)) = found {
+    if let Some((pi, id)) = self.session_for_hook(session_id) {
       self.switch_to_session(pi, Some(id), window, cx);
     }
   }
@@ -1089,6 +1081,12 @@ impl Workspace {
     .detach();
   }
 
+  /// Run `f` with the `claude` CLI on its own thread, result unwanted.
+  fn detached(&self, f: impl FnOnce(&Claude) + Send + 'static) {
+    let claude = self.claude.clone();
+    std::thread::spawn(move || f(&claude));
+  }
+
   fn project_index(&self, path: &Path) -> Option<usize> {
     self.projects.iter().position(|p| p.path == path)
   }
@@ -1105,7 +1103,7 @@ impl Workspace {
     let unwatched: Vec<(SessionId, Entity<TerminalView>)> = self.projects[pi]
       .sessions
       .iter()
-      .filter(|(_, s)| s._claude_child.is_none())
+      .filter(|(_, s)| s.claude_child_events.is_none())
       .map(|(&sid, s)| (sid, s.claude_terminal.clone()))
       .collect();
     for (sid, terminal) in unwatched {
@@ -1114,7 +1112,7 @@ impl Workspace {
         ws.on_claude_child(&path, sid, *event, window, cx);
       });
       if let Some(session) = self.projects[pi].sessions.get_mut(&sid) {
-        session._claude_child = Some(sub);
+        session.claude_child_events = Some(sub);
       }
     }
   }
@@ -1160,12 +1158,21 @@ impl Workspace {
         let Some(session) = ws.session_mut(&path, sid) else { return };
         session.watching_live = false;
         match result {
-          Ok((short, Some(agent))) if agent.is_live() && session.bg == short => {
+          Ok((short, _)) if session.bg != short || session.changing => {}
+          Ok((_, Settled::Live(agent))) => {
             session.live = true;
             if let Some(uuid) = agent.session_id {
               session.uuid = uuid;
             }
-            ws.flush_pending_send(&path, sid, window, cx);
+            ws.flush_pending_send(&path, sid, cx);
+          }
+          Ok((_, Settled::Gone)) => {
+            // Removed elsewhere (`claude rm`, the agents view): attaching can
+            // only fail now. Stop trying, and give the heading a session again
+            // the way a start does (`plan_launch`: a fresh one).
+            session.claude_terminal.update(cx, |t, cx| t.stop_child(cx));
+            session.bg.clear();
+            ws.launch_sessions(window, cx);
           }
           Ok(_) => {}
           Err(e) => eprintln!("claude agents: {e:#}"),
@@ -1196,7 +1203,15 @@ impl Workspace {
         if !session.bg.is_empty() || session.key.is_empty() || session.changing {
           continue;
         }
-        let kind = doc.session_by_id(&session.key).map_or(IdKind::Bg, |h| h.id_kind);
+        // Its heading must still be there and enabled: a session left waiting
+        // (blocked, failed) whose heading was since deleted or disabled is not
+        // started behind the user's back.
+        let Some(kind) =
+          doc.session_by_id(&session.key).filter(|h| !h.is_disabled()).map(|h| h.id_kind)
+        else {
+          continue;
+        };
+        session.failed = false;
         session.changing = true;
         session.status("finding this session's background session…", cx);
         requests.push(Request {
@@ -1206,91 +1221,74 @@ impl Workspace {
           kind,
         });
       }
-      disabled.extend(
-        doc
-          .sessions
-          .iter()
-          .filter(|h| h.is_disabled() && h.id_kind == IdKind::Bg && !h.id.is_empty())
-          .map(|h| h.id.clone()),
-      );
+      disabled.extend(doc.stoppable_ids().into_iter().map(str::to_string));
       deleted.extend(
         doc
-          .deleted
-          .iter()
-          .filter(|d| d.id_kind == IdKind::Bg && !self.removed_shorts.contains(&d.id))
-          .map(|d| d.id.clone()),
+          .removable_ids()
+          .into_iter()
+          .filter(|id| !self.removed_shorts.contains(*id))
+          .map(str::to_string),
       );
     }
     if requests.is_empty() && disabled.is_empty() && deleted.is_empty() {
       return;
     }
-    self.removed_shorts.extend(deleted.iter().cloned());
 
     let claude = self.claude.clone();
     let work = move || {
       let agents = claude.agents();
+      // `[DELETED]` jobs dealt with: removed, or already unknown to Claude
+      // Code. Nothing is recorded when the list itself failed.
+      let mut removed = Vec::new();
       if let Ok(agents) = &agents {
         for short in &disabled {
           if background::find(agents, short).is_some_and(|a| a.is_live()) {
             let _ = claude.stop(short).inspect_err(|e| eprintln!("[D] {short}: {e:#}"));
           }
         }
-        for short in &deleted {
-          if let Some(agent) = background::find(agents, short) {
-            if agent.is_live() {
-              let _ = claude.stop(short);
-            }
-            let _ = claude.rm(short).inspect_err(|e| eprintln!("[DELETED] {short}: {e:#}"));
+        for short in deleted {
+          if background::find(agents, &short).is_some() {
+            claude.remove(&short);
           }
+          removed.push(short);
         }
       }
-      requests
+      let plans = requests
         .into_iter()
         .map(|r| {
           let plan = match &agents {
             Ok(agents) => {
-              let transcript = r.kind == IdKind::Uuid
-                && ProjectState::session_dirs(&r.path)
-                  .is_some_and(|dirs| jc_core::claude::transcript_in(&dirs, &r.key));
+              let transcript =
+                r.kind == IdKind::Uuid && ProjectState::has_transcript(&r.path, &r.key);
               Ok(background::plan_launch(&r.key, r.kind, agents, transcript))
             }
             // Attaching to a known short id is safe without the list; anything
             // that would start a session is not.
-            Err(_) if r.kind == IdKind::Bg => Ok(LaunchPlan::Attach(r.key.clone())),
+            Err(_) if r.kind == IdKind::Bg => {
+              Ok(LaunchPlan::Attach { short: r.key.clone(), uuid: None })
+            }
             Err(e) => Err(format!("cannot list background sessions: {e:#}")),
           };
-          let uuid = match (&agents, &plan) {
-            (Ok(agents), Ok(LaunchPlan::Attach(short))) => {
-              background::find(agents, short).and_then(|a| a.session_id.clone())
-            }
-            _ => None,
-          };
-          (r.path, r.sid, plan, uuid)
+          (r.path, r.sid, plan)
         })
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+      (plans, removed)
     };
-    self.run_blocking(window, cx, work, |ws, plans, window, cx| {
-      for (path, sid, plan, uuid) in plans {
+    self.run_blocking(window, cx, work, |ws, (plans, removed), window, cx| {
+      ws.removed_shorts.extend(removed);
+      for (path, sid, plan) in plans {
         match plan {
-          Ok(LaunchPlan::Attach(short)) => ws.finish_launch(&path, sid, &short, uuid, window, cx),
+          Ok(LaunchPlan::Attach { short, uuid }) => {
+            ws.finish_launch(&path, sid, &short, uuid, window, cx)
+          }
           Ok(LaunchPlan::Start { resume }) => ws.start_session(path, sid, resume, window, cx),
           Ok(LaunchPlan::Blocked) => {
-            if let Some(session) = ws.session_mut(&path, sid) {
-              session.changing = false;
-              let msg = format!(
-                "{} is open in another Claude Code process (an older jc?). Close it, then \
-                 adopt this session again (Cmd-Shift-P) to move it to a background session.",
-                session.key
-              );
-              session.status(&msg, cx);
-            }
+            let msg = "this conversation is open in another Claude Code process (an older \
+                       jc?). Close it, then pick this session in Cmd-P or Cmd-Shift-P to move \
+                       it to a background session.";
+            ws.launch_failed(&path, sid, msg, cx);
           }
-          Err(e) => {
-            if let Some(session) = ws.session_mut(&path, sid) {
-              session.changing = false;
-              session.status(&e, cx);
-            }
-          }
+          Err(e) => ws.launch_failed(&path, sid, &e, cx),
         }
       }
     });
@@ -1329,13 +1327,21 @@ impl Workspace {
           ws.finish_launch(&path, sid, &short, resume, window, cx);
         }
         Err(e) => {
-          if let Some(session) = ws.session_mut(&path, sid) {
-            session.changing = false;
-            session.status(&format!("could not start a background session: {e:#}"), cx);
-          }
+          let msg = format!("could not start a background session: {e:#}");
+          ws.launch_failed(&path, sid, &msg, cx);
         }
       },
     );
+  }
+
+  /// `sid`'s start failed or was refused: say why in its pane, and stop
+  /// counting it as adopted so its heading is offered again.
+  fn launch_failed(&mut self, path: &Path, sid: SessionId, why: &str, cx: &mut Context<Self>) {
+    let Some(session) = self.session_mut(path, sid) else { return };
+    session.changing = false;
+    session.failed = true;
+    session.status(why, cx);
+    cx.notify();
   }
 
   /// Bind `sid`'s heading to background session `short` — rewriting its id
@@ -1366,7 +1372,10 @@ impl Workspace {
     match index {
       Some(index) => {
         let heading = &doc.sessions[index];
-        if heading.id != short || heading.id_kind != IdKind::Bg || heading.cira.is_none() {
+        if heading.id != short
+          || heading.id_kind != IdKind::Bg
+          || (heading.cira.is_none() && cira.is_some())
+        {
           todo_view.update(cx, |tv, cx| tv.bind_bg_at(index, short, cira.as_deref(), window, cx));
         }
       }
@@ -1384,8 +1393,9 @@ impl Workspace {
     session.unbound_key = None;
     session.changing = false;
     session.uuid = uuid.unwrap_or_default();
+    session.failed = false;
+    session.adopting = None;
     session.attach(short, &self.claude, cx);
-    session.export_cira_to_shell(cx);
     if is_active {
       todo_view.update(cx, |tv, cx| tv.set_active_key(Some(short), cx));
     }
@@ -1396,29 +1406,16 @@ impl Workspace {
   fn add_pending_session(
     &mut self,
     pi: usize,
-    heading: PendingHeading,
+    heading: Heading,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> SessionId {
-    let PendingHeading { key, label, cira, dangerous } = heading;
     let project_path = self.projects[pi].path.clone();
     let palette = palette_from_window(window);
     let project = &mut self.projects[pi];
     let id = project.next_session_id;
     project.next_session_id += 1;
-    let session = SessionState::create(
-      id,
-      key,
-      String::new(),
-      label,
-      cira,
-      dangerous,
-      &self.claude,
-      &project_path,
-      &palette,
-      window,
-      cx,
-    );
+    let session = SessionState::create(id, heading, &project_path, &palette, window, cx);
     project.sessions.insert(id, session);
     self.observe_claude_panes(pi, window, cx);
     self.switch_to_session(pi, Some(id), window, cx);
@@ -1453,6 +1450,13 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    // A second confirm while the first start is in flight would fork the
+    // conversation a second time.
+    let in_flight = |s: &SessionState| s.adopting.as_deref() == Some(uuid.as_str());
+    if self.projects[project_idx].sessions.values().any(in_flight) {
+      crate::notify::beep();
+      return;
+    }
     // The summary is the transcript's first user message, so two sessions that
     // opened with the same prompt would otherwise get the same display name.
     let label = jc_core::todo::unique_label(
@@ -1470,10 +1474,12 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let cira = Some(uuid::Uuid::new_v4().to_string());
-    let heading = PendingHeading { key: String::new(), label, cira, dangerous: false };
+    let heading = Heading::new(String::new(), IdKind::Bg, label, None, false);
     let id = self.add_pending_session(pi, heading, window, cx);
     let path = self.projects[pi].path.clone();
+    if let Some(session) = self.projects[pi].sessions.get_mut(&id) {
+      session.adopting = resume.clone();
+    }
     self.start_session(path, id, resume, window, cx);
   }
 
@@ -1509,6 +1515,27 @@ impl Workspace {
       return;
     };
 
+    // A heading already being started (an unbound one adopted twice) gets
+    // one session; a session whose start failed makes way for a new try.
+    let project = &self.projects[project_idx];
+    if project.sessions.values().any(|s| s.unbound_key.as_ref() == Some(key) && !s.failed) {
+      crate::notify::beep();
+      return;
+    }
+    let failed: Vec<SessionId> = project
+      .sessions
+      .values()
+      .filter(|s| {
+        s.failed
+          && (s.unbound_key.as_ref() == Some(key)
+            || (!heading.id.is_empty() && s.key == heading.id))
+      })
+      .map(|s| s.id)
+      .collect();
+    for sid in failed {
+      self.remove_running_session(project_idx, sid, window, cx);
+    }
+
     // Clear `[D]` if the heading was dormant (re-attaching resumes the
     // stopped session).
     if heading.is_disabled() {
@@ -1519,12 +1546,13 @@ impl Workspace {
     }
 
     let unbound = heading.id.is_empty();
-    let pending = PendingHeading {
-      key: heading.id.clone(),
-      label: heading.label.clone(),
-      cira: heading.cira.clone(),
-      dangerous: heading.dangerous,
-    };
+    let pending = Heading::new(
+      heading.id.clone(),
+      heading.id_kind,
+      heading.label.clone(),
+      heading.cira.clone(),
+      heading.dangerous,
+    );
     let id = self.add_pending_session(project_idx, pending, window, cx);
     if unbound {
       let path = self.projects[project_idx].path.clone();
@@ -1556,8 +1584,7 @@ impl Workspace {
     let known_uuid = session.uuid.clone();
     let label = session.label.clone();
     let cira = session.cira.clone();
-    // Detach first: an attach still open when the job stops would be
-    // restarted, and attaching resumes the job that is being replaced.
+    // Detach first (see `SessionState::attach`).
     session.claude_terminal.update(cx, |t, cx| {
       t.stop_child(cx);
       t.show_status(
@@ -1579,10 +1606,7 @@ impl Workspace {
       } else {
         Some(known_uuid)
       };
-      let transcript = uuid.as_deref().is_some_and(|uuid| {
-        ProjectState::session_dirs(&cwd)
-          .is_some_and(|dirs| jc_core::claude::transcript_in(&dirs, uuid))
-      });
+      let transcript = uuid.as_deref().is_some_and(|uuid| ProjectState::has_transcript(&cwd, uuid));
       let spec =
         background::toggle_spec(&label, cira.as_deref(), dangerous, uuid.as_deref(), transcript);
       claude.toggle_dangerous(&old_for_work, &spec, &cwd, Poll::START)
@@ -1617,11 +1641,12 @@ impl Workspace {
     let mut flush = Vec::new();
     for (pi, project) in self.projects.iter_mut().enumerate() {
       let doc = project.todo_view.read(cx).document();
+      let removable = doc.removable_ids();
       for session in project.sessions.values_mut() {
         if session.bg.is_empty() || session.changing {
           continue;
         }
-        if doc.deleted.iter().any(|d| d.id == session.key) {
+        if removable.contains(&session.key.as_str()) {
           gone.push((pi, session.id, session.bg.clone()));
           continue;
         }
@@ -1646,14 +1671,10 @@ impl Workspace {
     for (pi, sid, short) in gone {
       self.removed_shorts.insert(short.clone());
       self.remove_running_session(pi, sid, window, cx);
-      let claude = self.claude.clone();
-      std::thread::spawn(move || {
-        let _ = claude.stop(&short);
-        let _ = claude.rm(&short).inspect_err(|e| eprintln!("[DELETED] {short}: {e:#}"));
-      });
+      self.detached(move |claude| claude.remove(&short));
     }
     for (path, sid) in flush {
-      self.flush_pending_send(&path, sid, window, cx);
+      self.flush_pending_send(&path, sid, cx);
     }
   }
 
@@ -1722,6 +1743,15 @@ impl Workspace {
       SessionKey::Id(id) => project.session_by_key(id).map(|(sid, s)| (sid, s.bg.clone())),
       SessionKey::Unbound { .. } => None,
     };
+    // A start or `> dangerous` change in flight must finish binding the
+    // heading to the job it starts; disabling now would orphan that job.
+    if let Some((sid, _)) = &adopted
+      && project.sessions.get(sid).is_some_and(|s| s.changing)
+    {
+      crate::notify::beep();
+      self.panes[self.active_pane_index].read(cx).focus_content(window);
+      return;
+    }
 
     todo_view.update(cx, |tv, cx| {
       tv.toggle_session_disabled(key, window, cx);
@@ -1737,12 +1767,10 @@ impl Workspace {
     let mut switched = false;
 
     if is_now_disabled && let Some((sid, short)) = adopted {
-      // Detach before stopping: an attach still open when the job stops would
-      // be restarted, and attaching resumes the job.
+      // Detach before stopping (see `SessionState::attach`).
       switched = self.remove_running_session(project_idx, sid, window, cx);
       if !short.is_empty() {
-        let claude = self.claude.clone();
-        std::thread::spawn(move || {
+        self.detached(move |claude| {
           let _ = claude.stop(&short).inspect_err(|e| eprintln!("[D] {short}: {e:#}"));
         });
       }
@@ -1865,13 +1893,13 @@ impl Workspace {
     }
 
     if let Some(when) = schedule {
-      // Deferred send: arm a timer. Delivery, busy, and `> last=` happen at
+      // Deferred send: arm a timer. Delivery and `> last=` happen at
       // fire time (see `fire_scheduled_send`), not now. No workspace state
       // changed here (the TodoView mutated itself and notified), so we don't.
       let project_path = self.projects[self.active_project_index].path.clone();
       self.ensure_scheduled_armed(project_path, uuid, when, window, cx);
     } else if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
-      session.mark_user_input(cx);
+      session.end_launch_settle(cx);
       if ready {
         Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
       } else {
@@ -1892,13 +1920,7 @@ impl Workspace {
   }
 
   /// Deliver `sid`'s waiting Cmd-Enter message if its session is ready.
-  fn flush_pending_send(
-    &mut self,
-    path: &Path,
-    sid: SessionId,
-    _window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
+  fn flush_pending_send(&mut self, path: &Path, sid: SessionId, cx: &mut Context<Self>) {
     let Some(session) = self.session_mut(path, sid) else { return };
     if session.pending_send.is_none() || !Self::ready_for_input(session, cx) {
       return;
@@ -1987,7 +2009,7 @@ impl Workspace {
       ScheduledFire::Deliver(body) => {
         Self::deliver_to_terminal(&claude_terminal, &body, cx);
         if let Some(session) = self.projects[project_idx].sessions.get_mut(&id) {
-          session.mark_user_input(cx);
+          session.end_launch_settle(cx);
         }
         cx.notify();
       }
@@ -2147,14 +2169,14 @@ impl Workspace {
       // another attach). Ask `claude agents --json`, then try again.
       if event.project_path.as_ref().is_some_and(|p| self.project_index(p).is_some()) {
         if self.unmatched_hooks.len() == UNMATCHED_HOOKS_MAX {
-          self.unmatched_hooks.remove(0);
+          self.unmatched_hooks.pop_front();
         }
-        self.unmatched_hooks.push(event);
+        self.unmatched_hooks.push_back(event);
         self.refresh_session_uuids(window, cx);
       }
       return;
     };
-    self.flush_pending_send(&path, sid, window, cx);
+    self.flush_pending_send(&path, sid, cx);
 
     // Notify when the window is not active (user is in another app). Only a
     // blocked session is worth interrupting for; Stop/IdlePrompt are ambient.
@@ -2182,29 +2204,36 @@ impl Workspace {
     event: &HookEvent,
     cx: &App,
   ) -> Option<(PathBuf, SessionId, String, String)> {
-    let (project, session) = self.projects.iter_mut().find_map(|p| {
-      let session = p
-        .sessions
-        .values_mut()
-        .find(|s| background::hook_matches(&s.bg, &s.uuid, &event.session_id))?;
-      Some(((p.path.clone(), p.name.clone()), session))
-    })?;
+    let (pi, sid) = self.session_for_hook(&event.session_id)?;
+    let project = &mut self.projects[pi];
+    let project_ids = (project.path.clone(), project.name.clone());
+    let session = project.sessions.get_mut(&sid)?;
 
     session.uuid = event.session_id.clone();
     session.live = true;
     if let HookEventKind::PromptSubmit = event.kind {
-      session.mark_user_input(cx);
+      session.end_launch_settle(cx);
     }
-    Some((project.0, session.id, project.1, session.label.clone()))
+    Some((project_ids.0, sid, project_ids.1, session.label.clone()))
+  }
+
+  /// The `(project index, session)` a hook naming `hook_session` comes from.
+  fn session_for_hook(&self, hook_session: &str) -> Option<(usize, SessionId)> {
+    self.projects.iter().enumerate().find_map(|(pi, p)| {
+      p.sessions.iter().find(|(_, s)| s.owns_hook(hook_session)).map(|(&sid, _)| (pi, sid))
+    })
   }
 
   /// Ask `claude agents --json` for the current uuid of every running session
   /// jc has, then re-dispatch the hooks that matched none.
   fn refresh_session_uuids(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    if self.refreshing_agents {
+    if self.refreshing_agents
+      || self.last_agents_refresh.is_some_and(|t| t.elapsed() < AGENTS_REFRESH_GAP)
+    {
       return;
     }
     self.refreshing_agents = true;
+    self.last_agents_refresh = Some(Instant::now());
     let claude = self.claude.clone();
     self.run_blocking(
       window,
@@ -2229,7 +2258,7 @@ impl Workspace {
         }
         // Each is tried once more; one still unmatched is not jc's.
         for event in std::mem::take(&mut ws.unmatched_hooks) {
-          if ws.apply_hook_to_session(&event, cx).is_some() {
+          if ws.session_for_hook(&event.session_id).is_some() {
             ws.handle_hook_event(event, window, cx);
           }
         }
@@ -2245,7 +2274,7 @@ impl Workspace {
       .projects
       .iter_mut()
       .flat_map(|p| p.sessions.values_mut())
-      .find(|s| background::hook_matches(&s.bg, &s.uuid, old_session_id));
+      .find(|s| s.owns_hook(old_session_id));
     match session {
       Some(session) => {
         eprintln!(

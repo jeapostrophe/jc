@@ -94,11 +94,11 @@ pub enum SessionKey {
 impl SessionKey {
   /// The address of the heading at `index`: its id, or its verified position
   /// when the heading is unbound.
-  pub fn new(uuid: &str, index: usize, label: &str) -> Self {
-    if uuid.is_empty() {
+  pub fn new(id: &str, index: usize, label: &str) -> Self {
+    if id.is_empty() {
       Self::Unbound { index, label: label.to_string() }
     } else {
-      Self::Id(uuid.to_string())
+      Self::Id(id.to_string())
     }
   }
 }
@@ -208,24 +208,24 @@ impl TodoDocument {
     self.sessions.first()
   }
 
-  /// The session bound to `uuid`. An empty `uuid` names no session — see
+  /// The session bound to `id`. An empty `id` names no session — see
   /// [`SessionKey`].
-  pub fn session_by_id(&self, uuid: &str) -> Option<&TodoSession> {
-    self.sessions.get(self.index_by_id(uuid)?)
+  pub fn session_by_id(&self, id: &str) -> Option<&TodoSession> {
+    self.sessions.get(self.index_by_id(id)?)
   }
 
-  /// Position of the session owning `uuid` in [`Self::sessions`], for the
+  /// Position of the session owning `id` in [`Self::sessions`], for the
   /// `*_at` writers. Ids are unique where labels are not, so anything
   /// rewriting one specific session should address it this way.
   ///
-  /// An empty `uuid` is not an address — several legacy headings can share it —
+  /// An empty `id` is not an address — several legacy headings can share it —
   /// so it never matches. Use [`Self::index_of`] with a [`SessionKey`] when the
   /// heading may be unbound.
-  pub fn index_by_id(&self, uuid: &str) -> Option<usize> {
-    if uuid.is_empty() {
+  pub fn index_by_id(&self, id: &str) -> Option<usize> {
+    if id.is_empty() {
       return None;
     }
-    self.sessions.iter().position(|s| s.id == uuid)
+    self.sessions.iter().position(|s| s.id == id)
   }
 
   /// Position of the session `key` names, or `None` if the document has moved
@@ -238,6 +238,34 @@ impl TodoDocument {
         (session.id.is_empty() && session.label == *label).then_some(*index)
       }
     }
+  }
+
+  /// Short ids of `[DELETED]` headings whose job may be removed: no heading
+  /// that is still a session names the same id (a copied block).
+  pub fn removable_ids(&self) -> Vec<&str> {
+    let named = |id: &str| self.sessions.iter().any(|s| s.id == id);
+    let mut ids: Vec<&str> = self
+      .deleted
+      .iter()
+      .filter(|d| d.id_kind == IdKind::Bg && !named(&d.id))
+      .map(|d| d.id.as_str())
+      .collect();
+    ids.dedup();
+    ids
+  }
+
+  /// Short ids of `[D]` headings whose job may be stopped: no active heading
+  /// names the same id.
+  pub fn stoppable_ids(&self) -> Vec<&str> {
+    let active = |id: &str| self.sessions.iter().any(|s| s.id == id && !s.is_disabled());
+    let mut ids: Vec<&str> = self
+      .sessions
+      .iter()
+      .filter(|s| s.is_disabled() && s.id_kind == IdKind::Bg && !s.id.is_empty() && !active(&s.id))
+      .map(|s| s.id.as_str())
+      .collect();
+    ids.dedup();
+    ids
   }
 
   /// The session `key` names.
@@ -371,7 +399,7 @@ pub fn parse(text: &str) -> TodoDocument {
   let mut current_session: Option<TodoSession> = None;
   let mut byte_offset: usize = 0;
   // State: we just saw an `## Label` heading and are looking for its id line next.
-  let mut expecting_uuid_for: Option<TodoSession> = None;
+  let mut expecting_id_for: Option<TodoSession> = None;
   // State: we just saw an `## [DELETED] Label` heading; its id line, if it is
   // the next line, goes to `doc.deleted`.
   let mut expecting_deleted_id = false;
@@ -416,7 +444,7 @@ pub fn parse(text: &str) -> TodoDocument {
     }
 
     // If we're expecting an id line after a heading:
-    if let Some(ref mut pending) = expecting_uuid_for {
+    if let Some(ref mut pending) = expecting_id_for {
       if let Some((id_kind, rest)) = id_line(line) {
         pending.id = rest.to_string();
         pending.id_kind = id_kind;
@@ -425,17 +453,17 @@ pub fn parse(text: &str) -> TodoDocument {
         pending.id_byte_range = value_start..line_end;
         // Promote to current session.
         finalize_session(&mut doc, &mut current_session, line_start);
-        current_session = expecting_uuid_for.take();
+        current_session = expecting_id_for.take();
         in_metadata = true;
       } else {
         // No id line — accept the session with an empty id.
         finalize_session(&mut doc, &mut current_session, line_start);
-        current_session = expecting_uuid_for.take();
+        current_session = expecting_id_for.take();
         // Fall through to normal parsing of this line.
       }
     }
 
-    if expecting_uuid_for.is_some() {
+    if expecting_id_for.is_some() {
       // Already handled above, skip normal parsing for this line.
     } else if line.starts_with("# ") {
       // Any top-level heading ends the current session and leaves the Claude section.
@@ -465,7 +493,7 @@ pub fn parse(text: &str) -> TodoDocument {
           Some(rest) => (rest.to_string(), SessionStatus::Disabled),
           None => (after_h2.to_string(), SessionStatus::Active),
         };
-        expecting_uuid_for = Some(TodoSession {
+        expecting_id_for = Some(TodoSession {
           label,
           status,
           line: line_num,
@@ -843,7 +871,7 @@ pub fn send_from_wait(
       new_text.push_str(&ts_line);
       new_text.push_str(&before_wait[range.end..]);
     } else if !session.id.is_empty() {
-      // Insert after `> uuid=` line.
+      // Insert after the id line.
       let insert_at = skip_newline(text.as_bytes(), session.id_byte_range.end);
       new_text.push_str(&before_wait[..insert_at]);
       new_text.push_str(&ts_line);
@@ -999,15 +1027,8 @@ pub fn update_last_active(text: &str, session: &TodoSession, timestamp: u64) -> 
     result.push_str(&text[range.end..]);
     result
   } else if !session.id.is_empty() {
-    // Insert after the id line. The id_byte_range covers just the value; we
-    // need to find the end of the full id line + its newline.
-    let uuid_line_end = session.id_byte_range.end;
-    // Skip past the newline after the id line.
-    let insert_at = if uuid_line_end < text.len() && text.as_bytes()[uuid_line_end] == b'\n' {
-      uuid_line_end + 1
-    } else {
-      uuid_line_end
-    };
+    // Insert after the id line (`id_byte_range` covers just the value).
+    let insert_at = skip_newline(text.as_bytes(), session.id_byte_range.end);
     let mut result = String::with_capacity(text.len() + new_line.len() + 1);
     result.push_str(&text[..insert_at]);
     result.push_str(&new_line);
@@ -1209,7 +1230,7 @@ body
   }
 
   #[test]
-  fn id_byte_range_covers_uuid_text() {
+  fn id_byte_range_covers_the_id_text() {
     let text = "# Claude\n## My Label\n> uuid=my-uuid\n";
     let doc = parse(text);
     let session = &doc.sessions[0];
@@ -2652,5 +2673,29 @@ draft
     let doc = parse(text);
     let out = update_last_active(text, &doc.sessions[0], 7);
     assert_eq!(out, "# Claude\n## S\n> bg=aaaa1111\n> last=7\n\n### WAIT\n");
+  }
+
+  #[test]
+  fn a_copied_heading_marked_deleted_or_disabled_spares_the_live_one() {
+    // Two headings name bg=S (a copy-pasted block); marking the copy
+    // [DELETED] or [D] must not stop or remove S while the other names it.
+    let text = "\
+# Claude
+## Live
+> bg=aaaa1111
+## [DELETED] Copy
+> bg=aaaa1111
+## [D] Copy 2
+> bg=aaaa1111
+## [DELETED] Gone
+> bg=bbbb2222
+## [D] Asleep
+> bg=cccc3333
+## [D] Legacy
+> uuid=dddd4444-0000-0000-0000-000000000000
+";
+    let doc = parse(text);
+    assert_eq!(doc.removable_ids(), vec!["bbbb2222"]);
+    assert_eq!(doc.stoppable_ids(), vec!["cccc3333"]);
   }
 }

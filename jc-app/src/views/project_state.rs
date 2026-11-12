@@ -1,9 +1,8 @@
 use crate::views::code_view::CodeView;
 use crate::views::pane::PaneContentKind;
-use crate::views::session_state::{SessionId, SessionState};
+use crate::views::session_state::{Heading, SessionId, SessionState};
 use crate::views::todo_view::TodoView;
 use gpui::*;
-use jc_core::background::Claude;
 use jc_terminal::Palette;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,6 +12,10 @@ use std::path::{Path, PathBuf};
 /// "can't tell" rather than "nothing there".
 pub(crate) fn home_dir() -> Option<PathBuf> {
   std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
+fn transcript_known(dirs: Option<&[PathBuf]>, uuid: &str) -> bool {
+  dirs.is_none_or(|dirs| jc_core::claude::transcript_in(dirs, uuid))
 }
 
 pub struct SavedPaneLayout {
@@ -34,7 +37,6 @@ impl ProjectState {
     path: PathBuf,
     name: String,
     palette: &Palette,
-    claude: &Claude,
     window: &mut Window,
     cx: &mut App,
   ) -> Self {
@@ -63,7 +65,7 @@ impl ProjectState {
     // The later duplicates are then *unreachable* rather than dormant — every
     // lookup resolves an id to the first match — and jc does not repair them.
     // Editing the id line by hand is the fix.
-    let mut adopted_uuids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut adopted_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for todo_session in document
       .sessions
@@ -76,24 +78,19 @@ impl ProjectState {
       // rewriting the user's file before they ever saw it. It stays adoptable
       // in both pickers instead; adopting is where it gets a session.
       .filter(|s| !s.id.is_empty())
-      .filter(|s| adopted_uuids.insert(s.id.as_str()))
+      .filter(|s| adopted_ids.insert(s.id.as_str()))
     {
       let id = next_session_id;
       next_session_id += 1;
 
-      let state = SessionState::create(
-        id,
+      let heading = Heading::new(
         todo_session.id.clone(),
-        String::new(),
+        todo_session.id_kind,
         todo_session.label.clone(),
         todo_session.cira.clone(),
         todo_session.dangerous,
-        claude,
-        &path,
-        palette,
-        window,
-        cx,
       );
+      let state = SessionState::create(id, heading, &path, palette, window, cx);
       sessions.insert(id, state);
 
       let last = todo_session.last_active.unwrap_or(0);
@@ -124,9 +121,18 @@ impl ProjectState {
   /// Is this heading's session already running? Both pickers ask this to decide
   /// what to list as adoptable, so the rule lives here, once: a bound heading
   /// is adopted if a session carries its id; an unbound heading (empty id) is
-  /// never adopted, because that empty string names no session.
+  /// never adopted, because that empty string names no session. A session
+  /// whose start failed does not count, so its heading can be adopted again.
   pub fn is_adopted(&self, key: &str) -> bool {
-    !key.is_empty() && self.sessions.values().any(|s| s.key == key)
+    !key.is_empty() && self.sessions.values().any(|s| s.key == key && !s.failed)
+  }
+
+  /// Is conversation `uuid`'s transcript among this project's buckets? With
+  /// `$HOME` unset the buckets cannot be located, and the answer is yes: the
+  /// costly mistake is the other one, starting fresh over a conversation that
+  /// exists and so dropping the heading's only record of it.
+  pub fn has_transcript(project_path: &Path, uuid: &str) -> bool {
+    transcript_known(Self::session_dirs(project_path).as_deref(), uuid)
   }
 
   /// The earliest-created running session, or `None` if the project has none.
@@ -188,5 +194,17 @@ impl ProjectState {
       return None;
     }
     self.sessions.iter().find(|(_, s)| s.key == key).map(|(&id, s)| (id, s))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::transcript_known;
+
+  #[test]
+  fn an_unlocatable_transcript_counts_as_present() {
+    assert!(transcript_known(None, "335b461a-eba5-485f-898c-f757fdb3f2bf"));
+    let empty = std::env::temp_dir().join(format!("jc-no-buckets-{}", std::process::id()));
+    assert!(!transcript_known(Some(&[empty]), "335b461a-eba5-485f-898c-f757fdb3f2bf"));
   }
 }
