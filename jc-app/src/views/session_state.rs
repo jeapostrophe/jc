@@ -61,8 +61,6 @@ pub struct SessionState {
   /// it. Cleared whenever the attach client restarts, set again by
   /// `claude agents --json` or any hook from the session.
   pub live: bool,
-  /// A Cmd-Enter message waiting for `live` (see `Workspace::flush_pending_send`).
-  pub pending_send: Option<String>,
   /// A start, migration or `> dangerous` change is in flight. A session that
   /// is changing is never removed: its completion still has to bind the
   /// heading to whatever job it started.
@@ -169,7 +167,6 @@ impl SessionState {
       cira,
       dangerous,
       live: false,
-      pending_send: None,
       changing: false,
       failed: false,
       watching_live: false,

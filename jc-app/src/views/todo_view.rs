@@ -200,7 +200,7 @@ impl TodoView {
     uuid: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
-  ) -> Option<(String, Option<NaiveDateTime>)> {
+  ) -> Option<(String, usize, Option<NaiveDateTime>)> {
     let text = self.editor_text(cx);
     let selection = self.code_view.read(cx).editor().read(cx).selection_byte_range();
     let session = self.document.session_by_id(uuid)?;
@@ -217,7 +217,7 @@ impl TodoView {
     });
     self.reparse(cx);
     self.save(cx);
-    Some((result.message_text, result.schedule))
+    Some((result.message_text, result.message_index, result.schedule))
   }
 
   /// Whether the session bound to `uuid` currently has a pending scheduled
@@ -226,6 +226,22 @@ impl TodoView {
   /// reflected — no re-parse needed on this per-send hot path.
   pub fn has_pending_schedule(&self, uuid: &str) -> bool {
     self.document.session_by_id(uuid).and_then(|s| s.pending_scheduled()).is_some()
+  }
+
+  /// Record the just-sent message `index` of the session bound to `id` as a
+  /// scheduled send due at `when` (see [`todo::defer_message`]), and save.
+  pub fn defer_message(
+    &mut self,
+    id: &str,
+    index: usize,
+    when: NaiveDateTime,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let text = self.editor_text(cx);
+    if let Some(new_text) = todo::defer_message(&text, &self.document, id, index, when) {
+      self.set_text_and_save(new_text, window, cx);
+    }
   }
 
   /// Fire a scheduled send for the session bound to `uuid`. jc-core [`todo::fire_scheduled`] owns the

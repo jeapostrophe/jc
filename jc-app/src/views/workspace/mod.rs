@@ -1164,7 +1164,6 @@ impl Workspace {
             if let Some(uuid) = agent.session_id {
               session.uuid = uuid;
             }
-            ws.flush_pending_send(&path, sid, cx);
           }
           Ok((_, Settled::Gone)) => {
             // Removed elsewhere (`claude rm`, the agents view): attaching can
@@ -1638,7 +1637,6 @@ impl Workspace {
   fn reconcile_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let mut toggles = Vec::new();
     let mut gone = Vec::new();
-    let mut flush = Vec::new();
     for (pi, project) in self.projects.iter_mut().enumerate() {
       let doc = project.todo_view.read(cx).document();
       let removable = doc.removable_ids();
@@ -1660,9 +1658,6 @@ impl Workspace {
             toggles.push((project.path.clone(), session.id, heading.dangerous));
           }
         }
-        if session.pending_send.is_some() {
-          flush.push((project.path.clone(), session.id));
-        }
       }
     }
     for (path, sid, dangerous) in toggles {
@@ -1672,9 +1667,6 @@ impl Workspace {
       self.removed_shorts.insert(short.clone());
       self.remove_running_session(pi, sid, window, cx);
       self.detached(move |claude| claude.remove(&short));
-    }
-    for (path, sid) in flush {
-      self.flush_pending_send(&path, sid, cx);
     }
   }
 
@@ -1858,15 +1850,12 @@ impl Workspace {
     let todo_view = project.todo_view.clone();
     let ready = Self::ready_for_input(session, cx);
 
-    // Block all sends while a scheduled message is pending on this session, or
-    // a message is already waiting for the session to come up — a second
+    // Block all sends while a scheduled message is pending on this session
+    // (including one waiting for the session to come up, below) — a second
     // queued send to the same Claude is undefined. Beep like a rejected
     // keystroke and no-op; the user cancels a schedule by editing out the
     // `@jc(...)` marker. A session still starting has no heading to send from.
-    if uuid.is_empty()
-      || todo_view.read(cx).has_pending_schedule(&uuid)
-      || (!ready && session.pending_send.is_some())
-    {
+    if uuid.is_empty() || todo_view.read(cx).has_pending_schedule(&uuid) {
       crate::notify::beep();
       return;
     }
@@ -1876,7 +1865,7 @@ impl Workspace {
       tv.ensure_wait(&uuid, window, cx);
     });
 
-    let Some((message_text, schedule)) =
+    let Some((message_text, message_index, schedule)) =
       todo_view.update(cx, |tv, cx| tv.send_selection(&uuid, window, cx))
     else {
       return;
@@ -1898,16 +1887,20 @@ impl Workspace {
       // changed here (the TodoView mutated itself and notified), so we don't.
       let project_path = self.projects[self.active_project_index].path.clone();
       self.ensure_scheduled_armed(project_path, uuid, when, window, cx);
-    } else if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
-      session.end_launch_settle(cx);
-      if ready {
-        Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
-      } else {
-        // Typing now would land in an attach client still connecting to a
-        // session that is resuming; send once it is up.
-        session.pending_send = Some(message_text);
+    } else if !ready {
+      // Typing now would land in an attach client still connecting to a
+      // session that is resuming. Record the message as a past-due scheduled
+      // send instead: the file then says it is pending, not sent, it survives
+      // a jc quit, and `reconcile_schedules` delivers it once the session is
+      // up.
+      let now = chrono::Local::now().naive_local();
+      todo_view.update(cx, |tv, cx| tv.defer_message(&uuid, message_index, now, window, cx));
+      if let Some(session) = self.projects[self.active_project_index].active_session() {
         session.status("the message is sent once the session is up", cx);
       }
+    } else if let Some(session) = self.projects[self.active_project_index].active_session() {
+      session.end_launch_settle(cx);
+      Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
       cx.notify();
     }
   }
@@ -1917,18 +1910,6 @@ impl Workspace {
   /// (re)started.
   fn ready_for_input(session: &SessionState, cx: &App) -> bool {
     session.live && session.claude_terminal.read(cx).has_output_since_spawn()
-  }
-
-  /// Deliver `sid`'s waiting Cmd-Enter message if its session is ready.
-  fn flush_pending_send(&mut self, path: &Path, sid: SessionId, cx: &mut Context<Self>) {
-    let Some(session) = self.session_mut(path, sid) else { return };
-    if session.pending_send.is_none() || !Self::ready_for_input(session, cx) {
-      return;
-    }
-    if let Some(text) = session.pending_send.take() {
-      let terminal = session.claude_terminal.clone();
-      Self::deliver_to_terminal(&terminal, &text, cx);
-    }
   }
 
   /// Paste `message_text` into the Claude terminal, then submit with a delayed
@@ -2162,8 +2143,7 @@ impl Workspace {
       return;
     }
 
-    let Some((path, sid, project_name, session_label)) = self.apply_hook_to_session(&event, cx)
-    else {
+    let Some((project_name, session_label)) = self.apply_hook_to_session(&event, cx) else {
       // From a project jc has open but no session it knows: most likely one of
       // its own whose uuid changed while jc was not looking (a `/clear` in
       // another attach). Ask `claude agents --json`, then try again.
@@ -2176,8 +2156,6 @@ impl Workspace {
       }
       return;
     };
-    self.flush_pending_send(&path, sid, cx);
-
     // Notify when the window is not active (user is in another app). Only a
     // blocked session is worth interrupting for; Stop/IdlePrompt are ambient.
     let message = match event.kind {
@@ -2197,16 +2175,12 @@ impl Workspace {
 
   /// Apply a hook event to the session it names (see
   /// [`background::hook_matches`]): the session is live, and the uuid is
-  /// learned. Returns the matched `(project path, session, project name,
-  /// session label)`, or `None` when no session owns it.
-  fn apply_hook_to_session(
-    &mut self,
-    event: &HookEvent,
-    cx: &App,
-  ) -> Option<(PathBuf, SessionId, String, String)> {
+  /// learned. Returns the matched `(project name, session label)`, or `None` when no
+  /// session owns it.
+  fn apply_hook_to_session(&mut self, event: &HookEvent, cx: &App) -> Option<(String, String)> {
     let (pi, sid) = self.session_for_hook(&event.session_id)?;
     let project = &mut self.projects[pi];
-    let project_ids = (project.path.clone(), project.name.clone());
+    let project_name = project.name.clone();
     let session = project.sessions.get_mut(&sid)?;
 
     session.uuid = event.session_id.clone();
@@ -2214,7 +2188,7 @@ impl Workspace {
     if let HookEventKind::PromptSubmit = event.kind {
       session.end_launch_settle(cx);
     }
-    Some((project_ids.0, sid, project_ids.1, session.label.clone()))
+    Some((project_name, session.label.clone()))
   }
 
   /// The `(project index, session)` a hook naming `hook_session` comes from.

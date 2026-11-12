@@ -760,6 +760,22 @@ pub fn bind_bg_at(
   Some(splice(text, line_start..session.id_byte_range.end, &lines))
 }
 
+/// Turn the just-sent `### Message <index>` of the session bound to `id` into a
+/// scheduled send due at `when`, for a message that could not be delivered
+/// yet. The file then records it as pending rather than sent.
+pub fn defer_message(
+  text: &str,
+  doc: &TodoDocument,
+  id: &str,
+  index: usize,
+  when: NaiveDateTime,
+) -> Option<String> {
+  let session = doc.session_by_id(id)?;
+  let message = session.messages.iter().find(|m| m.index == index)?;
+  let heading = format!("### Message {index} @jc({})", format_schedule(when));
+  Some(splice(text, message.heading_byte_range.clone(), &heading))
+}
+
 // ---------------------------------------------------------------------------
 // Send from WAIT
 // ---------------------------------------------------------------------------
@@ -2697,5 +2713,26 @@ draft
     let doc = parse(text);
     assert_eq!(doc.removable_ids(), vec!["bbbb2222"]);
     assert_eq!(doc.stoppable_ids(), vec!["cccc3333"]);
+  }
+
+  #[test]
+  fn a_deferred_send_stays_pending_until_the_scheduled_path_delivers_it() {
+    // A Cmd-Enter to a session that is not up yet must not read as sent, and
+    // must survive a jc quit: it becomes a past-due scheduled send.
+    let text = "# Claude\n## S\n> bg=aaaa1111\n\n### WAIT\nhello there\n";
+    let session = parse(text).sessions[0].clone();
+    let sent = send_from_wait(text, &session, 0..0, Some(1), test_now()).unwrap();
+    assert_eq!(sent.schedule, None);
+    let doc = parse(&sent.new_text);
+    let deferred =
+      defer_message(&sent.new_text, &doc, "aaaa1111", sent.message_index, test_now()).unwrap();
+
+    let s = &parse(&deferred).sessions[0];
+    let pending = s.pending_scheduled().expect("the message is pending, not sent");
+    assert_eq!(pending.index, sent.message_index);
+    match fire_scheduled(&deferred, "aaaa1111", test_now(), 2) {
+      FireOutcome::Deliver { body, .. } => assert_eq!(body, sent.message_text),
+      _ => panic!("expected delivery"),
+    }
   }
 }

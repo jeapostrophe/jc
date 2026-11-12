@@ -190,14 +190,17 @@ unsafe fn observe_app_activation() {
   let block = RcBlock::new(|_notif: *mut AnyObject| {
     unsafe { bring_window_to_front() };
   });
-  let () = msg_send![
+  // The method returns the observer token (type `@`); declaring `()` fails
+  // objc2's message-encoding check in debug builds.
+  let observer: Retained<AnyObject> = msg_send![
     &*nc,
     addObserverForName: &*name,
     object: std::ptr::null::<AnyObject>(),
     queue: std::ptr::null::<AnyObject>(),
     usingBlock: &*block
   ];
-  // Leak the block so it lives for the app's lifetime.
+  // Leak the token and the block so the observer lives for the app's lifetime.
+  std::mem::forget(observer);
   std::mem::forget(block);
 }
 
