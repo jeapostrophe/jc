@@ -50,6 +50,9 @@ pub struct SessionState {
   pub uuid: String,
   /// The stable id (`> cira=`), passed as `CIRA_SESSION`.
   pub cira: Option<String>,
+  /// The shell pane was started with `CIRA_SESSION` (see
+  /// [`Self::export_cira_to_shell`]).
+  shell_has_cira: bool,
   /// Whether the background session runs with `--dangerously-skip-permissions`
   /// — the mode it was started with, compared against the heading's
   /// `> dangerous` to notice a change.
@@ -130,6 +133,7 @@ impl SessionState {
       key,
       bg,
       uuid: String::new(),
+      shell_has_cira: cira.is_some(),
       cira,
       dangerous,
       live: false,
@@ -155,6 +159,18 @@ impl SessionState {
     self.live = false;
     let argv = claude.attach_argv(short);
     self.claude_terminal.update(cx, |t, cx| t.spawn(ChildSpec::Command(argv), cx));
+  }
+
+  /// Restart the shell pane with `CIRA_SESSION` when its stable id was minted
+  /// after the shell started (a migrated or new session). Only ever happens
+  /// while the session is first being started, seconds after the shell opened.
+  pub fn export_cira_to_shell(&mut self, cx: &mut App) {
+    let Some(cira) = self.cira.clone().filter(|_| !self.shell_has_cira) else { return };
+    self.shell_has_cira = true;
+    self.general_terminal.update(cx, |t, cx| {
+      t.set_env(vec![("CIRA_SESSION".to_string(), cira)]);
+      t.spawn(ChildSpec::Shell, cx);
+    });
   }
 
   /// Print a `[jc]` status line in the Claude pane.

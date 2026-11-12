@@ -176,6 +176,26 @@ mod tests {
   }
 
   #[test]
+  fn the_login_shell_gets_the_env_too() {
+    // The shell pane exports CIRA_SESSION (Cira TMUX-02).
+    let child = PtyChild::spawn(
+      &ChildSpec::Shell,
+      &[("CIRA_SESSION".into(), "c-shell-9".into())],
+      80,
+      24,
+      None,
+    )
+    .unwrap();
+    child.handle.write_all(b"echo X=$CIRA_SESSION=X; exit\r").unwrap();
+    let mut out = Vec::new();
+    while let Ok(chunk) = child.bytes.recv_timeout(Duration::from_secs(30)) {
+      out.extend(chunk);
+    }
+    let out = String::from_utf8_lossy(&out);
+    assert!(out.contains("X=c-shell-9=X"), "shell output: {out}");
+  }
+
+  #[test]
   fn an_exited_child_is_reaped_and_reports_its_code() {
     let child = PtyChild::spawn(&sh("exit 3"), &[], 80, 24, None).unwrap();
     let pid = child.pid.unwrap();

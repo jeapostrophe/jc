@@ -294,6 +294,11 @@ impl TerminalView {
     self.start_child(cx);
   }
 
+  /// Replace the environment added to children started from now on.
+  pub fn set_env(&mut self, env: Vec<(String, String)>) {
+    self.config.env = env;
+  }
+
   /// Hang up the child and run nothing until the next [`Self::spawn`].
   pub fn stop_child(&mut self, cx: &mut Context<Self>) {
     self.config.child = None;

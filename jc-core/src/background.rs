@@ -175,6 +175,25 @@ pub fn hook_matches(short: &str, uuid: &str, hook_session: &str) -> bool {
       && hook_session.strip_prefix(short).is_some_and(|rest| rest.starts_with('-')))
 }
 
+/// The [`StartSpec`] that recreates a session with `> dangerous` set to
+/// `dangerous` (see [`Claude::toggle_dangerous`]).
+pub fn toggle_spec(
+  label: &str,
+  cira: Option<&str>,
+  dangerous: bool,
+  uuid: Option<&str>,
+  transcript_exists: bool,
+) -> StartSpec {
+  StartSpec {
+    label: label.to_string(),
+    cira: cira.map(str::to_string),
+    permissions: if dangerous { Permissions::Dangerous } else { Permissions::ForceDefault },
+    // `--resume` on a conversation with no transcript (a session never given
+    // a prompt) settles failed: "source session … not found".
+    resume: uuid.filter(|_| transcript_exists).map(str::to_string),
+  }
+}
+
 /// How often and how long to poll `claude agents --json`.
 #[derive(Debug, Clone, Copy)]
 pub struct Poll {
@@ -301,24 +320,28 @@ impl Claude {
     let second = self.start_once(spec, cwd)?;
     match self.wait_settled(&second, poll)? {
       Some(_) => Ok(second),
-      None => bail!("claude --bg failed twice ({first}, then {second})"),
+      None => {
+        if let Err(e) = self.rm(&second) {
+          eprintln!("claude rm {second}: {e:#}");
+        }
+        bail!("claude --bg failed twice ({first}, then {second})")
+      }
     }
   }
 
   /// Change a session's `> dangerous` mode: Claude Code keeps a job's saved
-  /// options, so the only route is to stop `short`, resume its conversation
-  /// `uuid` with the new mode — which starts a copy under a new short id and a
-  /// new uuid, carrying the conversation — and remove the old job. Returns the
-  /// new short id.
+  /// options, so the only route is to stop `short`, start `spec` (from
+  /// [`toggle_spec`]: resuming its conversation with the new mode starts a copy
+  /// under a new short id and a new uuid, carrying the conversation) and remove
+  /// the old job. Returns the new short id. If the start fails the old job is
+  /// left stopped, not removed; attaching resumes it.
   pub fn toggle_dangerous(
     &self,
     short: &str,
-    uuid: &str,
     spec: &StartSpec,
     cwd: &Path,
     poll: Poll,
   ) -> Result<String> {
-    debug_assert_eq!(spec.resume.as_deref(), Some(uuid), "the toggle resumes the conversation");
     self.stop(short)?;
     let new_short = self.start(spec, cwd, poll)?;
     if let Err(e) = self.rm(short) {
@@ -602,8 +625,9 @@ esac
     let spec =
       StartSpec { label: "L".into(), cira: None, permissions: Permissions::Unset, resume: None };
     assert!(fake.claude().start(&spec, &std::env::temp_dir(), FAST).is_err());
-    let bg_starts = fake.calls().iter().filter(|c| c[0] == "--bg").count();
-    assert_eq!(bg_starts, 2, "exactly one retry");
+    let verbs: Vec<String> = fake.calls().iter().map(|c| c[0].clone()).collect();
+    assert_eq!(verbs, strs(&["--bg", "agents", "rm", "--bg", "agents", "rm"]), "one retry");
+    assert_eq!(fake.calls()[5], strs(&["rm", "bbbb2222"]), "no failed job is left behind");
   }
 
   // ---- the dangerous toggle (Q-52) ----
@@ -619,11 +643,24 @@ esac
       resume: Some(U.into()),
     };
     let new_short =
-      fake.claude().toggle_dangerous("335b461a", U, &spec, &std::env::temp_dir(), FAST).unwrap();
+      fake.claude().toggle_dangerous("335b461a", &spec, &std::env::temp_dir(), FAST).unwrap();
     assert_eq!(new_short, "bbbb2222");
     let calls = fake.calls();
     assert_eq!(calls[0], strs(&["stop", "335b461a"]));
     assert_eq!(calls[1], spec.args());
     assert_eq!(calls.last().unwrap(), &strs(&["rm", "335b461a"]));
+  }
+
+  #[test]
+  fn a_toggle_continues_the_conversation_only_when_it_has_a_transcript() {
+    // A session that never took a prompt has no transcript, and `--resume` on
+    // it settles failed ("source session … not found"): start it fresh.
+    let spec = toggle_spec("L", Some("c-1"), true, Some(U), false);
+    assert_eq!(spec.resume, None);
+    assert_eq!(spec.permissions, Permissions::Dangerous);
+    let spec = toggle_spec("L", Some("c-1"), false, Some(U), true);
+    assert_eq!(spec.resume.as_deref(), Some(U));
+    assert_eq!(spec.permissions, Permissions::ForceDefault, "turning bypass off must say so");
+    assert_eq!(spec.cira.as_deref(), Some("c-1"));
   }
 }

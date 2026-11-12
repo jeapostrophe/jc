@@ -98,8 +98,8 @@ pub struct Workspace {
   /// Periodic task that re-arms scheduled-send timers from the live TODO markers.
   _schedule_reconcile_task: Option<Task<()>>,
   /// Scheduled sends that already have a timer armed, so reconciliation doesn't
-  /// double-arm the same one. Keyed `(project path, session UUID, delivery
-  /// time)` — the UUID, not the label: two headings can share a label at any
+  /// double-arm the same one. Keyed `(project path, heading id, delivery
+  /// time)` — the id, not the label: two headings can share a label at any
   /// instant (see `SessionKey`).
   armed_schedules: std::collections::HashSet<(PathBuf, String, NaiveDateTime)>,
   global_todo_view: Entity<crate::views::code_view::CodeView>,
@@ -1385,6 +1385,7 @@ impl Workspace {
     session.changing = false;
     session.uuid = uuid.unwrap_or_default();
     session.attach(short, &self.claude, cx);
+    session.export_cira_to_shell(cx);
     if is_active {
       todo_view.update(cx, |tv, cx| tv.set_active_key(Some(short), cx));
     }
@@ -1574,19 +1575,17 @@ impl Workspace {
     let work = move || -> anyhow::Result<String> {
       let uuid = if known_uuid.is_empty() {
         let agents = claude.agents()?;
-        background::find(&agents, &old_for_work)
-          .and_then(|a| a.session_id.clone())
-          .ok_or_else(|| anyhow::anyhow!("no conversation uuid for {old_for_work}"))?
+        background::find(&agents, &old_for_work).and_then(|a| a.session_id.clone())
       } else {
-        known_uuid
+        Some(known_uuid)
       };
-      let spec = StartSpec {
-        label,
-        cira,
-        permissions: if dangerous { Permissions::Dangerous } else { Permissions::ForceDefault },
-        resume: Some(uuid.clone()),
-      };
-      claude.toggle_dangerous(&old_for_work, &uuid, &spec, &cwd, Poll::START)
+      let transcript = uuid.as_deref().is_some_and(|uuid| {
+        ProjectState::session_dirs(&cwd)
+          .is_some_and(|dirs| jc_core::claude::transcript_in(&dirs, uuid))
+      });
+      let spec =
+        background::toggle_spec(&label, cira.as_deref(), dangerous, uuid.as_deref(), transcript);
+      claude.toggle_dangerous(&old_for_work, &spec, &cwd, Poll::START)
     };
     self.run_blocking(window, cx, work, move |ws, result, window, cx| {
       let claude = ws.claude.clone();

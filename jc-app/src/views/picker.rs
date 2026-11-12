@@ -727,7 +727,7 @@ enum SessionPickerEntryKind {
   /// An adopted session — stores its SessionId.
   Session(SessionId),
   /// A TODO.md session with no running terminal. Its heading address is the
-  /// entry's `key`, which for a legacy unbound heading is not a UUID.
+  /// entry's `key`, which for a legacy unbound heading is not an id.
   Unadopted { status: SessionStatus },
   /// A project with no sessions — selecting it will discover-or-create a session.
   EmptyProject,

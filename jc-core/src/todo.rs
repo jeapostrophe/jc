@@ -66,9 +66,9 @@ fn id_line(line: &str) -> Option<(IdKind, &str)> {
 /// redirects a send, or a scheduled `@jc(...)` delivery, to the wrong session.
 /// Every text operation ([`insert_wait_section`], [`fire_scheduled`],
 /// the WAIT-cursor, highlight and send paths in the app) therefore keys on the
-/// UUID, which is unique.
+/// heading id (`> bg=`, or a legacy `> uuid=`), which is unique.
 ///
-/// The one heading a UUID cannot address is one an older jc created and never
+/// The one heading an id cannot address is one an older jc created and never
 /// bound: its `> uuid=` is empty, and the empty string names every such heading
 /// at once. That case is addressed by POSITION, and the position is *verified*
 /// at write time — [`TodoDocument::index_of`] re-checks that the heading at that
@@ -78,13 +78,13 @@ fn id_line(line: &str) -> Option<(IdKind, &str)> {
 /// makes the key survive the window between a picker snapshot and its confirm.
 ///
 /// So this type is *not* the universal address. An operation that can only act
-/// on a bound heading takes the UUID directly as a `&str`; `SessionKey` exists
+/// on a bound heading takes the id directly as a `&str`; `SessionKey` exists
 /// for the two picker-originated operations that may name an unbound heading
 /// (`Workspace::adopt_session` and `Workspace::toggle_session_disabled`), and
 /// `Unbound` has no meaning outside them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionKey {
-  /// A bound heading, addressed by its (unique) UUID.
+  /// A bound heading, addressed by its (unique) id.
   Id(String),
   /// A heading with an empty `> uuid=`, addressed by its position in
   /// [`TodoDocument::sessions`] plus the label it carried when the key was taken.
@@ -92,7 +92,7 @@ pub enum SessionKey {
 }
 
 impl SessionKey {
-  /// The address of the heading at `index`: its UUID, or its verified position
+  /// The address of the heading at `index`: its id, or its verified position
   /// when the heading is unbound.
   pub fn new(uuid: &str, index: usize, label: &str) -> Self {
     if uuid.is_empty() {
@@ -178,7 +178,7 @@ impl TodoWait {
 
 impl TodoSession {
   /// How to address this heading, given its position in
-  /// [`TodoDocument::sessions`] — its UUID, or that verified position when it is
+  /// [`TodoDocument::sessions`] — its id, or that verified position when it is
   /// unbound. See [`SessionKey`].
   pub fn key(&self, index: usize) -> SessionKey {
     SessionKey::new(&self.id, index, &self.label)
@@ -215,7 +215,7 @@ impl TodoDocument {
   }
 
   /// Position of the session owning `uuid` in [`Self::sessions`], for the
-  /// `*_at` writers. UUIDs are unique where labels are not, so anything
+  /// `*_at` writers. Ids are unique where labels are not, so anything
   /// rewriting one specific session should address it this way.
   ///
   /// An empty `uuid` is not an address — several legacy headings can share it —
@@ -258,7 +258,7 @@ impl TodoDocument {
 
 /// Fixture lookup for tests. **Not an address** — two headings can share a label
 /// and this takes the first (see [`SessionKey`]); production code keys on the
-/// UUID.
+/// id.
 #[cfg(test)]
 impl TodoDocument {
   pub fn session_by_label(&self, label: &str) -> Option<&TodoSession> {
@@ -428,7 +428,7 @@ pub fn parse(text: &str) -> TodoDocument {
         current_session = expecting_uuid_for.take();
         in_metadata = true;
       } else {
-        // No uuid line — accept the session with an empty UUID.
+        // No id line — accept the session with an empty id.
         finalize_session(&mut doc, &mut current_session, line_start);
         current_session = expecting_uuid_for.take();
         // Fall through to normal parsing of this line.
