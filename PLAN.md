@@ -58,7 +58,7 @@ be reviewed on its own.
       `/copy` clipboard poll, and the `.jc/replies/` write path. Dropped `arboard`.
 - [x] **[SIMP-09]** Remove Cmd-Shift-E (open in external editor). Deleted
       `OpenInExternalEditor` and its `zed path:line` spawn.
-- [x] **[SIMP-10]** Cmd-P indicator becomes a boolean `*` for "this session has had
+- [x] **[SIMP-10]** (Superseded by Cira PLAN TMUX-06: the marker now comes from session state; the output counters are gone.) Cmd-P indicator becomes a boolean `*` for "this session has had
       activity". Defined as *any terminal output since the session was last on screen*:
       `TerminalView` counts parsed output batches (`output_batches`) against a baseline
       (`seen_batches`), `has_unseen_output` compares them, and
@@ -107,7 +107,7 @@ independent units in worktrees.
       duplicate of `TodoWait::body_end_line` that was off by one line).
       `todo::unique_label` survives, explicitly cosmetic — it keeps the picker from
       showing identical rows and carries no invariant.
-- [x] **[SIMP-15]** Move launch-settle detection into the terminal that sees the batches.
+- [x] **[SIMP-15]** (Superseded by Cira PLAN TMUX-06: `SettleWindow` was deleted with the output counters.) Move launch-settle detection into the terminal that sees the batches.
       The workspace was polling `output_batches` on the 2 s reconcile tick to decide when
       a freshly-spawned `claude` had stopped printing, with the settle policy expressed in
       tick counts whose meaning lived in another symbol. `jc_terminal::SettleWindow` now
