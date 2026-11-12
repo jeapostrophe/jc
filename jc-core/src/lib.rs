@@ -1,4 +1,5 @@
 pub mod background;
+pub mod cira;
 pub mod claude;
 pub mod config;
 pub mod hooks;
