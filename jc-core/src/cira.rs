@@ -179,7 +179,9 @@ pub enum HookState {
 ///
 /// Cira wins, except for an API-error stop newer than Cira's state: Cira has
 /// no state for one and still says `working`. An idle session is `*` only if
-/// it went idle after `seen`; with `seen` unknown it is not marked.
+/// it went idle after `seen`; with `seen` unknown it is not marked. When both
+/// say idle, the later time counts: a turn that ended while Cira was down is
+/// one only jc's hooks saw.
 pub fn marker(
   cira: Option<(State, Option<SystemTime>)>,
   hook: Option<(HookState, SystemTime)>,
@@ -202,7 +204,10 @@ pub fn marker(
     }
     (Some((state, since)), _) => match state {
       State::Dialog => Some(Marker::Dialog),
-      State::Idle => finished(since),
+      State::Idle => {
+        let hook_idle = hook.filter(|(h, _)| *h == HookState::Idle).map(|(_, at)| at);
+        finished(since.max(hook_idle))
+      }
       State::Waiting => Some(Marker::Waiting),
       State::Gone => Some(Marker::Gone),
       State::Working | State::Unknown => None,
@@ -444,6 +449,11 @@ mod tests {
     assert_eq!(marker(working, Some((HookState::Failed, at(300))), seen), Some(Marker::Finished));
     // One before it was followed by a new turn Cira saw.
     assert_eq!(marker(working, Some((HookState::Failed, at(150))), seen), None);
+    // Both idle: a turn that ended while Cira was down (Cira's idle is older
+    // than the last look, the hook's newer) still marks the session.
+    let stale_idle = Some((State::Idle, Some(at(50))));
+    assert_eq!(marker(stale_idle, Some((HookState::Idle, at(150))), seen), Some(Marker::Finished));
+    assert_eq!(marker(stale_idle, Some((HookState::Idle, at(60))), seen), None);
   }
 
   #[test]

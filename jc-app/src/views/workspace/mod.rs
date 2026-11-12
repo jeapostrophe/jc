@@ -127,6 +127,8 @@ pub struct Workspace {
   removed_shorts: HashSet<String>,
   /// Receives each `cira status --json` read by the Cira poll thread.
   _cira_poll_task: Task<()>,
+  /// Whether the last read reached Cira; `None` before the first. Logged on change.
+  cira_reachable: Option<bool>,
 }
 
 /// Unmatched hooks kept for re-dispatch; older ones are dropped.
@@ -355,6 +357,7 @@ impl Workspace {
       last_agents_refresh: None,
       removed_shorts: HashSet::new(),
       _cira_poll_task: cira_poll_task,
+      cira_reachable: None,
     };
 
     for pi in 0..ws.projects.len() {
@@ -2211,9 +2214,21 @@ impl Workspace {
   /// Apply a `cira status --json` read (`None`: Cira is unreachable) to every
   /// project. Returns whether anything shown changed.
   fn apply_cira(&mut self, status: Option<&jc_core::cira::Status>) -> bool {
+    if self.cira_reachable != Some(status.is_some()) {
+      self.cira_reachable = Some(status.is_some());
+      eprintln!("cira: {}", if status.is_some() { "reachable" } else { "unreachable" });
+    }
     let mut changed = false;
     for project in &mut self.projects {
-      changed |= project.apply_cira(status);
+      if project.apply_cira(status) {
+        changed = true;
+        let sessions: Vec<String> = project
+          .sessions
+          .values()
+          .map(|s| format!("{}={:?}", s.label, s.cira_state.map(|(state, _)| state)))
+          .collect();
+        eprintln!("cira: {} open={:?} {}", project.name, project.cira_open, sessions.join(" "));
+      }
     }
     changed
   }
