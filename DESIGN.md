@@ -20,6 +20,8 @@ What survives is the part that earns its keep: TODO.md as durable per-session st
 
 ## Assigned Session UUIDs
 
+*Superseded in part by **Background Sessions** below: jc no longer launches `claude` itself, so `--session-id`, `Launch` and `launch_for` are gone. The label-is-not-an-address reasoning stands, with the `> bg=` short id as the address.*
+
 jc used to *detect* a session's identity: launch a bare `claude`, write a blank `> uuid=` line into TODO.md, and wait for the first hook event to tell it which UUID the CLI had picked. That single choice paid for a surprising amount of machinery — an `Option<String>` UUID threaded through every session code path, a "one pending UUID-less session per project" constraint so hook events could be matched by `cwd`, and a window where a session existed but could not be addressed by anything.
 
 Claude Code will take the UUID as an argument. So jc mints a v4 UUID itself and launches `claude --session-id <uuid>`, writing the heading and the UUID at the same instant (`SessionState::create`, `Launch::New`). Existing sessions launch `claude --resume <uuid>` (`Launch::Resume`) when their transcript is still on disk. A session is identified from the first moment it exists, `SessionState::uuid` is a plain `String`, and a hook event for an unknown UUID is simply not ours.
@@ -35,6 +37,18 @@ So the transcript check survives — it is `ProjectState::launch_for`, and it ch
 The third consequence is that the heading *label* stops being an address. TODO.md's text operations — sends, WAIT insertion and cursor placement, `@jc(...)` scheduled delivery, the active-session highlight — all used to resolve a session by label, and every label lookup takes the first heading that matches. That was made safe by keeping labels unique: a `unique_label` at each creation point, plus a `dedupe_labels` repair pass over older files. The repair ran **once, at startup**, over a file the user edits by hand — so pasting a second `## New Session` heading mid-session left every send and every scheduled delivery addressing the wrong heading until the next restart. The machinery existed to prevent exactly that failure and did not cover it.
 
 With the UUID always populated, every one of those callers already holds a unique address, so they key on it and the uniqueness machinery is gone. The one heading a UUID cannot name is one an older jc left unbound (empty `> uuid=`), which is addressed by *verified position* instead: the picker carries the document index, and the writer re-checks against the live document that the heading at that index is still unbound and still carries the label the key was taken with, refusing otherwise. That is a continuous check rather than a startup pass, and it is what makes the address survive the window between a picker snapshot and its confirm. `jc-core/src/todo.rs`'s `SessionKey` doc comment is the canonical statement.
+
+## Background Sessions
+
+Each Claude pane is a client of a Claude Code background session (Cira DESIGN 12; Jay, 2026-11-11): `claude --bg` starts it under Claude Code's per-user supervisor, and the pane runs `claude attach <short>`. The session outlives jc, so quitting jc stops nothing, and a jc restart attaches again instead of relaunching. The terminal pane stays jc's own shell.
+
+That moves the session's identity. `--bg` ignores `--session-id`, so jc no longer chooses the conversation uuid, and a `/clear` made in another attach while jc is closed changes it where jc cannot see. The short id `--bg` prints does not change through `/clear`, stop, respawn or retirement, so it is the address: `> bg=<short>` replaces `> uuid=`, and the uuid becomes something jc learns (a hook's `session_id` starts with the short id until a `/clear`; after one, the `/clear` hook pair or `claude agents --json` says). The stable id Cira keys on is a third thing, `> cira=`, because the short id itself changes when `> dangerous` does.
+
+Three consequences follow from Claude Code's behaviour, each measured (Cira SP-03):
+
+- **A job keeps its saved options.** Passing `--dangerously-skip-permissions` to an existing session is impossible; resuming its conversation with different flags starts a copy under a new short id. So toggling `> dangerous` recreates the session: stop it, start the copy (with `--permission-mode default` to turn bypass off, since passing nothing keeps the saved mode), point the heading at it, and remove the old job.
+- **`--resume` on a held conversation forks.** Migrating a `> uuid=` heading by `claude --bg --resume <uuid>` continues the same conversation only when no process holds it. jc therefore migrates on start, after the old jc has quit, and refuses for a uuid an interactive `claude` still holds.
+- **The attach client is disposable.** It exits on Ctrl+Z, on Esc from the ← agents view, and when the session is stopped; the session does not. So the pane reaps and restarts its child, and attaching resumes a stopped session. Typing into a client that is still connecting is lost, so sends wait until the session is live rather than for a fixed grace.
 
 ## Why Not an Editor Plugin
 
@@ -79,7 +93,7 @@ If Claude Code is meant to be the primary developer environment, users need a wa
 
 ### Hooks
 
-Hooks are the one extension point that works well today. Claude Code fires events on prompt submit, stop, permission prompt, idle, and API error. jc's hook server receives these and updates each session's `busy` state; a permission prompt or an API error also raises a desktop notification, but only while the jc window is inactive — those are the two states where Claude is blocked on you and you are not looking. `Stop` and `IdlePrompt` are ambient and deliberately silent: the session picker's activity marker already says which sessions moved, without interrupting whatever you switched to. The same hooks can trigger external notification services (e.g., ntfy, Pushover) for phone alerts when away from the desktop. No skills or context pollution required — hooks are push-only and invisible to the conversation.
+Hooks are the one extension point that works well today. Claude Code fires events on prompt submit, stop, permission prompt, idle, and API error. jc's hook server receives these, learns from them that a session is live and which uuid it is on now; a permission prompt or an API error also raises a desktop notification, but only while the jc window is inactive — those are the two states where Claude is blocked on you and you are not looking. `Stop` and `IdlePrompt` are ambient and deliberately silent: the session picker's activity marker already says which sessions moved, without interrupting whatever you switched to. The same hooks can trigger external notification services (e.g., ntfy, Pushover) for phone alerts when away from the desktop. No skills or context pollution required — hooks are push-only and invisible to the conversation.
 
 ## Scheduled Messages
 

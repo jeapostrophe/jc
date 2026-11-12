@@ -56,7 +56,8 @@ A **project** is a code repository registered with jc. Each project has one or m
 ```markdown
 # Claude
 ## Refactor auth module
-> uuid=abc123-def456-...
+> bg=35a13d68
+> cira=8e565675-baa4-4f27-8d89-6ae89c563046
 ### Message 0
 first instruction sent to claude
 ### Message 1
@@ -71,11 +72,11 @@ The log is bounded: each send keeps the 25 most recent messages of that session 
 
 One exception: truncation stops at a message still waiting on a `@jc(...)` scheduled send, so it can never cancel one. That session's log stays as long as it needs to until the send fires. Numbers are never reused, so a message keeps the number it was sent under. jc never sends TODO.md to Claude — messages are delivered to the session terminal and Claude resumes from its own transcript — so dropping old entries costs it no context.
 
-jc mints the session UUID itself. A new session launches `claude --session-id <uuid>` under a freshly generated v4 UUID that is written to TODO.md at the same moment; existing sessions are resumed on startup with `claude --resume <uuid>`. If Claude has since garbage-collected a session's transcript, jc relaunches it with `--session-id` under the same UUID instead — you lose the conversation, but the heading, its message log, and its WAIT notes stay exactly where they were. `/clear` is handled transparently — the UUID in TODO.md is rewritten in place, with no terminal relaunch.
+Each session is a Claude Code **background session** (`claude --bg`), and its Claude pane is `claude attach` to it. Quitting jc only detaches: sessions keep running (Claude Code retires one after an hour idle with nothing attached, keeping its conversation), and the next start attaches every heading's session again. A new session is started with `claude --bg`, and its heading is written once Claude Code has printed the session's short id. If Claude Code no longer knows a heading's session, jc starts a fresh one behind the same heading — you lose the conversation, but the heading, its message log, and its WAIT notes stay exactly where they were. A heading an older jc wrote with `> uuid=` is moved to a background session on the first start, continuing its conversation, unless a running `claude` still holds it (quit the old jc first).
 
-Per-session metadata lives on `> ` lines under the heading. `> uuid=` and `> last=` are managed by jc; add `> dangerous` by hand to spawn that session's `claude` with `--dangerously-skip-permissions` (takes effect on next spawn). See `ARCH.md` for the full list.
+Per-session metadata lives on `> ` lines under the heading. `> bg=` (the background session's short id), `> cira=` (the stable id, exported as `CIRA_SESSION` to Claude and the terminal pane) and `> last=` are managed by jc; add or remove `> dangerous` by hand to run that session with `--dangerously-skip-permissions`, and jc recreates the session in the new mode, keeping its conversation. Disabling a session (`[D]`) stops it; renaming the heading to `## [DELETED] …` removes it. See `ARCH.md` for the full list.
 
-The `> uuid=` line, not the heading text, is what identifies a session — everything jc writes into TODO.md is addressed by it. Rename a heading to whatever you like, and give two headings the same name if that is what you want; sends and scheduled deliveries still land on the right one.
+The `> bg=` line, not the heading text, is what identifies a session — everything jc writes into TODO.md is addressed by it. Rename a heading to whatever you like, and give two headings the same name if that is what you want; sends and scheduled deliveries still land on the right one.
 
 ### Session Activity
 
