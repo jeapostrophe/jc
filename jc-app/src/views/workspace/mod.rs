@@ -307,19 +307,18 @@ impl Workspace {
     // the poll's own thread; only applying a read runs here.
     let cira = jc_core::cira::Cira::default();
     let cira_rx = jc_core::cira::poll(CIRA_POLL, move || cira.status());
-    let cira_poll_task =
-      cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
-        while let Ok(status) = cira_rx.recv_async().await {
-          let applied = this.update(cx, |ws, cx| {
-            if ws.apply_cira(status.as_ref()) {
-              cx.notify();
-            }
-          });
-          if applied.is_err() {
-            break; // workspace dropped; dropping the receiver ends the poll thread
+    let cira_poll_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+      while let Ok(status) = cira_rx.recv_async().await {
+        let applied = this.update(cx, |ws, cx| {
+          if ws.apply_cira(status.as_ref()) {
+            cx.notify();
           }
+        });
+        if applied.is_err() {
+          break; // workspace dropped; dropping the receiver ends the poll thread
         }
-      });
+      }
+    });
 
     let mut ws = Self {
       panes,
@@ -1718,7 +1717,7 @@ impl Workspace {
       // outgoing session and skips the save-viewport step. Repointing it
       // *first* would make the incoming session look like the outgoing one
       // and overwrite its saved layout, TODO cursor and scroll with the
-      // removed session's, and clear its activity marker.
+      // removed session's, and stamp it as seen.
       self.detach_active_session(pi, window, cx);
       return true;
     } else if was_project_active {
@@ -2207,7 +2206,7 @@ impl Workspace {
 
     session.uuid = event.session_id.clone();
     session.live = true;
-    session.note_hook(&event.kind, SystemTime::now());
+    session.note_hook(&event.kind, event.received);
     Some((project_name, session.label.clone()))
   }
 

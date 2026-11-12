@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 pub const HOOK_PATH_PREFIX: &str = "/jc-hook/";
 
@@ -9,6 +9,10 @@ pub struct HookEvent {
   pub session_id: String,
   pub project_path: Option<PathBuf>,
   pub kind: HookEventKind,
+  /// When the hook server received it. A hook that matched no session is
+  /// replayed later (`Workspace::refresh_session_uuids`); this is still when
+  /// it happened.
+  pub received: SystemTime,
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +173,7 @@ fn accept_loop(
     let _ = request.respond(json_response(200, "{}"));
 
     if let Some(kind) = kind {
-      let event = HookEvent { session_id, project_path, kind };
+      let event = HookEvent { session_id, project_path, kind, received: SystemTime::now() };
       if tx.send(event).is_err() {
         break; // receiver dropped
       }

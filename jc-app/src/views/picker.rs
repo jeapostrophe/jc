@@ -955,11 +955,11 @@ impl PickerDelegate for SessionPickerDelegate {
       SessionPickerEntryKind::Unadopted { .. } => "(adopt)",
       _ => "",
     };
-    let right = [entry.blocks.as_str(), state]
-      .into_iter()
-      .filter(|s| !s.is_empty())
-      .collect::<Vec<_>>()
-      .join("  ");
+    let right = match (entry.blocks.as_str(), state) {
+      (blocks, "") => blocks.to_string(),
+      ("", state) => state.to_string(),
+      (blocks, state) => format!("{blocks}  {state}"),
+    };
     let right_el = div().ml_auto().text_xs().text_color(muted_color).child(right);
 
     row.child(marker).child(main_text).child(right_el)

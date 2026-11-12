@@ -54,13 +54,13 @@ Three consequences follow from Claude Code's behaviour, each measured (Cira SP-0
 
 The picker's marker used to count the batches the Claude terminal parsed since the session was last on screen. Any output counted, so a ticking "3m 42s" or a spinner frame marked a session, and an attach client repaints the whole screen whenever it connects; a launch-settle window existed only to discount that repaint (Cira SP-03 confirmed it set the marker exactly as a spinner does). Jay, 2026-11-11: a ticking timer is not activity (Cira PLAN TMUX-06).
 
-The marker now comes from the session's state: `!` a permission dialog, `*` a turn finished since the session was last on screen, `~` waiting on background agents, `x` gone. Cira records that state from its own hooks for every session, including the hours jc is not running, and `cira status --json` lists it with when it began, so jc compares that time with when it last switched away from the session. jc's own hooks remain the fallback: for a session Cira does not know (Cira unreachable, or a session started without a `CIRA_SESSION`), and for an API-error stop (`StopFailure`), which Cira has no state for — a stop failure newer than Cira's state wins. The batch counters stay only for what they still answer: whether an attach has drawn its first frame (`TerminalView::has_output_since_spawn`).
+The marker now comes from the session's state: `!` a permission dialog, `*` a turn finished since the session was last on screen, `~` waiting on background agents, `x` gone. Cira records that state from its own hooks for every session, including the hours jc is not running, and `cira status --json` lists it with when it began, so jc compares that time with when it last switched away from the session. jc's own hooks remain the fallback: for a session Cira does not know (Cira unreachable, or a session started without a `CIRA_SESSION`), and for an API-error stop (`StopFailure`), which Cira has no state for — a stop failure newer than Cira's state wins.
 
 ## Why Not an Editor Plugin
 
 It's tempting to decompose jc into a Zed or nvim plugin + tmux + scripts. Editors already provide editing, syntax highlighting, and terminals.
 
-But jc's value is the *opinionated workflow orchestration* — the thing that makes managing 5 concurrent Claude sessions tractable. The session picker model (Cmd-P across all projects, with per-session activity markers), per-session pane/scroll state that survives a switch, and terminal-as-first-class-view are hard to replicate in an editor that thinks in terms of files and buffers, not Claude conversations. You'd end up rebuilding half of jc inside the editor.
+But jc's value is the *opinionated workflow orchestration* — the thing that makes managing 5 concurrent Claude sessions tractable. The session picker model (Cmd-P across all projects, with per-session state markers), per-session pane/scroll state that survives a switch, and terminal-as-first-class-view are hard to replicate in an editor that thinks in terms of files and buffers, not Claude conversations. You'd end up rebuilding half of jc inside the editor.
 
 ## Remote Workflow
 

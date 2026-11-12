@@ -113,13 +113,11 @@ impl Heading {
 }
 
 impl SessionState {
-  /// Record what a hook says about the session's state, if it says anything
-  /// and it is a change: the time kept is when the state began.
-  pub fn note_hook(&mut self, kind: &HookEventKind, now: SystemTime) {
-    if let Some(next) = HookState::from_hook(kind)
-      && self.hook_state.is_none_or(|(state, _)| state != next)
-    {
-      self.hook_state = Some((next, now));
+  /// Record what a hook received at `at` says about the session's state, if
+  /// it says anything (`jc_core::cira::note_hook`).
+  pub fn note_hook(&mut self, kind: &HookEventKind, at: SystemTime) {
+    if let Some(next) = HookState::from_hook(kind) {
+      self.hook_state = Some(cira::note_hook(self.hook_state, next, at));
     }
   }
 

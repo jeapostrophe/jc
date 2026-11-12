@@ -6,10 +6,8 @@
 //! (Cira's `FOR-AGENTS.md`), so unknown fields are ignored and a state this
 //! build does not know reads as [`State::Unknown`].
 //!
-//! The session marker ([`marker`]) comes from Cira's state when Cira knows the
-//! session, and from jc's own hooks ([`HookState`]) when it does not: while
-//! Cira is unreachable, for a session started without a `CIRA_SESSION`, and
-//! for an API-error stop, which Cira has no state for.
+//! [`marker`] turns that state, and jc's own hooks ([`HookState`]), into the
+//! session picker's mark.
 
 use crate::hooks::HookEventKind;
 use serde::Deserialize;
@@ -62,7 +60,7 @@ pub struct Session {
 }
 
 /// A session's state as Cira records it (Cira DESIGN 8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
   Working,
@@ -99,16 +97,19 @@ impl Status {
 }
 
 impl Project {
-  /// The session a jc session is: by its stable id (`> cira=`), else its short
-  /// id, else its current uuid. Empty values match nothing.
+  /// The session a jc session is. One jc started with a stable id (`> cira=`)
+  /// passed it as `CIRA_SESSION`, which is then its Cira id, so it is matched
+  /// by that alone: before Cira has seen it, its short id or uuid could only
+  /// find another session (the one a migration resumed from). One without is
+  /// matched by its short id, else its current uuid. Empty values match nothing.
   pub fn session(&self, cira: Option<&str>, short: &str, uuid: &str) -> Option<&Session> {
-    let some = |s: &str| (!s.is_empty()).then_some(s.to_string());
-    let (short, uuid) = (some(short), some(uuid));
-    cira
-      .filter(|c| !c.is_empty())
-      .and_then(|c| self.sessions.iter().find(|s| s.id == c))
-      .or_else(|| short.and_then(|v| self.sessions.iter().find(|s| s.short.as_ref() == Some(&v))))
-      .or_else(|| uuid.and_then(|v| self.sessions.iter().find(|s| s.uuid.as_ref() == Some(&v))))
+    if let Some(cira) = cira.filter(|c| !c.is_empty()) {
+      return self.sessions.iter().find(|s| s.id == cira);
+    }
+    let by = |value: &str, field: fn(&Session) -> Option<&str>| {
+      (!value.is_empty()).then(|| self.sessions.iter().find(|s| field(s) == Some(value))).flatten()
+    };
+    by(short, |s| s.short.as_deref()).or_else(|| by(uuid, |s| s.uuid.as_deref()))
   }
 }
 
@@ -119,19 +120,20 @@ impl Session {
   }
 }
 
-/// `TODO · 4 blocks`: the TODO pane header's suffix for a project's open
-/// blocks, empty when there are none or Cira is unreachable.
-pub fn blocks_suffix(open: Option<OpenCounts>) -> String {
+/// The picker's per-project count, `4 blocks`: empty when there are none or
+/// Cira is unreachable.
+pub fn blocks_label(open: Option<OpenCounts>) -> String {
   match open.map_or(0, |o| o.blocks) {
     0 => String::new(),
-    1 => " · 1 block".to_string(),
-    n => format!(" · {n} blocks"),
+    1 => "1 block".to_string(),
+    n => format!("{n} blocks"),
   }
 }
 
-/// The picker's per-project count: `4 blocks`, empty when none.
-pub fn blocks_label(open: Option<OpenCounts>) -> String {
-  blocks_suffix(open).trim_start_matches(" · ").to_string()
+/// The TODO pane header's suffix, as in `TODO · 4 blocks`.
+pub fn blocks_suffix(open: Option<OpenCounts>) -> String {
+  let label = blocks_label(open);
+  if label.is_empty() { label } else { format!(" · {label}") }
 }
 
 // ---------------------------------------------------------------------------
@@ -139,9 +141,9 @@ pub fn blocks_label(open: Option<OpenCounts>) -> String {
 // ---------------------------------------------------------------------------
 
 /// The Cmd-P picker's mark for a running session (Cira PLAN TMUX-06).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Marker {
-  /// `!`: a permission dialog is waiting, seen or not. Sorts first.
+  /// `!`: a permission dialog is waiting, seen or not.
   Dialog,
   /// `*`: it finished a turn since it was last on screen.
   Finished,
@@ -173,50 +175,6 @@ pub enum HookState {
   Failed,
 }
 
-/// The marker for a session, from Cira's view of it (`cira`: its state and
-/// since when), jc's hooks (`hook`: the last state they reported and when),
-/// and when it was last on screen (`seen`).
-///
-/// Cira wins, except for an API-error stop newer than Cira's state: Cira has
-/// no state for one and still says `working`. An idle session is `*` only if
-/// it went idle after `seen`; with `seen` unknown it is not marked. When both
-/// say idle, the later time counts: a turn that ended while Cira was down is
-/// one only jc's hooks saw.
-pub fn marker(
-  cira: Option<(State, Option<SystemTime>)>,
-  hook: Option<(HookState, SystemTime)>,
-  seen: Option<SystemTime>,
-) -> Option<Marker> {
-  let finished = |at: Option<SystemTime>| match (at, seen) {
-    (Some(at), Some(seen)) if at > seen => Some(Marker::Finished),
-    _ => None,
-  };
-  let from_hook = |(state, at): (HookState, SystemTime)| match state {
-    HookState::Dialog => Some(Marker::Dialog),
-    HookState::Idle | HookState::Failed => finished(Some(at)),
-    HookState::Working => None,
-  };
-  match (cira, hook) {
-    (Some((_, since)), Some(h @ (HookState::Failed, at)))
-      if since.is_none_or(|since| at > since) =>
-    {
-      from_hook(h)
-    }
-    (Some((state, since)), _) => match state {
-      State::Dialog => Some(Marker::Dialog),
-      State::Idle => {
-        let hook_idle = hook.filter(|(h, _)| *h == HookState::Idle).map(|(_, at)| at);
-        finished(since.max(hook_idle))
-      }
-      State::Waiting => Some(Marker::Waiting),
-      State::Gone => Some(Marker::Gone),
-      State::Working | State::Unknown => None,
-    },
-    (None, Some(h)) => from_hook(h),
-    (None, None) => None,
-  }
-}
-
 impl HookState {
   /// The state a jc hook reports, if it reports one.
   pub fn from_hook(kind: &HookEventKind) -> Option<Self> {
@@ -232,6 +190,63 @@ impl HookState {
       | HookEventKind::SessionClear { .. }
       | HookEventKind::IdlePrompt => None,
     }
+  }
+
+  /// A turn ended: `Stop` or `StopFailure`.
+  fn ends_turn(self) -> bool {
+    matches!(self, HookState::Idle | HookState::Failed)
+  }
+}
+
+/// The hook state after `next` arrives at `at`, from `last`. A turn end is
+/// always taken with its own time — two turns can end in a row, the second
+/// one automatic, once background agents report — while any other state keeps
+/// the time it began.
+pub fn note_hook(
+  last: Option<(HookState, SystemTime)>,
+  next: HookState,
+  at: SystemTime,
+) -> (HookState, SystemTime) {
+  match last {
+    Some((state, began)) if state == next && !next.ends_turn() => (state, began),
+    _ => (next, at),
+  }
+}
+
+/// The marker for a session, from Cira's view of it (`cira`: its state and
+/// since when), jc's hooks (`hook`: the last state they reported and when),
+/// and when it was last on screen (`seen`).
+///
+/// Cira's state wins, but for a turn end jc's hooks saw after it: Cira missed
+/// that one (it was down, or the turn ended on an API error, which Cira has no
+/// state for). Cira's `waiting` and `gone` still win, since the same `Stop`
+/// reached Cira, which alone knows about background agents and process ends.
+/// `*` needs a turn end after `seen`; with `seen` unknown nothing is `*`.
+/// From hooks alone, `!` needs a dialog after `seen`, because no jc hook says
+/// a dialog was answered.
+pub fn marker(
+  cira: Option<(State, Option<SystemTime>)>,
+  hook: Option<(HookState, SystemTime)>,
+  seen: Option<SystemTime>,
+) -> Option<Marker> {
+  let after_seen = |at: SystemTime| seen.is_some_and(|seen| at > seen);
+  let finished = |at: SystemTime| after_seen(at).then_some(Marker::Finished);
+  let Some((state, since)) = cira else {
+    return match hook? {
+      (HookState::Dialog, at) => (seen.is_none() || after_seen(at)).then_some(Marker::Dialog),
+      (HookState::Idle | HookState::Failed, at) => finished(at),
+      (HookState::Working, _) => None,
+    };
+  };
+  let missed_end =
+    hook.filter(|&(h, at)| h.ends_turn() && since.is_none_or(|since| at > since)).map(|(_, at)| at);
+  match (state, missed_end) {
+    (State::Waiting, _) => Some(Marker::Waiting),
+    (State::Gone, _) => Some(Marker::Gone),
+    (_, Some(at)) => finished(at),
+    (State::Dialog, None) => Some(Marker::Dialog),
+    (State::Idle, None) => since.and_then(finished),
+    (State::Working | State::Unknown, None) => None,
   }
 }
 
@@ -362,8 +377,10 @@ mod tests {
       }
     }
     // Every state Cira has is in the fixture, so each one's parse is checked.
-    let states: std::collections::HashSet<_> =
+    let mut states: Vec<_> =
       status.projects.iter().flat_map(|p| &p.sessions).map(|s| s.state).collect();
+    states.sort_by_key(|s| *s as u8);
+    states.dedup();
     assert_eq!(states.len(), 5, "{states:?}");
     assert!(status.projects.iter().any(|p| p.open.blocks > 0));
   }
@@ -396,16 +413,20 @@ mod tests {
   }
 
   #[test]
-  fn a_jc_session_is_found_by_cira_id_then_short_then_uuid() {
+  fn a_jc_session_is_found_by_cira_id_alone_else_short_then_uuid() {
     let (status, _) = fixture();
     let p = status.projects.iter().find(|p| p.sessions.len() > 1).unwrap();
     let [a, b, ..] = &p.sessions[..] else { unreachable!() };
-    let short_b = b.short.as_deref().unwrap();
-    let uuid_b = b.uuid.as_deref().unwrap();
-    assert_eq!(p.session(Some(&a.id), short_b, uuid_b).map(|s| &s.id), Some(&a.id));
-    assert_eq!(p.session(Some("not-cira"), short_b, "").map(|s| &s.id), Some(&b.id));
-    assert_eq!(p.session(None, "", uuid_b).map(|s| &s.id), Some(&b.id));
-    assert_eq!(p.session(Some(""), "", ""), None);
+    let id = |s: Option<&Session>| s.map(|s| s.id.clone());
+    let uuid_a = a.uuid.as_deref().unwrap();
+    let (short_b, uuid_b) = (b.short.as_deref().unwrap(), b.uuid.as_deref().unwrap());
+    assert_eq!(id(p.session(Some(&a.id), short_b, uuid_b)), Some(a.id.clone()));
+    // A stable id Cira has not seen yet finds nothing, never a session that
+    // merely shares its short id or uuid.
+    assert_eq!(id(p.session(Some("not-seen-yet"), short_b, uuid_b)), None);
+    assert_eq!(id(p.session(None, short_b, uuid_a)), Some(b.id.clone()), "short beats uuid");
+    assert_eq!(id(p.session(Some(""), "", uuid_b)), Some(b.id.clone()));
+    assert_eq!(id(p.session(None, "", "")), None);
   }
 
   #[test]
@@ -439,32 +460,59 @@ mod tests {
   }
 
   #[test]
-  fn cira_wins_over_hooks_except_a_newer_api_error() {
+  fn cira_wins_over_hooks_but_not_a_turn_end_it_missed() {
     let seen = Some(at(100));
     let working = Some((State::Working, Some(at(200))));
-    // A stale hook says idle; Cira says working since later.
+    // Hooks older than Cira's state, or not a turn end, change nothing.
     assert_eq!(marker(working, Some((HookState::Idle, at(150))), seen), None);
-    assert_eq!(marker(working, Some((HookState::Dialog, at(300))), seen), None);
-    // An API error after Cira's last state: Cira still says working.
-    assert_eq!(marker(working, Some((HookState::Failed, at(300))), seen), Some(Marker::Finished));
-    // One before it was followed by a new turn Cira saw.
     assert_eq!(marker(working, Some((HookState::Failed, at(150))), seen), None);
-    // Both idle: a turn that ended while Cira was down (Cira's idle is older
-    // than the last look, the hook's newer) still marks the session.
+    assert_eq!(marker(working, Some((HookState::Dialog, at(300))), seen), None);
+    // An API error after Cira's last state: Cira has no state for it.
+    assert_eq!(marker(working, Some((HookState::Failed, at(300))), seen), Some(Marker::Finished));
+    // A Stop Cira missed (its daemon restarting): Cira still says working.
+    assert_eq!(marker(working, Some((HookState::Idle, at(300))), seen), Some(Marker::Finished));
+    let dialog = Some((State::Dialog, Some(at(200))));
+    assert_eq!(marker(dialog, Some((HookState::Idle, at(300))), seen), Some(Marker::Finished));
+    // A turn that ended while Cira was down, after it last said idle.
     let stale_idle = Some((State::Idle, Some(at(50))));
     assert_eq!(marker(stale_idle, Some((HookState::Idle, at(150))), seen), Some(Marker::Finished));
     assert_eq!(marker(stale_idle, Some((HookState::Idle, at(60))), seen), None);
+    // The same Stop reached Cira, which alone knows of agents and process ends.
+    let waiting = Some((State::Waiting, Some(at(200))));
+    assert_eq!(marker(waiting, Some((HookState::Idle, at(201))), seen), Some(Marker::Waiting));
+    let gone = Some((State::Gone, Some(at(200))));
+    assert_eq!(marker(gone, Some((HookState::Idle, at(201))), seen), Some(Marker::Gone));
   }
 
   #[test]
   fn hooks_set_the_marker_while_cira_does_not_know_the_session() {
     let seen = Some(at(100));
-    assert_eq!(marker(None, Some((HookState::Dialog, at(50))), seen), Some(Marker::Dialog));
+    assert_eq!(marker(None, Some((HookState::Dialog, at(150))), seen), Some(Marker::Dialog));
+    // No jc hook says a dialog was answered: one from before the last look
+    // may be long gone.
+    assert_eq!(marker(None, Some((HookState::Dialog, at(50))), seen), None);
+    assert_eq!(marker(None, Some((HookState::Dialog, at(50))), None), Some(Marker::Dialog));
     assert_eq!(marker(None, Some((HookState::Idle, at(150))), seen), Some(Marker::Finished));
     assert_eq!(marker(None, Some((HookState::Failed, at(150))), seen), Some(Marker::Finished));
     assert_eq!(marker(None, Some((HookState::Idle, at(50))), seen), None);
     assert_eq!(marker(None, Some((HookState::Working, at(150))), seen), None);
     assert_eq!(marker(None, None, seen), None);
+  }
+
+  #[test]
+  fn every_turn_end_is_stamped_and_other_states_keep_their_start() {
+    let idle = note_hook(None, HookState::Idle, at(10));
+    assert_eq!(idle, (HookState::Idle, at(10)));
+    // A second Stop with no prompt between (an automatic turn) is a new end.
+    assert_eq!(note_hook(Some(idle), HookState::Idle, at(30)), (HookState::Idle, at(30)));
+    let failed = (HookState::Failed, at(10));
+    assert_eq!(note_hook(Some(failed), HookState::Failed, at(30)), (HookState::Failed, at(30)));
+    // A repeated dialog or prompt keeps the time it began.
+    let dialog = (HookState::Dialog, at(10));
+    assert_eq!(note_hook(Some(dialog), HookState::Dialog, at(30)), dialog);
+    let working = (HookState::Working, at(10));
+    assert_eq!(note_hook(Some(working), HookState::Working, at(30)), working);
+    assert_eq!(note_hook(Some(working), HookState::Idle, at(30)), (HookState::Idle, at(30)));
   }
 
   #[test]
@@ -478,13 +526,6 @@ mod tests {
     // is not a turn that finished.
     assert_eq!(state(HookEventKind::SessionStart), None);
     assert_eq!(state(HookEventKind::IdlePrompt), None);
-  }
-
-  #[test]
-  fn dialog_sorts_before_finished_before_the_rest() {
-    let mut marks = [Marker::Gone, Marker::Waiting, Marker::Finished, Marker::Dialog];
-    marks.sort();
-    assert_eq!(marks[..2], [Marker::Dialog, Marker::Finished]);
   }
 
   #[test]
@@ -507,15 +548,10 @@ mod tests {
     let started = Instant::now();
     assert_eq!(Cira::new(hanging, Duration::from_millis(300)).status(), None);
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
-    let fixture = dir.join("status.json");
-    std::fs::write(&fixture, FIXTURE).unwrap();
-    let answering = script("answering", &format!("cat '{}'", fixture.display()));
-    assert_eq!(Cira::new(answering, Duration::from_secs(5)).status(), Some(fixture_status()));
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cira/status.json");
+    let answering = script("answering", &format!("cat '{path}'"));
+    assert_eq!(Cira::new(answering, Duration::from_secs(5)).status(), Some(fixture().0));
     let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  fn fixture_status() -> Status {
-    fixture().0
   }
 
   #[test]

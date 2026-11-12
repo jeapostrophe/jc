@@ -47,7 +47,7 @@ vendor/
 | Project file listing | `git2` 0.20.x (vendored libgit2) — index + status, read once per Cmd-O picker open |
 | External-edit merge | `diffy` 0.4 three-way merge in `CodeView::try_merge` when a watched file changes under unsaved edits |
 | Claude sessions | Claude Code background sessions (`claude --bg`), driven through `claude agents --json`, `attach`, `stop` and `rm` by `jc_core::background` — argument vectors, off the main thread |
-| Cira | `cira status --json` every 2 s on a thread of its own (`jc_core::cira::poll`): pending counts and session states |
+| Cira | `cira status --json` polled on a thread of its own (`jc_core::cira::poll`): pending counts and session states |
 | IPC | Unix socket (`~/.config/jc/jc.sock`) — multiple `jc .` invocations route to one running instance |
 | File watching | `notify` 7.x with debouncing, per open `CodeView` (which is also what backs `TodoView`) |
 | Desktop notifications | macOS native: `UNUserNotificationCenter` banners (bundled .app) + dock bounce fallback |
@@ -106,15 +106,9 @@ Every Claude pane is a client of a Claude Code **background session**: the sessi
 
 Each row's right side also carries its project's open Cira blocks (`4 blocks`, `jc_core::cira::blocks_label`), and the TODO pane header says `TODO · 4 blocks` (`blocks_suffix`).
 
-**The marker comes from session state, not terminal output** (Cira PLAN TMUX-06; `DESIGN.md`, "The Session Marker Comes From State"). `jc_core::cira::marker` decides it from three inputs on `SessionState`:
+**The marker comes from session state, not terminal output** (Cira PLAN TMUX-06; why: `DESIGN.md`, "The Session Marker Comes From State"). `jc_core::cira::marker` holds the rule. Its inputs are three `SessionState` fields: `cira_state` (from the last `cira status --json`, matched by `cira::Project::session` within the Cira project that contains the jc project, `cira::Status::project_for`), `hook_state` (jc's own hooks, `SessionState::note_hook`, stamped with the time the hook server received them), and `seen`, stamped by `Workspace::switch_to_session` on the *outgoing* session, which is what makes it "since you last had it on screen" however the switch was made. Until jc has switched away once, the heading's `> last=` stands in.
 
-- `cira_state`: the session's `state` and `state_since` from the last `cira status --json`, matched by `> cira=` id, else short id, else uuid (`cira::Project::session`) within the Cira project that contains the jc project (the deepest, Cira's own rule: `cira::Status::project_for`). `None` while Cira is unreachable or does not know the session.
-- `hook_state`: the last state jc's own hooks reported and when it began (`SessionState::note_hook`, `cira::HookState::from_hook`): `PromptSubmit` working, `Stop` idle, `PermissionPrompt` dialog, `StopFailure` failed. `SessionStart` and `IdlePrompt` are not turns and change nothing.
-- `seen`: when jc last switched away from the session (`Workspace::switch_to_session`, on the outgoing session — stamping on the way out is what makes it "since you last had it on screen" however the switch was made). Until then the heading's `> last=` stands in.
-
-Cira's state wins; jc's hooks are used when Cira has none, and a `StopFailure` newer than Cira's `state_since` overrides it, since Cira has no state for an API error and still says working. `*` needs an idle time after `seen`; with neither `seen` nor `> last=` a session is not marked. The session on screen shows only `!`.
-
-`Workspace::new` starts the poll: `cira::poll` runs `Cira::status` (`cira status --json`, killed after `Cira::TIMEOUT`, 3 s, because `cira` itself waits 12 s for a daemon that does not accept) on its own thread every 2 s and sends each result; a main-thread task applies it (`Workspace::apply_cira`, `ProjectState::apply_cira`) and notifies only when something shown changed. Any failure — `cira` not on `PATH`, no daemon, a failure exit, unparsable output — is `None`: counts disappear and markers fall back to the hooks. `cira` finds its daemon through `CIRA_HOME` in jc's environment, else `~/.cira`.
+The poll: `Workspace::new` starts `cira::poll`, which calls `Cira::status` (`cira status --json`, given `Cira::TIMEOUT`) on its own thread every `CIRA_POLL`; a main-thread task applies each read (`Workspace::apply_cira`, `ProjectState::apply_cira`) and notifies only when something shown changed. Any failure reads as unreachable: counts disappear and markers fall back to the hooks. `cira` is found on `PATH`, like `claude`, and finds its daemon through `CIRA_HOME` in jc's environment, else `~/.cira`.
 
 **Sort order.** Groups, in order: current project's sessions, other projects' sessions, unadopted sessions (current project first), empty projects, and finally the active session, which always sorts last since you are already there. A session showing a permission dialog, in any project, sorts above all of these. Within both session groups — this project's and the others' — finished sessions come first; "where did the work move while I was elsewhere" is mostly a cross-project question. Every sub-group then sorts by `> last=` descending (`picker::sort_rank`).
 
