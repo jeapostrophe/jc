@@ -1,6 +1,6 @@
 use crate::colors::Palette;
 use crate::input::keystroke_to_bytes;
-use crate::pty::PtyHandle;
+use crate::pty::{ChildSpec, PtyChild, PtyHandle};
 use crate::render::{CellLayout, TerminalRenderState, measure_cell, paint_terminal};
 use crate::settle::{LaunchSettle, SettleStep, SettleWindow};
 use crate::terminal::{TerminalEvent, TerminalState};
@@ -9,14 +9,14 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::TermMode;
 use gpui::{
-  App, AsyncApp, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FutureExt,
+  App, AsyncApp, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, FutureExt,
   InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
   MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
-  Styled, Subscription, Timer, WeakEntity, Window, actions, canvas, div, px,
+  Styled, Subscription, Task, Timer, WeakEntity, Window, actions, canvas, div, px,
 };
 use parking_lot::Mutex;
-use std::io::Read;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,61 @@ const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const FONT_SIZE_STEP: Pixels = px(2.0);
 const FONT_SIZE_MIN: Pixels = px(8.0);
 const FONT_SIZE_MAX: Pixels = px(72.0);
+
+/// Bounds of the delay before a respawned child: [`RESPAWN_MIN`] after a
+/// child that ran at least [`RESPAWN_STABLE`], doubling up to [`RESPAWN_MAX`]
+/// while it keeps exiting sooner (an attach to a session that is gone, a
+/// missing binary).
+const RESPAWN_MIN: Duration = Duration::from_secs(1);
+const RESPAWN_MAX: Duration = Duration::from_secs(30);
+const RESPAWN_STABLE: Duration = Duration::from_secs(10);
+
+/// How long to wait before re-running a child that just exited after running
+/// for `lived`, given the delay used before it (`None` for a first start).
+fn respawn_delay(previous: Option<Duration>, lived: Duration) -> Duration {
+  match previous {
+    Some(previous) if lived < RESPAWN_STABLE => (previous * 2).clamp(RESPAWN_MIN, RESPAWN_MAX),
+    _ => RESPAWN_MIN,
+  }
+}
+
+/// The bytes a wheel movement of `lines` (positive = down) sends to a child
+/// that asked for mouse reporting or alternate scroll, reported at 1-based
+/// cell `col`, `row`. `None` when the child asked for neither, and the
+/// movement belongs to jc's own scrollback.
+fn wheel_bytes(mode: TermMode, lines: i32, col: usize, row: usize) -> Option<Vec<u8>> {
+  let has_mouse = mode.intersects(TermMode::MOUSE_MODE);
+  let alt_scroll = mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL);
+  if lines == 0 || !(has_mouse || alt_scroll) {
+    return None;
+  }
+  let count = lines.unsigned_abs() as usize;
+  let one: Vec<u8> = if !has_mouse {
+    // Alternate scroll: cursor keys.
+    if lines > 0 { b"\x1b[B".to_vec() } else { b"\x1b[A".to_vec() }
+  } else {
+    let button: u8 = if lines > 0 { 65 } else { 64 };
+    if mode.contains(TermMode::SGR_MOUSE) {
+      format!("\x1b[<{button};{col};{row}M").into_bytes()
+    } else {
+      let cb = button + 32;
+      let cx_byte = (col as u8).saturating_add(32);
+      let cy_byte = (row as u8).saturating_add(32);
+      vec![b'\x1b', b'[', b'M', cb, cx_byte, cy_byte]
+    }
+  };
+  Some(one.repeat(count))
+}
+
+/// What happened to a terminal's child process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildEvent {
+  /// A child was (re)started.
+  Spawned,
+  /// The child exited and was reaped (`code` is `None` when it could not be
+  /// started or waited for). A terminal with `respawn` set restarts it.
+  Exited { code: Option<u32> },
+}
 
 actions!(
   terminal,
@@ -65,10 +120,15 @@ pub struct TerminalConfig {
   pub initial_cols: u16,
   pub initial_rows: u16,
   pub palette: Option<Palette>,
-  /// Optional command to run instead of the default shell.
-  /// When set, the terminal spawns this command (e.g. `"claude"`)
-  /// rather than the user's login shell.
-  pub command: Option<String>,
+  /// What to run. `None` starts no child until [`TerminalView::spawn`]; the
+  /// pane shows [`TerminalView::show_status`] lines meanwhile.
+  pub child: Option<ChildSpec>,
+  /// Added to the child's environment.
+  pub env: Vec<(String, String)>,
+  /// Re-run the child whenever it exits, after [`respawn_delay`]. Used for
+  /// `claude attach`, whose exit (Ctrl+Z, Esc from the agents view, a
+  /// `claude stop`) only detaches the client from a session that lives on.
+  pub respawn: bool,
   /// Discount this child's launch output from [`TerminalView::has_unseen_output`],
   /// so the flag means "it printed something while you were away" rather than
   /// "jc started it".
@@ -91,7 +151,9 @@ impl Default for TerminalConfig {
       initial_cols: 80,
       initial_rows: 24,
       palette: None,
-      command: None,
+      child: Some(ChildSpec::Shell),
+      env: Vec::new(),
+      respawn: false,
       launch_settle: None,
     }
   }
@@ -121,7 +183,19 @@ fn pixel_to_grid(
 /// GPUI view that embeds a terminal emulator.
 pub struct TerminalView {
   state: TerminalState,
-  pty: Arc<PtyHandle>,
+  /// The running child's PTY; `None` before the first spawn and after an exit.
+  /// Dropping it hangs the child up.
+  pty: Option<Arc<PtyHandle>>,
+  working_dir: Option<PathBuf>,
+  /// Bumped at every (re)spawn, so an exit reported by a replaced child is
+  /// ignored.
+  generation: u64,
+  spawned_at: Instant,
+  /// `output_batches` when the current child started.
+  batches_at_spawn: usize,
+  /// The delay used before the last respawn (see [`respawn_delay`]).
+  last_respawn_delay: Option<Duration>,
+  _respawn_task: Option<Task<()>>,
   palette: Palette,
   config: TerminalConfig,
   default_font_size: Pixels,
@@ -153,6 +227,8 @@ pub struct TerminalView {
   /// and the relay runs on the foreground executor. The lock is for `&self`
   /// interior mutability across two owners, not for cross-thread contention.
   settle: Arc<Mutex<Option<SettleWindow>>>,
+  /// Events the emulator raises (terminal replies), drained by the VTE thread.
+  term_events: flume::Receiver<TerminalEvent>,
   _subscriptions: Vec<Subscription>,
   /// Cursor blink task — only runs while focused.
   _blink_task: Option<gpui::Task<()>>,
@@ -168,44 +244,120 @@ impl TerminalView {
     let cols = config.initial_cols;
     let rows = config.initial_rows;
 
-    let (bytes_tx, bytes_rx) = flume::unbounded::<Vec<u8>>();
     let (event_tx, event_rx) = flume::unbounded();
-
     let state = TerminalState::new(cols as usize, rows as usize, event_tx);
+    let palette = config.palette.take().unwrap_or_default();
+    let default_font_size = config.font_size;
+    let focus = cx.focus_handle();
 
-    let (pty, reader) = if let Some(ref cmd) = config.command {
-      PtyHandle::spawn_command(cmd, cols, rows, working_dir).expect("failed to spawn command")
-    } else {
-      PtyHandle::spawn_shell(cols, rows, working_dir).expect("failed to spawn shell")
+    let _subscriptions = vec![
+      cx.on_focus(&focus, _window, Self::on_focus),
+      cx.on_blur(&focus, _window, Self::on_blur),
+    ];
+
+    let mut view = Self {
+      state,
+      pty: None,
+      working_dir: working_dir.map(PathBuf::from),
+      generation: 0,
+      spawned_at: Instant::now(),
+      batches_at_spawn: 0,
+      last_respawn_delay: None,
+      _respawn_task: None,
+      term_events: event_rx,
+      palette,
+      config,
+      default_font_size,
+      focus,
+      last_size: Arc::new(Mutex::new((cols, rows))),
+      focused: false,
+      cursor_visible: true,
+      cursor_reset_at: Instant::now(),
+      cached_layout: None,
+      canvas_origin: Arc::new(Mutex::new(gpui::Point::default())),
+      visible: Arc::new(AtomicBool::new(true)),
+      output_batches: Arc::new(AtomicUsize::new(0)),
+      seen_batches: AtomicUsize::new(0),
+      settle: Arc::new(Mutex::new(None)),
+      _subscriptions,
+      _blink_task: None,
     };
-    let pty = Arc::new(pty);
+    view.start_child(cx);
+    view
+  }
 
-    // Background thread: blocking PTY reads -> channel
-    std::thread::spawn(move || {
-      let mut reader = reader;
-      let mut buf = [0u8; 4096];
-      loop {
-        match reader.read(&mut buf) {
-          Ok(0) | Err(_) => break,
-          Ok(n) => {
-            if bytes_tx.send(buf[..n].to_vec()).is_err() {
-              break;
-            }
-          }
+  /// Run `spec` in this terminal, hanging up any child it already runs, and
+  /// keep re-running it on exit if the terminal was made with `respawn`.
+  pub fn spawn(&mut self, spec: ChildSpec, cx: &mut Context<Self>) {
+    self.config.child = Some(spec);
+    self.last_respawn_delay = None;
+    self.start_child(cx);
+  }
+
+  /// Hang up the child and run nothing until the next [`Self::spawn`].
+  pub fn stop_child(&mut self, cx: &mut Context<Self>) {
+    self.config.child = None;
+    self.generation += 1;
+    self.pty = None;
+    self._respawn_task = None;
+    cx.notify();
+  }
+
+  /// Has the current child printed anything yet?
+  pub fn has_output_since_spawn(&self) -> bool {
+    self.pty.is_some() && self.output_batches.load(Ordering::Relaxed) != self.batches_at_spawn
+  }
+
+  /// Print a dim `[jc] text` line, as if the child had printed it. For a
+  /// terminal waiting on something before its child can start, or one whose
+  /// child exited.
+  pub fn show_status(&mut self, text: &str, cx: &mut Context<Self>) {
+    let line = format!("\r\n\x1b[2m[jc] {text}\x1b[0m\r\n");
+    let mut processor = alacritty_terminal::vte::ansi::Processor::<
+      alacritty_terminal::vte::ansi::StdSyncHandler,
+    >::default();
+    self.state.with_term_mut(|term| processor.advance(term, line.as_bytes()));
+    cx.notify();
+  }
+
+  /// Start `config.child`, replacing (and hanging up) any current child.
+  fn start_child(&mut self, cx: &mut Context<Self>) {
+    self.generation += 1;
+    self.pty = None;
+    self._respawn_task = None;
+    let generation = self.generation;
+    let Some(spec) = self.config.child.clone() else { return };
+
+    let (cols, rows) = *self.last_size.lock();
+    let child =
+      match PtyChild::spawn(&spec, &self.config.env, cols, rows, self.working_dir.as_deref()) {
+        Ok(child) => child,
+        Err(e) => {
+          self.show_status(&format!("could not start {spec:?}: {e:#}"), cx);
+          self.spawned_at = Instant::now();
+          self.on_child_exit(generation, None, cx);
+          return;
         }
-      }
-    });
+      };
+    self.pty = Some(child.handle.clone());
+    self.spawned_at = Instant::now();
+    self.batches_at_spawn = self.output_batches.load(Ordering::Relaxed);
+    if let Some(policy) = self.config.launch_settle {
+      *self.settle.lock() = Some(SettleWindow::new(policy, Instant::now()));
+    }
+    cx.emit(ChildEvent::Spawned);
 
-    // Background thread: VTE parsing off the main thread.
-    // The heavy `processor.advance()` work runs here; only lightweight
-    // `cx.notify()` / bell emission happens on the main executor.
-    let term_handle = state.term_handle();
-    let pty_for_write = pty.clone();
-    let visible = Arc::new(AtomicBool::new(true));
-    let visible_for_bg = visible.clone();
+    // Background thread: VTE parsing off the main thread. The heavy
+    // `processor.advance()` work runs here; only lightweight `cx.notify()`
+    // happens on the main executor. It holds the PTY weakly, for terminal
+    // replies only, so dropping the view still hangs the child up.
+    let term_handle = self.state.term_handle();
+    let pty_for_write: Weak<PtyHandle> = Arc::downgrade(&child.handle);
+    let term_events = self.term_events.clone();
+    let visible_for_bg = self.visible.clone();
+    let output_batches_for_bg = self.output_batches.clone();
+    let bytes_rx = child.bytes;
     let (notify_tx, notify_rx) = flume::unbounded::<()>(); // one signal per parsed batch
-    let output_batches = Arc::new(AtomicUsize::new(0));
-    let output_batches_for_bg = output_batches.clone();
     std::thread::spawn(move || {
       let mut processor = alacritty_terminal::vte::ansi::Processor::<
         alacritty_terminal::vte::ansi::StdSyncHandler,
@@ -230,9 +382,11 @@ impl TerminalView {
         output_batches_for_bg.fetch_add(1, Ordering::Relaxed);
         // Handle terminal events. PtyWrite is answered here on the VTE thread;
         // the rest only matter as "something changed, repaint".
-        while let Ok(event) = event_rx.try_recv() {
-          if let TerminalEvent::PtyWrite(s) = event {
-            let _ = pty_for_write.write_all(s.as_bytes());
+        while let Ok(event) = term_events.try_recv() {
+          if let TerminalEvent::PtyWrite(s) = event
+            && let Some(pty) = pty_for_write.upgrade()
+          {
+            let _ = pty.write_all(s.as_bytes());
           }
         }
         if notify_tx.send(()).is_err() {
@@ -246,15 +400,14 @@ impl TerminalView {
     // sources — the batch that would reset a debounce is exactly the batch this
     // loop already waits on.
     //
-    // The window is installed HERE, before the relay exists, rather than being
-    // poked in afterwards: a window that arrived after the relay had already
-    // parked on an unbounded receive would never be serviced, and a child that
-    // then went quiet would leave the marker set for the life of the process.
-    let visible_for_relay = visible.clone();
-    let settle = Arc::new(Mutex::new(
-      config.launch_settle.map(|policy| SettleWindow::new(policy, Instant::now())),
-    ));
-    let settle_for_relay = settle.clone();
+    // The window is installed above, before the relay exists, rather than
+    // being poked in afterwards: a window that arrived after the relay had
+    // already parked on an unbounded receive would never be serviced, and a
+    // child that then went quiet would leave the marker set for the life of
+    // the process.
+    let visible_for_relay = self.visible.clone();
+    let settle_for_relay = self.settle.clone();
+    let exited = child.exited;
     cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
       loop {
         // Service the settle window first: it either wants the baseline taken
@@ -269,7 +422,7 @@ impl TerminalView {
           Some(SettleStep::Wait(duration)) => Some(duration),
           Some(SettleStep::Clear) => {
             if this.update(cx, |view, _| view.clear_output_seen()).is_err() {
-              break; // view dropped
+              return; // view dropped
             }
             *settle_for_relay.lock() = None;
             None
@@ -309,42 +462,38 @@ impl TerminalView {
           }
           // The settle window's next decision point came first — go ask it.
           Err(_) => {}
-          // The VTE thread is gone: the child has exited.
+          // The VTE thread is gone: the child has closed the PTY.
           Ok(Err(_)) => break,
         }
       }
+      let code = exited.recv_async().await.ok().flatten();
+      let _ = this.update(cx, |view, cx| view.on_child_exit(generation, code, cx));
     })
     .detach();
+  }
 
-    let palette = config.palette.take().unwrap_or_default();
-    let default_font_size = config.font_size;
-    let focus = cx.focus_handle();
-
-    let _subscriptions = vec![
-      cx.on_focus(&focus, _window, Self::on_focus),
-      cx.on_blur(&focus, _window, Self::on_blur),
-    ];
-
-    Self {
-      state,
-      pty,
-      palette,
-      config,
-      default_font_size,
-      focus,
-      last_size: Arc::new(Mutex::new((cols, rows))),
-      focused: false,
-      cursor_visible: true,
-      cursor_reset_at: Instant::now(),
-      cached_layout: None,
-      canvas_origin: Arc::new(Mutex::new(gpui::Point::default())),
-      visible,
-      output_batches,
-      seen_batches: AtomicUsize::new(0),
-      settle,
-      _subscriptions,
-      _blink_task: None,
+  fn on_child_exit(&mut self, generation: u64, code: Option<u32>, cx: &mut Context<Self>) {
+    if generation != self.generation {
+      return; // a replaced child
     }
+    self.pty = None;
+    cx.emit(ChildEvent::Exited { code });
+    let code = code.map_or("unknown".to_string(), |c| c.to_string());
+    if !self.config.respawn || self.config.child.is_none() {
+      self.show_status(&format!("exited (code {code})"), cx);
+      return;
+    }
+    let delay = respawn_delay(self.last_respawn_delay, self.spawned_at.elapsed());
+    self.last_respawn_delay = Some(delay);
+    self.show_status(&format!("exited (code {code}); restarting in {}s", delay.as_secs()), cx);
+    self._respawn_task = Some(cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+      Timer::after(delay).await;
+      let _ = this.update(cx, |view, cx| {
+        if view.generation == generation {
+          view.start_child(cx);
+        }
+      });
+    }));
   }
 
   /// Update the terminal color palette at runtime.
@@ -381,9 +530,15 @@ impl TerminalView {
     self.visible.store(is_visible, Ordering::Relaxed);
   }
 
-  /// Write raw bytes to the terminal's PTY.
+  /// Write raw bytes to the terminal's PTY; dropped while no child runs.
   pub fn write_bytes_to_pty(&self, bytes: &[u8]) {
-    let _ = self.pty.write_all(bytes);
+    self.write_pty(bytes);
+  }
+
+  fn write_pty(&self, bytes: &[u8]) {
+    if let Some(pty) = &self.pty {
+      let _ = pty.write_all(bytes);
+    }
   }
 
   /// Returns true if the terminal has bracketed-paste mode enabled.
@@ -391,8 +546,9 @@ impl TerminalView {
     self.state.with_term(|t| t.mode().contains(TermMode::BRACKETED_PASTE))
   }
 
-  /// Get a clone of the PTY handle for use in background threads.
-  pub fn pty_handle(&self) -> Arc<PtyHandle> {
+  /// Get a clone of the PTY handle for use in background threads, or `None`
+  /// while no child runs.
+  pub fn pty_handle(&self) -> Option<Arc<PtyHandle>> {
     self.pty.clone()
   }
 
@@ -405,10 +561,10 @@ impl TerminalView {
       let sanitized = text.replace('\x1b', "");
       buf.extend_from_slice(sanitized.as_bytes());
       buf.extend_from_slice(b"\x1b[201~");
-      let _ = self.pty.write_all(&buf);
+      self.write_pty(&buf);
     } else {
       let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-      let _ = self.pty.write_all(normalized.as_bytes());
+      self.write_pty(normalized.as_bytes());
     }
   }
 
@@ -428,8 +584,19 @@ impl TerminalView {
     });
   }
 
-  /// Scroll the terminal scrollback by the given number of lines (positive = down).
+  /// Scroll by the given number of lines (positive = down), as the wheel
+  /// would: a child that asked for mouse reporting (`claude attach`, which
+  /// runs fullscreen on the alternate screen with no scrollback) gets wheel
+  /// events at the middle of the pane; otherwise jc's scrollback moves.
   pub fn scroll_lines(&mut self, lines: i32, cx: &mut Context<Self>) {
+    let mode = self.state.with_term(|t| *t.mode());
+    let (cols, rows) = *self.last_size.lock();
+    let col = cols as usize / 2 + 1;
+    let row = rows as usize / 2 + 1;
+    if let Some(bytes) = wheel_bytes(mode, lines, col, row) {
+      self.write_pty(&bytes);
+      return;
+    }
     // Scroll::Delta uses the opposite convention: positive scrolls *up* (toward history).
     self.state.with_term_mut(|term| {
       term.scroll_display(Scroll::Delta(-lines));
@@ -466,7 +633,7 @@ impl TerminalView {
       term.mode().contains(TermMode::FOCUS_IN_OUT)
     });
     if send_focus {
-      let _ = self.pty.write_all(b"\x1b[I");
+      self.write_pty(b"\x1b[I");
     }
     self.reset_cursor_blink();
     self.start_blink_task(cx);
@@ -482,7 +649,7 @@ impl TerminalView {
       term.mode().contains(TermMode::FOCUS_IN_OUT)
     });
     if send_blur {
-      let _ = self.pty.write_all(b"\x1b[O");
+      self.write_pty(b"\x1b[O");
     }
     cx.notify();
   }
@@ -575,7 +742,7 @@ impl TerminalView {
       term.selection = None;
       term.scroll_display(Scroll::Bottom);
     });
-    let _ = self.pty.write_all(b"\t");
+    self.write_pty(b"\t");
   }
 
   fn send_shift_tab(&mut self, _: &SendShiftTab, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -584,7 +751,7 @@ impl TerminalView {
       term.selection = None;
       term.scroll_display(Scroll::Bottom);
     });
-    let _ = self.pty.write_all(b"\x1b[Z");
+    self.write_pty(b"\x1b[Z");
   }
 
   fn send_enter(&mut self, _: &SendEnter, _window: &mut Window, _cx: &mut Context<Self>) {
@@ -593,7 +760,7 @@ impl TerminalView {
       term.selection = None;
       term.scroll_display(Scroll::Bottom);
     });
-    let _ = self.pty.write_all(b"\r");
+    self.write_pty(b"\r");
   }
 
   fn send_shift_enter(
@@ -607,7 +774,7 @@ impl TerminalView {
       term.selection = None;
       term.scroll_display(Scroll::Bottom);
     });
-    let _ = self.pty.write_all(b"\x1b[13;2u");
+    self.write_pty(b"\x1b[13;2u");
   }
 
   /// Send a mouse event to the PTY in SGR or legacy format.
@@ -627,13 +794,13 @@ impl TerminalView {
     if sgr {
       let suffix = if pressed { 'M' } else { 'm' };
       let seq = format!("\x1b[<{button};{col};{row}{suffix}");
-      let _ = self.pty.write_all(seq.as_bytes());
+      self.write_pty(seq.as_bytes());
     } else {
       let cb = button + 32;
       let cx_byte = (col as u8).saturating_add(32);
       let cy_byte = (row as u8).saturating_add(32);
       let seq = [b'\x1b', b'[', b'M', cb, cx_byte, cy_byte];
-      let _ = self.pty.write_all(&seq);
+      self.write_pty(&seq);
     }
   }
 
@@ -673,6 +840,8 @@ impl TerminalView {
     }
   }
 }
+
+impl EventEmitter<ChildEvent> for TerminalView {}
 
 impl Focusable for TerminalView {
   fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -763,43 +932,10 @@ impl Render for TerminalView {
         }
 
         let mode = this.state.with_term(|t| *t.mode());
-        let has_mouse = mode.intersects(TermMode::MOUSE_MODE);
-        let alt_scroll =
-          mode.contains(TermMode::ALT_SCREEN) && mode.contains(TermMode::ALTERNATE_SCROLL);
-
-        if has_mouse || alt_scroll {
-          if alt_scroll && !has_mouse {
-            // Send cursor up/down key sequences
-            let (key, count) = if delta_lines > 0 {
-              (b"\x1b[B" as &[u8], delta_lines as usize) // Down
-            } else {
-              (b"\x1b[A" as &[u8], (-delta_lines) as usize) // Up
-            };
-            for _ in 0..count {
-              let _ = this.pty.write_all(key);
-            }
-          } else {
-            // Send SGR mouse scroll events
-            let button = if delta_lines > 0 { 65 } else { 64 };
-            let count = delta_lines.unsigned_abs() as usize;
-            let (point, _) = this.grid_point_and_side(event.position, layout);
-            let col = point.column.0 + 1;
-            let row = point.line.0 + 1;
-            if mode.contains(TermMode::SGR_MOUSE) {
-              let seq = format!("\x1b[<{button};{col};{row}M");
-              for _ in 0..count {
-                let _ = this.pty.write_all(seq.as_bytes());
-              }
-            } else {
-              let cb = button + 32;
-              let cx_byte = (col as u8).saturating_add(32);
-              let cy_byte = (row as u8).saturating_add(32);
-              let seq = [b'\x1b', b'[', b'M', cb, cx_byte, cy_byte];
-              for _ in 0..count {
-                let _ = this.pty.write_all(&seq);
-              }
-            }
-          }
+        let (point, _) = this.grid_point_and_side(event.position, layout);
+        let (col, row) = (point.column.0 + 1, (point.line.0 + 1).max(1) as usize);
+        if let Some(bytes) = wheel_bytes(mode, delta_lines, col, row) {
+          this.write_pty(&bytes);
         } else {
           // Normal mode: scroll the scrollback buffer
           this.state.with_term_mut(|term| {
@@ -808,18 +944,15 @@ impl Render for TerminalView {
         }
         cx.notify();
       }))
-      .on_key_down(cx.listener({
-        let pty = self.pty.clone();
-        move |this, event: &KeyDownEvent, _window, _cx| {
-          this.reset_cursor_blink();
-          let mode = this.state.with_term(|t| *t.mode());
-          if let Some(bytes) = keystroke_to_bytes(&event.keystroke, mode) {
-            this.state.with_term_mut(|term| {
-              term.selection = None;
-              term.scroll_display(Scroll::Bottom);
-            });
-            let _ = pty.write_all(&bytes);
-          }
+      .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, _cx| {
+        this.reset_cursor_blink();
+        let mode = this.state.with_term(|t| *t.mode());
+        if let Some(bytes) = keystroke_to_bytes(&event.keystroke, mode) {
+          this.state.with_term_mut(|term| {
+            term.selection = None;
+            term.scroll_display(Scroll::Bottom);
+          });
+          this.write_pty(&bytes);
         }
       }))
       .child(
@@ -855,7 +988,9 @@ impl Render for TerminalView {
                 *last = (new_cols, new_rows);
                 let pixel_width = f32::from(visible.size.width) as u16;
                 let pixel_height = f32::from(visible.size.height) as u16;
-                let _ = pty_for_resize.resize(new_cols, new_rows, pixel_width, pixel_height);
+                if let Some(pty) = &pty_for_resize {
+                  let _ = pty.resize(new_cols, new_rows, pixel_width, pixel_height);
+                }
                 term.resize(crate::terminal::TermDimensions {
                   cols: new_cols as usize,
                   rows: new_rows as usize,
@@ -877,5 +1012,53 @@ impl Render for TerminalView {
         )
         .size_full(),
       )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn respawn_backs_off_while_the_child_keeps_exiting_quickly() {
+    let quick = Duration::from_millis(200);
+    assert_eq!(respawn_delay(None, quick), RESPAWN_MIN);
+    let mut delay = respawn_delay(None, quick);
+    for _ in 0..10 {
+      delay = respawn_delay(Some(delay), quick);
+    }
+    assert_eq!(delay, RESPAWN_MAX, "doubles up to the cap");
+    // A child that ran a while (a long attach ended by Ctrl+Z) comes back fast.
+    assert_eq!(respawn_delay(Some(RESPAWN_MAX), RESPAWN_STABLE), RESPAWN_MIN);
+  }
+
+  /// What `claude attach` asks for (SP-03): alt screen, mouse 1000/1002/1003
+  /// with SGR encoding.
+  fn attach_mode() -> TermMode {
+    TermMode::ALT_SCREEN
+      | TermMode::MOUSE_REPORT_CLICK
+      | TermMode::MOUSE_DRAG
+      | TermMode::MOUSE_MOTION
+      | TermMode::SGR_MOUSE
+  }
+
+  #[test]
+  fn wheel_goes_to_a_child_in_mouse_mode_as_sgr_buttons() {
+    assert_eq!(wheel_bytes(attach_mode(), 2, 40, 12).unwrap(), b"\x1b[<65;40;12M\x1b[<65;40;12M");
+    assert_eq!(wheel_bytes(attach_mode(), -1, 1, 1).unwrap(), b"\x1b[<64;1;1M");
+  }
+
+  #[test]
+  fn wheel_moves_jc_scrollback_for_a_plain_child() {
+    // A plain shell or a plain `claude`: no mouse mode, primary screen.
+    assert_eq!(wheel_bytes(TermMode::default() - TermMode::ALTERNATE_SCROLL, 3, 1, 1), None);
+    assert_eq!(wheel_bytes(TermMode::default(), 3, 1, 1), None, "alternate scroll needs the alt screen");
+    assert_eq!(wheel_bytes(attach_mode(), 0, 1, 1), None);
+  }
+
+  #[test]
+  fn alternate_scroll_without_mouse_sends_cursor_keys() {
+    let mode = TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL;
+    assert_eq!(wheel_bytes(mode, -2, 1, 1).unwrap(), b"\x1b[A\x1b[A");
   }
 }
