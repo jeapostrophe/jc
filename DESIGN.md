@@ -50,6 +50,12 @@ Three consequences follow from Claude Code's behaviour, each measured (Cira SP-0
 - **`--resume` on a held conversation forks.** Migrating a `> uuid=` heading by `claude --bg --resume <uuid>` continues the same conversation only when no process holds it. jc therefore migrates on start, after the old jc has quit, and refuses for a uuid an interactive `claude` still holds.
 - **The attach client is disposable.** It exits on Ctrl+Z, on Esc from the ← agents view, and when the session is stopped; the session does not. So the pane reaps and restarts its child, and attaching resumes a stopped session. Typing into a client that is still connecting is lost, so sends wait until the session is live rather than for a fixed grace.
 
+## The Session Marker Comes From State
+
+The picker's marker used to count the batches the Claude terminal parsed since the session was last on screen. Any output counted, so a ticking "3m 42s" or a spinner frame marked a session, and an attach client repaints the whole screen whenever it connects; a launch-settle window existed only to discount that repaint (Cira SP-03 confirmed it set the marker exactly as a spinner does). Jay, 2026-11-11: a ticking timer is not activity (Cira PLAN TMUX-06).
+
+The marker now comes from the session's state: `!` a permission dialog, `*` a turn finished since the session was last on screen, `~` waiting on background agents, `x` gone. Cira records that state from its own hooks for every session, including the hours jc is not running, and `cira status --json` lists it with when it began, so jc compares that time with when it last switched away from the session. jc's own hooks remain the fallback: for a session Cira does not know (Cira unreachable, or a session started without a `CIRA_SESSION`), and for an API-error stop (`StopFailure`), which Cira has no state for — a stop failure newer than Cira's state wins. The batch counters stay only for what they still answer: whether an attach has drawn its first frame (`TerminalView::has_output_since_spawn`).
+
 ## Why Not an Editor Plugin
 
 It's tempting to decompose jc into a Zed or nvim plugin + tmux + scripts. Editors already provide editing, syntax highlighting, and terminals.
@@ -93,7 +99,7 @@ If Claude Code is meant to be the primary developer environment, users need a wa
 
 ### Hooks
 
-Hooks are the one extension point that works well today. Claude Code fires events on prompt submit, stop, permission prompt, idle, and API error. jc's hook server receives these, learns from them that a session is live and which uuid it is on now; a permission prompt or an API error also raises a desktop notification, but only while the jc window is inactive — those are the two states where Claude is blocked on you and you are not looking. `Stop` and `IdlePrompt` are ambient and deliberately silent: the session picker's activity marker already says which sessions moved, without interrupting whatever you switched to. The same hooks can trigger external notification services (e.g., ntfy, Pushover) for phone alerts when away from the desktop. No skills or context pollution required — hooks are push-only and invisible to the conversation.
+Hooks are the one extension point that works well today. Claude Code fires events on prompt submit, stop, permission prompt, idle, and API error. jc's hook server receives these, learns from them that a session is live and which uuid it is on now; a permission prompt or an API error also raises a desktop notification, but only while the jc window is inactive — those are the two states where Claude is blocked on you and you are not looking. `Stop` and `IdlePrompt` are ambient and deliberately silent: the session picker's marker already says which sessions moved, without interrupting whatever you switched to. The same hooks can trigger external notification services (e.g., ntfy, Pushover) for phone alerts when away from the desktop. No skills or context pollution required — hooks are push-only and invisible to the conversation.
 
 ## Scheduled Messages
 

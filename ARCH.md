@@ -14,8 +14,9 @@ scripts/
   update-gpui-component.sh          # re-vendor gpui-component from cargo cache + apply patches
   backup-todos.sh                   # one-time TODO.md.bak snapshot before the log-bound sweep
 jc-core/                            # data model + config persistence
-  src/lib.rs, claude.rs, config.rs, model.rs, theme.rs, todo.rs,
-      hooks.rs, hooks_settings.rs
+  src/lib.rs, background.rs, cira.rs, claude.rs, config.rs, model.rs,
+      theme.rs, todo.rs, hooks.rs, hooks_settings.rs
+  tests/fixtures/cira/                # `cira status --json` captured from a dev daemon (make-status.sh)
 jc-terminal/                        # embedded terminal emulator
   src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
   examples/terminal_window.rs
@@ -46,6 +47,7 @@ vendor/
 | Project file listing | `git2` 0.20.x (vendored libgit2) — index + status, read once per Cmd-O picker open |
 | External-edit merge | `diffy` 0.4 three-way merge in `CodeView::try_merge` when a watched file changes under unsaved edits |
 | Claude sessions | Claude Code background sessions (`claude --bg`), driven through `claude agents --json`, `attach`, `stop` and `rm` by `jc_core::background` — argument vectors, off the main thread |
+| Cira | `cira status --json` every 2 s on a thread of its own (`jc_core::cira::poll`): pending counts and session states |
 | IPC | Unix socket (`~/.config/jc/jc.sock`) — multiple `jc .` invocations route to one running instance |
 | File watching | `notify` 7.x with debouncing, per open `CodeView` (which is also what backs `TodoView`) |
 | Desktop notifications | macOS native: `UNUserNotificationCenter` banners (bundled .app) + dock bounce fallback |
@@ -93,32 +95,28 @@ Every Claude pane is a client of a Claude Code **background session**: the sessi
 
 | Marker | Entry |
 |---|---|
-| red `*` | Running session with unseen Claude terminal output |
+| bold red `!` | A permission dialog is waiting, seen or not |
+| red `*` | It finished a turn since it was last on screen |
+| grey `~` (on a running session) | Its turn is over; background agents are still running |
+| grey `x` | The session process has ended |
 | green `>` | The active session |
 | yellow `~` | In TODO.md but not running — confirming adopts it |
 | grey `~` | Same, but disabled (`[D]`) |
 | blue `+` | Registered project with no sessions |
 
-**Activity marker.** `TerminalView` keeps two counters: `output_batches`, bumped by the VTE background thread once per coalesced batch it parses (hidden terminals still parse, so a backgrounded session still records activity), and `seen_batches`, the value `clear_output_seen` snapshotted. `TerminalView::has_unseen_output` is just the two being unequal. The counters themselves are private to `jc-terminal`; the app crate sees only `has_unseen_output`, which the picker reads on each session's *Claude* terminal, and `clear_output_seen`. The baseline is taken from two places.
+Each row's right side also carries its project's open Cira blocks (`4 blocks`, `jc_core::cira::blocks_label`), and the TODO pane header says `TODO · 4 blocks` (`blocks_suffix`).
 
-The first is `Workspace::switch_to_session`, on the session being switched *away from*. Clearing on the way out rather than the way in is what makes the marker mean "since you last had it on screen" no matter how the switch was made (picker, Cmd-\`, notification click). The session currently on screen is excluded by the picker itself (`is_active`), since you are looking at it.
+**The marker comes from session state, not terminal output** (Cira PLAN TMUX-06; `DESIGN.md`, "The Session Marker Comes From State"). `jc_core::cira::marker` decides it from three inputs on `SessionState`:
 
-The second is the **launch-settle window**. A freshly started `claude attach` repaints the whole screen, and a resuming session replays its transcript; that is jc attaching, not work done while you were away. `SessionState::create` asks for one by setting `TerminalConfig::launch_settle` on the Claude terminal (the general terminal leaves it `None`), and `TerminalView::start_child` installs a new `SettleWindow` at every (re)start, before spawning the relay that drives it — a window poked in afterwards could arrive after the relay had already parked on an unbounded receive, and would then never be serviced.
+- `cira_state`: the session's `state` and `state_since` from the last `cira status --json`, matched by `> cira=` id, else short id, else uuid (`cira::Project::session`) within the Cira project that contains the jc project (the deepest, Cira's own rule: `cira::Status::project_for`). `None` while Cira is unreachable or does not know the session.
+- `hook_state`: the last state jc's own hooks reported and when it began (`SessionState::note_hook`, `cira::HookState::from_hook`): `PromptSubmit` working, `Stop` idle, `PermissionPrompt` dialog, `StopFailure` failed. `SessionStart` and `IdlePrompt` are not turns and change nothing.
+- `seen`: when jc last switched away from the session (`Workspace::switch_to_session`, on the outgoing session — stamping on the way out is what makes it "since you last had it on screen" however the switch was made). Until then the heading's `> last=` stands in.
 
-The relay already blocks on the batch signal to schedule repaints, so it is woken by exactly the event the window needs: there is no second task and no poll. Each pass asks the window what to do, then waits for either the next batch or the window's own deadline, whichever comes first (gpui's `FutureExt::with_timeout`, which polls the receive first so a batch wins the tie). A batch restarts the quiet wait; a deadline means the window is due to decide.
+Cira's state wins; jc's hooks are used when Cira has none, and a `StopFailure` newer than Cira's `state_since` overrides it, since Cira has no state for an API error and still says working. `*` needs an idle time after `seen`; with neither `seen` nor `> last=` a session is not marked. The session on screen shows only `!`.
 
-The mechanism is `settle.rs`'s and the numbers are the caller's: `SessionState::CLAUDE_LAUNCH_SETTLE` sets 4 s of quiet after the child has printed *something*, bounded at 30 s. What counts as settled is a fact about the Claude CLI, not about terminal emulation, so the durations live in `jc-app` and travel in as a `LaunchSettle`. `SettleWindow` itself is pure — it observes `Instant`s and answers `Clear`/`Wait`/`Done` — so the policy is unit-tested without a PTY, against fixture durations rather than a second copy of the shipped ones.
+`Workspace::new` starts the poll: `cira::poll` runs `Cira::status` (`cira status --json`, killed after `Cira::TIMEOUT`, 3 s, because `cira` itself waits 12 s for a daemon that does not accept) on its own thread every 2 s and sends each result; a main-thread task applies it (`Workspace::apply_cira`, `ProjectState::apply_cira`) and notifies only when something shown changed. Any failure — `cira` not on `PATH`, no daemon, a failure exit, unparsable output — is `None`: counts disappear and markers fall back to the hooks. `cira` finds its daemon through `CIRA_HOME` in jc's environment, else `~/.cira`.
 
-Four properties the window holds, each of which was once a bug:
-
-- A child that has printed *nothing* is slow to start, not quiet, so it is never baselined early — otherwise its banner lands above the baseline.
-- The quiet wait restarts at every batch, so the pause a resuming session takes between its first frame and its transcript replay does not end the window.
-- The give-up path *clears* rather than merely stopping. A child still printing re-marks itself on its next batch, whereas a marker left set never retires (only switching away clears one), and `has_activity` is the picker's primary sort key.
-- A session is baselined exactly once, so real output arriving after it settles is never silently swallowed.
-
-`SessionState::mark_user_input` — called from `Workspace::send_to_terminal`, `Workspace::fire_scheduled_send` and the `PromptSubmit` hook — ends the window through `TerminalView::cancel_launch_settle` *without* clearing: once you have given a session work, everything it prints is a response to something you asked for. The window is per terminal, so a project restored mid-run by `Workspace::open_project` gets its own.
-
-**Sort order.** Groups, in order: current project's sessions, other projects' sessions, unadopted sessions (current project first), empty projects, and finally the active session, which always sorts last since you are already there. Within both session groups — this project's and the others' — sessions with activity come first; "where did the work move while I was elsewhere" is mostly a cross-project question. Every sub-group then sorts by `> last=` descending.
+**Sort order.** Groups, in order: current project's sessions, other projects' sessions, unadopted sessions (current project first), empty projects, and finally the active session, which always sorts last since you are already there. A session showing a permission dialog, in any project, sorts above all of these. Within both session groups — this project's and the others' — finished sessions come first; "where did the work move while I was elsewhere" is mostly a cross-project question. Every sub-group then sorts by `> last=` descending (`picker::sort_rank`).
 
 The title bar shows `project > session` only. Per-pane headers carry the `[+]` dirty marker.
 
@@ -273,7 +271,8 @@ does three things:
    is re-pointed: only the label moved, and the TODO view's highlight keys on the id.
 
 The scans themselves are in memory; every `claude` command they cause runs on its own thread
-(`Workspace::run_blocking`). Everything else is
+(`Workspace::run_blocking`). The Cira poll is a loop of its own on its own thread (see Session
+Picker). Everything else is
 event-driven — hooks arrive over the hook server's channel, external file changes over the
 per-`CodeView` `notify` watcher, and terminal output over the VTE thread's flume channel.
 
@@ -284,8 +283,8 @@ The terminal emulator (`jc-terminal/`) uses `alacritty_terminal` for VTE parsing
 ### Data Flow (3-Thread Pipeline)
 
 1. **PTY reader thread** — blocking read loop on the PTY fd, 4KB chunks, sends via flume channel; at EOF it reaps the child and reports its exit code (`pty::PtyChild`), so an exited child never lingers as a zombie. The thread holds its own dup of the master, so dropping the view does not by itself hang the child up: `PtyHandle`'s `Drop` sends it SIGHUP. Children are argument vectors (`ChildSpec`), never split on whitespace.
-2. **VTE parser thread** (`std::thread`) — receives bytes, coalesces with visibility-aware caps (64KB visible / 256KB hidden), runs `Processor::advance()` under `Mutex<Term>` lock, bumps `output_batches`, answers `PtyWrite` events, signals main thread
-3. **Main-thread relay** — async task waiting on the batch signal or the launch-settle window's deadline, whichever comes first: it drives that window (see Session Picker) and calls `cx.notify()` for GPUI repaint (skipped when hidden). When the child exits it emits `ChildEvent::Exited` and, for a terminal made with `respawn`, starts the child again after the backoff.
+2. **VTE parser thread** (`std::thread`) — receives bytes, coalesces with visibility-aware caps (64KB visible / 256KB hidden), runs `Processor::advance()` under `Mutex<Term>` lock, bumps `output_batches` (read only by `has_output_since_spawn`: has the attach drawn its first frame), answers `PtyWrite` events, signals main thread
+3. **Main-thread relay** — async task waiting on the batch signal; calls `cx.notify()` for GPUI repaint (skipped when hidden). When the child exits it emits `ChildEvent::Exited` and, for a terminal made with `respawn`, starts the child again after the backoff.
 
 A pane whose child asked for mouse reporting (`claude attach` runs fullscreen on the alternate screen, so jc has no scrollback for it) gets wheel events instead of scrollback movement, from the wheel and from Cmd-Alt scroll-other alike (`view::wheel_bytes`).
 
@@ -323,7 +322,7 @@ Project matching: hook payload includes `cwd`, matched against configured projec
 
 ### Effect of Each Event
 
-`Workspace::apply_hook_to_session` marks the owning session `live`, records the event's uuid as its current one, and for `PromptSubmit` ends its launch-settle window (`SessionState::mark_user_input`). `SessionClear` is handled before dispatch, in `Workspace::handle_session_clear`.
+`Workspace::apply_hook_to_session` marks the owning session `live`, records the event's uuid as its current one, and records the state the event reports for the marker's fallback (`SessionState::note_hook`; see Session Picker). `SessionClear` is handled before dispatch, in `Workspace::handle_session_clear`.
 
 ## Notifications
 
@@ -334,7 +333,7 @@ A desktop notification fires only for a session that is **blocked on you**, and 
 | `PermissionPrompt` | "Permission needed" |
 | `StopFailure` | "API error" |
 
-`Stop` and `IdlePrompt` are ambient — they mark the session live and nothing else. What moved while you were away is reported by the session picker's activity marker instead, which costs no interruption.
+`Stop` and `IdlePrompt` are ambient — they raise no notification. What moved while you were away is reported by the session picker's marker instead, which costs no interruption.
 
 macOS native via `objc2`:
 

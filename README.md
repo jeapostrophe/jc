@@ -28,7 +28,7 @@ Claude takes minutes per task. If you wait, you get four cycles an hour. If you 
 
 jc keeps your place outside your head. Each session's notes live in the project's TODO.md, under a `### WAIT` marker: you type the next instruction there whenever you think of it, and Cmd-Enter sends it and files it into the message log. Coming back to a session means reading what you already wrote, not reconstructing it.
 
-Switching is cheap. Cmd-P lists every session in every project; each session keeps its own pane layout, cursor position, and terminal scrollback, restored on switch-back. A red `*` marks the sessions whose Claude terminal has printed something since you last had it on screen, so the picker tells you where the work moved while you were elsewhere. Desktop notifications stay out of the way — only a blocked session (permission prompt, API error) interrupts you, and only when jc isn't the front app.
+Switching is cheap. Cmd-P lists every session in every project; each session keeps its own pane layout, cursor position, and terminal scrollback, restored on switch-back. A red `*` marks the sessions that finished a turn since you last had them on screen, so the picker tells you where the work moved while you were elsewhere. Desktop notifications stay out of the way — only a blocked session (permission prompt, API error) interrupts you, and only when jc isn't the front app.
 
 See [DESIGN.md](DESIGN.md) for the full rationale.
 
@@ -80,17 +80,22 @@ The `> bg=` line, not the heading text, is what identifies a session — everyth
 
 ### Session Activity
 
-The Cmd-P session picker marks each session with a single character:
+The Cmd-P session picker marks each session with a single character. A running session's mark comes from its state — from Cira (the mailbox between you and your sessions, at `~/Dev/cira`; optional) when Cira knows the session, else from jc's own hooks — never from what its terminal prints, so a ticking "3m 42s" is not activity:
 
 | Marker | Meaning |
 |---|---|
-| red `*` | This session's Claude terminal has printed output since you last had it on screen |
+| bold red `!` | A permission dialog is waiting, whether or not you have seen it |
+| red `*` | It finished a turn (or stopped on an API error) since you last had it on screen |
+| grey `~` | Its turn is over, and background agents it started are still running |
+| grey `x` | The session process has ended |
 | green `>` | The session you're on now |
 | yellow `~` | In TODO.md but not running — pick it to adopt |
 | grey `~` | Disabled (`[D]`) |
 | blue `+` | A registered project with no sessions yet |
 
-Sessions sort activity-first, then by recency; the session you're on sorts last, since you're already there. The marker clears when you switch away from a session, so it always means "since you last had it on screen", and the session you're currently on never shows one.
+Sessions with a permission dialog sort first, from any project; then this project's sessions and then the others', each finished-first and then by recency; the session you're on sorts last, since you're already there. Switching away from a session clears its `*`, so it always means "since you last had it on screen"; until jc has switched away from a session once, that is the last time you sent to it (`> last=`). The session you're on shows only `!`.
+
+When Cira is running, each row also shows its project's open Cira blocks (`4 blocks`), and the TODO pane's header says the same (`TODO · 4 blocks`). jc reads both with `cira status --json` every 2 seconds, off the main thread; without Cira it shows no counts and marks sessions from its hooks alone.
 
 ## Views
 
@@ -157,7 +162,7 @@ Press **Cmd-?** for the in-app overlay.
 2. Type the next instruction there. It's a plain Markdown buffer — write it over several sittings if you like, while Claude works on the last one.
 3. **Cmd-Enter** sends the draft to the Claude terminal, files it as `### Message N`, and stamps `> last=`.
 4. **Cmd-P** to move to another session while that one runs. Your panes, cursor, and terminal scrollback come back when you return.
-5. Sessions that printed something while you were away carry a red `*` in the picker.
+5. Sessions that finished a turn while you were away carry a red `*` in the picker, and one waiting on a permission dialog a bold red `!`.
 
 ### Navigate Code
 
