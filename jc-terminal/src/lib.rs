@@ -7,6 +7,6 @@ mod terminal;
 mod view;
 
 pub use colors::Palette;
-pub use settle::LaunchSettle;
 pub use pty::ChildSpec;
+pub use settle::LaunchSettle;
 pub use view::{ChildEvent, TerminalConfig, TerminalView, init};

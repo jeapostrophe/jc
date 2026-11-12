@@ -17,19 +17,13 @@ pub enum CloseConfirmEvent {
 
 pub struct CloseConfirm {
   focus: FocusHandle,
-  session_count: usize,
   conflicts: Vec<String>,
   is_quit: bool,
 }
 
 impl CloseConfirm {
-  pub fn new(
-    session_count: usize,
-    conflicts: Vec<String>,
-    is_quit: bool,
-    cx: &mut Context<Self>,
-  ) -> Self {
-    Self { focus: cx.focus_handle(), session_count, conflicts, is_quit }
+  pub fn new(conflicts: Vec<String>, is_quit: bool, cx: &mut Context<Self>) -> Self {
+    Self { focus: cx.focus_handle(), conflicts, is_quit }
   }
 }
 
@@ -48,12 +42,6 @@ impl Render for CloseConfirm {
     let action = if self.is_quit { "Quit" } else { "Close" };
 
     let mut messages: Vec<String> = Vec::new();
-
-    if self.session_count > 0 {
-      let sessions = if self.session_count == 1 { "session" } else { "sessions" };
-      messages
-        .push(format!("{} active Claude {} will be terminated.", self.session_count, sessions));
-    }
 
     if !self.conflicts.is_empty() {
       let files = self.conflicts.join(", ");

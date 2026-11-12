@@ -68,6 +68,7 @@ impl PtyChild {
       native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
     let mut child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
+    #[cfg(test)]
     let pid = child.process_id();
     let killer = child.clone_killer();
 
@@ -144,8 +145,10 @@ mod tests {
 
   /// `ps` state of `pid`, or empty once the process is gone (reaped).
   fn ps_state(pid: u32) -> String {
-    let out =
-      std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+    let out = std::process::Command::new("ps")
+      .args(["-o", "stat=", "-p", &pid.to_string()])
+      .output()
+      .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
   }
 

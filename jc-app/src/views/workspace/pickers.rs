@@ -227,18 +227,7 @@ impl Workspace {
                 this.create_new_session(pi, window, cx);
               }
               ProjectActionsResult::AdoptJsonlSession(uuid, summary) => {
-                // The summary is the transcript's first user message, so two
-                // sessions that opened with the same prompt would otherwise get
-                // the same display name. Addressing is by UUID either way (see
-                // `jc_core::todo::SessionKey`); this is for the picker's sake.
-                let todo_view = this.projects[pi].todo_view.clone();
-                let label = jc_core::todo::unique_label(todo_view.read(cx).document(), &summary);
-                todo_view.update(cx, |tv, cx| {
-                  tv.insert_session_heading(&uuid, &label, window, cx);
-                  tv.save(cx);
-                });
-                let key = jc_core::todo::SessionKey::Uuid(uuid);
-                this.adopt_session(pi, &key, window, cx);
+                this.adopt_transcript(pi, uuid, &summary, window, cx);
               }
             }
             cx.notify();

@@ -129,7 +129,12 @@ pub enum LaunchPlan {
 ///   conversation; refuse when an interactive process holds it; otherwise
 ///   continue it with `--bg --resume U` (whose short id is U's prefix) when its
 ///   transcript is on disk, or start fresh when it is not.
-pub fn plan_launch(id: &str, kind: IdKind, agents: &[Agent], transcript_exists: bool) -> LaunchPlan {
+pub fn plan_launch(
+  id: &str,
+  kind: IdKind,
+  agents: &[Agent],
+  transcript_exists: bool,
+) -> LaunchPlan {
   match kind {
     IdKind::Bg => match find(agents, id) {
       Some(_) => LaunchPlan::Attach(id.to_string()),
@@ -180,7 +185,8 @@ pub struct Poll {
 impl Poll {
   /// A cold start can take about two minutes to reach idle under load, and an
   /// `agents --json` call costs about a second at load ~140.
-  pub const START: Poll = Poll { interval: Duration::from_millis(1500), timeout: Duration::from_secs(180) };
+  pub const START: Poll =
+    Poll { interval: Duration::from_millis(1500), timeout: Duration::from_secs(180) };
 }
 
 /// The `claude` executable and the calls jc makes to it.
@@ -520,7 +526,10 @@ esac
   #[test]
   fn a_legacy_uuid_is_migrated_once_and_never_while_running() {
     // Not running anywhere, transcript on disk: continue it in the background.
-    assert_eq!(plan_launch(U, IdKind::Uuid, &[], true), LaunchPlan::Start { resume: Some(U.into()) });
+    assert_eq!(
+      plan_launch(U, IdKind::Uuid, &[], true),
+      LaunchPlan::Start { resume: Some(U.into()) }
+    );
     // Transcript gone: a fresh session (the heading survives).
     assert_eq!(plan_launch(U, IdKind::Uuid, &[], false), LaunchPlan::Start { resume: None });
     // Held by an interactive `claude` (an old jc): resuming would fork a copy.
@@ -541,7 +550,11 @@ esac
     assert!(hook_matches("35a13d68", "", "35a13d68-0f6e-4b1e-9d36-1f2a3b4c5d6e"));
     // After `/clear` the uuid no longer starts with the short id; the learned
     // uuid matches it.
-    assert!(hook_matches("35a13d68", "6955c2a6-aaaa-bbbb-cccc-dddddddddddd", "6955c2a6-aaaa-bbbb-cccc-dddddddddddd"));
+    assert!(hook_matches(
+      "35a13d68",
+      "6955c2a6-aaaa-bbbb-cccc-dddddddddddd",
+      "6955c2a6-aaaa-bbbb-cccc-dddddddddddd"
+    ));
     // Someone else's session.
     assert!(!hook_matches("35a13d68", "", "a5185f98-0000-0000-0000-000000000000"));
     // A short id is a whole uuid segment, not any prefix.
@@ -554,8 +567,14 @@ esac
 
   #[test]
   fn start_runs_claude_bg_in_the_project_and_returns_the_short_id() {
-    let fake = Fake::new(&["aaaa1111"], &[r#"[{"id":"aaaa1111","kind":"background","status":"idle"}]"#]);
-    let spec = StartSpec { label: "L".into(), cira: Some("c".into()), permissions: Permissions::Unset, resume: None };
+    let fake =
+      Fake::new(&["aaaa1111"], &[r#"[{"id":"aaaa1111","kind":"background","status":"idle"}]"#]);
+    let spec = StartSpec {
+      label: "L".into(),
+      cira: Some("c".into()),
+      permissions: Permissions::Unset,
+      resume: None,
+    };
     let short = fake.claude().start(&spec, &std::env::temp_dir(), FAST).unwrap();
     assert_eq!(short, "aaaa1111");
     let calls = fake.calls();
@@ -567,7 +586,8 @@ esac
     let failed = r#"[{"id":"aaaa1111","kind":"background","state":"failed"}]"#;
     let live = r#"[{"id":"bbbb2222","kind":"background","status":"idle","state":"blocked"}]"#;
     let fake = Fake::new(&["aaaa1111", "bbbb2222"], &[failed, live]);
-    let spec = StartSpec { label: "L".into(), cira: None, permissions: Permissions::Unset, resume: None };
+    let spec =
+      StartSpec { label: "L".into(), cira: None, permissions: Permissions::Unset, resume: None };
     let short = fake.claude().start(&spec, &std::env::temp_dir(), FAST).unwrap();
     assert_eq!(short, "bbbb2222");
     let verbs: Vec<String> = fake.calls().iter().map(|c| c[0].clone()).collect();
@@ -579,7 +599,8 @@ esac
   fn a_second_failed_start_is_an_error() {
     let failed = r#"[{"id":"aaaa1111","kind":"background","state":"failed"},{"id":"bbbb2222","kind":"background","state":"failed"}]"#;
     let fake = Fake::new(&["aaaa1111", "bbbb2222"], &[failed]);
-    let spec = StartSpec { label: "L".into(), cira: None, permissions: Permissions::Unset, resume: None };
+    let spec =
+      StartSpec { label: "L".into(), cira: None, permissions: Permissions::Unset, resume: None };
     assert!(fake.claude().start(&spec, &std::env::temp_dir(), FAST).is_err());
     let bg_starts = fake.calls().iter().filter(|c| c[0] == "--bg").count();
     assert_eq!(bg_starts, 2, "exactly one retry");

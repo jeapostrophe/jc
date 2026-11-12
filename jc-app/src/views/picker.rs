@@ -788,7 +788,7 @@ impl SessionPickerDelegate {
         }
         let last_active = todo_documents
           .get(pi)
-          .and_then(|d| d.session_by_uuid(&session.uuid))
+          .and_then(|d| d.session_by_id(&session.key))
           .and_then(|ts| ts.last_active)
           .unwrap_or(0);
         entries.push(SessionPickerEntry {
@@ -796,8 +796,9 @@ impl SessionPickerDelegate {
           project_index: pi,
           project_name: project.name.clone(),
           label: session.label.clone(),
-          // A running session is always bound, so its UUID is a true address.
-          key: Some(SessionKey::Uuid(session.uuid.clone())),
+          // A running session's heading id is a true address; one still
+          // starting has no heading yet.
+          key: (!session.key.is_empty()).then(|| SessionKey::Id(session.key.clone())),
           // The session on screen is the one you're looking at, so its output
           // is by definition already seen.
           has_activity: !is_active && session.claude_terminal.read(cx).has_unseen_output(),
@@ -808,7 +809,7 @@ impl SessionPickerDelegate {
       // TODO.md sessions with no running terminal (see `ProjectState::is_adopted`).
       if let Some(doc) = todo_documents.get(pi) {
         for (index, todo_session) in doc.sessions.iter().enumerate() {
-          if project.is_adopted(&todo_session.uuid) {
+          if project.is_adopted(&todo_session.id) {
             continue;
           }
           entries.push(SessionPickerEntry {
@@ -816,7 +817,7 @@ impl SessionPickerDelegate {
             project_index: pi,
             project_name: project.name.clone(),
             label: todo_session.label.clone(),
-            // An unbound heading has no UUID to key on; `index` is its address,
+            // An unbound heading has no id to key on; `index` is its address,
             // re-verified against the live document at write time.
             key: Some(todo_session.key(index)),
             has_activity: false,
@@ -1058,7 +1059,7 @@ impl ProjectActionsPickerDelegate {
       let mut dormant: Vec<(SessionKey, String, u64)> = Vec::new();
       if let Some(doc) = todo_documents.get(active_project_index) {
         for (index, ts) in doc.sessions.iter().enumerate() {
-          if !project.is_adopted(&ts.uuid) {
+          if !project.is_adopted(&ts.id) {
             dormant.push((ts.key(index), ts.label.clone(), ts.last_active.unwrap_or(0)));
           }
         }
@@ -1079,10 +1080,20 @@ impl ProjectActionsPickerDelegate {
     //    project's transcripts live in its root bucket plus any git-worktree
     //    buckets (each transcript in exactly one bucket), so scan them all.
     {
-      let existing_uuids: HashSet<&str> = todo_documents
-        .get(active_project_index)
-        .map(|doc| doc.sessions.iter().map(|s| s.uuid.as_str()).collect())
-        .unwrap_or_default();
+      // A transcript is known when a heading names it (`> uuid=`), a running
+      // session is on it (its uuid after a `/clear`), or it was created by a
+      // heading's background session (its uuid starts with the `> bg=` short
+      // id).
+      let doc = todo_documents.get(active_project_index);
+      let ids: HashSet<&str> =
+        doc.map(|doc| doc.sessions.iter().map(|s| s.id.as_str()).collect()).unwrap_or_default();
+      let running: HashSet<&str> =
+        projects[active_project_index].sessions.values().map(|s| s.uuid.as_str()).collect();
+      let known = |uuid: &str| {
+        ids.contains(uuid)
+          || running.contains(uuid)
+          || uuid.split_once('-').is_some_and(|(short, _)| ids.contains(short))
+      };
 
       let mut discovered: Vec<(String, String, std::time::SystemTime)> = Vec::new();
       for session_dir in ProjectState::session_dirs(project_path).unwrap_or_default() {
@@ -1093,7 +1104,7 @@ impl ProjectActionsPickerDelegate {
             continue;
           }
           let Some(uuid) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-          if existing_uuids.contains(uuid) {
+          if known(uuid) {
             continue;
           }
           let mtime =

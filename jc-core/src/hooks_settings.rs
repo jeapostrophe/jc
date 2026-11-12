@@ -97,7 +97,7 @@ pub fn install_hooks(project_path: &Path, port: u16) -> Result<()> {
     .expect("SessionEnd should be an array")
     .push(session_end_entry);
 
-  // SessionStart hook (detect new session after /clear) — only "command" type is supported.
+  // SessionStart hook (a /clear, and every start or resume: the session is live) — only "command" type is supported.
   let session_start_entry = serde_json::json!({
       "hooks": [{
         "type": "command",

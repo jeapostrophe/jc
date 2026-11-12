@@ -16,8 +16,8 @@ use gpui::{
 };
 use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -486,14 +486,15 @@ impl TerminalView {
     let delay = respawn_delay(self.last_respawn_delay, self.spawned_at.elapsed());
     self.last_respawn_delay = Some(delay);
     self.show_status(&format!("exited (code {code}); restarting in {}s", delay.as_secs()), cx);
-    self._respawn_task = Some(cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
-      Timer::after(delay).await;
-      let _ = this.update(cx, |view, cx| {
-        if view.generation == generation {
-          view.start_child(cx);
-        }
-      });
-    }));
+    self._respawn_task =
+      Some(cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
+        Timer::after(delay).await;
+        let _ = this.update(cx, |view, cx| {
+          if view.generation == generation {
+            view.start_child(cx);
+          }
+        });
+      }));
   }
 
   /// Update the terminal color palette at runtime.
@@ -1052,7 +1053,11 @@ mod tests {
   fn wheel_moves_jc_scrollback_for_a_plain_child() {
     // A plain shell or a plain `claude`: no mouse mode, primary screen.
     assert_eq!(wheel_bytes(TermMode::default() - TermMode::ALTERNATE_SCROLL, 3, 1, 1), None);
-    assert_eq!(wheel_bytes(TermMode::default(), 3, 1, 1), None, "alternate scroll needs the alt screen");
+    assert_eq!(
+      wheel_bytes(TermMode::default(), 3, 1, 1),
+      None,
+      "alternate scroll needs the alt screen"
+    );
     assert_eq!(wheel_bytes(attach_mode(), 0, 1, 1), None);
   }
 

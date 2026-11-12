@@ -27,7 +27,7 @@ pub struct TodoView {
   code_view: Entity<CodeView>,
   file_path: PathBuf,
   document: TodoDocument,
-  active_uuid: Option<String>,
+  active_key: Option<String>,
   _editor_subscription: Subscription,
 }
 
@@ -58,7 +58,7 @@ impl TodoView {
     let text = code_view.read(cx).editor_text(cx);
     let document = todo::parse(&text);
 
-    Self { code_view, file_path, document, active_uuid: None, _editor_subscription }
+    Self { code_view, file_path, document, active_key: None, _editor_subscription }
   }
 
   pub fn code_view(&self) -> &Entity<super::code_view::CodeView> {
@@ -88,7 +88,7 @@ impl TodoView {
   /// 0-based line of the last line in the WAIT body of the session bound to
   /// `uuid` — where the cursor goes so the user can type.
   pub fn wait_line(&self, uuid: &str, cx: &App) -> Option<u32> {
-    let wait = self.document.session_by_uuid(uuid)?.wait.as_ref()?;
+    let wait = self.document.session_by_id(uuid)?.wait.as_ref()?;
     Some(wait.body_end_line(&self.editor_text(cx)))
   }
 }
@@ -110,27 +110,29 @@ impl TodoView {
     &self.document
   }
 
-  /// Set the active session's UUID. Its headings get highlighted with the
+  /// Set the active session's heading id. Its headings get highlighted with the
   /// `@type` / `@function` theme colors while other sessions use default
   /// markdown heading colors.
-  pub fn set_active_uuid(&mut self, uuid: Option<&str>, cx: &mut Context<Self>) {
-    let changed = self.active_uuid.as_deref() != uuid;
-    self.active_uuid = uuid.map(|s| s.to_string());
+  pub fn set_active_key(&mut self, key: Option<&str>, cx: &mut Context<Self>) {
+    let changed = self.active_key.as_deref() != key;
+    self.active_key = key.map(|s| s.to_string());
     if changed {
       self.apply_session_highlights(cx);
     }
   }
 
-  /// Insert a `## <label>\n> uuid=<uuid>\n\n### WAIT\n` heading and save.
+  /// Insert a `## <label>` heading bound to background session `short` with
+  /// stable id `cira`, and save.
   pub fn insert_session_heading(
     &mut self,
-    uuid: &str,
     label: &str,
+    short: &str,
+    cira: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let text = self.code_view.read(cx).editor_text(cx);
-    let new_text = todo::insert_session_heading(&text, &self.document, uuid, label);
+    let new_text = todo::insert_session_heading(&text, &self.document, label, short, cira);
     self.set_text_and_save(new_text, window, cx);
   }
 
@@ -175,9 +177,8 @@ impl TodoView {
     cx: &mut Context<Self>,
   ) {
     let Some(index) = self.document.index_of(key) else {
-      // Reachable whenever memory and file disagree (a `/clear` whose heading
-      // write missed, a hand-edited `> uuid=`, a heading renamed since the
-      // picker snapshot). Cmd-Shift-Backspace then does nothing at all, so say
+      // Reachable whenever memory and file disagree (a hand-edited id line, a
+      // heading renamed since the picker snapshot). Cmd-Shift-Backspace then does nothing at all, so say
       // why rather than appearing to be ignored.
       eprintln!("toggle-disabled: no TODO heading for {key:?}");
       return;
@@ -202,7 +203,7 @@ impl TodoView {
   ) -> Option<(String, Option<NaiveDateTime>)> {
     let text = self.editor_text(cx);
     let selection = self.code_view.read(cx).editor().read(cx).selection_byte_range();
-    let session = self.document.session_by_uuid(uuid)?;
+    let session = self.document.session_by_id(uuid)?;
     let now = now_unix_secs();
     let now_local = chrono::Local::now().naive_local();
     let result = todo::send_from_wait(&text, session, selection, Some(now), now_local)?;
@@ -224,7 +225,7 @@ impl TodoView {
   /// editor change, so a marker the user just added or removed is already
   /// reflected — no re-parse needed on this per-send hot path.
   pub fn has_pending_schedule(&self, uuid: &str) -> bool {
-    self.document.session_by_uuid(uuid).and_then(|s| s.pending_scheduled()).is_some()
+    self.document.session_by_id(uuid).and_then(|s| s.pending_scheduled()).is_some()
   }
 
   /// Fire a scheduled send for the session bound to `uuid`. jc-core [`todo::fire_scheduled`] owns the
@@ -285,18 +286,21 @@ impl TodoView {
     }
   }
 
-  /// Write `new_uuid` onto the session at `index` in the parsed document.
-  /// Positional because the caller minting a UUID has no UUID to key on yet.
-  pub fn update_session_uuid_at(
+  /// Bind the heading at `index` in the parsed document to background
+  /// session `short` (see [`todo::bind_bg_at`]) and save. Positional because
+  /// the heading's old id (a legacy `> uuid=`, an older short id, or none) is
+  /// about to stop being its address.
+  pub fn bind_bg_at(
     &mut self,
     index: usize,
-    new_uuid: &str,
+    short: &str,
+    cira: Option<&str>,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let text = self.editor_text(cx);
-    if let Some(new_text) = todo::update_session_uuid_at(&text, &self.document, index, new_uuid) {
-      self.set_text(new_text, window, cx);
+    if let Some(new_text) = todo::bind_bg_at(&text, &self.document, index, short, cira) {
+      self.set_text_and_save(new_text, window, cx);
     }
   }
 
@@ -313,7 +317,7 @@ impl TodoView {
   /// color, except a pending scheduled `### Message N @jc(...)` heading → `@keyword`
   /// color so it stands out as not-yet-delivered.
   fn apply_session_highlights(&self, cx: &mut Context<Self>) {
-    let session = self.active_uuid.as_deref().and_then(|uuid| self.document.session_by_uuid(uuid));
+    let session = self.active_key.as_deref().and_then(|uuid| self.document.session_by_id(uuid));
 
     let Some(session) = session else {
       self.code_view.update(cx, |cv, cx| {

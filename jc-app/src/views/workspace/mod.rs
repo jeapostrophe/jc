@@ -5,17 +5,19 @@ use crate::views::close_confirm::{CloseConfirm, CloseConfirmEvent};
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
-use crate::views::session_state::{Launch, SavedViewState, SessionId, SessionState};
+use crate::views::session_state::{SavedViewState, SessionId, SessionState};
 use crate::views::todo_view::ScheduledFire;
 use chrono::NaiveDateTime;
 use gpui::*;
 use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
+use jc_core::background::{self, Claude, LaunchPlan, Permissions, Poll, StartSpec};
 use jc_core::config::{AppConfig, AppState};
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
 use jc_core::theme::Appearance;
-use jc_core::todo::{SessionKey, TodoDocument, TodoSession};
-use jc_terminal::{Palette, TerminalView};
+use jc_core::todo::{IdKind, SessionKey, TodoDocument, TodoSession};
+use jc_terminal::{ChildEvent, Palette, TerminalView};
+use std::collections::HashSet;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
@@ -110,7 +112,28 @@ pub struct Workspace {
   pre_close_confirm_focus: Option<FocusHandle>,
   /// Whether the pending close is a quit (vs window close).
   close_confirm_is_quit: bool,
+  /// The `claude` CLI every background-session command goes through.
+  claude: Claude,
+  /// Hooks from a known project that matched no session, kept until the next
+  /// `claude agents --json` refresh teaches jc the uuid they carry.
+  unmatched_hooks: Vec<HookEvent>,
+  /// A `claude agents --json` refresh for unmatched hooks is in flight.
+  refreshing_agents: bool,
+  /// Short ids of `[DELETED]` headings jc has already stopped and removed.
+  removed_shorts: HashSet<String>,
 }
+
+/// What a session about to wait for its background session starts from: its
+/// heading's id (empty for one not written yet), label, stable id and mode.
+struct PendingHeading {
+  key: String,
+  label: String,
+  cira: Option<String>,
+  dangerous: bool,
+}
+
+/// Unmatched hooks kept for re-dispatch; older ones are dropped.
+const UNMATCHED_HOOKS_MAX: usize = 32;
 
 impl Workspace {
   pub fn new(
@@ -121,6 +144,7 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) -> Self {
     let palette = palette_from_window(window);
+    let claude = Claude::default();
 
     // Build a ProjectState per registered project.
     let mut projects = Vec::new();
@@ -129,6 +153,7 @@ impl Workspace {
         project.path.clone(),
         project.name(),
         &palette,
+        &claude,
         window,
         cx,
       ));
@@ -141,7 +166,7 @@ impl Workspace {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".into());
-      projects.push(ProjectState::create(path, name, &palette, window, cx));
+      projects.push(ProjectState::create(path, name, &palette, &claude, window, cx));
     }
 
     // Create global TODO view (~/.claude/TODO.md) as a read-only CodeView.
@@ -305,8 +330,16 @@ impl Workspace {
       close_confirm: None,
       pre_close_confirm_focus: None,
       close_confirm_is_quit: false,
+      claude,
+      unmatched_hooks: Vec::new(),
+      refreshing_agents: false,
+      removed_shorts: HashSet::new(),
     };
 
+    for pi in 0..ws.projects.len() {
+      ws.observe_claude_panes(pi, window, cx);
+    }
+    ws.launch_sessions(window, cx);
     ws.refresh_breadcrumb_observers(cx);
     ws.reconcile_schedules(window, cx);
     ws.start_schedule_reconcile_loop(window, cx);
@@ -446,12 +479,13 @@ impl Workspace {
   }
 
   /// Auto-save dirty buffers and close/quit. Shows confirm dialog if there
-  /// are active sessions or buffers with merge conflicts that can't be saved.
+  /// are buffers with merge conflicts that can't be saved. Working sessions
+  /// are no reason to ask: closing only detaches from background sessions,
+  /// which keep running.
   fn try_close(&mut self, is_quit: bool, window: &mut Window, cx: &mut Context<Self>) {
     let conflicts = self.save_all_dirty(cx);
-    let active = self.active_session_count();
 
-    if conflicts.is_empty() && active == 0 {
+    if conflicts.is_empty() {
       // Nothing to warn about — just close.
       if is_quit {
         cx.quit();
@@ -459,7 +493,7 @@ impl Workspace {
         window.remove_window();
       }
     } else {
-      self.show_close_confirm(active, conflicts, is_quit, window, cx);
+      self.show_close_confirm(conflicts, is_quit, window, cx);
     }
   }
 
@@ -502,14 +536,8 @@ impl Workspace {
     conflicts
   }
 
-  /// Count sessions that are actively working (not idle/stopped).
-  fn active_session_count(&self) -> usize {
-    self.projects.iter().flat_map(|p| p.sessions.values()).filter(|s| s.busy).count()
-  }
-
   fn show_close_confirm(
     &mut self,
-    session_count: usize,
     conflicts: Vec<String>,
     is_quit: bool,
     window: &mut Window,
@@ -517,7 +545,7 @@ impl Workspace {
   ) {
     self.close_confirm_is_quit = is_quit;
     self.pre_close_confirm_focus = window.focused(cx);
-    let view = cx.new(|cx| CloseConfirm::new(session_count, conflicts, is_quit, cx));
+    let view = cx.new(|cx| CloseConfirm::new(conflicts, is_quit, cx));
     let sub = cx.subscribe_in(&view, window, |this: &mut Self, _, event, window, cx| match event {
       CloseConfirmEvent::Confirmed => {
         this.close_confirm = None;
@@ -737,7 +765,7 @@ impl Workspace {
     // When switching to the TODO editor, ensure a WAIT section exists and scroll to it.
     if kind == PaneContentKind::TodoEditor {
       let project = &self.projects[self.active_project_index];
-      if let Some(uuid) = project.active_uuid().map(str::to_string) {
+      if let Some(uuid) = project.active_key().map(str::to_string) {
         let todo_view = project.todo_view.clone();
         todo_view.update(cx, |tv, cx| tv.ensure_wait(&uuid, window, cx));
         if let Some(wait_line) = todo_view.read(cx).wait_line(&uuid, cx) {
@@ -827,10 +855,12 @@ impl Workspace {
       .map(|n| n.to_string_lossy().into_owned())
       .unwrap_or_else(|| "unknown".into());
 
-    let project = ProjectState::create(canonical.clone(), name, &palette, window, cx);
+    let project = ProjectState::create(canonical.clone(), name, &palette, &self.claude, window, cx);
     self.projects.push(project);
 
     let project_idx = self.projects.len() - 1;
+    self.observe_claude_panes(project_idx, window, cx);
+    self.launch_sessions(window, cx);
     let active = self.projects[project_idx].active_session;
     self.switch_to_session(project_idx, active, window, cx);
 
@@ -903,9 +933,9 @@ impl Workspace {
     }
 
     // Update the TODO view's active session highlight.
-    let uuid = self.projects[project_idx].active_uuid().map(|s| s.to_string());
+    let uuid = self.projects[project_idx].active_key().map(|s| s.to_string());
     let todo_view = self.projects[project_idx].todo_view.clone();
-    todo_view.update(cx, |tv, cx| tv.set_active_uuid(uuid.as_deref(), cx));
+    todo_view.update(cx, |tv, cx| tv.set_active_key(uuid.as_deref(), cx));
 
     // Breadcrumb observers depend on the active session's code_view.
     self.refresh_breadcrumb_observers(cx);
@@ -945,19 +975,20 @@ impl Workspace {
     self.switch_to_session(next_pi, next_sid, window, cx);
   }
 
-  /// Switch to the session a clicked notification names. Notifications always
-  /// carry the session UUID.
+  /// Switch to the session a clicked notification names. Notifications carry
+  /// the hook's conversation uuid.
   fn switch_to_session_id(
     &mut self,
     session_id: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let found = self
-      .projects
-      .iter()
-      .enumerate()
-      .find_map(|(pi, p)| p.session_by_uuid(session_id).map(|(id, _)| (pi, id)));
+    let found = self.projects.iter().enumerate().find_map(|(pi, p)| {
+      p.sessions
+        .iter()
+        .find(|(_, s)| background::hook_matches(&s.bg, &s.uuid, session_id))
+        .map(|(&id, _)| (pi, id))
+    });
     if let Some((pi, id)) = found {
       self.switch_to_session(pi, Some(id), window, cx);
     }
@@ -1034,66 +1065,427 @@ impl Workspace {
   }
 
   // ---------------------------------------------------------------------------
-  // Session creation
+  // Session creation and background sessions
   // ---------------------------------------------------------------------------
 
-  /// Launch a brand new Claude session under a UUID jc mints itself, so the
-  /// session is identified from the first instant rather than being detected
-  /// after the fact.
+  /// Run `work` on its own thread (it may block on `claude` for minutes), then
+  /// `done` with its result on the main thread, if the workspace still exists.
+  fn run_blocking<T: Send + 'static>(
+    &self,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+    work: impl FnOnce() -> T + Send + 'static,
+    done: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+  ) {
+    let (tx, rx) = flume::bounded(1);
+    std::thread::spawn(move || {
+      let _ = tx.send(work());
+    });
+    cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+      if let Ok(value) = rx.recv_async().await {
+        let _ = this.update_in(cx, |ws, window, cx| done(ws, value, window, cx));
+      }
+    })
+    .detach();
+  }
+
+  fn project_index(&self, path: &Path) -> Option<usize> {
+    self.projects.iter().position(|p| p.path == path)
+  }
+
+  fn session_mut(&mut self, path: &Path, sid: SessionId) -> Option<&mut SessionState> {
+    let pi = self.project_index(path)?;
+    self.projects[pi].sessions.get_mut(&sid)
+  }
+
+  /// Watch every Claude pane in project `pi` that is not watched yet, so an
+  /// attach client's restart is noticed (see [`Self::on_claude_child`]).
+  fn observe_claude_panes(&mut self, pi: usize, window: &mut Window, cx: &mut Context<Self>) {
+    let path = self.projects[pi].path.clone();
+    let unwatched: Vec<(SessionId, Entity<TerminalView>)> = self.projects[pi]
+      .sessions
+      .iter()
+      .filter(|(_, s)| s._claude_child.is_none())
+      .map(|(&sid, s)| (sid, s.claude_terminal.clone()))
+      .collect();
+    for (sid, terminal) in unwatched {
+      let path = path.clone();
+      let sub = cx.subscribe_in(&terminal, window, move |ws, _, event: &ChildEvent, window, cx| {
+        ws.on_claude_child(&path, sid, *event, window, cx);
+      });
+      if let Some(session) = self.projects[pi].sessions.get_mut(&sid) {
+        session._claude_child = Some(sub);
+      }
+    }
+  }
+
+  /// An attach client (re)started or exited. Either way the session is not
+  /// known to be reachable until `claude agents --json` or a hook says so.
+  fn on_claude_child(
+    &mut self,
+    path: &Path,
+    sid: SessionId,
+    event: ChildEvent,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(session) = self.session_mut(path, sid) else { return };
+    session.live = false;
+    if event == ChildEvent::Spawned {
+      self.watch_live(path.to_path_buf(), sid, window, cx);
+    }
+  }
+
+  /// Poll `claude agents --json` until the session behind `sid`'s pane runs,
+  /// then mark it live, learn its uuid, and send what waited for it.
+  fn watch_live(
+    &mut self,
+    path: PathBuf,
+    sid: SessionId,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(session) = self.session_mut(&path, sid) else { return };
+    if session.bg.is_empty() || session.watching_live {
+      return;
+    }
+    session.watching_live = true;
+    let short = session.bg.clone();
+    let claude = self.claude.clone();
+    self.run_blocking(
+      window,
+      cx,
+      move || claude.wait_settled(&short, Poll::START).map(|a| (short, a)),
+      move |ws, result, window, cx| {
+        let Some(session) = ws.session_mut(&path, sid) else { return };
+        session.watching_live = false;
+        match result {
+          Ok((short, Some(agent))) if agent.is_live() && session.bg == short => {
+            session.live = true;
+            if let Some(uuid) = agent.session_id {
+              session.uuid = uuid;
+            }
+            ws.flush_pending_send(&path, sid, window, cx);
+          }
+          Ok(_) => {}
+          Err(e) => eprintln!("claude agents: {e:#}"),
+        }
+      },
+    );
+  }
+
+  /// Give every Claude pane that has no background session yet (`bg` empty,
+  /// heading id known, nothing in flight) the session its heading names —
+  /// attaching, migrating a `> uuid=`, or starting fresh, per
+  /// [`background::plan_launch`] — and, in the same `claude agents --json`
+  /// pass, stop the running jobs of `[D]` headings and remove the jobs of
+  /// `[DELETED]` ones (Cira Q-37).
+  fn launch_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    struct Request {
+      path: PathBuf,
+      sid: SessionId,
+      key: String,
+      kind: IdKind,
+    }
+    let mut requests = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    let mut deleted: Vec<String> = Vec::new();
+    for project in &mut self.projects {
+      let doc = project.todo_view.read(cx).document().clone();
+      for session in project.sessions.values_mut() {
+        if !session.bg.is_empty() || session.key.is_empty() || session.changing {
+          continue;
+        }
+        let kind = doc.session_by_id(&session.key).map_or(IdKind::Bg, |h| h.id_kind);
+        session.changing = true;
+        session.status("finding this session's background session…", cx);
+        requests.push(Request {
+          path: project.path.clone(),
+          sid: session.id,
+          key: session.key.clone(),
+          kind,
+        });
+      }
+      disabled.extend(
+        doc
+          .sessions
+          .iter()
+          .filter(|h| h.is_disabled() && h.id_kind == IdKind::Bg && !h.id.is_empty())
+          .map(|h| h.id.clone()),
+      );
+      deleted.extend(
+        doc
+          .deleted
+          .iter()
+          .filter(|d| d.id_kind == IdKind::Bg && !self.removed_shorts.contains(&d.id))
+          .map(|d| d.id.clone()),
+      );
+    }
+    if requests.is_empty() && disabled.is_empty() && deleted.is_empty() {
+      return;
+    }
+    self.removed_shorts.extend(deleted.iter().cloned());
+
+    let claude = self.claude.clone();
+    let work = move || {
+      let agents = claude.agents();
+      if let Ok(agents) = &agents {
+        for short in &disabled {
+          if background::find(agents, short).is_some_and(|a| a.is_live()) {
+            let _ = claude.stop(short).inspect_err(|e| eprintln!("[D] {short}: {e:#}"));
+          }
+        }
+        for short in &deleted {
+          if let Some(agent) = background::find(agents, short) {
+            if agent.is_live() {
+              let _ = claude.stop(short);
+            }
+            let _ = claude.rm(short).inspect_err(|e| eprintln!("[DELETED] {short}: {e:#}"));
+          }
+        }
+      }
+      requests
+        .into_iter()
+        .map(|r| {
+          let plan = match &agents {
+            Ok(agents) => {
+              let transcript = r.kind == IdKind::Uuid
+                && ProjectState::session_dirs(&r.path)
+                  .is_some_and(|dirs| jc_core::claude::transcript_in(&dirs, &r.key));
+              Ok(background::plan_launch(&r.key, r.kind, agents, transcript))
+            }
+            // Attaching to a known short id is safe without the list; anything
+            // that would start a session is not.
+            Err(_) if r.kind == IdKind::Bg => Ok(LaunchPlan::Attach(r.key.clone())),
+            Err(e) => Err(format!("cannot list background sessions: {e:#}")),
+          };
+          let uuid = match (&agents, &plan) {
+            (Ok(agents), Ok(LaunchPlan::Attach(short))) => {
+              background::find(agents, short).and_then(|a| a.session_id.clone())
+            }
+            _ => None,
+          };
+          (r.path, r.sid, plan, uuid)
+        })
+        .collect::<Vec<_>>()
+    };
+    self.run_blocking(window, cx, work, |ws, plans, window, cx| {
+      for (path, sid, plan, uuid) in plans {
+        match plan {
+          Ok(LaunchPlan::Attach(short)) => ws.finish_launch(&path, sid, &short, uuid, window, cx),
+          Ok(LaunchPlan::Start { resume }) => ws.start_session(path, sid, resume, window, cx),
+          Ok(LaunchPlan::Blocked) => {
+            if let Some(session) = ws.session_mut(&path, sid) {
+              session.changing = false;
+              let msg = format!(
+                "{} is open in another Claude Code process (an older jc?). Close it, then \
+                 adopt this session again (Cmd-Shift-P) to move it to a background session.",
+                session.key
+              );
+              session.status(&msg, cx);
+            }
+          }
+          Err(e) => {
+            if let Some(session) = ws.session_mut(&path, sid) {
+              session.changing = false;
+              session.status(&e, cx);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  /// Start a background session for `sid` with `claude --bg`, continuing
+  /// conversation `resume` when given, then bind and attach it.
+  fn start_session(
+    &mut self,
+    path: PathBuf,
+    sid: SessionId,
+    resume: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(session) = self.session_mut(&path, sid) else { return };
+    session.changing = true;
+    let cira = session.cira.get_or_insert_with(|| uuid::Uuid::new_v4().to_string()).clone();
+    let spec = StartSpec {
+      label: session.label.clone(),
+      cira: Some(cira),
+      permissions: if session.dangerous { Permissions::Dangerous } else { Permissions::Unset },
+      resume: resume.clone(),
+    };
+    session.status("starting a background session…", cx);
+    let claude = self.claude.clone();
+    let cwd = path.clone();
+    self.run_blocking(
+      window,
+      cx,
+      move || claude.start(&spec, &cwd, Poll::START),
+      move |ws, result, window, cx| match result {
+        Ok(short) => {
+          // A continued conversation keeps its uuid; a fresh one is learned
+          // from its first hook.
+          ws.finish_launch(&path, sid, &short, resume, window, cx);
+        }
+        Err(e) => {
+          if let Some(session) = ws.session_mut(&path, sid) {
+            session.changing = false;
+            session.status(&format!("could not start a background session: {e:#}"), cx);
+          }
+        }
+      },
+    );
+  }
+
+  /// Bind `sid`'s heading to background session `short` — rewriting its id
+  /// line, or inserting the heading for a session that has none yet — and
+  /// attach the Claude pane to it.
+  fn finish_launch(
+    &mut self,
+    path: &Path,
+    sid: SessionId,
+    short: &str,
+    uuid: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(pi) = self.project_index(path) else { return };
+    let project = &mut self.projects[pi];
+    let todo_view = project.todo_view.clone();
+    let is_active = project.active_session == Some(sid);
+    let Some(session) = project.sessions.get_mut(&sid) else { return };
+    let cira = session.cira.clone();
+
+    let doc = todo_view.read(cx).document();
+    let index = match (&session.unbound_key, session.key.is_empty()) {
+      (Some(key), _) => doc.index_of(key),
+      (None, false) => doc.index_by_id(&session.key),
+      (None, true) => None,
+    };
+    match index {
+      Some(index) => {
+        let heading = &doc.sessions[index];
+        if heading.id != short || heading.id_kind != IdKind::Bg || heading.cira.is_none() {
+          todo_view.update(cx, |tv, cx| tv.bind_bg_at(index, short, cira.as_deref(), window, cx));
+        }
+      }
+      None if session.key.is_empty() && session.unbound_key.is_none() => {
+        let cira = cira.unwrap_or_default();
+        let label = session.label.clone();
+        todo_view.update(cx, |tv, cx| tv.insert_session_heading(&label, short, &cira, window, cx));
+      }
+      None => eprintln!(
+        "launch: the heading for {} moved; attaching {short} without recording it",
+        session.key
+      ),
+    }
+
+    session.unbound_key = None;
+    session.changing = false;
+    session.uuid = uuid.unwrap_or_default();
+    session.attach(short, &self.claude, cx);
+    if is_active {
+      todo_view.update(cx, |tv, cx| tv.set_active_key(Some(short), cx));
+    }
+    cx.notify();
+  }
+
+  /// Add a session whose pane waits for a background session, and switch to it.
+  fn add_pending_session(
+    &mut self,
+    pi: usize,
+    heading: PendingHeading,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> SessionId {
+    let PendingHeading { key, label, cira, dangerous } = heading;
+    let project_path = self.projects[pi].path.clone();
+    let palette = palette_from_window(window);
+    let project = &mut self.projects[pi];
+    let id = project.next_session_id;
+    project.next_session_id += 1;
+    let session = SessionState::create(
+      id,
+      key,
+      String::new(),
+      label,
+      cira,
+      dangerous,
+      &self.claude,
+      &project_path,
+      &palette,
+      window,
+      cx,
+    );
+    project.sessions.insert(id, session);
+    self.observe_claude_panes(pi, window, cx);
+    self.switch_to_session(pi, Some(id), window, cx);
+    id
+  }
+
+  /// Start a brand-new background session; its heading is written once
+  /// `claude --bg` has printed the short id that addresses it.
   fn create_new_session(
     &mut self,
     project_idx: usize,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let project_path = self.projects[project_idx].path.clone();
-    let palette = palette_from_window(window);
-
-    let project = &mut self.projects[project_idx];
-    let id = project.next_session_id;
-    project.next_session_id += 1;
-
-    // A label is a display name, not an address — see `SessionKey`.
     // Cosmetic only — nothing addresses a session by label (see
     // `jc_core::todo::SessionKey`); this just stops the picker showing
     // several identical rows.
-    let label = jc_core::todo::unique_label(project.todo_view.read(cx).document(), "New Session");
-    let uuid = uuid::Uuid::new_v4().to_string();
-
-    let session = SessionState::create(
-      id,
-      uuid.clone(),
-      label.clone(),
-      &project_path,
-      &palette,
-      false,
-      Launch::New,
-      window,
-      cx,
+    let label = jc_core::todo::unique_label(
+      self.projects[project_idx].todo_view.read(cx).document(),
+      "New Session",
     );
-
-    project.sessions.insert(id, session);
-
-    let todo_view = project.todo_view.clone();
-    todo_view.update(cx, |tv, cx| {
-      tv.insert_session_heading(&uuid, &label, window, cx);
-      tv.save(cx);
-    });
-
-    self.switch_to_session(project_idx, Some(id), window, cx);
+    self.start_unrecorded(project_idx, label, None, window, cx);
   }
 
-  /// Adopt a TODO.md session that isn't running yet. The launch flag comes from
-  /// whether the transcript is still on disk (`ProjectState::launch_for`), so a
-  /// session Claude has garbage-collected comes back as a fresh conversation
-  /// under its own UUID instead of a dead pane.
+  /// Continue transcript `uuid`, which no heading names, as a background
+  /// session under a new heading labelled from `summary`.
+  pub(super) fn adopt_transcript(
+    &mut self,
+    project_idx: usize,
+    uuid: String,
+    summary: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    // The summary is the transcript's first user message, so two sessions that
+    // opened with the same prompt would otherwise get the same display name.
+    let label = jc_core::todo::unique_label(
+      self.projects[project_idx].todo_view.read(cx).document(),
+      summary,
+    );
+    self.start_unrecorded(project_idx, label, Some(uuid), window, cx);
+  }
+
+  fn start_unrecorded(
+    &mut self,
+    pi: usize,
+    label: String,
+    resume: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let cira = Some(uuid::Uuid::new_v4().to_string());
+    let heading = PendingHeading { key: String::new(), label, cira, dangerous: false };
+    let id = self.add_pending_session(pi, heading, window, cx);
+    let path = self.projects[pi].path.clone();
+    self.start_session(path, id, resume, window, cx);
+  }
+
+  /// Adopt a TODO.md session that isn't running yet: its pane attaches to the
+  /// background session the heading names, migrating a `> uuid=` heading or
+  /// starting fresh as [`background::plan_launch`] decides.
   ///
   /// `key` may be a `SessionKey::Unbound` — a heading an older jc left with a
-  /// blank `> uuid=`. Adoption is the one operation that mints a UUID, and it
-  /// happens here rather than at startup so binding a legacy heading to a new
-  /// (empty) conversation is something the user chose to do. The heading is
-  /// re-resolved against the *live* document, so a key taken from a picker
-  /// snapshot cannot write to a heading that has moved since.
+  /// blank `> uuid=`. It gets a fresh background session, and its id line is
+  /// written when that session's short id is known; that is something the
+  /// user chose to do, never done at startup. The heading is re-resolved
+  /// against the *live* document, so a key taken from a picker snapshot cannot
+  /// write to a heading that has moved since.
   fn adopt_session(
     &mut self,
     project_idx: usize,
@@ -1102,32 +1494,12 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     let todo_view = self.projects[project_idx].todo_view.clone();
+    let resolved = todo_view.read(cx).document().session_of(key).cloned();
 
-    // Bind an unbound heading now, in one write. A minted UUID has no
-    // conversation *by construction*, so it is `Launch::New` outright — asking
-    // `launch_for` would get `Resume` when the filesystem can't be seen at all
-    // (`$HOME` unset) and spawn `claude --resume <fresh-uuid>` into a dead pane,
-    // permanently, since the heading is bound by then.
-    let resolved = todo_view.update(cx, |tv, cx| {
-      let index = tv.document().index_of(key)?;
-      let heading = &tv.document().sessions[index];
-      // The display name comes off the heading we just resolved, never from the
-      // picker snapshot: the two can disagree, and the file is the truth.
-      let label = heading.label.clone();
-      let uuid = heading.uuid.clone();
-      if !uuid.is_empty() {
-        return Some((uuid, label, None));
-      }
-      let minted = uuid::Uuid::new_v4().to_string();
-      tv.update_session_uuid_at(index, &minted, window, cx);
-      Some((minted, label, Some(Launch::New)))
-    });
-
-    // Refuse to launch a session whose UUID isn't in the file. It could never
-    // be label-synced or disabled afterwards (both key on the UUID), and the
-    // still-unbound heading would stay adoptable — so a second press would
-    // spawn a second process for the same heading.
-    let Some((uuid, label, minted_launch)) = resolved else {
+    // Refuse to launch a session whose heading isn't in the file. It could
+    // never be label-synced or disabled afterwards, and the heading would stay
+    // adoptable — so a second press would start a second session for it.
+    let Some(heading) = resolved else {
       eprintln!("adopt: no TODO heading for {key:?}; not launching");
       // The picker already dropped `pre_picker_focus` on the assumption that
       // this call would focus something. It won't, so do it here or the next
@@ -1135,44 +1507,190 @@ impl Workspace {
       self.panes[self.active_pane_index].read(cx).focus_content(window);
       return;
     };
-    let uuid = &uuid;
 
-    // Clear `[D]` if the heading was dormant, then save once for both edits —
-    // each save is a full-document copy and a blocking write on the main thread.
-    let key = SessionKey::Uuid(uuid.clone());
-    let is_disabled =
-      todo_view.read(cx).document().session_of(&key).is_some_and(TodoSession::is_disabled);
-    todo_view.update(cx, |tv, cx| {
-      if is_disabled {
-        tv.toggle_session_disabled(&key, window, cx);
+    // Clear `[D]` if the heading was dormant (re-attaching resumes the
+    // stopped session).
+    if heading.is_disabled() {
+      todo_view.update(cx, |tv, cx| {
+        tv.toggle_session_disabled(key, window, cx);
+        tv.save(cx);
+      });
+    }
+
+    let unbound = heading.id.is_empty();
+    let pending = PendingHeading {
+      key: heading.id.clone(),
+      label: heading.label.clone(),
+      cira: heading.cira.clone(),
+      dangerous: heading.dangerous,
+    };
+    let id = self.add_pending_session(project_idx, pending, window, cx);
+    if unbound {
+      let path = self.projects[project_idx].path.clone();
+      if let Some(session) = self.projects[project_idx].sessions.get_mut(&id) {
+        session.unbound_key = Some(key.clone());
       }
-      tv.save(cx);
+      self.start_session(path, id, None, window, cx);
+    } else {
+      self.launch_sessions(window, cx);
+    }
+  }
+
+  /// Recreate `sid`'s background session with `dangerous` as its permission
+  /// mode (Cira Q-52): Claude Code keeps a job's saved options, so this stops
+  /// it, continues its conversation in a copy with the new mode, points the
+  /// heading at the copy, and removes the old job.
+  fn change_dangerous(
+    &mut self,
+    path: PathBuf,
+    sid: SessionId,
+    dangerous: bool,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(session) = self.session_mut(&path, sid) else { return };
+    session.changing = true;
+    session.live = false;
+    let old = session.bg.clone();
+    let known_uuid = session.uuid.clone();
+    let label = session.label.clone();
+    let cira = session.cira.clone();
+    // Detach first: an attach still open when the job stops would be
+    // restarted, and attaching resumes the job that is being replaced.
+    session.claude_terminal.update(cx, |t, cx| {
+      t.stop_child(cx);
+      t.show_status(
+        if dangerous {
+          "restarting with --dangerously-skip-permissions…"
+        } else {
+          "restarting without --dangerously-skip-permissions…"
+        },
+        cx,
+      );
     });
+    let claude = self.claude.clone();
+    let cwd = path.clone();
+    let old_for_work = old.clone();
+    let work = move || -> anyhow::Result<String> {
+      let uuid = if known_uuid.is_empty() {
+        let agents = claude.agents()?;
+        background::find(&agents, &old_for_work)
+          .and_then(|a| a.session_id.clone())
+          .ok_or_else(|| anyhow::anyhow!("no conversation uuid for {old_for_work}"))?
+      } else {
+        known_uuid
+      };
+      let spec = StartSpec {
+        label,
+        cira,
+        permissions: if dangerous { Permissions::Dangerous } else { Permissions::ForceDefault },
+        resume: Some(uuid.clone()),
+      };
+      claude.toggle_dangerous(&old_for_work, &uuid, &spec, &cwd, Poll::START)
+    };
+    self.run_blocking(window, cx, work, move |ws, result, window, cx| {
+      let claude = ws.claude.clone();
+      let Some(session) = ws.session_mut(&path, sid) else { return };
+      match result {
+        Ok(new_short) => {
+          session.dangerous = dangerous;
+          // The copy is a new conversation uuid, learned from its first hook.
+          ws.finish_launch(&path, sid, &new_short, None, window, cx);
+        }
+        Err(e) => {
+          session.changing = false;
+          session.refused_dangerous = Some(dangerous);
+          session.status(&format!("could not change > dangerous: {e:#}"), cx);
+          // Back to the old job; attaching resumes it if it was stopped.
+          session.attach(&old, &claude, cx);
+        }
+      }
+    });
+  }
 
-    let project_path = self.projects[project_idx].path.clone();
-    let palette = palette_from_window(window);
+  /// Bring running background sessions in line with TODO.md: recreate one
+  /// whose `> dangerous` changed, detach, stop and remove one whose heading
+  /// became `[DELETED]`, and send messages that were waiting for a session to
+  /// come up.
+  fn reconcile_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let mut toggles = Vec::new();
+    let mut gone = Vec::new();
+    let mut flush = Vec::new();
+    for (pi, project) in self.projects.iter_mut().enumerate() {
+      let doc = project.todo_view.read(cx).document();
+      for session in project.sessions.values_mut() {
+        if session.bg.is_empty() || session.changing {
+          continue;
+        }
+        if doc.deleted.iter().any(|d| d.id == session.key) {
+          gone.push((pi, session.id, session.bg.clone()));
+          continue;
+        }
+        if let Some(heading) = doc.session_by_id(&session.key) {
+          if session.refused_dangerous.is_some_and(|r| r != heading.dangerous) {
+            session.refused_dangerous = None;
+          }
+          if heading.dangerous != session.dangerous
+            && session.refused_dangerous != Some(heading.dangerous)
+          {
+            toggles.push((project.path.clone(), session.id, heading.dangerous));
+          }
+        }
+        if session.pending_send.is_some() {
+          flush.push((project.path.clone(), session.id));
+        }
+      }
+    }
+    for (path, sid, dangerous) in toggles {
+      self.change_dangerous(path, sid, dangerous, window, cx);
+    }
+    for (pi, sid, short) in gone {
+      self.removed_shorts.insert(short.clone());
+      self.remove_running_session(pi, sid, window, cx);
+      let claude = self.claude.clone();
+      std::thread::spawn(move || {
+        let _ = claude.stop(&short);
+        let _ = claude.rm(&short).inspect_err(|e| eprintln!("[DELETED] {short}: {e:#}"));
+      });
+    }
+    for (path, sid) in flush {
+      self.flush_pending_send(&path, sid, window, cx);
+    }
+  }
 
-    let project = &mut self.projects[project_idx];
-    let dangerous =
-      project.todo_view.read(cx).document().session_by_uuid(uuid).is_some_and(|s| s.dangerous);
-    let launch = minted_launch.unwrap_or_else(|| project.launch_for(uuid));
-    let id = project.next_session_id;
-    project.next_session_id += 1;
+  /// Drop running session `sid` from project `pi` — its attach client is hung
+  /// up, the background session itself is untouched — and show another
+  /// session if it was on screen.
+  fn remove_running_session(
+    &mut self,
+    pi: usize,
+    sid: SessionId,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> bool {
+    let on_screen = pi == self.active_project_index;
+    let project = &mut self.projects[pi];
+    let was_project_active = project.active_session == Some(sid);
+    project.sessions.remove(&sid);
 
-    let session = SessionState::create(
-      id,
-      uuid.to_string(),
-      label,
-      &project_path,
-      &palette,
-      dangerous,
-      launch,
-      window,
-      cx,
-    );
-
-    project.sessions.insert(id, session);
-    self.switch_to_session(project_idx, Some(id), window, cx);
+    if was_project_active && on_screen {
+      // The session we were sitting on: it needs a replacement view. Note
+      // that `active_session` is deliberately left pointing at the id just
+      // removed — it now resolves to `None`, so `switch_to_session` sees no
+      // outgoing session and skips the save-viewport step. Repointing it
+      // *first* would make the incoming session look like the outgoing one
+      // and overwrite its saved layout, TODO cursor and scroll with the
+      // removed session's, and clear its activity marker.
+      self.detach_active_session(pi, window, cx);
+      return true;
+    } else if was_project_active {
+      // Same, but for a project we are not looking at. Repoint it so it still
+      // has a session to show next time, and do NOT switch: removing a
+      // background session must not yank the user into another project.
+      project.active_session = project.first_session();
+    }
+    cx.notify();
+    false
   }
 
   /// Collect TodoDocument references from each project's todo_view.
@@ -1184,10 +1702,11 @@ impl Workspace {
   // Session disable toggle
   // ---------------------------------------------------------------------------
 
-  /// Toggle the `[D]` marker on the heading `key` names, detaching its terminal
-  /// if it is running and just became disabled. Never addressed by label: with
-  /// two same-labelled headings a label-keyed toggle marks the wrong one and
-  /// detaches a live session (see `SessionKey`).
+  /// Toggle the `[D]` marker on the heading `key` names. Disabling a running
+  /// session detaches its pane and stops its background session (`claude
+  /// stop`; its conversation is kept, and adopting it again resumes it). Never
+  /// addressed by label: with two same-labelled headings a label-keyed toggle
+  /// marks the wrong one and stops a live session (see `SessionKey`).
   fn toggle_session_disabled(
     &mut self,
     project_idx: usize,
@@ -1200,8 +1719,8 @@ impl Workspace {
 
     // Check if the session is currently adopted (running). An unbound heading
     // never is, so this is `None` for an `Unbound` key.
-    let adopted_id = match key {
-      SessionKey::Uuid(uuid) => project.session_by_uuid(uuid).map(|(id, _)| id),
+    let adopted = match key {
+      SessionKey::Id(id) => project.session_by_key(id).map(|(sid, s)| (sid, s.bg.clone())),
       SessionKey::Unbound { .. } => None,
     };
 
@@ -1210,7 +1729,6 @@ impl Workspace {
       tv.save(cx);
     });
 
-    // If the session was adopted and is now being disabled, detach it.
     let is_now_disabled =
       todo_view.read(cx).document().session_of(key).is_some_and(TodoSession::is_disabled);
     // Whether control ended up in `switch_to_session`, which focuses the pane it
@@ -1219,27 +1737,15 @@ impl Workspace {
     // dismissed picker input and keystrokes would go nowhere.
     let mut switched = false;
 
-    if is_now_disabled && let Some(id) = adopted_id {
-      let on_screen = project_idx == self.active_project_index;
-      let project = &mut self.projects[project_idx];
-      let was_project_active = project.active_session == Some(id);
-      project.sessions.remove(&id);
-
-      if was_project_active && on_screen {
-        // The session we were sitting on: it needs a replacement view. Note
-        // that `active_session` is deliberately left pointing at the id just
-        // removed — it now resolves to `None`, so `switch_to_session` sees no
-        // outgoing session and skips the save-viewport step. Repointing it
-        // *first* would make the incoming session look like the outgoing one
-        // and overwrite its saved layout, TODO cursor and scroll with the
-        // disabled session's, and clear its activity marker.
-        switched = true;
-        self.detach_active_session(project_idx, window, cx);
-      } else if was_project_active {
-        // Same, but for a project we are not looking at. Repoint it so it still
-        // has a session to show next time, and do NOT switch: disabling a
-        // background session must not yank the user into another project.
-        project.active_session = project.first_session();
+    if is_now_disabled && let Some((sid, short)) = adopted {
+      // Detach before stopping: an attach still open when the job stops would
+      // be restarted, and attaching resumes the job.
+      switched = self.remove_running_session(project_idx, sid, window, cx);
+      if !short.is_empty() {
+        let claude = self.claude.clone();
+        std::thread::spawn(move || {
+          let _ = claude.stop(&short).inspect_err(|e| eprintln!("[D] {short}: {e:#}"));
+        });
       }
     }
 
@@ -1320,14 +1826,20 @@ impl Workspace {
     let Some(session) = project.active_session() else {
       return;
     };
-    let uuid = session.uuid.clone();
+    let uuid = session.key.clone();
     let claude_terminal = session.claude_terminal.clone();
     let todo_view = project.todo_view.clone();
+    let ready = Self::ready_for_input(session, cx);
 
-    // Block all sends while a scheduled message is pending on this session — a
-    // second queued send to the same Claude is undefined. Beep like a rejected
-    // keystroke and no-op; the user cancels by editing out the `@jc(...)` marker.
-    if todo_view.read(cx).has_pending_schedule(&uuid) {
+    // Block all sends while a scheduled message is pending on this session, or
+    // a message is already waiting for the session to come up — a second
+    // queued send to the same Claude is undefined. Beep like a rejected
+    // keystroke and no-op; the user cancels a schedule by editing out the
+    // `@jc(...)` marker. A session still starting has no heading to send from.
+    if uuid.is_empty()
+      || todo_view.read(cx).has_pending_schedule(&uuid)
+      || (!ready && session.pending_send.is_some())
+    {
       crate::notify::beep();
       return;
     }
@@ -1359,13 +1871,42 @@ impl Workspace {
       // changed here (the TodoView mutated itself and notified), so we don't.
       let project_path = self.projects[self.active_project_index].path.clone();
       self.ensure_scheduled_armed(project_path, uuid, when, window, cx);
-    } else {
-      // Immediate send: mark busy and deliver now.
-      if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
-        session.mark_user_input(cx);
+    } else if let Some(session) = self.projects[self.active_project_index].active_session_mut() {
+      session.mark_user_input(cx);
+      if ready {
+        Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
+      } else {
+        // Typing now would land in an attach client still connecting to a
+        // session that is resuming; send once it is up.
+        session.pending_send = Some(message_text);
+        session.status("the message is sent once the session is up", cx);
       }
-      Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
       cx.notify();
+    }
+  }
+
+  /// Text typed into `session`'s Claude pane reaches the session: the session
+  /// process runs, and the attach client has drawn its first frame since it
+  /// (re)started.
+  fn ready_for_input(session: &SessionState, cx: &App) -> bool {
+    session.live && session.claude_terminal.read(cx).has_output_since_spawn()
+  }
+
+  /// Deliver `sid`'s waiting Cmd-Enter message if its session is ready.
+  fn flush_pending_send(
+    &mut self,
+    path: &Path,
+    sid: SessionId,
+    _window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(session) = self.session_mut(path, sid) else { return };
+    if session.pending_send.is_none() || !Self::ready_for_input(session, cx) {
+      return;
+    }
+    if let Some(text) = session.pending_send.take() {
+      let terminal = session.claude_terminal.clone();
+      Self::deliver_to_terminal(&terminal, &text, cx);
     }
   }
 
@@ -1373,18 +1914,19 @@ impl Workspace {
   /// Enter so the app has time to process the pasted content.
   fn deliver_to_terminal(claude_terminal: &Entity<TerminalView>, message_text: &str, cx: &App) {
     claude_terminal.read(cx).write_text(message_text);
-    let pty = claude_terminal.read(cx).pty_handle();
+    let Some(pty) = claude_terminal.read(cx).pty_handle() else { return };
     std::thread::spawn(move || {
       std::thread::sleep(StdDuration::from_millis(200));
       let _ = pty.write_all(b"\r");
     });
   }
 
-  /// Arm a timer to deliver a scheduled message at `when`. A past-due target
-  /// (e.g. a catch-up send re-armed at startup) fires after a short grace so a
-  /// freshly-spawned Claude terminal has time to reach its prompt. The timer
-  /// re-reads the live TODO at fire time, so a cancelled or rescheduled marker
-  /// is handled there rather than tracked here.
+  /// Arm a timer to deliver a scheduled message at `when`; a past-due one
+  /// fires at once. Only sessions ready for input are armed
+  /// ([`Self::reconcile_schedules`]), so a catch-up send at startup waits for
+  /// the session to come up rather than for a fixed grace. The timer re-reads
+  /// the live TODO at fire time, so a cancelled or rescheduled marker is
+  /// handled there rather than tracked here.
   fn arm_scheduled_send(
     &mut self,
     project_path: PathBuf,
@@ -1393,12 +1935,8 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    /// Grace before firing a past-due send, so a just-launched terminal is ready.
-    const CATCHUP_GRACE: StdDuration = StdDuration::from_secs(5);
-
     let now = chrono::Local::now().naive_local();
-    let raw = (when - now).to_std().unwrap_or(StdDuration::ZERO);
-    let delay = if raw.is_zero() { CATCHUP_GRACE } else { raw };
+    let delay = (when - now).to_std().unwrap_or(StdDuration::ZERO);
     cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
       Timer::after(delay).await;
       let _ = this.update_in(cx, |ws, window, cx| {
@@ -1431,12 +1969,13 @@ impl Workspace {
       return;
     };
 
-    // The target session must still be live to receive the message. Resolve its
+    // The target session must still be up to receive the message. Resolve its
     // terminal BEFORE `deliver_scheduled` consumes the marker, so a message is
     // never marked delivered (and lost) when there's nowhere to send it — the
     // marker stays pending and re-arms on a later tick.
     let Some((id, claude_terminal)) = self.projects[project_idx]
-      .session_by_uuid(uuid)
+      .session_by_key(uuid)
+      .filter(|(_, s)| Self::ready_for_input(s, cx))
       .map(|(id, s)| (id, s.claude_terminal.clone()))
     else {
       return;
@@ -1501,15 +2040,17 @@ impl Workspace {
           .document()
           .sessions
           .iter()
-          // Only headings with a session actually running: delivery needs a
-          // terminal. A marker on a dormant or still-unbound heading is not
-          // dropped — it stays in the file with its pending highlight, and
-          // adopting the session arms it on the next tick (firing immediately,
-          // after the catch-up grace, if its time has already passed).
-          .filter(|s| project.sessions.values().any(|r| r.uuid == s.uuid))
+          // Only headings whose session is up: delivery needs a terminal that
+          // reaches it. A marker on a dormant, still-starting or still-unbound
+          // heading is not dropped — it stays in the file with its pending
+          // highlight, and is armed on the first tick after the session comes
+          // up (firing immediately if its time has already passed).
+          .filter(|s| {
+            project.session_by_key(&s.id).is_some_and(|(_, r)| Self::ready_for_input(r, cx))
+          })
           .filter_map(move |s| {
             s.pending_scheduled()
-              .and_then(|m| m.schedule.map(|dt| (path.clone(), s.uuid.clone(), dt)))
+              .and_then(|m| m.schedule.map(|dt| (path.clone(), s.id.clone(), dt)))
           })
       })
       .collect();
@@ -1520,22 +2061,25 @@ impl Workspace {
 
   /// Spawn the periodic task that reconciles jc's state against the live TODO
   /// documents: scheduled-send timers (so time edits are picked up without
-  /// waiting for the original, possibly later, timer to fire), each running
-  /// session's label (so a heading renamed in TODO.md takes effect). All
-  /// in-memory — no I/O.
+  /// waiting for the original, possibly later, timer to fire), background
+  /// sessions ([`Self::reconcile_background`]: `> dangerous` changes,
+  /// `[DELETED]` headings, waiting sends), and each running session's label
+  /// (so a heading renamed in TODO.md takes effect). The main thread does no
+  /// I/O here; `claude` commands run on their own threads.
   fn start_schedule_reconcile_loop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let task = cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
       loop {
         Timer::after(StdDuration::from_secs(2)).await;
         let stepped = this.update_in(cx, |ws, window, cx| {
           ws.reconcile_schedules(window, cx);
+          ws.reconcile_background(window, cx);
           let mut changed = false;
           for i in 0..ws.projects.len() {
             changed |= ws.projects[i].sync_sessions_from_todo(cx);
           }
           if changed {
             // Only the label moved: `sync_sessions_from_todo` never rewrites a
-            // session's UUID, and the TODO view highlights by UUID, so there is
+            // session's id, and the TODO view highlights by id, so there is
             // nothing to re-point — just redraw the label wherever it shows.
             cx.notify();
           }
@@ -1554,7 +2098,7 @@ impl Workspace {
 
   fn jump_to_wait(&mut self, _: &JumpToWait, window: &mut Window, cx: &mut Context<Self>) {
     let project = &self.projects[self.active_project_index];
-    let Some(uuid) = project.active_uuid().map(str::to_string) else {
+    let Some(uuid) = project.active_key().map(str::to_string) else {
       return;
     };
     let todo_view = project.todo_view.clone();
@@ -1590,26 +2134,28 @@ impl Workspace {
   fn handle_hook_event(&mut self, event: HookEvent, window: &mut Window, cx: &mut Context<Self>) {
     eprintln!("hook: {:?} session={}", event.kind, event.session_id);
 
-    // Handle session clear: update the session's UUID.
+    // Handle session clear: follow the session onto its new uuid.
     if let HookEventKind::SessionClear { ref old_session_id, ref new_session_id } = event.kind {
-      self.handle_session_clear(
-        event.project_path.as_deref(),
-        old_session_id,
-        new_session_id,
-        window,
-        cx,
-      );
+      self.handle_session_clear(old_session_id, new_session_id);
       cx.notify();
       return;
     }
 
-    // Every remaining event is addressed to a session identified by its UUID.
-    // UUIDs are assigned by jc at launch (`--session-id`), so a hook for an
-    // unknown UUID belongs to a session jc doesn't manage — ignore it.
-    let Some((project_name, session_label)) = self.apply_hook_to_session(&event, cx) else {
-      cx.notify();
+    let Some((path, sid, project_name, session_label)) = self.apply_hook_to_session(&event, cx)
+    else {
+      // From a project jc has open but no session it knows: most likely one of
+      // its own whose uuid changed while jc was not looking (a `/clear` in
+      // another attach). Ask `claude agents --json`, then try again.
+      if event.project_path.as_ref().is_some_and(|p| self.project_index(p).is_some()) {
+        if self.unmatched_hooks.len() == UNMATCHED_HOOKS_MAX {
+          self.unmatched_hooks.remove(0);
+        }
+        self.unmatched_hooks.push(event);
+        self.refresh_session_uuids(window, cx);
+      }
       return;
     };
+    self.flush_pending_send(&path, sid, window, cx);
 
     // Notify when the window is not active (user is in another app). Only a
     // blocked session is worth interrupting for; Stop/IdlePrompt are ambient.
@@ -1628,88 +2174,89 @@ impl Workspace {
     cx.notify();
   }
 
-  /// Apply a hook event to the session it names. Returns the matched
-  /// `(project name, session label)`, or `None` when no session owns the UUID.
-  fn apply_hook_to_session(&mut self, event: &HookEvent, cx: &App) -> Option<(String, String)> {
-    if event.session_id.is_empty() {
-      return None;
-    }
-    let (project_name, session) = self.projects.iter_mut().find_map(|p| {
-      let name = p.name.clone();
-      p.sessions.values_mut().find(|s| s.uuid == event.session_id).map(|s| (name, s))
+  /// Apply a hook event to the session it names (see
+  /// [`background::hook_matches`]): the session is live, and the uuid is
+  /// learned. Returns the matched `(project path, session, project name,
+  /// session label)`, or `None` when no session owns it.
+  fn apply_hook_to_session(
+    &mut self,
+    event: &HookEvent,
+    cx: &App,
+  ) -> Option<(PathBuf, SessionId, String, String)> {
+    let (project, session) = self.projects.iter_mut().find_map(|p| {
+      let session = p
+        .sessions
+        .values_mut()
+        .find(|s| background::hook_matches(&s.bg, &s.uuid, &event.session_id))?;
+      Some(((p.path.clone(), p.name.clone()), session))
     })?;
 
-    match event.kind {
-      HookEventKind::PromptSubmit => session.mark_user_input(cx),
-      HookEventKind::Stop
-      | HookEventKind::StopFailure
-      | HookEventKind::PermissionPrompt
-      | HookEventKind::IdlePrompt => session.busy = false,
-      HookEventKind::SessionClear { .. } => unreachable!("handled before dispatch"),
+    session.uuid = event.session_id.clone();
+    session.live = true;
+    if let HookEventKind::PromptSubmit = event.kind {
+      session.mark_user_input(cx);
     }
-    Some((project_name, session.label.clone()))
+    Some((project.0, session.id, project.1, session.label.clone()))
   }
 
-  /// Handle a `/clear` event: the old session ended and a new one started in
-  /// the same Claude process. Update the session's UUID to the new one.
-  /// No terminal relaunch needed — `/clear` resets the conversation but the
-  /// Claude process keeps running in the same terminal.
-  fn handle_session_clear(
-    &mut self,
-    project_path: Option<&Path>,
-    old_session_id: &str,
-    new_session_id: &str,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) {
-    let Some(project_path) = project_path else { return };
-    let Some(project) = self.projects.iter().find(|p| p.path == *project_path) else { return };
-    if !project.sessions.values().any(|s| s.uuid == old_session_id) {
-      eprintln!("hook: session-clear for unknown uuid {old_session_id}");
+  /// Ask `claude agents --json` for the current uuid of every running session
+  /// jc has, then re-dispatch the hooks that matched none.
+  fn refresh_session_uuids(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.refreshing_agents {
       return;
     }
-
-    eprintln!("hook: session cleared, uuid {old_session_id} -> {new_session_id}");
-
-    // Update TODO.md FIRST, and only adopt the new UUID in memory if that
-    // succeeded. The two must not diverge: a session whose in-memory UUID has no
-    // heading stops syncing its label, can't be disabled (both look the heading
-    // up by UUID), and on the next start resumes whatever the file still says —
-    // a wrong conversation, not merely a dead one.
-    //
-    // The heading is located by the OLD uuid, not by label: two headings can
-    // share a label, and writing to the first would point it at this session's
-    // conversation while leaving this one behind.
-    let todo_view = project.todo_view.clone();
-    let old_session_id = old_session_id.to_string();
-    let new_session_id = new_session_id.to_string();
-    let written = todo_view.update(cx, |tv, cx| {
-      let Some(index) = tv.document().index_by_uuid(&old_session_id) else { return false };
-      tv.update_session_uuid_at(index, &new_session_id, window, cx);
-      tv.save(cx);
-      true
-    });
-
-    if written {
-      if let Some(project) = self.projects.iter_mut().find(|p| p.path == *project_path)
-        && let Some(session) = project.sessions.values_mut().find(|s| s.uuid == old_session_id)
-      {
-        let is_active = project.active_session == Some(session.id);
-        session.uuid = new_session_id.clone();
-        // The TODO view highlights the active session by UUID, so the swap has
-        // to be told to it too — otherwise the active heading's colouring goes
-        // out until the next session switch.
-        if is_active {
-          todo_view.update(cx, |tv, cx| tv.set_active_uuid(Some(&new_session_id), cx));
+    self.refreshing_agents = true;
+    let claude = self.claude.clone();
+    self.run_blocking(
+      window,
+      cx,
+      move || claude.agents(),
+      |ws, agents, window, cx| {
+        ws.refreshing_agents = false;
+        let agents = match agents {
+          Ok(agents) => agents,
+          Err(e) => {
+            eprintln!("claude agents: {e:#}");
+            return;
+          }
+        };
+        for session in ws.projects.iter_mut().flat_map(|p| p.sessions.values_mut()) {
+          if let Some(uuid) = background::find(&agents, &session.bg)
+            .filter(|a| a.is_live())
+            .and_then(|a| a.session_id.clone())
+          {
+            session.uuid = uuid;
+          }
         }
+        // Each is tried once more; one still unmatched is not jc's.
+        for event in std::mem::take(&mut ws.unmatched_hooks) {
+          if ws.apply_hook_to_session(&event, cx).is_some() {
+            ws.handle_hook_event(event, window, cx);
+          }
+        }
+      },
+    );
+  }
+
+  /// Handle a `/clear` event: the session's conversation moved to a new uuid
+  /// in the same Claude process. Only the in-memory uuid follows it: TODO.md
+  /// names the background session by its short id, which a `/clear` keeps.
+  fn handle_session_clear(&mut self, old_session_id: &str, new_session_id: &str) {
+    let session = self
+      .projects
+      .iter_mut()
+      .flat_map(|p| p.sessions.values_mut())
+      .find(|s| background::hook_matches(&s.bg, &s.uuid, old_session_id));
+    match session {
+      Some(session) => {
+        eprintln!(
+          "hook: session {} cleared, uuid {old_session_id} -> {new_session_id}",
+          session.bg
+        );
+        session.uuid = new_session_id.to_string();
       }
-    } else {
-      eprintln!(
-        "hook: session-clear could not find a heading for uuid {old_session_id}; \
-         leaving the session on it so memory and TODO.md stay in step"
-      );
+      None => eprintln!("hook: session-clear for unknown uuid {old_session_id}"),
     }
-    cx.notify();
   }
 }
 

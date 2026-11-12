@@ -19,6 +19,9 @@ pub enum HookEventKind {
   StopFailure,
   IdlePrompt,
   PermissionPrompt,
+  /// The session process started, resumed or compacted (any `SessionStart`
+  /// but a `/clear`'s): it is live and can take input.
+  SessionStart,
   /// A `/clear` was detected: the old session ended and a new one started.
   SessionClear {
     old_session_id: String,
@@ -156,8 +159,9 @@ fn accept_loop(
         }
       }
 
-      // Ignore other session-start/session-end events.
-      "session-end" | "session-start" => None,
+      "session-start" => Some(HookEventKind::SessionStart),
+      // Ignore other session-end events.
+      "session-end" => None,
 
       _ => None,
     };
