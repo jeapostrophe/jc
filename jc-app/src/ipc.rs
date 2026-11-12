@@ -19,8 +19,7 @@ struct IpcResponse {
 }
 
 fn socket_path() -> PathBuf {
-  let home = std::env::var("HOME").expect("HOME environment variable not set");
-  PathBuf::from(home).join(".config/jc/jc.sock")
+  jc_core::config::config_dir().join("jc.sock")
 }
 
 /// Try to send an `open_project` command to an already-running instance.

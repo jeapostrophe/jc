@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// User-editable configuration (~/.config/jc/config.toml).
+/// User-editable configuration (`config.toml` in [`config_dir`]).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
@@ -12,7 +12,7 @@ pub struct AppConfig {
   pub window: WindowLayout,
 }
 
-/// App-managed state (~/.config/jc/state.toml).
+/// App-managed state (`state.toml` in [`config_dir`]).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppState {
@@ -45,8 +45,18 @@ impl AppState {
   }
 }
 
-fn config_dir() -> PathBuf {
-  dirs::home_dir().expect("could not determine home directory").join(".config/jc")
+/// JC's config and state directory: `$JC_CONFIG_DIR` when set and non-empty, else
+/// `~/.config/jc`. The override lets a second JC build run beside the installed one
+/// without sharing its `state.toml` or its single-instance socket (`jc.sock`).
+pub fn config_dir() -> PathBuf {
+  config_dir_from(std::env::var_os("JC_CONFIG_DIR"), dirs::home_dir())
+}
+
+fn config_dir_from(over: Option<std::ffi::OsString>, home: Option<PathBuf>) -> PathBuf {
+  match over.filter(|d| !d.is_empty()) {
+    Some(dir) => PathBuf::from(dir),
+    None => home.expect("could not determine home directory").join(".config/jc"),
+  }
 }
 
 fn ensure_config_dir() -> Result<PathBuf> {
@@ -105,4 +115,20 @@ pub fn load_state() -> Result<AppState> {
 
 pub fn save_state(state: &AppState) -> Result<()> {
   save_toml("state.toml", state)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn jc_config_dir_overrides_home_config() {
+    let home = Path::new("/home/someone");
+    assert_eq!(
+      config_dir_from(Some("/tmp/jc-scratch".into()), Some(home.to_path_buf())),
+      PathBuf::from("/tmp/jc-scratch")
+    );
+    assert_eq!(config_dir_from(Some("".into()), Some(home.to_path_buf())), home.join(".config/jc"));
+    assert_eq!(config_dir_from(None, Some(home.to_path_buf())), home.join(".config/jc"));
+  }
 }
