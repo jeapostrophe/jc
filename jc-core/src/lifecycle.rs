@@ -126,34 +126,167 @@ pub fn attach_delay(previous: Option<Duration>, lived: Duration) -> Duration {
   }
 }
 
-/// Whether a pane whose child `exited` (when, and the pause
-/// [`attach_delay`] gave it) is still waiting out that pause at `now`.
-pub fn backing_off(exited: Option<(SystemTime, Duration)>, now: SystemTime) -> bool {
-  exited.is_some_and(|(exited, delay)| now < exited + delay)
+/// When a pane's child last exited and the pause [`attach_delay`] gave it:
+/// the Claude pane's attach client and the shell pane's both wait it out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Backoff(Option<(SystemTime, Duration)>);
+
+impl Backoff {
+  /// A child that ran for `lived` exited at `now`.
+  pub fn exited(&mut self, lived: Duration, now: SystemTime) {
+    let previous = self.0.map(|(_, delay)| delay);
+    self.0 = Some((now, attach_delay(previous, lived)));
+  }
+
+  /// Still waiting out the pause at `now`.
+  pub fn waiting(&self, now: SystemTime) -> bool {
+    self.0.is_some_and(|(exited, delay)| now < exited + delay)
+  }
+
+  /// The last exit came after `at`: a status read begun at `at` predates it.
+  pub fn exited_after(&self, at: SystemTime) -> bool {
+    self.0.is_some_and(|(exited, _)| exited > at)
+  }
+
+  /// Start the next child at once (Jay asked).
+  pub fn clear(&mut self) {
+    self.0 = None;
+  }
 }
 
-/// What the Terminal pane runs, from Cira's answer to `cira session shell`
-/// (Cira DESIGN 12, PLAN TMUX-02).
+/// What the Terminal pane runs (Cira DESIGN 12, PLAN TMUX-02).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShellRun {
+  /// Nothing: it asks `cira session shell` once its pause is over.
+  #[default]
+  Idle,
+  /// A `cira session shell` is in flight.
+  Asking,
+  /// Attached to the session's shell in Cira's tmux server.
+  Shared,
+  /// jc's own shell, "not shared": Cira gave none.
+  Own,
+  /// Nothing, for good: the session was removed through Cira.
+  Held,
+}
+
+/// What the Terminal pane does next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellChild {
   /// Attach to the session's shell in Cira's tmux server: this argument list.
   Shared(Vec<String>),
-  /// Cira gave no shell: run jc's own, marked "not shared", for this reason.
+  /// Run jc's own shell, marked "not shared", for this reason.
   Own(String),
-  /// The session has no shell to give (removed through Cira): run nothing.
+  /// The session was removed: run nothing, for this reason.
   Held(String),
+  /// Cira refused for a reason that may pass: run nothing, ask again after
+  /// the pause.
+  Retry(String),
 }
 
-/// The Terminal pane's child for Cira's answer. jc only attaches: it never
-/// makes or ends a shell in Cira's server.
-pub fn shell_child(answer: Result<SessionShell, CallError>) -> ShellChild {
+/// The Terminal pane's child for Cira's answer; `removed` when Cira lists the
+/// session removed. jc only attaches: it never makes or ends a shell.
+pub fn shell_child(answer: Result<SessionShell, CallError>, removed: bool) -> ShellChild {
   match answer {
     Ok(shell) if !shell.argv.is_empty() => ShellChild::Shared(shell.argv),
     Ok(_) => ShellChild::Own("Cira's answer names no command".into()),
+    // Exit 5 also covers an id tmux cannot name and an ambiguous one: only a
+    // removal is for good.
     Err(CallError::Refused { code: exit::INVALID, message, .. }) => {
-      ShellChild::Held(message.trim().to_string())
+      let why = message.trim().to_string();
+      if removed { ShellChild::Held(why) } else { ShellChild::Retry(why) }
     }
     Err(e) => ShellChild::Own(e.to_string()),
+  }
+}
+
+/// How many times in a row the shared client may fail within
+/// [`ATTACH_STABLE`] before the pane runs jc's own shell instead.
+pub const SHARED_FAILURES: u32 = 3;
+
+/// The Terminal pane's state: what it runs, its pause, and the ask in flight.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellPane {
+  run: ShellRun,
+  backoff: Backoff,
+  /// The Cira id the ask in flight is for.
+  asked: Option<String>,
+  /// Quick failed exits of the shared client in a row.
+  failures: u32,
+}
+
+impl ShellPane {
+  pub fn run(&self) -> ShellRun {
+    self.run
+  }
+
+  /// Ask Cira for session `id`'s shell now? Only a pane running nothing,
+  /// past its pause; it is then asking.
+  pub fn ask(&mut self, id: &str, now: SystemTime) -> bool {
+    if self.run != ShellRun::Idle || self.backoff.waiting(now) {
+      return false;
+    }
+    self.run = ShellRun::Asking;
+    self.asked = Some(id.to_string());
+    true
+  }
+
+  /// Cira's answer to the ask for `id` arrived at `now` (`removed`: Cira
+  /// lists the session removed). The child to run, or `None` when nothing
+  /// waits for this answer.
+  pub fn answered(
+    &mut self,
+    id: &str,
+    answer: Result<SessionShell, CallError>,
+    removed: bool,
+    now: SystemTime,
+  ) -> Option<ShellChild> {
+    if self.run != ShellRun::Asking || self.asked.as_deref() != Some(id) {
+      return None;
+    }
+    self.asked = None;
+    let child = shell_child(answer, removed);
+    self.run = match child {
+      ShellChild::Shared(_) => ShellRun::Shared,
+      ShellChild::Own(_) => ShellRun::Own,
+      ShellChild::Held(_) => ShellRun::Held,
+      ShellChild::Retry(_) => {
+        self.backoff.exited(Duration::ZERO, now);
+        ShellRun::Idle
+      }
+    };
+    Some(child)
+  }
+
+  /// Its child exited at `now` with `code` after `lived`; `said` is the last
+  /// line it printed. Jc's own shell, when the shared client has now failed
+  /// quickly [`SHARED_FAILURES`] times in a row (a tmux that cannot reach its
+  /// server, or one upgraded under it); otherwise it asks again after its
+  /// pause. An `exit` (code 0) is never a failure.
+  pub fn exited(
+    &mut self,
+    code: Option<u32>,
+    lived: Duration,
+    now: SystemTime,
+    said: Option<&str>,
+  ) -> Option<ShellChild> {
+    let shared = match self.run {
+      ShellRun::Shared => true,
+      ShellRun::Own => false,
+      _ => return None,
+    };
+    self.run = ShellRun::Idle;
+    self.backoff.exited(lived, now);
+    let failed = shared && code != Some(0) && lived < ATTACH_STABLE;
+    self.failures = if failed { self.failures + 1 } else { 0 };
+    if self.failures < SHARED_FAILURES {
+      return None;
+    }
+    self.failures = 0;
+    self.backoff.clear();
+    self.run = ShellRun::Own;
+    let said = said.map_or_else(|| "it printed nothing".to_string(), |s| format!("\"{s}\""));
+    Some(ShellChild::Own(format!("tmux exited {SHARED_FAILURES} times in a row ({said})")))
   }
 }
 
@@ -368,39 +501,144 @@ mod tests {
     assert_eq!(attach_delay(Some(ATTACH_MAX), ATTACH_STABLE), ATTACH_MIN);
   }
 
+  fn listed_shell(argv: &[&str]) -> SessionShell {
+    // The answer a real `cira session shell --json` gave (make-shell.sh).
+    let mut shell: SessionShell = serde_json::from_slice(SHELL_FIXTURE).unwrap();
+    shell.argv = argv.iter().map(|w| w.to_string()).collect();
+    shell
+  }
+
+  const SHELL_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/cira/session-shell.json");
+
+  fn refused(code: i32, message: &str) -> CallError {
+    CallError::Refused { code, message: format!("{message}\n"), stdout: vec![] }
+  }
+
   #[test]
   fn a_pane_waits_out_its_pause_after_its_child_exited() {
-    assert!(!backing_off(None, at(100)), "never exited");
-    assert!(backing_off(Some((at(100), Duration::from_secs(5))), at(104)));
-    assert!(!backing_off(Some((at(100), Duration::from_secs(5))), at(105)));
+    let mut b = Backoff::default();
+    assert!(!b.waiting(at(100)), "never exited");
+    b.exited(Duration::from_millis(10), at(100));
+    assert!(b.waiting(at(100)) && !b.waiting(at(101)), "ATTACH_MIN after a first quick exit");
+    assert!(b.exited_after(at(99)) && !b.exited_after(at(100)));
+    b.exited(Duration::from_millis(10), at(200));
+    assert!(b.waiting(at(201)) && !b.waiting(at(202)), "doubles while it keeps exiting");
+    b.clear();
+    assert!(!b.waiting(at(200)));
   }
 
   #[test]
   fn the_terminal_pane_attaches_to_ciras_shell_and_says_when_it_cannot() {
-    let shell = |argv: &[&str]| SessionShell {
-      session: "c-1".into(),
-      argv: argv.iter().map(|w| w.to_string()).collect(),
-      created: false,
-    };
     let argv = ["/t/tmux", "-u", "-S", "/h/tmux.sock", "attach-session", "-t", "=s-c-1"];
+    let shared = ShellChild::Shared(argv.iter().map(|w| w.to_string()).collect());
+    let real: SessionShell = serde_json::from_slice(SHELL_FIXTURE).unwrap();
+    assert!(matches!(shell_child(Ok(real), false), ShellChild::Shared(a) if a.len() == 7));
+    assert_eq!(shell_child(Ok(listed_shell(&argv)), false), shared);
+    assert!(matches!(shell_child(Ok(listed_shell(&[])), false), ShellChild::Own(_)));
     assert_eq!(
-      shell_child(Ok(shell(&argv))),
-      ShellChild::Shared(argv.iter().map(|w| w.to_string()).collect())
+      shell_child(Err(CallError::Unreachable), false),
+      ShellChild::Own("Cira is unreachable".into())
     );
-    // An answer with nothing to run is not attached to.
-    assert!(matches!(shell_child(Ok(shell(&[]))), ShellChild::Own(_)));
-    // Cira unreachable, or tmux missing (exit 1): jc's own shell, saying why.
-    match shell_child(Err(CallError::Unreachable)) {
-      ShellChild::Own(why) => assert_eq!(why, "Cira is unreachable"),
-      other => panic!("{other:?}"),
+    let no_tmux = refused(exit::ERROR, "no tmux");
+    assert!(
+      matches!(shell_child(Err(no_tmux), false), ShellChild::Own(w) if w.contains("no tmux"))
+    );
+  }
+
+  #[test]
+  fn only_a_removal_holds_the_pane_and_other_refusals_are_asked_again() {
+    // Exit 5 is also an ambiguous or un-nameable id: not for good.
+    let removed = refused(exit::INVALID, "session c-1 was removed; it has no shell");
+    assert!(matches!(shell_child(Err(removed.clone()), true), ShellChild::Held(_)));
+    assert!(matches!(shell_child(Err(removed), false), ShellChild::Retry(_)), "status lags");
+    let ambiguous = refused(exit::INVALID, "c-1 names two sessions");
+    let mut pane = ShellPane::default();
+    assert!(pane.ask("c-1", at(100)));
+    assert!(matches!(
+      pane.answered("c-1", Err(ambiguous), false, at(100)),
+      Some(ShellChild::Retry(_))
+    ));
+    assert_eq!(pane.run(), ShellRun::Idle);
+    assert!(!pane.ask("c-1", at(100)), "waits out its pause");
+    assert!(pane.ask("c-1", at(101)), "then asks again");
+  }
+
+  #[test]
+  fn the_shell_pane_asks_once_and_takes_only_the_answer_it_waits_for() {
+    let argv = ["/t/tmux", "attach-session", "-t", "=s-c-1"];
+    let mut pane = ShellPane::default();
+    assert!(pane.ask("c-1", at(100)));
+    assert!(!pane.ask("c-1", at(100)), "one ask in flight");
+    // An answer for another id (the session was rebound) is not taken.
+    assert_eq!(pane.answered("c-2", Ok(listed_shell(&argv)), false, at(100)), None);
+    assert!(matches!(
+      pane.answered("c-1", Ok(listed_shell(&argv)), false, at(100)),
+      Some(ShellChild::Shared(_))
+    ));
+    assert_eq!(pane.run(), ShellRun::Shared);
+    // A second answer to the same ask finds the pane running: stale.
+    assert_eq!(pane.answered("c-1", Ok(listed_shell(&argv)), false, at(100)), None);
+    assert!(!pane.ask("c-1", at(200)), "a running shell is never replaced");
+    // Jay's `exit`: it asks again after its pause.
+    assert_eq!(pane.exited(Some(0), Duration::from_secs(60), at(300), None), None);
+    assert!(!pane.ask("c-1", at(300)) && pane.ask("c-1", at(301)));
+    // A removal holds it for good.
+    let removed = refused(exit::INVALID, "removed");
+    assert!(matches!(pane.answered("c-1", Err(removed), true, at(301)), Some(ShellChild::Held(_))));
+    assert!(!pane.ask("c-1", at(9999)));
+    assert_eq!(pane.exited(None, Duration::ZERO, at(9999), None), None, "nothing runs");
+  }
+
+  #[test]
+  fn only_a_genuinely_failed_ask_gives_jcs_own_shell_and_its_exit_asks_cira_again() {
+    let mut pane = ShellPane::default();
+    assert!(pane.ask("c-1", at(100)));
+    assert!(matches!(
+      pane.answered("c-1", Err(CallError::Unreachable), false, at(100)),
+      Some(ShellChild::Own(_))
+    ));
+    assert_eq!(pane.run(), ShellRun::Own);
+    assert!(!pane.ask("c-1", at(200)), "jc's own shell runs until it exits");
+    assert_eq!(pane.exited(Some(0), Duration::from_secs(60), at(300), None), None);
+    assert!(pane.ask("c-1", at(301)), "then Cira is asked again");
+  }
+
+  #[test]
+  fn a_shared_client_that_keeps_failing_gives_way_to_jcs_own_shell_saying_why() {
+    let argv = ["/t/tmux", "attach-session", "-t", "=s-c-1"];
+    let mut pane = ShellPane::default();
+    let mut t = 100;
+    let mut fail = |pane: &mut ShellPane| {
+      assert!(pane.ask("c-1", at(t + 60)), "asks after its pause");
+      pane.answered("c-1", Ok(listed_shell(&argv)), false, at(t + 60));
+      t += 120;
+      pane.exited(Some(1), Duration::from_millis(50), at(t), Some("server exited unexpectedly"))
+    };
+    for _ in 1..SHARED_FAILURES {
+      assert_eq!(fail(&mut pane), None);
     }
-    let no_tmux =
-      CallError::Refused { code: exit::ERROR, message: "no tmux\n".into(), stdout: vec![] };
-    assert!(matches!(shell_child(Err(no_tmux)), ShellChild::Own(why) if why.contains("no tmux")));
-    // A removed session has no shell; a stand-in would carry its id for nothing.
-    let removed =
-      CallError::Refused { code: exit::INVALID, message: "removed\n".into(), stdout: vec![] };
-    assert!(matches!(shell_child(Err(removed)), ShellChild::Held(why) if why.contains("removed")));
+    match fail(&mut pane) {
+      Some(ShellChild::Own(why)) => {
+        assert!(why.contains("server exited unexpectedly"), "{why}");
+        assert!(why.contains(&SHARED_FAILURES.to_string()), "{why}");
+      }
+      other => panic!("expected jc's own shell, got {other:?}"),
+    }
+    assert_eq!(pane.run(), ShellRun::Own);
+    // A client that ran a while, or Jay's `exit`, starts the count again.
+    let mut pane = ShellPane::default();
+    for (code, lived) in
+      [(Some(1), 50), (Some(0), 50), (Some(1), 50), (Some(1), 60_000), (Some(1), 50)]
+    {
+      assert!(pane.ask("c-1", at(t + 60)));
+      pane.answered("c-1", Ok(listed_shell(&argv)), false, at(t + 60));
+      t += 120;
+      assert_eq!(
+        pane.exited(code, Duration::from_millis(lived), at(t), None),
+        None,
+        "{code:?} {lived}"
+      );
+    }
   }
 
   #[test]
