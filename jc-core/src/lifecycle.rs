@@ -1,0 +1,330 @@
+//! What jc does about a session Cira owns (Cira DESIGN 12, PLAN TMUX-01): when
+//! a Claude pane attaches, waits or holds ([`pane_action`]), what a changed
+//! TODO.md marker asks of Cira ([`mark_request`]), and which side of a label
+//! moved ([`label_sync`]). Pure: the workspace feeds them `cira status --json`
+//! and what it remembers ([`Records`], `sessions.toml` in jc's config dir).
+
+use crate::cira::{JobState, ModePending, Session};
+use crate::todo::Mark;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime};
+
+/// What a Claude pane does now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneAction {
+  /// Run `claude attach <short>`, replacing any client it runs.
+  Attach(String),
+  /// Leave the pane as it is.
+  Keep,
+  /// Attach nothing yet; the reason is shown. Re-asked at every status read.
+  Wait(String),
+  /// Attach nothing until Jay asks (or, for a stopped session, until its job
+  /// runs again); the reason is shown.
+  Hold(String),
+}
+
+/// What the pane should do for `session` (Cira's view of it, `None` when
+/// Cira does not list it), given whether Cira answered at all, the short id
+/// its attach client runs on (`None` when no client runs), and `since`: when
+/// it last attached or Jay last asked it to.
+///
+/// A running client is never torn down here: Cira stops or forks the job, and
+/// the client exits by itself. A pane with no client attaches to Cira's
+/// current job, except while an operation is in flight or a fork is due (it
+/// would attach to the job being replaced, and attaching resumes a stopped
+/// job), and except for a session stopped through Cira since `since`, which
+/// attaching would undo.
+pub fn pane_action(
+  session: Option<&Session>,
+  reachable: bool,
+  attached: Option<&str>,
+  since: Option<SystemTime>,
+) -> PaneAction {
+  let wait = |why: &str| match attached {
+    Some(_) => PaneAction::Keep,
+    None => PaneAction::Wait(why.to_string()),
+  };
+  if !reachable {
+    return wait("Cira is unreachable; this pane attaches once it answers");
+  }
+  let Some(s) = session else {
+    return wait("Cira does not list this session");
+  };
+  if s.removed_at.is_some() {
+    return match attached {
+      Some(_) => PaneAction::Keep,
+      None => PaneAction::Hold("removed through Cira".into()),
+    };
+  }
+  if let Some(op) = s.op.as_ref().filter(|o| o.running) {
+    return wait(&format!("waiting while Cira runs its {}…", op.op));
+  }
+  if s.mode_pending == ModePending::Due {
+    return wait(if s.dangerous { "becoming dangerous…" } else { "becoming normal…" });
+  }
+  let Some(job) = &s.job else {
+    return match s.op_error() {
+      Some(error) => PaneAction::Hold(error.to_string()),
+      None => wait("waiting for Cira to start its job…"),
+    };
+  };
+  match attached {
+    Some(short) if short == job.short => return PaneAction::Keep,
+    Some(_) => return PaneAction::Attach(job.short.clone()),
+    None => {}
+  }
+  let stopped_since = s.stopped().is_some_and(|at| since.is_none_or(|since| at > since));
+  match job.state {
+    JobState::Running => PaneAction::Attach(job.short.clone()),
+    _ if stopped_since => PaneAction::Hold(
+      "stopped through Cira; it attaches again once it runs (a message wakes it), or by \
+       \"Attach this session\" in Cmd-Shift-P"
+        .into(),
+    ),
+    JobState::Absent => PaneAction::Hold(format!("its job {} is gone", job.short)),
+    JobState::Failed => {
+      PaneAction::Hold(s.op_error().unwrap_or("its job failed to start").to_string())
+    }
+    JobState::Stopped | JobState::Unknown => PaneAction::Attach(job.short.clone()),
+  }
+}
+
+/// Bounds of the pause before a pane attaches again after its client exited:
+/// [`ATTACH_MIN`] after a client that ran at least [`ATTACH_STABLE`], doubling
+/// up to [`ATTACH_MAX`] while it keeps exiting sooner.
+pub const ATTACH_MIN: Duration = Duration::from_secs(1);
+pub const ATTACH_MAX: Duration = Duration::from_secs(30);
+pub const ATTACH_STABLE: Duration = Duration::from_secs(10);
+
+/// The pause before attaching again, after a client that `lived` and the
+/// pause `previous` used before it.
+pub fn attach_delay(previous: Option<Duration>, lived: Duration) -> Duration {
+  match previous {
+    Some(previous) if lived < ATTACH_STABLE => (previous * 2).clamp(ATTACH_MIN, ATTACH_MAX),
+    _ => ATTACH_MIN,
+  }
+}
+
+/// A request a heading's marker change makes of Cira.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkRequest {
+  /// `cira session stop`.
+  Stop,
+  /// `cira session rm`.
+  Remove,
+}
+
+/// What a heading whose marker jc last acted on as `last` asks now that it
+/// says `now`. Edge-triggered (Cira DESIGN 12): only a change asks anything,
+/// so a stale `[D]` never stops a session started again from the page. With
+/// no record jc has nothing to compare, and the marker becomes the record.
+pub fn mark_request(last: Option<Mark>, now: Mark) -> Option<MarkRequest> {
+  match (last?, now) {
+    (last, now) if last == now => None,
+    (_, Mark::Deleted) => Some(MarkRequest::Remove),
+    (Mark::Active, Mark::Disabled) => Some(MarkRequest::Stop),
+    _ => None,
+  }
+}
+
+/// Which side of a session's label moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelSync {
+  /// They agree.
+  Agreed,
+  /// The heading was renamed: send it to Cira (`cira session label`).
+  Send,
+  /// Cira's label changed: write it into the heading.
+  Write(String),
+}
+
+/// The heading says `heading`, Cira says `cira`, and the two last agreed on
+/// `last`. The label is Cira's (Q-159), so when both moved, or jc has no
+/// record of them agreeing, Cira's wins.
+pub fn label_sync(heading: &str, cira: Option<&str>, last: Option<&str>) -> LabelSync {
+  match cira {
+    Some(cira) if cira == heading => LabelSync::Agreed,
+    None => LabelSync::Send,
+    Some(cira) if last == Some(cira) => LabelSync::Send,
+    Some(cira) => LabelSync::Write(cira.to_string()),
+  }
+}
+
+/// What jc remembers per Cira session id across restarts, so a marker edit
+/// or a rename made while it was closed is acted on at its next start.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Records {
+  pub sessions: BTreeMap<String, Record>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Record {
+  /// The marker jc last acted on.
+  pub mark: Option<Mark>,
+  /// The label the heading and Cira last agreed on.
+  pub label: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::cira::Status;
+
+  /// A session as `cira status --json` lists it, from the real fixture's
+  /// shape with `life` merged in.
+  fn session(life: serde_json::Value) -> Session {
+    let mut s = serde_json::json!({
+      "id": "c-1", "state": "idle", "state_since": "2026-11-12T10:00:00Z",
+      "owned": true, "dangerous": false, "mode_pending": "none",
+    });
+    for (k, v) in life.as_object().unwrap() {
+      s[k] = v.clone();
+    }
+    let status = serde_json::json!({ "projects": [{ "name": "p", "sessions": [s] }] });
+    Status::parse(status.to_string().as_bytes()).unwrap().session("c-1").unwrap().clone()
+  }
+
+  fn job(short: &str, state: &str) -> serde_json::Value {
+    serde_json::json!({ "short": short, "dangerous": false, "state": state })
+  }
+
+  fn at(secs: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+  }
+
+  const STOPPED_AT_200: &str = "1970-01-01T00:03:20Z";
+
+  fn attach(short: &str) -> PaneAction {
+    PaneAction::Attach(short.into())
+  }
+
+  #[test]
+  fn a_pane_attaches_to_the_job_cira_names() {
+    let s = session(serde_json::json!({ "job": job("aaaa1111", "running") }));
+    assert_eq!(pane_action(Some(&s), true, None, None), attach("aaaa1111"));
+    assert_eq!(pane_action(Some(&s), true, Some("aaaa1111"), None), PaneAction::Keep);
+    // A stopped or retired job: attach resumes it (no stop was asked).
+    let s = session(serde_json::json!({ "job": job("aaaa1111", "stopped") }));
+    assert_eq!(pane_action(Some(&s), true, None, Some(at(100))), attach("aaaa1111"));
+  }
+
+  #[test]
+  fn a_forked_job_is_attached_by_its_new_short_id() {
+    // A mode change forked the job: the client on the old one is replaced,
+    // never re-run on the short id it had.
+    let s = session(serde_json::json!({ "job": job("bbbb2222", "running"), "dangerous": true }));
+    assert_eq!(pane_action(Some(&s), true, Some("aaaa1111"), None), attach("bbbb2222"));
+  }
+
+  #[test]
+  fn nothing_is_attached_while_an_operation_is_in_flight_or_a_fork_is_due() {
+    let running_op = serde_json::json!({ "op": "mode", "running": true, "at": "x" });
+    let s = session(serde_json::json!({ "job": job("aaaa1111", "stopped"), "op": running_op }));
+    assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Wait(_)));
+    // A client still on the job is left for the operation to end.
+    assert_eq!(pane_action(Some(&s), true, Some("aaaa1111"), None), PaneAction::Keep);
+    let s = session(serde_json::json!({ "job": job("aaaa1111", "stopped"), "mode_pending": "due" }));
+    assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Wait(_)));
+    // Waiting for idle: the job still runs in its old mode, so attach.
+    let s = session(serde_json::json!({
+      "job": job("aaaa1111", "running"), "mode_pending": "waiting_for_idle"
+    }));
+    assert_eq!(pane_action(Some(&s), true, None, None), attach("aaaa1111"));
+  }
+
+  #[test]
+  fn a_session_stopped_through_cira_is_not_resumed_by_attaching() {
+    let s = session(serde_json::json!({
+      "job": job("aaaa1111", "stopped"), "stopped_at": STOPPED_AT_200
+    }));
+    assert!(matches!(pane_action(Some(&s), true, None, Some(at(100))), PaneAction::Hold(_)));
+    assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Hold(_)), "jc start");
+    // Jay asked after the stop (adopting it, the palette's attach): attach.
+    assert_eq!(pane_action(Some(&s), true, None, Some(at(300))), attach("aaaa1111"));
+    // A delivery woke it: follow it.
+    let s = session(serde_json::json!({
+      "job": job("aaaa1111", "running"), "stopped_at": STOPPED_AT_200
+    }));
+    assert_eq!(pane_action(Some(&s), true, None, Some(at(100))), attach("aaaa1111"));
+  }
+
+  #[test]
+  fn removed_failed_and_gone_jobs_are_held() {
+    let s = session(serde_json::json!({
+      "job": job("aaaa1111", "absent"), "removed_at": STOPPED_AT_200
+    }));
+    assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Hold(_)));
+    let s = session(serde_json::json!({ "job": job("aaaa1111", "absent") }));
+    assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Hold(_)));
+    let failed = serde_json::json!({ "op": "start", "running": false, "error": "held", "at": "x" });
+    let s = session(serde_json::json!({ "op": failed }));
+    assert_eq!(pane_action(Some(&s), true, None, None), PaneAction::Hold("held".into()));
+    // No job yet and nothing failed: its start is on its way.
+    let s = session(serde_json::json!({}));
+    assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Wait(_)));
+  }
+
+  #[test]
+  fn while_cira_is_unreachable_nothing_new_is_attached() {
+    let s = session(serde_json::json!({ "job": job("aaaa1111", "running") }));
+    assert!(matches!(pane_action(None, false, None, None), PaneAction::Wait(_)));
+    assert!(matches!(pane_action(Some(&s), false, None, None), PaneAction::Wait(_)));
+    // A client already attached keeps running: the session lives on.
+    assert_eq!(pane_action(None, false, Some("aaaa1111"), None), PaneAction::Keep);
+    assert!(matches!(pane_action(None, true, None, None), PaneAction::Wait(_)), "unknown to Cira");
+  }
+
+  #[test]
+  fn attaching_again_backs_off_while_the_client_keeps_exiting_quickly() {
+    let quick = Duration::from_millis(200);
+    assert_eq!(attach_delay(None, quick), ATTACH_MIN);
+    let mut delay = attach_delay(None, quick);
+    for _ in 0..10 {
+      delay = attach_delay(Some(delay), quick);
+    }
+    assert_eq!(delay, ATTACH_MAX, "doubles up to the cap");
+    assert_eq!(attach_delay(Some(ATTACH_MAX), ATTACH_STABLE), ATTACH_MIN);
+  }
+
+  #[test]
+  fn a_marker_asks_cira_only_when_it_changes() {
+    use Mark::*;
+    assert_eq!(mark_request(Some(Active), Disabled), Some(MarkRequest::Stop));
+    assert_eq!(mark_request(Some(Active), Deleted), Some(MarkRequest::Remove));
+    assert_eq!(mark_request(Some(Disabled), Deleted), Some(MarkRequest::Remove));
+    // The same marker again (every JC start with a `[D]` heading) asks nothing.
+    assert_eq!(mark_request(Some(Disabled), Disabled), None);
+    assert_eq!(mark_request(Some(Deleted), Deleted), None);
+    // Back to active: attaching resumes it; removal is terminal.
+    assert_eq!(mark_request(Some(Disabled), Active), None);
+    assert_eq!(mark_request(Some(Deleted), Disabled), None);
+    // No record: nothing to compare.
+    assert_eq!(mark_request(None, Disabled), None);
+  }
+
+  #[test]
+  fn the_side_that_moved_wins_and_cira_wins_a_tie() {
+    assert_eq!(label_sync("A", Some("A"), Some("old")), LabelSync::Agreed);
+    assert_eq!(label_sync("B", Some("A"), Some("A")), LabelSync::Send, "renamed in TODO.md");
+    assert_eq!(label_sync("A", Some("B"), Some("A")), LabelSync::Write("B".into()), "on the page");
+    assert_eq!(label_sync("C", Some("B"), Some("A")), LabelSync::Write("B".into()), "both");
+    assert_eq!(label_sync("C", Some("B"), None), LabelSync::Write("B".into()), "no record");
+    assert_eq!(label_sync("C", None, None), LabelSync::Send, "Cira has no label");
+  }
+
+  #[test]
+  fn records_round_trip_through_toml() {
+    let mut records = Records::default();
+    records.sessions.insert(
+      "c-1".into(),
+      Record { mark: Some(Mark::Disabled), label: Some("a \"quoted\" label".into()) },
+    );
+    records.sessions.insert("c-2".into(), Record::default());
+    let text = toml::to_string_pretty(&records).unwrap();
+    assert_eq!(toml::from_str::<Records>(&text).unwrap(), records, "{text}");
+    assert_eq!(toml::from_str::<Records>("").unwrap(), Records::default());
+  }
+}

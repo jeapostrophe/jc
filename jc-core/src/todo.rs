@@ -13,21 +13,22 @@ pub struct TodoDocument {
   pub claude_section_line: Option<u32>,
   pub sessions: Vec<TodoSession>,
   /// `## [DELETED] …` headings that still name a session. They are never
-  /// sessions themselves; jc lists them only to remove their background
-  /// session (`claude stop` + `claude rm`).
+  /// sessions themselves; jc lists them only so their removal reaches Cira
+  /// (`cira session rm`, see [`TodoDocument::marks`]).
   pub deleted: Vec<DeletedSession>,
 }
 
 /// Which metadata line names a heading's session.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum IdKind {
-  /// `> bg=<short>`: the short id `claude --bg` printed. Stable across
-  /// `/clear`, stop, respawn and retirement, and what `claude attach` takes.
+  /// `> cira=<id>`: the stable id Cira minted at `cira session new`, which is
+  /// the session's `CIRA_SESSION`. Cira owns the session; its background job
+  /// and short id change under it (a mode change forks a new one).
   #[default]
-  Bg,
+  Cira,
   /// `> uuid=<uuid>`: written by a jc that ran `claude` in its own terminal.
-  /// jc migrates it to `> bg=` the first time it starts the session
-  /// (`jc_core::background::plan_launch`).
+  /// jc migrates it once by `cira session new --resume` and rewrites the line
+  /// to `> cira=` (Cira PLAN TMUX-01).
   Uuid,
 }
 
@@ -35,10 +36,21 @@ impl IdKind {
   /// The metadata key that introduces this kind of id line.
   pub fn prefix(self) -> &'static str {
     match self {
-      Self::Bg => "> bg=",
+      Self::Cira => "> cira=",
       Self::Uuid => "> uuid=",
     }
   }
+}
+
+/// What a heading's marker says of its session, the state jc remembers per
+/// Cira id so that a change becomes one request to Cira (Cira DESIGN 12):
+/// `[D]` a `cira session stop`, `[DELETED]` a `cira session rm`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mark {
+  Deleted,
+  Disabled,
+  Active,
 }
 
 /// A `[DELETED]` heading's id line.
@@ -50,7 +62,7 @@ pub struct DeletedSession {
 
 /// The id line at the start of `line`, if it is one.
 fn id_line(line: &str) -> Option<(IdKind, &str)> {
-  [IdKind::Bg, IdKind::Uuid]
+  [IdKind::Cira, IdKind::Uuid]
     .into_iter()
     .find_map(|kind| line.strip_prefix(kind.prefix()).map(|rest| (kind, rest)))
 }
@@ -66,7 +78,7 @@ fn id_line(line: &str) -> Option<(IdKind, &str)> {
 /// redirects a send, or a scheduled `@jc(...)` delivery, to the wrong session.
 /// Every text operation ([`insert_wait_section`], [`fire_scheduled`],
 /// the WAIT-cursor, highlight and send paths in the app) therefore keys on the
-/// heading id (`> bg=`, or a legacy `> uuid=`), which is unique.
+/// heading id (`> cira=`, or a legacy `> uuid=`), which is unique.
 ///
 /// The one heading an id cannot address is one an older jc created and never
 /// bound: its `> uuid=` is empty, and the empty string names every such heading
@@ -115,29 +127,29 @@ pub enum SessionStatus {
 
 #[derive(Debug, Default, Clone)]
 pub struct TodoSession {
-  /// The heading's address: the `> bg=` short id, or a legacy `> uuid=` not
-  /// yet migrated (see [`IdKind`]). Empty for an unbound heading.
+  /// The heading's address: its `> cira=` id, or a legacy `> uuid=` not yet
+  /// migrated (see [`IdKind`]). Empty for an unbound heading.
   pub id: String,
   pub id_kind: IdKind,
-  /// The stable session id from `> cira=`, passed to Claude and the shell pane
-  /// as `CIRA_SESSION`. Unlike the short id it survives a `> dangerous` toggle.
-  pub cira: Option<String>,
   pub label: String,
   pub status: SessionStatus,
   pub line: u32,
   pub heading_byte_range: Range<usize>,
-  /// 1-based line number of the id line (`> bg=` or `> uuid=`).
+  /// 1-based line number of the id line (`> cira=` or `> uuid=`).
   pub id_line: u32,
   /// Byte range of the id value within the full document text (the
-  /// characters after `> bg=` or `> uuid=`). `0..0` when there is no id line.
+  /// characters after `> cira=` or `> uuid=`). `0..0` when there is no id line.
   pub id_byte_range: Range<usize>,
   /// Unix timestamp (seconds) of the last TODO submit, parsed from `> last=`.
   pub last_active: Option<u64>,
   /// Byte range of the entire `> last=TIMESTAMP` line (for replacement).
   pub last_active_line_range: Option<Range<usize>>,
-  /// True if the session has a `> dangerous` metadata line — spawn `claude`
-  /// with `--dangerously-skip-permissions`.
+  /// True if a legacy heading has a `> dangerous` metadata line. Read only to
+  /// migrate it: the mode lives in Cira (Cira Q-155), and migrating removes
+  /// the line ([`bind_cira_at`]).
   pub dangerous: bool,
+  /// Byte range of the `> dangerous` line with its newline, for its removal.
+  pub dangerous_line_range: Option<Range<usize>>,
   pub messages: Vec<TodoMessage>,
   pub wait: Option<TodoWait>,
 }
@@ -177,6 +189,16 @@ impl TodoWait {
 }
 
 impl TodoSession {
+  /// The heading's Cira session id, once it has one (`> cira=`).
+  pub fn cira(&self) -> Option<&str> {
+    (self.id_kind == IdKind::Cira && !self.id.is_empty()).then_some(self.id.as_str())
+  }
+
+  /// What its marker says (see [`Mark`]).
+  pub fn mark(&self) -> Mark {
+    if self.is_disabled() { Mark::Disabled } else { Mark::Active }
+  }
+
   /// How to address this heading, given its position in
   /// [`TodoDocument::sessions`] — its id, or that verified position when it is
   /// unbound. See [`SessionKey`].
@@ -240,32 +262,23 @@ impl TodoDocument {
     }
   }
 
-  /// Short ids of `[DELETED]` headings whose job may be removed: no heading
-  /// that is still a session names the same id (a copied block).
-  pub fn removable_ids(&self) -> Vec<&str> {
-    let named = |id: &str| self.sessions.iter().any(|s| s.id == id);
-    let mut ids: Vec<&str> = self
+  /// Each Cira id the document names, with what its headings' markers say.
+  /// A copied block can name one id under several headings; the most alive
+  /// marker wins (`Active` over `Disabled` over `Deleted`), so marking the
+  /// copy never stops or removes the session the other heading still runs.
+  pub fn marks(&self) -> std::collections::BTreeMap<&str, Mark> {
+    let mut marks = std::collections::BTreeMap::new();
+    let named = self.sessions.iter().filter_map(|s| Some((s.cira()?, s.mark())));
+    let deleted = self
       .deleted
       .iter()
-      .filter(|d| d.id_kind == IdKind::Bg && !named(&d.id))
-      .map(|d| d.id.as_str())
-      .collect();
-    ids.dedup();
-    ids
-  }
-
-  /// Short ids of `[D]` headings whose job may be stopped: no active heading
-  /// names the same id.
-  pub fn stoppable_ids(&self) -> Vec<&str> {
-    let active = |id: &str| self.sessions.iter().any(|s| s.id == id && !s.is_disabled());
-    let mut ids: Vec<&str> = self
-      .sessions
-      .iter()
-      .filter(|s| s.is_disabled() && s.id_kind == IdKind::Bg && !s.id.is_empty() && !active(&s.id))
-      .map(|s| s.id.as_str())
-      .collect();
-    ids.dedup();
-    ids
+      .filter(|d| d.id_kind == IdKind::Cira)
+      .map(|d| (d.id.as_str(), Mark::Deleted));
+    for (id, mark) in named.chain(deleted) {
+      let best = marks.entry(id).or_insert(mark);
+      *best = (*best).max(mark);
+    }
+    marks
   }
 
   /// The session `key` names.
@@ -426,8 +439,8 @@ pub fn parse(text: &str) -> TodoDocument {
         session.last_active_line_range = Some(line_start..line_end);
       } else if rest == "dangerous" {
         session.dangerous = true;
-      } else if let Some(cira) = rest.strip_prefix("cira=") {
-        session.cira = Some(cira.to_string());
+        session.dangerous_line_range =
+          Some(line_start..skip_newline(text.as_bytes(), line_end));
       }
       // Unknown metadata keys are silently consumed so future additions
       // don't break older parsers.
@@ -481,7 +494,7 @@ pub fn parse(text: &str) -> TodoDocument {
       if !in_claude_section {
         // Ignore — this heading is outside the Claude section.
       } else if after_h2.starts_with("[DELETED] ") {
-        // Not a session; only its id line is wanted, for removal.
+        // Not a session; only its id line is wanted, for its removal.
         expecting_deleted_id = true;
       } else if !after_h2.is_empty() {
         // `[D]` marks a dormant session. `[X]` is a retired marker jc used to
@@ -648,8 +661,8 @@ pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
   (2..).map(|n| format!("{base} {n}")).find(|c| !taken(c)).unwrap()
 }
 
-/// Build new text with a `## <label>\n> bg=<short>\n> cira=<cira>\n\n### WAIT\n`
-/// heading inserted.
+/// Build new text with a `## <label>\n> cira=<cira>\n\n### WAIT\n` heading
+/// inserted.
 /// If a `# Claude` section exists, the heading goes right after it. Otherwise
 /// a `# Claude` section is appended at the end of the text.
 ///
@@ -659,10 +672,9 @@ pub fn insert_session_heading(
   text: &str,
   doc: &TodoDocument,
   label: &str,
-  short: &str,
   cira: &str,
 ) -> String {
-  let heading = format!("## {label}\n> bg={short}\n> cira={cira}\n\n### WAIT\n");
+  let heading = format!("## {label}\n> cira={cira}\n\n### WAIT\n");
 
   if let Some(claude_line) = doc.claude_section_line {
     // Find byte offset right after the `# Claude` line.
@@ -728,36 +740,41 @@ pub fn toggle_session_disabled_at(text: &str, doc: &TodoDocument, index: usize) 
 // Binding a heading to its background session
 // ---------------------------------------------------------------------------
 
-/// Point the session at `index` in `doc.sessions` at background session
-/// `short`: its id line becomes `> bg=<short>` whatever it was before (a legacy
-/// `> uuid=`, an older `> bg=`, or none), and `> cira=<cira>` is added when
-/// `cira` is given and the heading has none. An existing `> cira=` is kept: the
-/// stable id outlives every short id the heading has had.
+/// Give the heading at `index` in `doc.sessions` the Cira id `cira`: its id
+/// line becomes `> cira=<cira>` whatever it was (a legacy `> uuid=`, or none),
+/// and a legacy `> dangerous` line goes, since the mode now lives in Cira
+/// (Cira Q-155), which was told it when the session was made.
 ///
 /// Positional rather than label-keyed — see [`SessionKey`]. Callers holding an
 /// id resolve it with [`TodoDocument::index_by_id`].
-pub fn bind_bg_at(
-  text: &str,
-  doc: &TodoDocument,
-  index: usize,
-  short: &str,
-  cira: Option<&str>,
-) -> Option<String> {
+pub fn bind_cira_at(text: &str, doc: &TodoDocument, index: usize, cira: &str) -> Option<String> {
   let session = doc.sessions.get(index)?;
-  let mut lines = format!("> bg={short}");
-  if session.cira.is_none()
-    && let Some(cira) = cira
-  {
-    lines.push_str(&format!("\n> cira={cira}"));
-  }
+  let line = format!("> cira={cira}");
+  // The later range first, so the earlier one's offsets still hold.
+  let text = match &session.dangerous_line_range {
+    Some(range) => Cow::Owned(splice(text, range.clone(), "")),
+    None => Cow::Borrowed(text),
+  };
   // A hand-written heading may have no id line at all; give it one directly
   // below the heading rather than dropping the id on the floor.
   if session.id_byte_range == (0..0) {
     let at = session.heading_byte_range.end;
-    return Some(splice(text, at..at, &format!("\n{lines}")));
+    return Some(splice(&text, at..at, &format!("\n{line}")));
   }
   let line_start = session.id_byte_range.start - session.id_kind.prefix().len();
-  Some(splice(text, line_start..session.id_byte_range.end, &lines))
+  Some(splice(&text, line_start..session.id_byte_range.end, &line))
+}
+
+/// Rename the heading at `index` to `label`, keeping its `[D]` marker.
+pub fn rename_heading_at(
+  text: &str,
+  doc: &TodoDocument,
+  index: usize,
+  label: &str,
+) -> Option<String> {
+  let session = doc.sessions.get(index)?;
+  let marker = if session.is_disabled() { "[D] " } else { "" };
+  Some(splice(text, session.heading_byte_range.clone(), &format!("## {marker}{label}")))
 }
 
 /// Turn the just-sent `### Message <index>` of the session bound to `id` into a
@@ -1501,13 +1518,12 @@ some notes
 # Claude
 ";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "My Label", "aaaa1111", "c-1");
-    assert!(result.contains("# Claude\n## My Label\n> bg=aaaa1111\n> cira=c-1\n"));
+    let result = insert_session_heading(text, &doc, "My Label", "c-1");
+    assert!(result.contains("# Claude\n## My Label\n> cira=c-1\n"));
     // Verify it re-parses correctly.
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 1);
-    assert_eq!(new_doc.sessions[0].id, "aaaa1111");
-    assert_eq!(new_doc.sessions[0].cira.as_deref(), Some("c-1"));
+    assert_eq!(new_doc.sessions[0].cira(), Some("c-1"));
     assert!(new_doc.sessions[0].wait.is_some());
   }
 
@@ -1518,22 +1534,22 @@ some notes
 some notes
 ";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "Test Label", "bbbb2222", "c-2");
-    assert!(result.contains("# Claude\n## Test Label\n> bg=bbbb2222\n"));
+    let result = insert_session_heading(text, &doc, "Test Label", "c-2");
+    assert!(result.contains("# Claude\n## Test Label\n> cira=c-2\n"));
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 1);
-    assert_eq!(new_doc.sessions[0].id, "bbbb2222");
+    assert_eq!(new_doc.sessions[0].id, "c-2");
   }
 
   #[test]
   fn insert_session_heading_empty_document() {
     let text = "";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "Fresh", "cccc3333", "c-3");
-    assert_eq!(result, "# Claude\n## Fresh\n> bg=cccc3333\n> cira=c-3\n\n### WAIT\n");
+    let result = insert_session_heading(text, &doc, "Fresh", "c-3");
+    assert_eq!(result, "# Claude\n## Fresh\n> cira=c-3\n\n### WAIT\n");
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 1);
-    assert_eq!(new_doc.sessions[0].id, "cccc3333");
+    assert_eq!(new_doc.sessions[0].id, "c-3");
     assert_eq!(new_doc.sessions[0].label, "Fresh");
   }
 
@@ -1548,7 +1564,7 @@ some notes
 notes
 ";
     let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "New Label", "new-uuid", "c-4");
+    let result = insert_session_heading(text, &doc, "New Label", "new-uuid");
     // New heading should be inserted right after `# Claude`, before the old session.
     let new_doc = parse(&result);
     assert_eq!(new_doc.sessions.len(), 2);
@@ -2551,59 +2567,58 @@ draft
     assert_eq!(session.label, "New Session");
   }
 
-  // `> bg=` replaces `> uuid=` (Cira PLAN TMUX-01): the background session's
-  // short id is the heading's address, and a `> uuid=` heading is legacy.
+  // `> cira=` replaces `> uuid=` (Cira PLAN TMUX-01/02): the id Cira minted
+  // is the heading's address, and a `> uuid=` heading is legacy.
   #[test]
-  fn bg_line_is_the_session_address() {
-    let text = "# Claude\n## S\n> bg=335b461a\n> cira=c-1\n> dangerous\n\n### WAIT\n";
+  fn cira_line_is_the_session_address() {
+    let text = "# Claude\n## S\n> cira=c-1\n> last=5\n\n### WAIT\n";
     let doc = parse(text);
     let s = &doc.sessions[0];
-    assert_eq!(s.id, "335b461a");
-    assert_eq!(s.id_kind, IdKind::Bg);
-    assert_eq!(s.cira.as_deref(), Some("c-1"));
-    assert!(s.dangerous);
-    assert_eq!(&text[s.id_byte_range.clone()], "335b461a");
+    assert_eq!((s.id.as_str(), s.id_kind), ("c-1", IdKind::Cira));
+    assert_eq!(s.cira(), Some("c-1"));
+    assert_eq!(s.last_active, Some(5));
+    assert_eq!(&text[s.id_byte_range.clone()], "c-1");
   }
 
   #[test]
   fn uuid_line_is_a_legacy_address() {
-    let text = "# Claude\n## S\n> uuid=335b461a-eba5-485f-898c-f757fdb3f2bf\n\n### WAIT\n";
+    let text = "# Claude\n## S\n> uuid=335b461a-eba5-485f-898c-f757fdb3f2bf\n> dangerous\n\n### WAIT\n";
     let s = &parse(text).sessions[0];
     assert_eq!(s.id, "335b461a-eba5-485f-898c-f757fdb3f2bf");
     assert_eq!(s.id_kind, IdKind::Uuid);
-    assert_eq!(s.cira, None);
+    assert_eq!(s.cira(), None, "a legacy heading has no Cira id until it is migrated");
+    assert!(s.dangerous, "read only so the migration can tell Cira");
   }
 
   #[test]
   fn deleted_headings_are_listed_apart_from_sessions() {
-    // `[DELETED]` is never a session, but its background session must still be
-    // found so it can be removed (Q-37).
+    // `[DELETED]` is never a session, but its Cira id must still be found so
+    // the removal reaches Cira.
     let text = "\
 # Claude
 ## [DELETED] Old
-> bg=aaaa1111
 > cira=c-old
 
 ### WAIT
 ## Live
-> bg=bbbb2222
+> cira=c-live
 ## [DELETED] Older
 > uuid=cccc3333-0000-0000-0000-000000000000
 ## [DELETED] Bare
 ";
     let doc = parse(text);
     let ids: Vec<&str> = doc.sessions.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(ids, vec!["bbbb2222"]);
+    assert_eq!(ids, vec!["c-live"]);
     let deleted: Vec<(&str, IdKind)> =
       doc.deleted.iter().map(|d| (d.id.as_str(), d.id_kind)).collect();
     assert_eq!(
       deleted,
-      vec![("aaaa1111", IdKind::Bg), ("cccc3333-0000-0000-0000-000000000000", IdKind::Uuid)]
+      vec![("c-old", IdKind::Cira), ("cccc3333-0000-0000-0000-000000000000", IdKind::Uuid)]
     );
   }
 
   #[test]
-  fn bind_bg_migrates_a_legacy_uuid_line() {
+  fn binding_a_legacy_heading_writes_its_cira_id_and_drops_dangerous() {
     let text = "\
 # Claude
 ## S
@@ -2617,30 +2632,21 @@ hi
 draft
 ";
     let doc = parse(text);
-    let out = bind_bg_at(text, &doc, 0, "335b461a", Some("c-9")).unwrap();
+    let out = bind_cira_at(text, &doc, 0, "c-9").expect("the heading is there");
     assert!(!out.contains("> uuid="), "the legacy line is replaced, not kept: {out}");
+    assert!(!out.contains("> dangerous"), "the mode is Cira's now (Q-155): {out}");
     let s = &parse(&out).sessions[0];
-    assert_eq!((s.id.as_str(), s.id_kind), ("335b461a", IdKind::Bg));
-    assert_eq!(s.cira.as_deref(), Some("c-9"));
+    assert_eq!(s.cira(), Some("c-9"));
     assert_eq!(s.last_active, Some(42));
-    assert!(s.dangerous);
+    assert!(!s.dangerous);
     assert_eq!(s.messages.len(), 1);
     assert!(out.ends_with("### WAIT\ndraft\n"), "body untouched: {out}");
+    assert!(out.starts_with("# Claude\n## S\n> cira=c-9\n> last=42\n\n"), "{out}");
   }
 
   #[test]
-  fn bind_bg_rewrites_a_bg_line_and_keeps_the_stable_id() {
-    // Toggling `> dangerous` forks a new short id (Q-52); the stable Cira id
-    // must not change with it.
-    let text = "# Claude\n## S\n> bg=aaaa1111\n> cira=c-1\n> dangerous\n\n### WAIT\n";
-    let doc = parse(text);
-    let out = bind_bg_at(text, &doc, 0, "bbbb2222", Some("c-other")).unwrap();
-    assert_eq!(out, "# Claude\n## S\n> bg=bbbb2222\n> cira=c-1\n> dangerous\n\n### WAIT\n");
-  }
-
-  #[test]
-  fn bind_bg_adds_a_missing_id_line() {
-    // A hand-written heading with no id line: the short id must land on the
+  fn binding_adds_a_missing_id_line() {
+    // A hand-written heading with no id line: the id must land on the
     // session rather than being silently dropped.
     let text = "\
 # Claude
@@ -2650,20 +2656,19 @@ draft
 ";
     let doc = parse(text);
     assert_eq!(doc.sessions[0].id, "");
-    let updated = bind_bg_at(text, &doc, 0, "fresh000", Some("c-2")).unwrap();
+    let updated = bind_cira_at(text, &doc, 0, "c-2").expect("the heading is there");
     let new_doc = parse(&updated);
     assert_eq!(new_doc.sessions.len(), 1);
     assert_eq!(new_doc.sessions[0].label, "My Session");
-    assert_eq!(new_doc.sessions[0].id, "fresh000");
-    assert_eq!(new_doc.sessions[0].cira.as_deref(), Some("c-2"));
+    assert_eq!(new_doc.sessions[0].cira(), Some("c-2"));
     assert!(new_doc.sessions[0].wait.is_some(), "WAIT survived the insert");
   }
 
   #[test]
-  fn bind_bg_at_targets_the_right_duplicate_label() {
+  fn binding_targets_the_right_duplicate_label() {
     // Two sessions an older jc wrote with the same auto-label and no id yet.
     // A label-keyed write hits the first heading twice and strands the second;
-    // the index-keyed write must give each its own short id.
+    // the index-keyed write must give each its own id.
     let text = "\
 # Claude
 ## New Session
@@ -2674,63 +2679,83 @@ draft
     let doc = parse(text);
     assert_eq!(doc.sessions.len(), 2);
 
-    let once = bind_bg_at(text, &doc, 0, "aaaa0000", None).unwrap();
+    let once = bind_cira_at(text, &doc, 0, "c-a").unwrap();
     let doc = parse(&once);
-    let twice = bind_bg_at(&once, &doc, 1, "bbbb0000", None).unwrap();
+    let twice = bind_cira_at(&once, &doc, 1, "c-b").unwrap();
 
     let final_doc = parse(&twice);
     let ids: Vec<&str> = final_doc.sessions.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(ids, vec!["aaaa0000", "bbbb0000"], "each session keeps its own id");
+    assert_eq!(ids, vec!["c-a", "c-b"], "each session keeps its own id");
   }
 
   #[test]
-  fn update_last_active_lands_under_a_bg_line() {
-    let text = "# Claude\n## S\n> bg=aaaa1111\n\n### WAIT\n";
+  fn renaming_a_heading_keeps_its_marker_and_body() {
+    let text = "# Claude\n## [D] Old name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n";
+    let doc = parse(text);
+    let out = rename_heading_at(text, &doc, 0, "New name").expect("the heading is there");
+    assert_eq!(out, "# Claude\n## [D] New name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n");
+    let doc = parse(&out);
+    let out = rename_heading_at(&out, &doc, 1, "Renamed").unwrap();
+    assert!(out.ends_with("## Renamed\n> cira=c-2\n"), "{out}");
+  }
+
+  #[test]
+  fn update_last_active_lands_under_a_cira_line() {
+    let text = "# Claude\n## S\n> cira=c-1\n\n### WAIT\n";
     let doc = parse(text);
     let out = update_last_active(text, &doc.sessions[0], 7);
-    assert_eq!(out, "# Claude\n## S\n> bg=aaaa1111\n> last=7\n\n### WAIT\n");
+    assert_eq!(out, "# Claude\n## S\n> cira=c-1\n> last=7\n\n### WAIT\n");
   }
 
   #[test]
-  fn a_copied_heading_marked_deleted_or_disabled_spares_the_live_one() {
-    // Two headings name bg=S (a copy-pasted block); marking the copy
-    // [DELETED] or [D] must not stop or remove S while the other names it.
+  fn each_cira_id_takes_its_most_alive_marker() {
+    // Two headings name c-1 (a copy-pasted block): marking the copy [DELETED]
+    // or [D] must not stop or remove the session the other still runs.
     let text = "\
 # Claude
 ## Live
-> bg=aaaa1111
+> cira=c-1
 ## [DELETED] Copy
-> bg=aaaa1111
+> cira=c-1
 ## [D] Copy 2
-> bg=aaaa1111
+> cira=c-1
 ## [DELETED] Gone
-> bg=bbbb2222
+> cira=c-2
 ## [D] Asleep
-> bg=cccc3333
+> cira=c-3
+## [D] Asleep copy
+> cira=c-3
+## [DELETED] Asleep copy 2
+> cira=c-3
 ## [D] Legacy
 > uuid=dddd4444-0000-0000-0000-000000000000
+## Unbound
 ";
     let doc = parse(text);
-    assert_eq!(doc.removable_ids(), vec!["bbbb2222"]);
-    assert_eq!(doc.stoppable_ids(), vec!["cccc3333"]);
+    let marks: Vec<(&str, Mark)> = doc.marks().into_iter().collect();
+    assert_eq!(
+      marks,
+      vec![("c-1", Mark::Active), ("c-2", Mark::Deleted), ("c-3", Mark::Disabled)],
+      "legacy and unbound headings have no Cira id to mark"
+    );
   }
 
   #[test]
   fn a_deferred_send_stays_pending_until_the_scheduled_path_delivers_it() {
     // A Cmd-Enter to a session that is not up yet must not read as sent, and
     // must survive a jc quit: it becomes a past-due scheduled send.
-    let text = "# Claude\n## S\n> bg=aaaa1111\n\n### WAIT\nhello there\n";
+    let text = "# Claude\n## S\n> cira=c-1\n\n### WAIT\nhello there\n";
     let session = parse(text).sessions[0].clone();
     let sent = send_from_wait(text, &session, 0..0, Some(1), test_now()).unwrap();
     assert_eq!(sent.schedule, None);
     let doc = parse(&sent.new_text);
     let deferred =
-      defer_message(&sent.new_text, &doc, "aaaa1111", sent.message_index, test_now()).unwrap();
+      defer_message(&sent.new_text, &doc, "c-1", sent.message_index, test_now()).unwrap();
 
     let s = &parse(&deferred).sessions[0];
     let pending = s.pending_scheduled().expect("the message is pending, not sent");
     assert_eq!(pending.index, sent.message_index);
-    match fire_scheduled(&deferred, "aaaa1111", test_now(), 2) {
+    match fire_scheduled(&deferred, "c-1", test_now(), 2) {
       FireOutcome::Deliver { body, .. } => assert_eq!(body, sent.message_text),
       _ => panic!("expected delivery"),
     }

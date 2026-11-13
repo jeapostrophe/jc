@@ -1,6 +1,9 @@
-//! What jc reads from Cira (the mailbox between Jay and his sessions): each
-//! project's pending counts and each session's state, from `cira status
-//! --json`, polled on a thread of its own ([`poll`]).
+//! jc as a client of Cira (the mailbox between Jay and his sessions, which owns
+//! each session's lifecycle: Cira DESIGN 12). jc reads each project's pending
+//! counts and each session's state and lifecycle from `cira status --json`,
+//! polled on a thread of its own ([`poll`]), and asks for every change with
+//! `cira session new|mode|stop|rm|label` ([`Cira::new_session`] and its
+//! siblings).
 //!
 //! Cira's JSON is a contract whose fields are added, never renamed or dropped
 //! (Cira's `FOR-AGENTS.md`), so unknown fields are ignored and a state this
@@ -47,16 +50,87 @@ pub struct OpenCounts {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Session {
-  /// Its Cira id: the `CIRA_SESSION` jc passed (`> cira=`), else a uuid.
+  /// Its Cira id: the `CIRA_SESSION` Cira minted (`> cira=`), else a uuid.
   pub id: String,
   pub state: State,
   /// When it entered `state`, RFC 3339.
   pub state_since: String,
-  /// Its background short id (`> bg=`), once reported.
+  /// The background short id its hooks last reported.
   #[serde(default)]
   pub short: Option<String>,
   #[serde(default)]
   pub uuid: Option<String>,
+  /// Its name, Cira's (Q-159); jc shows it and sends renames.
+  #[serde(default)]
+  pub label: Option<String>,
+  /// The desired mode: `--dangerously-skip-permissions`.
+  #[serde(default)]
+  pub dangerous: bool,
+  /// Its hooks report bypass while Cira wants it normal.
+  #[serde(default)]
+  pub drift: bool,
+  /// The job Cira bound to it: what `claude attach` takes.
+  #[serde(default)]
+  pub job: Option<Job>,
+  #[serde(default)]
+  pub mode_pending: ModePending,
+  /// The lifecycle operation running now, or the last that failed.
+  #[serde(default)]
+  pub op: Option<Op>,
+  /// When `cira session stop` was last asked of it, RFC 3339.
+  #[serde(default)]
+  pub stopped_at: Option<String>,
+  /// When it was removed, RFC 3339: terminal.
+  #[serde(default)]
+  pub removed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Job {
+  pub short: String,
+  /// The flags it was started with.
+  #[serde(default)]
+  pub dangerous: bool,
+  /// What `claude agents --json --all` last said of it.
+  pub state: JobState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+  Running,
+  Stopped,
+  Failed,
+  /// Claude Code no longer lists it: removed.
+  Absent,
+  /// Not listed since the daemon started, or a state added after this build.
+  #[serde(other)]
+  Unknown,
+}
+
+/// Whether the job owes a fork into the desired mode (Cira DESIGN 12).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModePending {
+  #[default]
+  None,
+  WaitingForIdle,
+  /// The daemon forks it now.
+  Due,
+  /// Deferred by a stop until the job runs again.
+  Stopped,
+  #[serde(other)]
+  Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Op {
+  /// `start`, `mode`, `stop`, `remove` or `respawn`.
+  pub op: String,
+  /// Running now; otherwise it failed, and `error` says why.
+  pub running: bool,
+  #[serde(default)]
+  pub error: Option<String>,
 }
 
 /// A session's state as Cira records it (Cira DESIGN 8).
@@ -79,6 +153,11 @@ pub enum State {
 impl Status {
   pub fn parse(json: &[u8]) -> serde_json::Result<Self> {
     serde_json::from_slice(json)
+  }
+
+  /// The session with Cira id `id`, in whichever project holds it.
+  pub fn session(&self, id: &str) -> Option<&Session> {
+    self.projects.iter().flat_map(|p| &p.sessions).find(|s| s.id == id)
   }
 
   /// The Cira project a jc project at `path` belongs to: the deepest one whose
@@ -113,10 +192,29 @@ impl Project {
   }
 }
 
+fn rfc3339(at: &str) -> Option<SystemTime> {
+  chrono::DateTime::parse_from_rfc3339(at).ok().map(SystemTime::from)
+}
+
 impl Session {
   /// `state_since` as a time, `None` when it does not parse.
   pub fn since(&self) -> Option<SystemTime> {
-    chrono::DateTime::parse_from_rfc3339(&self.state_since).ok().map(SystemTime::from)
+    rfc3339(&self.state_since)
+  }
+
+  /// `stopped_at` as a time.
+  pub fn stopped(&self) -> Option<SystemTime> {
+    self.stopped_at.as_deref().and_then(rfc3339)
+  }
+
+  /// A lifecycle operation is running on it now.
+  pub fn op_running(&self) -> bool {
+    self.op.as_ref().is_some_and(|o| o.running)
+  }
+
+  /// Why its last operation failed, if it did.
+  pub fn op_error(&self) -> Option<&str> {
+    self.op.as_ref().filter(|o| !o.running).and_then(|o| o.error.as_deref())
   }
 }
 
@@ -260,6 +358,8 @@ pub fn marker(
 pub struct Cira {
   program: PathBuf,
   timeout: Duration,
+  /// How long a `cira session …` request may take ([`Cira::CALL`]).
+  call: Duration,
 }
 
 impl Default for Cira {
@@ -276,65 +376,233 @@ impl Cira {
   pub const TIMEOUT: Duration = Duration::from_secs(3);
 
   pub fn new(program: impl Into<PathBuf>, timeout: Duration) -> Self {
-    Self { program: program.into(), timeout }
+    Self { program: program.into(), timeout, call: Self::CALL }
   }
 
   /// `cira status --json`, or `None` when Cira is unreachable: not installed,
   /// no daemon, too slow, any failure exit, or output that does not parse.
   /// Blocks for up to the timeout, so it is never called on the main thread.
   pub fn status(&self) -> Option<Status> {
-    let mut child = Command::new(&self.program)
-      .args(["status", "--json"])
-      .stdin(Stdio::null())
-      .stdout(Stdio::piped())
-      .stderr(Stdio::null())
-      .spawn()
-      .ok()?;
-    // Read on a thread of its own, so a large answer cannot fill the pipe and
-    // stall the child while this one waits for it to exit.
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-      let mut out = Vec::new();
-      stdout.read_to_end(&mut out).map(|_| out)
-    });
-    let deadline = Instant::now() + self.timeout;
-    let exit = loop {
-      match child.try_wait() {
-        Ok(Some(exit)) => break exit,
-        Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-        _ => {
-          let _ = child.kill();
-          let _ = child.wait();
-          return None;
-        }
-      }
-    };
-    let out = reader.join().ok()?.ok()?;
-    if !exit.success() {
+    let mut cmd = Command::new(&self.program);
+    let (code, out, _) = run_bounded(cmd.args(["status", "--json"]), self.timeout)?;
+    if code != Some(0) {
       return None;
     }
     Status::parse(&out).ok()
   }
+
+  /// The same, with `call` for each `cira session …` request.
+  pub fn with_call_timeout(self, call: Duration) -> Self {
+    Self { call, ..self }
+  }
+
+  /// `cira session new`: Cira mints the session's id and starts its job.
+  /// With `wait`, returns once the job has started or its start has failed.
+  pub fn new_session(&self, req: &NewSession) -> Result<Created, CallError> {
+    let timeout = if req.wait { Self::WAIT.max(self.call) } else { self.call };
+    let out = self.call(&req.args(), timeout)?;
+    serde_json::from_slice(&out).map_err(|e| CallError::Malformed(e.to_string()))
+  }
+
+  /// `cira session mode`: ask for `dangerous`, compare-and-set against the
+  /// mode jc showed (`from`; exit 4 when it is no longer that).
+  pub fn set_mode(&self, id: &str, dangerous: bool, from: bool) -> Result<(), CallError> {
+    self.call(&mode_args(id, dangerous, from), self.call).map(drop)
+  }
+
+  /// `cira session stop`.
+  pub fn stop(&self, id: &str) -> Result<(), CallError> {
+    self.call(&jays_args("stop", id), self.call).map(drop)
+  }
+
+  /// `cira session rm`: terminal.
+  pub fn remove(&self, id: &str) -> Result<(), CallError> {
+    self.call(&jays_args("rm", id), self.call).map(drop)
+  }
+
+  /// `cira session label`: the label is Cira's (Q-159).
+  pub fn rename(&self, id: &str, label: &str) -> Result<(), CallError> {
+    let args = strs(&["session", "label", "--json", "--", id, label]);
+    self.call(&args, self.call).map(drop)
+  }
+
+  /// How long a request may take: `cira` waits up to 12 s for a daemon to
+  /// accept, then the request itself.
+  pub const CALL: Duration = Duration::from_secs(30);
+  /// `session new --wait`: Cira waits two starts and a margin (its `WAIT`).
+  const WAIT: Duration = Duration::from_secs(2 * 180 + 60);
+
+  /// Run `cira <args>`, its stdout on success.
+  fn call(&self, args: &[String], timeout: Duration) -> Result<Vec<u8>, CallError> {
+    let run = run_bounded(Command::new(&self.program).args(args), timeout);
+    let (code, stdout, stderr) = run.ok_or(CallError::Unreachable)?;
+    match code {
+      Some(0) => Ok(stdout),
+      // 125: no daemon accepted, nothing sent; 124: no answer.
+      Some(124) | Some(125) | None => Err(CallError::Unreachable),
+      Some(code) => Err(CallError::Refused { code, message: stderr, stdout }),
+    }
+  }
+}
+
+/// Why a `cira session …` request did not succeed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallError {
+  /// Not installed, no daemon, no answer in time: nothing known recorded.
+  Unreachable,
+  /// Cira answered with exit `code` (`cira_proto::exit`: 4 conflict, 5
+  /// invalid, 6 not found, …); `message` is its stderr. `stdout` is what it
+  /// printed anyway (`new --wait --json` prints the session when its job
+  /// failed to start, exit 1).
+  Refused { code: i32, message: String, stdout: Vec<u8> },
+  /// It answered with output this build cannot read.
+  Malformed(String),
+}
+
+impl std::fmt::Display for CallError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      CallError::Unreachable => write!(f, "Cira is unreachable"),
+      CallError::Refused { code, message, .. } => write!(f, "{} (exit {code})", message.trim()),
+      CallError::Malformed(e) => write!(f, "Cira's answer did not parse: {e}"),
+    }
+  }
+}
+
+/// Exit codes of Cira's contract jc acts on (Cira FOR-AGENTS "Exit codes").
+pub mod exit {
+  /// `session new --wait`: the job did not start (stdout still has the session).
+  pub const ERROR: i32 = 1;
+  /// `--from` is no longer the session's mode.
+  pub const CONFLICT: i32 = 4;
+  /// Refused, e.g. `--resume` of a conversation with no transcript, or a
+  /// removed session asked to stop.
+  pub const INVALID: i32 = 5;
+}
+
+/// A `cira session new` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewSession {
+  pub cwd: PathBuf,
+  pub label: String,
+  /// Continue this Claude conversation (migrating a `> uuid=` heading).
+  pub resume: Option<String>,
+  pub dangerous: bool,
+  pub wait: bool,
+}
+
+impl NewSession {
+  /// The arguments after `cira`. Values go as `--opt=value`, so a label that
+  /// starts with `-` is never read as a flag. Starting a dangerous session is
+  /// Jay's (Q-171), and jc acts for Jay, so it says `--from-jay`.
+  pub fn args(&self) -> Vec<String> {
+    let mut args = strs(&["session", "new", "--json"]);
+    args.push(format!("--cwd={}", self.cwd.display()));
+    args.push(format!("--label={}", self.label));
+    if let Some(uuid) = &self.resume {
+      args.push(format!("--resume={uuid}"));
+    }
+    if self.dangerous {
+      args.extend(strs(&["--dangerous", "--from-jay"]));
+    }
+    if self.wait {
+      args.push("--wait".into());
+    }
+    args
+  }
+}
+
+/// `cira session new --json`'s answer, as much as jc uses.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Created {
+  pub session: String,
+  /// Under `--wait`: the session as `cira status --json` lists it.
+  #[serde(default)]
+  pub status: Option<Session>,
+}
+
+fn strs(v: &[&str]) -> Vec<String> {
+  v.iter().map(|s| s.to_string()).collect()
+}
+
+/// `session mode|stop|rm` change a session's job, which is Jay's (Q-157): jc
+/// is Jay's client, so it says `--from-jay`.
+fn jays_args(verb: &str, id: &str) -> Vec<String> {
+  strs(&["session", verb, "--json", "--from-jay", "--", id])
+}
+
+fn mode_args(id: &str, dangerous: bool, from: bool) -> Vec<String> {
+  let mode = |d: bool| if d { "dangerous" } else { "normal" };
+  let mut args = strs(&["session", "mode", "--json", "--from-jay"]);
+  args.push(format!("--from={}", mode(from)));
+  args.extend(strs(&["--", id, mode(dangerous)]));
+  args
+}
+
+/// Run `cmd` with stdin closed, killing it after `timeout`: its exit code
+/// (`None` when killed or signalled), stdout and stderr. `None` when it could
+/// not be started.
+fn run_bounded(cmd: &mut Command, timeout: Duration) -> Option<(Option<i32>, Vec<u8>, String)> {
+  let mut child = cmd
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .ok()?;
+  // Read on threads of their own, so a large answer cannot fill a pipe and
+  // stall the child while this one waits for it to exit.
+  let drain = |pipe: Option<Box<dyn Read + Send>>| {
+    std::thread::spawn(move || {
+      let mut out = Vec::new();
+      if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut out);
+      }
+      out
+    })
+  };
+  let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+  let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+  let deadline = Instant::now() + timeout;
+  let exit = loop {
+    match child.try_wait() {
+      Ok(Some(exit)) => break Some(exit),
+      Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+      _ => {
+        let _ = child.kill();
+        let _ = child.wait();
+        break None;
+      }
+    }
+  };
+  let stdout = stdout.join().unwrap_or_default();
+  let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
+  Some((exit.and_then(|e| e.code()), stdout, stderr))
 }
 
 /// Call `read` every `every`, on a thread of its own, and send each result.
 /// The caller's thread never runs `read`. Reads never overlap: the next waits
-/// for the last and then `every`. The thread ends once the receiver is
-/// dropped.
+/// for the last and then `every`, or less once something is sent on the
+/// returned kick (a read wanted now: a Claude pane's attach client exited).
+/// The thread ends once the receiver is dropped.
 pub fn poll<T: Send + 'static>(
   every: Duration,
   mut read: impl FnMut() -> T + Send + 'static,
-) -> flume::Receiver<T> {
+) -> (flume::Receiver<T>, flume::Sender<()>) {
   let (tx, rx) = flume::bounded(1);
+  let (kick, kicked) = flume::unbounded();
   std::thread::Builder::new()
     .name("jc-cira-poll".into())
     .spawn(move || {
       while tx.send(read()).is_ok() {
-        std::thread::sleep(every);
+        match kicked.recv_timeout(every) {
+          Ok(()) => while kicked.try_recv().is_ok() {},
+          Err(flume::RecvTimeoutError::Timeout) => {}
+          Err(flume::RecvTimeoutError::Disconnected) => std::thread::sleep(every),
+        }
       }
     })
     .expect("spawning the Cira poll thread");
-  rx
+  (rx, kick)
 }
 
 #[cfg(test)]
@@ -558,7 +826,7 @@ mod tests {
   fn the_poll_reads_off_the_calling_thread() {
     let caller = std::thread::current().id();
     let started = Instant::now();
-    let rx = poll(Duration::from_millis(10), move || {
+    let (rx, _kick) = poll(Duration::from_millis(10), move || {
       std::thread::sleep(Duration::from_millis(200));
       std::thread::current().id()
     });
@@ -570,4 +838,115 @@ mod tests {
       assert_ne!(reader, caller);
     }
   }
+
+  // ---- jc as Cira's client (PLAN TMUX-01/02) ----
+
+  fn script(name: &str, body: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("jc-cira-call-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+  }
+
+  #[test]
+  fn new_session_passes_values_that_cannot_be_read_as_flags() {
+    let req = NewSession {
+      cwd: "/p/q r".into(),
+      label: "-n surprise".into(),
+      resume: None,
+      dangerous: false,
+      wait: false,
+    };
+    assert_eq!(
+      req.args(),
+      ["session", "new", "--json", "--cwd=/p/q r", "--label=-n surprise"],
+      "a plain start is anyone's: no --from-jay"
+    );
+    let req = NewSession {
+      resume: Some("335b461a-eba5-485f-898c-f757fdb3f2bf".into()),
+      dangerous: true,
+      wait: true,
+      ..req
+    };
+    let args = req.args();
+    assert!(args.contains(&"--resume=335b461a-eba5-485f-898c-f757fdb3f2bf".to_string()));
+    assert!(args.contains(&"--dangerous".to_string()));
+    assert!(args.contains(&"--from-jay".to_string()), "a dangerous start is Jay's (Q-171)");
+    assert!(args.contains(&"--wait".to_string()));
+  }
+
+  #[test]
+  fn mode_stop_and_rm_are_jays_and_name_the_session_after_a_double_dash() {
+    assert_eq!(
+      mode_args("-c1", true, false),
+      ["session", "mode", "--json", "--from-jay", "--from=normal", "--", "-c1", "dangerous"]
+    );
+    assert_eq!(mode_args("c1", false, true)[4..], ["--from=dangerous", "--", "c1", "normal"]);
+    assert_eq!(jays_args("stop", "c1"), ["session", "stop", "--json", "--from-jay", "--", "c1"]);
+    assert_eq!(jays_args("rm", "c1")[1], "rm");
+  }
+
+  #[test]
+  fn a_call_tells_unreachable_from_refused() {
+    let t = Duration::from_secs(10);
+    let gone = Cira::new("/nonexistent/jc-test/cira", t);
+    assert_eq!(gone.stop("c1"), Err(CallError::Unreachable), "not installed");
+    // 125: no daemon accepted; nothing was sent.
+    let no_daemon = Cira::new(script("no-daemon", "echo 'no daemon' >&2; exit 125"), t);
+    assert_eq!(no_daemon.stop("c1"), Err(CallError::Unreachable));
+    let conflict = Cira::new(script("conflict", "echo 'mode is dangerous' >&2; exit 4"), t);
+    match conflict.set_mode("c1", true, false) {
+      Err(CallError::Refused { code: exit::CONFLICT, message, .. }) => {
+        assert_eq!(message.trim(), "mode is dangerous")
+      }
+      other => panic!("expected a conflict, got {other:?}"),
+    }
+    let slow = Cira::new(script("slow", "exec sleep 30"), t)
+      .with_call_timeout(Duration::from_millis(200));
+    assert_eq!(slow.rename("c1", "x"), Err(CallError::Unreachable), "no answer in time");
+  }
+
+  #[test]
+  fn new_session_reads_the_minted_id_and_the_status_a_failed_wait_prints() {
+    let t = Duration::from_secs(10);
+    let made = Cira::new(
+      script("made", r#"echo '{"project":"p","session":"s-1","recorded":true,"project_created":false}'"#),
+      t,
+    );
+    let req = NewSession {
+      cwd: "/p".into(),
+      label: "L".into(),
+      resume: None,
+      dangerous: false,
+      wait: false,
+    };
+    assert_eq!(made.new_session(&req).unwrap().session, "s-1");
+    // `--wait` whose job did not start: exit 1, the session still printed.
+    let (_, raw) = fixture();
+    let listed = raw["projects"][0]["sessions"][0].clone();
+    let body = serde_json::json!({ "project": "p", "session": "s-2", "status": listed });
+    let failed = Cira::new(script("failed", &format!("echo '{body}'; exit 1")), t);
+    match failed.new_session(&NewSession { wait: true, ..req }) {
+      Err(CallError::Refused { code: exit::ERROR, stdout, .. }) => {
+        let created: Created = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(created.session, "s-2");
+        assert!(created.status.is_some());
+      }
+      other => panic!("expected exit 1 with the session, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn a_kick_starts_the_next_read_at_once() {
+    let started = Instant::now();
+    let (rx, kick) = poll(Duration::from_secs(60), Instant::now);
+    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    kick.send(()).unwrap();
+    rx.recv_timeout(Duration::from_secs(5)).expect("a second read well before 60 s");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+  }
+
 }

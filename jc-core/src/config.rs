@@ -74,6 +74,11 @@ pub fn state_path() -> PathBuf {
   config_dir().join("state.toml")
 }
 
+/// What jc remembers of each Cira session (`crate::lifecycle::Records`).
+pub fn sessions_path() -> PathBuf {
+  config_dir().join("sessions.toml")
+}
+
 pub fn theme_path() -> PathBuf {
   config_dir().join("theme.toml")
 }
@@ -115,6 +120,14 @@ pub fn load_state() -> Result<AppState> {
 
 pub fn save_state(state: &AppState) -> Result<()> {
   save_toml("state.toml", state)
+}
+
+pub fn load_sessions() -> Result<crate::lifecycle::Records> {
+  load_toml(&sessions_path())
+}
+
+pub fn save_sessions(records: &crate::lifecycle::Records) -> Result<()> {
+  save_toml("sessions.toml", records)
 }
 
 #[cfg(test)]
