@@ -230,6 +230,7 @@ impl Render for Workspace {
       .child(self.render_title_bar(cx))
       .when(self.cira.reachable == Some(false), |el| el.child(cira_unreachable_banner(cx)))
       .when_some(self.hook_warning.clone(), |el, why| el.child(warning_banner(why.into(), cx)))
+      .when_some(self.refusal.clone(), |el, (_, why)| el.child(warning_banner(why.into(), cx)))
       .child(pane_area)
       .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
       .when_some(self.keybinding_help.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))

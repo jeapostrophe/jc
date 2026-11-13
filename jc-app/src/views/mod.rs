@@ -39,19 +39,17 @@ pub fn scroll_editor_to_line<V: 'static>(
   });
 }
 
-/// Renders a warning banner while unsaved edits conflict with a change on disk.
-pub fn external_change_banner(externally_modified: bool, cx: &App) -> AnyElement {
-  if externally_modified {
-    let theme = cx.theme();
-    div()
-      .px_2()
-      .py_1()
-      .bg(theme.warning)
-      .text_sm()
-      .text_color(theme.warning_foreground)
-      .child("Merge conflict \u{2014} nothing is saved until Cmd-R reloads from disk (unsaved edits will be lost)")
-      .into_any_element()
-  } else {
-    div().into_any_element()
-  }
+/// One warning line over an editor pane: a conflict, or a save that failed
+/// (`SharedFile::banner`), else nothing.
+pub fn file_banner(text: Option<String>, cx: &App) -> AnyElement {
+  let Some(text) = text else { return div().into_any_element() };
+  let theme = cx.theme();
+  div()
+    .px_2()
+    .py_1()
+    .bg(theme.warning)
+    .text_sm()
+    .text_color(theme.warning_foreground)
+    .child(text)
+    .into_any_element()
 }

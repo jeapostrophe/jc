@@ -586,6 +586,15 @@ pub struct NewSession {
 }
 
 impl NewSession {
+  /// A session Jay starts from jcc (New session, a transcript or an unbound
+  /// heading adopted), in `cwd`, continuing `resume` if given (then waiting
+  /// for its job): dangerous, Jay's default (Q-168: "I actually prefer
+  /// everything to be dangerous unless specifically choosing auto").
+  pub fn for_jay(cwd: PathBuf, label: String, resume: Option<String>) -> Self {
+    let wait = resume.is_some();
+    Self { cwd, label, resume, dangerous: true, wait }
+  }
+
   /// The arguments after `cira`. Values go as `--opt=value`, so a label that
   /// starts with `-` is never read as a flag. The mode is always named: Cira
   /// starts a session dangerous unless asked for auto, and refuses a
@@ -1036,6 +1045,18 @@ mod tests {
     assert!(args.contains(&"--dangerous".to_string()));
     assert!(args.contains(&"--from-jay".to_string()), "a dangerous start is Jay's (Q-171)");
     assert!(args.contains(&"--wait".to_string()));
+  }
+
+  #[test]
+  fn a_session_jay_starts_is_dangerous_and_his() {
+    let fresh = NewSession::for_jay("/p".into(), "New Session".into(), None);
+    assert_eq!(
+      fresh.args(),
+      ["session", "new", "--json", "--cwd=/p", "--label=New Session", "--dangerous", "--from-jay"],
+      "Jay's new session started auto (Q-168: dangerous unless he chooses auto)"
+    );
+    let adopted = NewSession::for_jay("/p".into(), "T".into(), Some("u".into()));
+    assert!(adopted.dangerous && adopted.wait, "{adopted:?}");
   }
 
   #[test]

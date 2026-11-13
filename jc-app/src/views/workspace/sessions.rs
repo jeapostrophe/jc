@@ -173,43 +173,65 @@ impl Workspace {
   }
 
   /// Open jcc's todo.md for each project a read names and whose TODO is not
-  /// open yet, and start its sessions. A project no Cira project holds is
-  /// registered under its directory's name, as `cira session new` would, so
-  /// its TODO opens at a later read. Returns whether one opened.
+  /// open yet, and start its sessions ([`lifecycle::plan_todos`]). One that
+  /// another project already holds (a directory inside it, in the same Cira
+  /// project) stays closed, its pane saying where to work instead. A project
+  /// no Cira project holds is registered under its directory's name, as `cira
+  /// session new` would, so its TODO opens at a later read; a refusal shows in
+  /// its TODO pane. Returns whether anything shown changed.
   fn open_todos(&mut self, status: &Status, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    let projects: Vec<(PathBuf, Option<PathBuf>)> = self
+      .projects
+      .iter()
+      .map(|p| {
+        (p.path.clone(), p.todo_view.read(cx).code_view().read(cx).file_path().map(PathBuf::from))
+      })
+      .collect();
     let palette = super::palette_from_window(window);
-    let mut opened = false;
-    for pi in 0..self.projects.len() {
-      if self.projects[pi].todo_open(cx) {
-        continue;
-      }
-      let path = self.projects[pi].path.clone();
-      if let Some(todo) = self.flavor.todo_path(&path, Some(status)) {
-        self.projects[pi].open_todo(todo, &palette, window, cx);
-        opened = true;
-        continue;
-      }
-      let Some(cira) = self.cira_client.clone() else { continue };
-      if !self.cira.registering.insert(path.clone()) {
-        continue;
-      }
-      let name = self.projects[pi].name.clone();
-      self.run_blocking(
-        window,
-        cx,
-        move || cira.add_project(&name, &path).map_err(|e| (name, path, e)),
-        |ws, added, _window, _cx| match added {
-          Ok(()) => ws.kick_cira(),
-          Err((name, path, e)) => {
-            eprintln!("cira project add {name} --path {}: {e}", path.display())
+    let mut changed = false;
+    for (pi, plan) in lifecycle::plan_todos(status, &projects) {
+      match plan {
+        lifecycle::TodoPlan::Open(todo) => {
+          self.projects[pi].open_todo(todo, &palette, window, cx);
+          changed = true;
+        }
+        lifecycle::TodoPlan::HeldBy { todo, project } => {
+          let why = format!(
+            "{} is already open as project {}: jcc keeps one view of it, so work there",
+            todo.display(),
+            project.display()
+          );
+          changed |= self.projects[pi].todo_view.update(cx, |tv, cx| tv.set_waiting(Some(why), cx));
+        }
+        lifecycle::TodoPlan::Register => {
+          let Some(cira) = self.cira_client.clone() else { continue };
+          let path = self.projects[pi].path.clone();
+          if !self.cira.registering.insert(path.clone()) {
+            continue;
           }
-        },
-      );
+          let name = self.projects[pi].name.clone();
+          self.run_blocking(
+            window,
+            cx,
+            move || cira.add_project(&name, &path).map_err(|e| (name, path, e)),
+            |ws, added, _window, cx| match added {
+              Ok(()) => ws.kick_cira(),
+              Err((name, path, e)) => {
+                let why = format!("jcc's TODO cannot open: `cira project add {name}` refused: {e}");
+                eprintln!("{why} ({})", path.display());
+                if let Some(pi) = ws.project_index(&path) {
+                  ws.projects[pi].todo_view.update(cx, |tv, cx| tv.set_waiting(Some(why), cx));
+                }
+              }
+            },
+          );
+        }
+      }
     }
-    if opened {
+    if changed {
       self.refresh_breadcrumb_observers(cx);
     }
-    opened
+    changed
   }
 
   /// Bring every Claude pane in line with Cira: migrate a legacy heading,
@@ -566,7 +588,7 @@ impl Workspace {
     // Its heading goes into jcc's todo.md, which opens once Cira names the
     // project: until then there is nowhere to write it.
     if !self.projects[pi].todo_open(cx) {
-      crate::notify::beep();
+      self.refuse("No new session yet: jcc's TODO for this project is not open (see its pane)", cx);
       return;
     }
     // Cosmetic only — nothing addresses a session by label (see
@@ -591,8 +613,12 @@ impl Workspace {
     // on the same conversation (Cira answers the same one, but jc would write
     // two headings).
     let in_flight = |s: &SessionState| s.adopting.as_deref() == Some(uuid.as_str());
-    if !self.projects[pi].todo_open(cx) || self.projects[pi].sessions.values().any(in_flight) {
-      crate::notify::beep();
+    if !self.projects[pi].todo_open(cx) {
+      self.refuse("Not adopted: jcc's TODO for this project is not open (see its pane)", cx);
+      return;
+    }
+    if self.projects[pi].sessions.values().any(in_flight) {
+      self.refuse("Not adopted: that conversation is already being asked for", cx);
       return;
     }
     // The summary is the transcript's first user message, so two sessions that
@@ -611,8 +637,13 @@ impl Workspace {
       move |ws, running, window, cx| {
         let Some(pi) = ws.project_index(&path) else { return };
         if running {
-          eprintln!("adopt: a `claude` process still runs {uuid} (jc?); not resuming it in Cira");
-          crate::notify::beep();
+          ws.refuse(
+            format!(
+              "Not adopted: a `claude` process still runs {uuid} (jc?); end it there first, \
+               or Cira would run it twice"
+            ),
+            cx,
+          );
           return;
         }
         ws.start_unrecorded(pi, label, Some(uuid), window, cx);
@@ -644,8 +675,7 @@ impl Workspace {
     if let Some(session) = self.projects[pi].sessions.get_mut(&sid) {
       session.adopting = resume.clone();
     }
-    let wait = resume.is_some();
-    let req = NewSession { cwd: path.clone(), label, resume, dangerous: false, wait };
+    let req = NewSession::for_jay(path.clone(), label, resume);
     self.request_session(path, sid, req, "asking Cira for a session…", window, cx);
   }
 
@@ -682,7 +712,7 @@ impl Workspace {
     // failed makes way for a new try.
     let project = &self.projects[pi];
     if project.sessions.values().any(|s| s.unbound_key.as_ref() == Some(key) && !s.failed) {
-      crate::notify::beep();
+      self.refuse("Not adopted: a session for that heading is already being asked for", cx);
       return;
     }
     let failed: Vec<SessionId> = project
@@ -714,13 +744,7 @@ impl Workspace {
     session.attach_since = Some(SystemTime::now());
     if heading.id.is_empty() {
       session.unbound_key = Some(key.clone());
-      let req = NewSession {
-        cwd: path.clone(),
-        label: heading.label.clone(),
-        resume: None,
-        dangerous: false,
-        wait: false,
-      };
+      let req = NewSession::for_jay(path.clone(), heading.label.clone(), None);
       self.request_session(path, sid, req, "asking Cira for a session…", window, cx);
     }
     self.kick_cira();
@@ -747,7 +771,7 @@ impl Workspace {
     let path = self.projects[pi].path.clone();
     let Some(session) = self.projects[pi].active_session() else { return };
     let (Some(id), Some(from)) = (session.cira.clone(), session.dangerous()) else {
-      crate::notify::beep();
+      self.refuse("No mode change yet: Cira has not listed this session", cx);
       return;
     };
     let sid = session.id;
@@ -938,7 +962,7 @@ impl Workspace {
     };
     // A request in flight must finish writing the heading's id first.
     if adopted.is_some_and(|(_, asking)| asking) {
-      crate::notify::beep();
+      self.refuse("Not now: Cira is still answering for this session's heading", cx);
       self.panes[self.active_pane_index].read(cx).focus_content(window);
       return;
     }

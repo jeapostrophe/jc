@@ -33,6 +33,8 @@ pub struct TodoView {
   document: TodoDocument,
   /// Whose sessions the document holds (`jc_core::flavor::Flavor::section`).
   flavor: Flavor,
+  /// jcc, while no file is open: why, if more than waiting for Cira.
+  waiting: Option<String>,
   active_key: Option<String>,
   _editor_subscription: Subscription,
 }
@@ -65,13 +67,24 @@ impl TodoView {
     let flavor = Flavor::current();
     let document = todo::parse(&text, flavor);
 
-    Self { code_view, document, flavor, active_key: None, _editor_subscription }
+    Self { code_view, document, flavor, waiting: None, active_key: None, _editor_subscription }
   }
 
   /// Open `todo`, for a view made with none (jcc, once Cira names the project).
   pub fn open(&mut self, todo: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    self.waiting = None;
     self.code_view.update(cx, |cv, cx| cv.open_file(todo, window, cx));
     self.reparse(cx);
+  }
+
+  /// Say why the TODO is not open (jcc). Returns whether that changed.
+  pub fn set_waiting(&mut self, why: Option<String>, cx: &mut Context<Self>) -> bool {
+    let changed = self.waiting != why;
+    if changed {
+      self.waiting = why;
+      cx.notify();
+    }
+    changed
   }
 
   pub fn is_open(&self, cx: &App) -> bool {
@@ -428,13 +441,18 @@ impl TodoView {
 
 impl Render for TodoView {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    let waiting = !self.is_open(cx);
+    let waiting = (!self.is_open(cx)).then(|| {
+      self
+        .waiting
+        .clone()
+        .unwrap_or_else(|| "jcc's TODO opens once Cira names this project (`cira status`)".into())
+    });
     div()
       .id("todo-view")
       .size_full()
       .flex()
       .flex_col()
-      .when(waiting, |el| {
+      .when_some(waiting, |el, why| {
         let theme = cx.theme();
         el.child(
           div()
@@ -443,7 +461,7 @@ impl Render for TodoView {
             .bg(theme.warning)
             .text_sm()
             .text_color(theme.warning_foreground)
-            .child("jcc's TODO opens once Cira names this project (`cira status`)"),
+            .child(why),
         )
       })
       .child(self.code_view.clone())

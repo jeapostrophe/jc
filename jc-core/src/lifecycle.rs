@@ -4,10 +4,11 @@
 //! moved ([`label_sync`]). Pure: the workspace feeds them `cira status --json`
 //! and what it remembers ([`Records`], `sessions.toml` in jc's config dir).
 
-use crate::cira::{CallError, JobState, ModePending, Session, SessionShell, exit};
+use crate::cira::{CallError, JobState, ModePending, Session, SessionShell, Status, exit};
 use crate::todo::Mark;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 /// What a Claude pane does now.
@@ -352,9 +353,77 @@ pub struct Record {
   pub label: Option<String>,
 }
 
+/// What a jcc project whose todo.md is not open yet does with a status read
+/// ([`plan_todos`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TodoPlan {
+  /// Open this file and start its sessions.
+  Open(PathBuf),
+  /// This file is already the TODO of jc project `project` (an enclosing
+  /// directory in the same Cira project): opening it twice would start every
+  /// session twice, so it stays closed here.
+  HeldBy { todo: PathBuf, project: PathBuf },
+  /// No Cira project holds the directory yet: register one.
+  Register,
+}
+
+/// jcc: for each project (`path`, the todo.md it has open), in order, what a
+/// status read means for one with none open. One todo.md is never open in two
+/// projects: the first to claim it, or the one that already has it, keeps it.
+pub fn plan_todos(
+  status: &Status,
+  projects: &[(PathBuf, Option<PathBuf>)],
+) -> Vec<(usize, TodoPlan)> {
+  // Who holds each todo.md: those open already, then each claim in order.
+  let mut held: Vec<(PathBuf, PathBuf)> =
+    projects.iter().filter_map(|(path, open)| Some((open.clone()?, path.clone()))).collect();
+  let mut plans = Vec::new();
+  for (i, (path, open)) in projects.iter().enumerate() {
+    if open.is_some() {
+      continue;
+    }
+    let Some(todo) = status.todo_for(path) else {
+      plans.push((i, TodoPlan::Register));
+      continue;
+    };
+    match held.iter().find(|(t, _)| *t == todo) {
+      Some((_, project)) => plans.push((i, TodoPlan::HeldBy { todo, project: project.clone() })),
+      None => {
+        held.push((todo.clone(), path.clone()));
+        plans.push((i, TodoPlan::Open(todo)));
+      }
+    }
+  }
+  plans
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn one_todo_md_is_never_open_in_two_projects() {
+    // jc projects ~/w/cira and ~/w/cira/worktrees/x are both in Cira project `cira`.
+    let status =
+      Status::parse(br#"{"home":"/store","projects":[{"name":"cira","path":"/w/cira"}]}"#).unwrap();
+    let todo = PathBuf::from("/store/projects/cira/todo.md");
+    let outer = PathBuf::from("/w/cira");
+    let inner = PathBuf::from("/w/cira/worktrees/x");
+    let other = PathBuf::from("/elsewhere");
+
+    let plans = plan_todos(&status, &[(outer.clone(), None), (inner.clone(), None), (other, None)]);
+    assert_eq!(plans[0], (0, TodoPlan::Open(todo.clone())));
+    assert_eq!(
+      plans[1],
+      (1, TodoPlan::HeldBy { todo: todo.clone(), project: outer.clone() }),
+      "two views on one todo.md would start and attach every session twice"
+    );
+    assert_eq!(plans[2], (2, TodoPlan::Register));
+
+    // Whichever project already has it open keeps it.
+    let plans = plan_todos(&status, &[(outer.clone(), None), (inner.clone(), Some(todo.clone()))]);
+    assert_eq!(plans, [(0, TodoPlan::HeldBy { todo, project: inner })]);
+  }
   use crate::cira::Status;
 
   /// A session as `cira status --json` lists it, from the real fixture's

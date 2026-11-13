@@ -94,7 +94,10 @@ impl CodeView {
     let ours = self.editor.read(cx).value().to_string();
     let Some(file) = self.file.as_mut() else { return };
     let old_base = file.base().to_string();
+    let old_banner = file.banner();
     match file.disk_changed(&ours) {
+      // A conflict may have ended (the disk went back to the base).
+      DiskChange::Unchanged if self.banner() != old_banner => cx.notify(),
       DiskChange::Unchanged => {}
       DiskChange::Replace(text) => {
         // An unedited pane scrolls to the change so it is seen.
@@ -118,12 +121,12 @@ impl CodeView {
     let ours = self.editor.read(cx).value().to_string();
     let Some(file) = self.file.as_mut() else { return };
     let old_base = file.base().to_string();
-    let was_conflicted = file.has_conflict();
+    let had_banner = file.banner().is_some();
     let content = file.reload();
     // Single pass: find the first changed line (or None if identical / initial load).
     let first_changed_line = first_differing_line(&old_base, &content);
     if first_changed_line.is_none() && !old_base.is_empty() && ours == old_base {
-      if was_conflicted {
+      if had_banner {
         cx.notify();
       }
       return;
@@ -161,8 +164,9 @@ impl CodeView {
 
   /// Unsaved edits conflict with a change on disk: nothing is saved until
   /// Cmd-R reloads ([`SharedFile::save`]).
-  pub fn has_conflict(&self) -> bool {
-    self.file.as_ref().is_some_and(SharedFile::has_conflict)
+  /// The pane's banner: a conflict and where its text is kept, or a failed save.
+  pub fn banner(&self) -> Option<String> {
+    self.file.as_ref().and_then(SharedFile::banner)
   }
 
   pub fn editor(&self) -> &Entity<InputState> {
@@ -185,12 +189,17 @@ impl CodeView {
 
   /// Save the buffer, merged with whatever another writer saved since this
   /// pane last read the file ([`SharedFile::save`]); a merge shows in the
-  /// buffer. `false` when nothing was written: the file is conflicted (the
-  /// banner says so) or could not be written.
+  /// buffer. `false` when nothing was written: the file is conflicted or
+  /// could not be written, which the banner says ([`SharedFile::banner`]).
   pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
     let ours = self.editor.read(cx).value().to_string();
     let Some(file) = self.file.as_mut() else { return false };
-    match file.save(&ours) {
+    let old_banner = file.banner();
+    let saved = file.save(&ours);
+    if file.banner() != old_banner {
+      cx.notify();
+    }
+    match saved {
       Ok(Saved::Written(text)) => {
         if text != ours {
           self.editor.update(cx, |state, cx| {
@@ -289,7 +298,7 @@ impl Render for CodeView {
       .size_full()
       .font_family("Lilex")
       .on_action(cx.listener(Self::reload_from_disk))
-      .child(super::external_change_banner(self.has_conflict(), cx))
+      .child(super::file_banner(self.banner(), cx))
       .child(Input::new(&self.editor).h_full().appearance(false).bordered(false))
   }
 }

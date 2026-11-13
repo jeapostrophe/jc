@@ -140,10 +140,16 @@ pub struct Workspace {
   /// until jc restarts, since its sessions send this app nothing.
   hook_warning: Option<String>,
   _hook_failure_task: Option<Task<()>>,
+  /// Why the last action was refused, shown for a few seconds
+  /// (`Workspace::refuse`), with a number so a later refusal's timer is not
+  /// cleared by an earlier one's.
+  refusal: Option<(u64, String)>,
 }
 
 /// Unmatched hooks kept for re-dispatch; older ones are dropped.
 const UNMATCHED_HOOKS_MAX: usize = 32;
+/// How long a refusal's reason stays on screen.
+const REFUSAL_SHOWN: StdDuration = StdDuration::from_secs(8);
 /// The pause between two reads of `cira status --json`.
 const CIRA_POLL: StdDuration = StdDuration::from_secs(2);
 
@@ -399,6 +405,7 @@ impl Workspace {
       _cira_poll_task: cira_poll_task,
       hook_warning: None,
       _hook_failure_task: None,
+      refusal: None,
     };
 
     if flavor == Flavor::Jcc {
@@ -582,6 +589,24 @@ impl Workspace {
       return 0;
     }
     self.projects.iter().flat_map(|p| p.sessions.values()).filter(|s| s.busy).count()
+  }
+
+  /// Refuse an action: the beep, and why, in a banner for a few seconds.
+  pub(super) fn refuse(&mut self, why: impl Into<String>, cx: &mut Context<Self>) {
+    crate::notify::beep();
+    let n = self.refusal.as_ref().map_or(0, |(n, _)| n + 1);
+    self.refusal = Some((n, why.into()));
+    cx.notify();
+    cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+      Timer::after(REFUSAL_SHOWN).await;
+      let _ = this.update(cx, |ws, cx| {
+        if ws.refusal.as_ref().is_some_and(|(m, _)| *m == n) {
+          ws.refusal = None;
+          cx.notify();
+        }
+      });
+    })
+    .detach();
   }
 
   /// Save all dirty buffers (TODO views, code views, global TODO).

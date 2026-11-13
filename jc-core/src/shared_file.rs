@@ -16,8 +16,13 @@
 //! - **An own write is recognised by its content.** A disk change whose text
 //!   equals the base is this pane's own save (or no change); anything else is
 //!   someone's, however soon after a save it lands.
-//! - **A conflict stops every save** until [`SharedFile::reload`] takes the
-//!   disk's text.
+//! - **A conflict stops every save to the file and loses nothing.** The
+//!   pane's text goes to `<file>.conflict-<unix secs>` beside it instead, at
+//!   the conflict and at every save while it lasts (a send, a schedule), and
+//!   the banner names that copy. It ends when [`SharedFile::reload`] takes the
+//!   disk's text, or the disk returns to the base or merges cleanly.
+//! - **A failed save is visible**: the banner says why until a save works,
+//!   and a save waits a bounded time for another's lock.
 //! - **A save replaces the file whole** ([`crate::replace`]): through a
 //!   symlink, keeping permissions, never truncating it in place.
 
@@ -30,8 +35,14 @@ pub struct SharedFile {
   /// What this pane last read from or wrote to the file: the common ancestor
   /// of its edits and anyone else's.
   base: String,
-  /// The pane's edits and a disk change could not be merged.
-  conflict: bool,
+  /// The pane's edits and a disk change could not be merged, and the copy
+  /// beside the file that holds the pane's text meanwhile (`None` when even
+  /// that could not be written: then `failure` says why).
+  conflict: Option<Option<PathBuf>>,
+  /// Why the last save failed; `None` once one works.
+  failure: Option<String>,
+  /// How long a save waits for another save's lock.
+  lock_wait: std::time::Duration,
 }
 
 /// What a disk change means for the pane ([`SharedFile::disk_changed`]).
@@ -59,10 +70,12 @@ pub enum Saved {
 /// How many times a save starts over when the file changes between its read
 /// and its replace before giving up.
 const SAVE_ATTEMPTS: usize = 5;
+/// How long a save waits for the lock another save holds.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl SharedFile {
   pub fn new(path: PathBuf) -> Self {
-    Self { path, base: String::new(), conflict: false }
+    Self { path, base: String::new(), conflict: None, failure: None, lock_wait: LOCK_WAIT }
   }
 
   pub fn path(&self) -> &Path {
@@ -74,7 +87,57 @@ impl SharedFile {
   }
 
   pub fn has_conflict(&self) -> bool {
-    self.conflict
+    self.conflict.is_some()
+  }
+
+  /// What the pane's banner says, if anything: a conflict and where the
+  /// pane's text is kept, or why the last save failed.
+  pub fn banner(&self) -> Option<String> {
+    let failed = self.failure.as_ref().map(|why| format!("{} not saved: {why}", self.name()));
+    match &self.conflict {
+      Some(Some(copy)) => Some(format!(
+        "Merge conflict \u{2014} your text is kept in {}; nothing is saved to {} until Cmd-R \
+         reloads it from disk",
+        copy.display(),
+        self.name()
+      )),
+      Some(None) => Some(format!(
+        "Merge conflict \u{2014} nothing is saved until Cmd-R reloads from disk. {}",
+        failed.unwrap_or_default()
+      )),
+      None => failed,
+    }
+  }
+
+  fn name(&self) -> String {
+    self.path.file_name().unwrap_or_default().to_string_lossy().into_owned()
+  }
+
+  /// Enter (or stay in) a conflict, keeping `ours` beside the file: in the
+  /// conflict's copy, made at its start and replaced at each later save.
+  fn keep(&mut self, ours: &str) {
+    let copy = match &self.conflict {
+      Some(Some(copy)) => copy.clone(),
+      _ => {
+        let secs = std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)
+          .unwrap_or_default()
+          .as_secs();
+        let mut name = self.path.clone().into_os_string();
+        name.push(format!(".conflict-{secs}"));
+        PathBuf::from(name)
+      }
+    };
+    match crate::replace::write_replacing(&copy, ours.as_bytes()) {
+      Ok(()) => {
+        self.conflict = Some(Some(copy));
+        self.failure = None;
+      }
+      Err(e) => {
+        self.conflict = Some(None);
+        self.failure = Some(format!("cannot keep your text in {}: {e}", copy.display()));
+      }
+    }
   }
 
   /// Take the disk's text as the base, ending any conflict. A missing file
@@ -83,7 +146,8 @@ impl SharedFile {
   pub fn reload(&mut self) -> String {
     let text = read(&self.path).unwrap_or_else(|e| format!("Error: {e}"));
     self.base = text.clone();
-    self.conflict = false;
+    self.conflict = None;
+    self.failure = None;
     text
   }
 
@@ -91,6 +155,8 @@ impl SharedFile {
   pub fn disk_changed(&mut self, ours: &str) -> DiskChange {
     let Ok(theirs) = read(&self.path) else { return DiskChange::Unchanged };
     if theirs == self.base {
+      // Our own write, or the change that conflicted was undone.
+      self.conflict = None;
       return DiskChange::Unchanged;
     }
     if ours == self.base {
@@ -100,17 +166,18 @@ impl SharedFile {
     match diffy::merge(&self.base, ours, &theirs) {
       Ok(merged) => {
         self.base = theirs;
-        self.conflict = false;
+        self.conflict = None;
         DiskChange::Replace(merged)
       }
       Err(_) => {
-        self.conflict = true;
+        self.keep(ours);
         DiskChange::Conflict
       }
     }
   }
 
   /// Save `ours`, merging in whatever another writer saved since the base.
+  /// A failure is also kept for [`Self::banner`] until a save works.
   pub fn save(&mut self, ours: &str) -> io::Result<Saved> {
     self.save_with(ours, |file, bytes| file.write_all(bytes), || {})
   }
@@ -125,13 +192,28 @@ impl SharedFile {
     mut write: impl FnMut(&mut fs::File, &[u8]) -> io::Result<()>,
     mut before_replace: impl FnMut(),
   ) -> io::Result<Saved> {
-    if self.conflict {
+    if self.has_conflict() {
+      self.keep(ours);
       return Ok(Saved::Conflict);
     }
+    let saved = self.write(ours, &mut write, &mut before_replace);
+    match &saved {
+      Ok(Saved::Written(_)) => self.failure = None,
+      Ok(Saved::Conflict) => {}
+      Err(e) => self.failure = Some(e.to_string()),
+    }
+    saved
+  }
+
+  fn write(
+    &mut self,
+    ours: &str,
+    mut write: impl FnMut(&mut fs::File, &[u8]) -> io::Result<()>,
+    mut before_replace: impl FnMut(),
+  ) -> io::Result<Saved> {
     let target = crate::replace::resolve(&self.path)?;
     let dir = target.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let lock = fs::File::open(dir)?;
-    lock.lock()?;
+    let _lock = lock(dir, self.lock_wait)?;
     for _ in 0..SAVE_ATTEMPTS {
       let theirs = read(&target)?;
       let text = if theirs == self.base {
@@ -140,7 +222,7 @@ impl SharedFile {
         match diffy::merge(&self.base, ours, &theirs) {
           Ok(merged) => merged,
           Err(_) => {
-            self.conflict = true;
+            self.keep(ours);
             return Ok(Saved::Conflict);
           }
         }
@@ -160,6 +242,32 @@ impl SharedFile {
       }
     }
     Err(io::Error::other(format!("{} kept changing while saving", target.display())))
+  }
+}
+
+/// An exclusive lock on `dir`, held until the result drops, waiting at most
+/// `wait` for another save to let go. A filesystem with no locks (some
+/// network ones) saves unlocked: the check before the rename still holds.
+fn lock(dir: &Path, wait: std::time::Duration) -> io::Result<Option<fs::File>> {
+  let file = fs::File::open(dir)?;
+  let deadline = std::time::Instant::now() + wait;
+  loop {
+    match file.try_lock() {
+      Ok(()) => return Ok(Some(file)),
+      Err(fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => {
+        return Ok(None);
+      }
+      Err(fs::TryLockError::Error(e)) => return Err(e),
+      Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+      }
+      Err(fs::TryLockError::WouldBlock) => {
+        return Err(io::Error::new(
+          io::ErrorKind::TimedOut,
+          format!("another save has held the lock on {} for {wait:?}", dir.display()),
+        ));
+      }
+    }
   }
 }
 
@@ -209,6 +317,109 @@ mod tests {
 
   fn done(path: &Path) {
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
+  }
+
+  /// The `.conflict-*` copies beside `path`.
+  fn conflict_copies(path: &Path) -> Vec<PathBuf> {
+    let mut copies: Vec<PathBuf> = fs::read_dir(path.parent().unwrap())
+      .unwrap()
+      .flatten()
+      .map(|e| e.path())
+      .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("TODO.md.conflict-"))
+      .collect();
+    copies.sort();
+    copies
+  }
+
+  #[test]
+  fn a_conflict_keeps_jays_text_beside_the_file_and_says_where() {
+    let path = scratch("p2-keep");
+    let mut jc = opened(&path);
+    let theirs = BASE.replace("notes\n", "notes from elsewhere\n");
+    fs::write(&path, &theirs).unwrap();
+    let ours = BASE.replace("notes\n", "notes from jc\n");
+    assert_eq!(jc.save(&ours).unwrap(), Saved::Conflict);
+    let copies = conflict_copies(&path);
+    assert_eq!(copies.len(), 1, "a conflicting save kept Jay's text nowhere");
+    assert_eq!(disk(&copies[0]), ours);
+    let banner = jc.banner().expect("the banner says there is a conflict");
+    assert!(banner.contains(&copies[0].display().to_string()), "{banner}");
+    // An automatic edit while the conflict lasts (a send) is kept too.
+    let sent = jc_sends(&ours);
+    assert_eq!(jc.save(&sent).unwrap(), Saved::Conflict);
+    assert_eq!(conflict_copies(&path), copies, "one copy per conflict");
+    assert_eq!(disk(&copies[0]), sent, "the send made during the conflict was lost");
+    assert_eq!(disk(&path), theirs);
+    done(&path);
+  }
+
+  #[test]
+  fn a_conflict_seen_by_the_watcher_keeps_jays_text_too() {
+    let path = scratch("p2-watch");
+    let mut jc = opened(&path);
+    fs::write(&path, BASE.replace("notes\n", "notes from elsewhere\n")).unwrap();
+    let ours = BASE.replace("notes\n", "notes from jc\n");
+    assert_eq!(jc.disk_changed(&ours), DiskChange::Conflict);
+    let copies = conflict_copies(&path);
+    assert_eq!(copies.len(), 1, "the watcher's conflict kept Jay's text nowhere");
+    assert_eq!(disk(&copies[0]), ours);
+    done(&path);
+  }
+
+  #[test]
+  fn a_conflict_ends_when_the_disk_returns_to_the_base() {
+    let path = scratch("p2-back");
+    let mut jc = opened(&path);
+    fs::write(&path, BASE.replace("notes\n", "notes from elsewhere\n")).unwrap();
+    let ours = BASE.replace("notes\n", "notes from jc\n");
+    assert_eq!(jc.disk_changed(&ours), DiskChange::Conflict);
+    // The other writer undoes its edit.
+    fs::write(&path, BASE).unwrap();
+    assert_eq!(jc.disk_changed(&ours), DiskChange::Unchanged);
+    assert!(!jc.has_conflict(), "the conflict outlived the change that caused it");
+    assert_eq!(jc.banner(), None);
+    assert_eq!(jc.save(&ours).unwrap(), Saved::Written(ours.clone()));
+    assert_eq!(disk(&path), ours);
+    done(&path);
+  }
+
+  #[test]
+  fn a_save_waits_a_bounded_time_for_the_lock_and_says_so() {
+    let path = scratch("p3-lock");
+    let held = fs::File::open(path.parent().unwrap()).unwrap();
+    held.lock().unwrap(); // another save, stuck
+    let (tx, rx) = std::sync::mpsc::channel();
+    let saving = path.clone();
+    std::thread::spawn(move || {
+      let mut jc = opened(&saving);
+      jc.lock_wait = std::time::Duration::from_millis(200);
+      let saved = jc.save(&jc_sends(BASE));
+      let _ = tx.send((saved.is_err(), jc.banner()));
+    });
+    let (failed, banner) = rx
+      .recv_timeout(std::time::Duration::from_secs(10))
+      .expect("a save waited without bound on a lock another save holds");
+    assert!(failed);
+    let banner = banner.expect("a save that failed says so in the banner");
+    assert!(banner.contains("lock"), "{banner}");
+    drop(held);
+    assert_eq!(disk(&path), BASE);
+    done(&path);
+  }
+
+  #[test]
+  fn a_save_that_cannot_read_the_file_says_so_and_the_next_good_one_clears_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = scratch("p3-read");
+    let mut jc = opened(&path);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(jc.save(&jc_sends(BASE)).is_err());
+    let banner = jc.banner().expect("an automatic save that failed was silent");
+    assert!(banner.contains("not saved"), "{banner}");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    jc.save(&jc_sends(BASE)).unwrap();
+    assert_eq!(jc.banner(), None);
+    done(&path);
   }
 
   #[test]
