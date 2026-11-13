@@ -232,7 +232,9 @@ impl Workspace {
             return;
           }
           session.run_shell(lifecycle::shell_child(answer), cx);
-          cx.notify();
+          if session.shell == ShellRun::Own {
+            cx.notify(); // the header says "not shared"
+          }
         },
       );
     }
@@ -704,10 +706,13 @@ impl Workspace {
     if !matches!(session.shell, ShellRun::Shared | ShellRun::Own) {
       return;
     }
+    let was_own = session.shell == ShellRun::Own;
     session.shell = ShellRun::Idle;
     let previous = session.shell_exited.map(|(_, delay)| delay);
     session.shell_exited = Some((SystemTime::now(), lifecycle::attach_delay(previous, lived)));
-    cx.notify();
+    if was_own {
+      cx.notify(); // the header drops "not shared"
+    }
     self.kick_cira();
   }
 
