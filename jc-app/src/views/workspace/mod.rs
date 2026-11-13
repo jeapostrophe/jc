@@ -380,7 +380,9 @@ impl Workspace {
       cx,
       jc_core::config::load_sessions,
       // With no records a marker asks nothing (`lifecycle::mark_request`),
-      // so starting empty is safe once a bad file is kept aside. When it
+      // so starting empty sends no stop or rm once a bad file is kept aside
+      // (a marker or rename made while jc was closed is not acted on, and
+      // Cira's label wins: `lifecycle::label_sync`). When it
       // could not be read or moved, `records` stays `None`: no marker or
       // label is acted on and nothing is saved over the file.
       |ws, loaded, _window, _cx| match loaded {

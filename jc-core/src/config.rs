@@ -84,13 +84,24 @@ pub fn theme_path() -> PathBuf {
   config_dir().join("theme.toml")
 }
 
-fn load_toml<T: Default + serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-  match fs::read_to_string(path) {
-    Ok(contents) => {
-      toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
-    }
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+/// The file's bytes, `None` when there is none.
+fn read_config(path: &Path) -> Result<Option<Vec<u8>>> {
+  match fs::read(path) {
+    Ok(bytes) => Ok(Some(bytes)),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
     Err(e) => Err(anyhow::anyhow!("failed to read {}: {e}", path.display())),
+  }
+}
+
+/// TOML that is not UTF-8 does not parse either.
+fn parse_toml<T: serde::de::DeserializeOwned>(bytes: Vec<u8>) -> Result<T> {
+  Ok(toml::from_str(&String::from_utf8(bytes)?)?)
+}
+
+fn load_toml<T: Default + serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+  match read_config(path)? {
+    Some(bytes) => parse_toml(bytes).with_context(|| format!("failed to parse {}", path.display())),
+    None => Ok(T::default()),
   }
 }
 
@@ -136,12 +147,8 @@ fn load_toml_keeping_bad<T: Default + serde::de::DeserializeOwned>(
   path: &Path,
   now: SystemTime,
 ) -> Result<(T, Option<PathBuf>)> {
-  let contents = match fs::read_to_string(path) {
-    Ok(contents) => contents,
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((T::default(), None)),
-    Err(e) => return Err(anyhow::anyhow!("failed to read {}: {e}", path.display())),
-  };
-  match toml::from_str(&contents) {
+  let Some(bytes) = read_config(path)? else { return Ok((T::default(), None)) };
+  match parse_toml(bytes) {
     Ok(value) => Ok((value, None)),
     Err(e) => {
       let secs = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -185,10 +192,19 @@ mod tests {
     );
     assert!(!path.exists(), "the bad file is moved, not copied");
 
+    // Bytes that are not UTF-8 (a write cut off inside a character) did not
+    // parse either.
+    fs::write(&path, b"[sessions.c-1]\nlabel = \"caf\xc3").unwrap();
+    let (_, kept) = load_toml_keeping_bad::<crate::lifecycle::Records>(&path, now).unwrap();
+    assert_eq!(kept.as_deref(), Some(aside.as_path()), "a non-UTF-8 file is kept aside");
+
     // A file that parses, or none at all, is not moved.
     fs::write(&path, "").unwrap();
     let (_, kept) = load_toml_keeping_bad::<crate::lifecycle::Records>(&path, now).unwrap();
     assert!(path.exists() && kept.is_none());
+    fs::remove_file(&path).unwrap();
+    let (_, kept) = load_toml_keeping_bad::<crate::lifecycle::Records>(&path, now).unwrap();
+    assert!(kept.is_none());
     fs::remove_dir_all(&dir).unwrap();
   }
 
