@@ -1,5 +1,6 @@
 use crate::views::code_view::CodeView;
 use chrono::NaiveDateTime;
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{InputEvent, RopeExt as _};
@@ -22,11 +23,13 @@ pub enum ScheduledFire {
   Cancelled,
 }
 
-/// TodoView wraps a [`CodeView`] opened on the project's `TODO.md` file,
-/// adding parsing, highlighting, validation, and event emission on changes.
+/// TodoView wraps a [`CodeView`] opened on this app's TODO for a project
+/// (`Flavor::todo_path`: jc's is the project's `TODO.md`, jcc's its todo.md in
+/// Cira's store), adding parsing, highlighting, validation, and event emission
+/// on changes. jcc's opens only once Cira names the project; until then it
+/// holds no file, and nothing in it is saved.
 pub struct TodoView {
   code_view: Entity<CodeView>,
-  file_path: PathBuf,
   document: TodoDocument,
   /// Whose sessions the document holds (`jc_core::flavor::Flavor::section`).
   flavor: Flavor,
@@ -35,13 +38,13 @@ pub struct TodoView {
 }
 
 impl TodoView {
-  pub fn new(project_path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-    let file_path = project_path.join("TODO.md");
-    let open_path = file_path.clone();
+  pub fn new(todo: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
     let code_view = cx.new(|cx| {
       let mut cv = CodeView::new(window, cx);
       cv.set_language_override("todo-markdown", cx);
-      cv.open_file(open_path, window, cx);
+      if let Some(todo) = todo {
+        cv.open_file(todo, window, cx);
+      }
       cv
     });
 
@@ -62,7 +65,17 @@ impl TodoView {
     let flavor = Flavor::current();
     let document = todo::parse(&text, flavor);
 
-    Self { code_view, file_path, document, flavor, active_key: None, _editor_subscription }
+    Self { code_view, document, flavor, active_key: None, _editor_subscription }
+  }
+
+  /// Open `todo`, for a view made with none (jcc, once Cira names the project).
+  pub fn open(&mut self, todo: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    self.code_view.update(cx, |cv, cx| cv.open_file(todo, window, cx));
+    self.reparse(cx);
+  }
+
+  pub fn is_open(&self, cx: &App) -> bool {
+    self.code_view.read(cx).file_path().is_some()
   }
 
   pub fn code_view(&self) -> &Entity<super::code_view::CodeView> {
@@ -81,8 +94,13 @@ impl TodoView {
     self.code_view.read(cx).editor_text(cx)
   }
 
-  pub fn save(&self, cx: &mut Context<Self>) {
-    self.code_view.update(cx, |cv, cx| cv.save(cx));
+  /// Save, merging in what another writer (the other app, Jay's editor)
+  /// saved meanwhile, and re-parse what the merge brought in. Nothing is
+  /// written while the file is conflicted ([`CodeView::save`]).
+  pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    let saved = self.code_view.update(cx, |cv, cx| cv.save(window, cx));
+    self.reparse(cx);
+    saved
   }
 
   pub fn scroll_to_line(&self, line: u32, window: &mut Window, cx: &mut Context<Self>) {
@@ -150,6 +168,7 @@ impl TodoView {
   /// so the backup below and the destructive write it exists to protect have one
   /// owner -- a `.bak` must never outlive a rewrite that did not reach disk.
   pub fn truncate_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(file_path) = self.code_view.read(cx).file_path().map(PathBuf::from) else { return };
     let text = self.editor_text(cx);
     let Some(new_text) = todo::truncate_all_sessions(&text, self.flavor, todo::MAX_MESSAGES) else {
       return;
@@ -160,13 +179,13 @@ impl TodoView {
     // even shown -- and TODO.md is typically not in version control. Keep one
     // copy of what the log looked like before it was first bounded. Only the
     // first sweep writes it; later ones are no-ops anyway, and never clobber it.
-    let mut backup = self.file_path.clone().into_os_string();
+    let mut backup = file_path.clone().into_os_string();
     backup.push(".bak");
     let backup = std::path::PathBuf::from(backup);
     if !backup.exists()
       && let Err(e) = std::fs::write(&backup, &text)
     {
-      eprintln!("Failed to back up {} before truncating: {e}", self.file_path.display());
+      eprintln!("Failed to back up {} before truncating: {e}", file_path.display());
     }
 
     self.set_text_and_save(new_text, window, cx);
@@ -219,7 +238,7 @@ impl TodoView {
       });
     });
     self.reparse(cx);
-    self.save(cx);
+    self.save(window, cx);
     Some((result.message_text, result.message_index, result.schedule))
   }
 
@@ -289,7 +308,7 @@ impl TodoView {
 
   fn set_text_and_save(&mut self, new_text: String, window: &mut Window, cx: &mut Context<Self>) {
     self.set_text(new_text, window, cx);
-    self.save(cx);
+    self.save(window, cx);
   }
 
   /// Ensure the session has a WAIT section, inserting one if missing.
@@ -298,7 +317,7 @@ impl TodoView {
     let text = self.editor_text(cx);
     if let Some(new_text) = todo::insert_wait_section(&text, &self.document, uuid) {
       self.set_text(new_text, window, cx);
-      self.save(cx);
+      self.save(window, cx);
       true
     } else {
       false
@@ -408,8 +427,26 @@ impl TodoView {
 }
 
 impl Render for TodoView {
-  fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-    div().id("todo-view").size_full().child(self.code_view.clone())
+  fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    let waiting = !self.is_open(cx);
+    div()
+      .id("todo-view")
+      .size_full()
+      .flex()
+      .flex_col()
+      .when(waiting, |el| {
+        let theme = cx.theme();
+        el.child(
+          div()
+            .px_2()
+            .py_1()
+            .bg(theme.warning)
+            .text_sm()
+            .text_color(theme.warning_foreground)
+            .child("jcc's TODO opens once Cira names this project (`cira status`)"),
+        )
+      })
+      .child(self.code_view.clone())
   }
 }
 

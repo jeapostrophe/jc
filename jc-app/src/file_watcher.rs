@@ -1,15 +1,11 @@
 use gpui::{AsyncWindowContext, Context, WeakEntity, Window};
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set up a file-system watcher on `dir` (non-recursive).
 ///
 /// *  `path_matches` — called inside the notify callback for each event path;
 ///    return `true` to accept the event.
-/// *  `suppress` — when provided, events are silently dropped while the flag
-///    is `true` (used to ignore self-writes).
 /// *  `on_change` — called on the main thread after one or more matching events
 ///    have been coalesced.
 ///
@@ -17,7 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub fn watch_dir<E, P, F>(
   dir: &Path,
   path_matches: P,
-  suppress: Option<Arc<AtomicBool>>,
   on_change: F,
   window: &Window,
   cx: &mut Context<E>,
@@ -31,16 +26,11 @@ where
 
   let mut watcher =
     notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-      if let Ok(event) = res {
-        match event.kind {
-          EventKind::Modify(_) | EventKind::Create(_) => {
-            let dominated = suppress.as_ref().is_some_and(|s| s.load(Ordering::Relaxed));
-            if !dominated && event.paths.iter().any(|p| path_matches(p)) {
-              let _ = tx.send(());
-            }
-          }
-          _ => {}
-        }
+      if let Ok(event) = res
+        && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
+        && event.paths.iter().any(|p| path_matches(p))
+      {
+        let _ = tx.send(());
       }
     })
     .ok()?;

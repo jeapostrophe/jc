@@ -4,8 +4,6 @@ use gpui::*;
 use gpui_component::input::Position;
 use jc_core::background::{self, Claude};
 use jc_core::cira::{self, HookState, Marker};
-use jc_core::claude::Launch;
-use jc_core::flavor::Flavor;
 use jc_core::hooks::HookEventKind;
 use jc_core::lifecycle::{Backoff, ShellChild, ShellPane, ShellRun};
 use jc_core::todo::SessionKey;
@@ -39,11 +37,11 @@ const CLAUDE_LAUNCH_SETTLE: LaunchSettle =
   LaunchSettle { quiet: Duration::from_secs(4), give_up: Duration::from_secs(30) };
 
 /// How a session's panes start, by flavor (`jc_core::flavor::Flavor`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Start {
-  /// jc: the Claude pane runs `claude` itself on the heading's uuid
-  /// (`Flavor::claude_command`), the Terminal pane jc's own shell.
-  Own { launch: Launch, dangerous: bool },
+  /// jc: the Claude pane runs this `claude` command line itself
+  /// (`jc_core::claude::claude_argv`), the Terminal pane jc's own shell.
+  Own(Vec<String>),
   /// jcc: the Claude pane waits for [`SessionState::attach`] to the job Cira
   /// names, the Terminal pane for the shell Cira keeps.
   Cira,
@@ -191,9 +189,8 @@ impl SessionState {
     cx: &mut App,
   ) -> Self {
     let Heading { key, label, cira } = heading;
-    // jc's own `claude`, only ever from the flavor: in jcc this is `None`.
     let own = match start {
-      Start::Own { launch, dangerous } => Flavor::current().claude_command(&key, launch, dangerous),
+      Start::Own(argv) => Some(argv),
       Start::Cira => None,
     };
     let (claude_config, general_config) = match own {

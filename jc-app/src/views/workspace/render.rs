@@ -229,6 +229,7 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::scroll_other_page_down))
       .child(self.render_title_bar(cx))
       .when(self.cira.reachable == Some(false), |el| el.child(cira_unreachable_banner(cx)))
+      .when_some(self.hook_warning.clone(), |el, why| el.child(warning_banner(why.into(), cx)))
       .child(pane_area)
       .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
       .when_some(self.keybinding_help.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))
@@ -239,14 +240,16 @@ impl Render for Workspace {
 /// Shown while `cira status` does not answer: Cira owns the sessions, so no
 /// Claude pane attaches anything new until it does (Cira PLAN TMUX-01).
 fn cira_unreachable_banner(cx: &App) -> Div {
+  warning_banner(
+    "Cira is unreachable: Claude panes attach nothing new until it answers (`cira status`)".into(),
+    cx,
+  )
+}
+
+/// One line on the warning color across the window.
+fn warning_banner(text: SharedString, cx: &App) -> Div {
   let theme = cx.theme();
-  div()
-    .px_2()
-    .py_1()
-    .bg(theme.warning)
-    .text_sm()
-    .text_color(theme.warning_foreground)
-    .child("Cira is unreachable: Claude panes attach nothing new until it answers (`cira status`)")
+  div().px_2().py_1().bg(theme.warning).text_sm().text_color(theme.warning_foreground).child(text)
 }
 
 fn modal_overlay(content: &AnyView) -> Deferred {

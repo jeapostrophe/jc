@@ -3838,8 +3838,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "diffy",
  "dirs 6.0.0",
  "flume",
+ "libc",
  "serde",
  "serde_json",
  "tiny_http",

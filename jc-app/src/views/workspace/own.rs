@@ -115,7 +115,7 @@ impl Workspace {
       if is_disabled {
         tv.toggle_session_disabled(&key, window, cx);
       }
-      tv.save(cx);
+      tv.save(window, cx);
     });
 
     let project = &mut self.projects[project_idx];
@@ -138,13 +138,14 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     let palette = super::palette_from_window(window);
+    let argv = jc_core::claude::claude_argv(&uuid, launch, dangerous);
     let project = &mut self.projects[project_idx];
     let id = project.next_session_id;
     project.next_session_id += 1;
     let session = SessionState::create(
       id,
       Heading { key: uuid, label, cira: None },
-      Start::Own { launch, dangerous },
+      Start::Own(argv),
       &project.path,
       &palette,
       window,
@@ -177,7 +178,7 @@ impl Workspace {
 
     todo_view.update(cx, |tv, cx| {
       tv.toggle_session_disabled(key, window, cx);
-      tv.save(cx);
+      tv.save(window, cx);
     });
 
     let is_now_disabled =
@@ -249,7 +250,7 @@ impl Workspace {
     let written = todo_view.update(cx, |tv, cx| {
       let Some(index) = tv.document().index_by_id(old_session_id) else { return false };
       tv.update_session_uuid_at(index, new_session_id, window, cx);
-      tv.save(cx);
+      tv.save(window, cx);
       true
     });
     if !written {

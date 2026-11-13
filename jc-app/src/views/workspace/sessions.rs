@@ -36,6 +36,9 @@ pub(super) struct CiraView {
   /// begun before then still has the old label, and is not a change on the
   /// page.
   pub renamed_at: std::collections::HashMap<String, SystemTime>,
+  /// jc projects jcc has asked Cira to register (`cira project add`), so
+  /// each is asked once: a project gives jcc's todo.md its place.
+  pub registering: std::collections::HashSet<PathBuf>,
 }
 
 impl Workspace {
@@ -99,8 +102,9 @@ impl Workspace {
 
   /// Ask for a fresh `cira status --json` now.
   pub(super) fn kick_cira(&self) {
-    // jc has no poll thread: the receiver is gone and this sends nothing.
-    let _ = self.cira_kick.send(());
+    if let Some(kick) = &self.cira_kick {
+      let _ = kick.send(());
+    }
   }
 
   fn cira_reachable(&self) -> bool {
@@ -109,8 +113,8 @@ impl Workspace {
 
   /// Keep what jc remembers, on the saver thread.
   fn save_records(&self) {
-    if let Some(records) = &self.cira.records {
-      let _ = self.records_tx.send(records.clone());
+    if let (Some(records), Some(tx)) = (&self.cira.records, &self.records_tx) {
+      let _ = tx.send(records.clone());
     }
   }
 
@@ -149,6 +153,9 @@ impl Workspace {
     for project in &mut self.projects {
       changed |= project.apply_cira(status.as_ref());
     }
+    if let Some(status) = &status {
+      changed |= self.open_todos(status, window, cx);
+    }
     if status.is_some() {
       self.cira.status = status;
     }
@@ -163,6 +170,46 @@ impl Workspace {
     if changed {
       cx.notify();
     }
+  }
+
+  /// Open jcc's todo.md for each project a read names and whose TODO is not
+  /// open yet, and start its sessions. A project no Cira project holds is
+  /// registered under its directory's name, as `cira session new` would, so
+  /// its TODO opens at a later read. Returns whether one opened.
+  fn open_todos(&mut self, status: &Status, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    let palette = super::palette_from_window(window);
+    let mut opened = false;
+    for pi in 0..self.projects.len() {
+      if self.projects[pi].todo_open(cx) {
+        continue;
+      }
+      let path = self.projects[pi].path.clone();
+      if let Some(todo) = self.flavor.todo_path(&path, Some(status)) {
+        self.projects[pi].open_todo(todo, &palette, window, cx);
+        opened = true;
+        continue;
+      }
+      let Some(cira) = self.cira_client.clone() else { continue };
+      if !self.cira.registering.insert(path.clone()) {
+        continue;
+      }
+      let name = self.projects[pi].name.clone();
+      self.run_blocking(
+        window,
+        cx,
+        move || cira.add_project(&name, &path).map_err(|e| (name, path, e)),
+        |ws, added, _window, _cx| match added {
+          Ok(()) => ws.kick_cira(),
+          Err((name, path, e)) => {
+            eprintln!("cira project add {name} --path {}: {e}", path.display())
+          }
+        },
+      );
+    }
+    if opened {
+      self.refresh_breadcrumb_observers(cx);
+    }
+    opened
   }
 
   /// Bring every Claude pane in line with Cira: migrate a legacy heading,
@@ -303,8 +350,8 @@ impl Workspace {
   // Asking Cira for a session
   // ---------------------------------------------------------------------------
 
-  /// Move legacy heading `sid` (`> uuid=U`, moved by Jay from jc's `# Claude`
-  /// into jcc's `# Cira`) to a session Cira runs: `cira session new --resume U
+  /// Move legacy heading `sid` (`> uuid=U`, a block Jay cut from jc's TODO.md
+  /// and pasted into jcc's todo.md) to a session Cira runs: `cira session new --resume U
   /// --wait`, carrying `> dangerous`. A conversation with no transcript (it
   /// never took a prompt) starts fresh. Its heading is rewritten only once
   /// Cira has a job for it, so a failed start is asked again — which retries
@@ -516,6 +563,12 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    // Its heading goes into jcc's todo.md, which opens once Cira names the
+    // project: until then there is nowhere to write it.
+    if !self.projects[pi].todo_open(cx) {
+      crate::notify::beep();
+      return;
+    }
     // Cosmetic only — nothing addresses a session by label (see
     // `jc_core::todo::SessionKey`); this just stops the picker showing
     // several identical rows.
@@ -538,7 +591,7 @@ impl Workspace {
     // on the same conversation (Cira answers the same one, but jc would write
     // two headings).
     let in_flight = |s: &SessionState| s.adopting.as_deref() == Some(uuid.as_str());
-    if self.projects[pi].sessions.values().any(in_flight) {
+    if !self.projects[pi].todo_open(cx) || self.projects[pi].sessions.values().any(in_flight) {
       crate::notify::beep();
       return;
     }
@@ -546,7 +599,25 @@ impl Workspace {
     // opened with the same prompt would otherwise get the same display name.
     let label =
       jc_core::todo::unique_label(self.projects[pi].todo_view.read(cx).document(), summary);
-    self.start_unrecorded(pi, label, Some(uuid), window, cx);
+    // jc's headings are in a file jcc never reads, so a conversation jc runs
+    // is not known to be taken until its processes are looked at: resuming
+    // it in Cira too would run it twice.
+    let path = self.projects[pi].path.clone();
+    let check = uuid.clone();
+    self.run_blocking(
+      window,
+      cx,
+      move || jc_core::claude::conversation_running(&check),
+      move |ws, running, window, cx| {
+        let Some(pi) = ws.project_index(&path) else { return };
+        if running {
+          eprintln!("adopt: a `claude` process still runs {uuid} (jc?); not resuming it in Cira");
+          crate::notify::beep();
+          return;
+        }
+        ws.start_unrecorded(pi, label, Some(uuid), window, cx);
+      },
+    );
   }
 
   fn start_unrecorded(
@@ -633,7 +704,7 @@ impl Workspace {
     if heading.is_disabled() {
       todo_view.update(cx, |tv, cx| {
         tv.toggle_session_disabled(key, window, cx);
-        tv.save(cx);
+        tv.save(window, cx);
       });
     }
 
@@ -689,7 +760,7 @@ impl Workspace {
       move || cira.set_mode(&at, &id, to, from),
       move |ws, result, _window, cx| {
         let Some(session) = ws.session_mut(&path, sid) else { return };
-        let mode = if to { "dangerous" } else { "normal" };
+        let mode = if to { "dangerous" } else { "auto" };
         match result {
           Ok(()) => session.status(&format!("asked Cira to make this session {mode}"), cx),
           Err(CallError::Refused { code: exit::CONFLICT, message, .. }) => {
@@ -874,7 +945,7 @@ impl Workspace {
 
     todo_view.update(cx, |tv, cx| {
       tv.toggle_session_disabled(key, window, cx);
-      tv.save(cx);
+      tv.save(window, cx);
     });
 
     let is_now_disabled =

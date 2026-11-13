@@ -39,7 +39,7 @@ pub fn scroll_editor_to_line<V: 'static>(
   });
 }
 
-/// Renders a warning banner when a file has been externally modified and auto-merge failed.
+/// Renders a warning banner while unsaved edits conflict with a change on disk.
 pub fn external_change_banner(externally_modified: bool, cx: &App) -> AnyElement {
   if externally_modified {
     let theme = cx.theme();
@@ -49,7 +49,7 @@ pub fn external_change_banner(externally_modified: bool, cx: &App) -> AnyElement
       .bg(theme.warning)
       .text_sm()
       .text_color(theme.warning_foreground)
-      .child("Merge conflict \u{2014} press Cmd-R to reload from disk (unsaved edits will be lost)")
+      .child("Merge conflict \u{2014} nothing is saved until Cmd-R reloads from disk (unsaved edits will be lost)")
       .into_any_element()
   } else {
     div().into_any_element()

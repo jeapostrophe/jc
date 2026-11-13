@@ -9,7 +9,10 @@ mod views;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use jc_core::config;
 use jc_core::flavor::Flavor;
+use std::io::Read as _;
+use std::os::fd::IntoRawFd as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(Parser)]
 #[command(name = "jc", about = "Claude Code session orchestrator")]
@@ -29,9 +32,20 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
-  // `jcc` (the jcc.app bundle's executable) is Cira's client; any other name
-  // is jc (Cira PLAN TMUX-07). Chosen before anything reads config or TODO.md.
-  let flavor = Flavor::from_program(std::env::args_os().next().as_deref()).init();
+  // `jcc` (the jcc.app bundle's executable, or JC_FLAVOR=jcc) is Cira's
+  // client; anything else is jc (Cira PLAN TMUX-07). Chosen before anything
+  // reads config or a TODO.
+  let flavor = match Flavor::chosen(
+    std::env::args_os().next().as_deref(),
+    std::env::var_os("JC_FLAVOR").as_deref(),
+  ) {
+    Ok(flavor) => flavor,
+    Err((flavor, why)) => {
+      eprintln!("{why}; running as {}", flavor.name());
+      flavor
+    }
+  }
+  .init();
   let matches = Cli::command().name(flavor.name()).get_matches();
   let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
@@ -99,35 +113,104 @@ fn cmd_clean_hooks() -> anyhow::Result<()> {
   Ok(())
 }
 
-/// Store project paths globally so the signal handler can access them.
-static SIGNAL_CLEANUP_PATHS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// The write end of the pipe [`on_signal`] wakes the cleanup thread through;
+/// -1 until [`spawn_cleanup`] makes it.
+static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
 
+/// On SIGINT or SIGTERM, remove this app's hooks from every project and its
+/// IPC socket, then die of the signal. The GPUI event loop swallows Ctrl-C, so
+/// Drop doesn't always run.
 fn install_signal_handler(state: &config::AppState) {
   let paths: Vec<PathBuf> = state.projects.iter().map(|p| p.path.clone()).collect();
-  *SIGNAL_CLEANUP_PATHS.lock().unwrap() = paths;
-
+  let cleanup = move || {
+    ipc::cleanup_socket();
+    for path in &paths {
+      let _ = jc_core::hooks_settings::uninstall_hooks(Flavor::current(), path);
+    }
+  };
+  // Re-raise with the default handler for normal exit behavior.
+  let exit = |sig| unsafe {
+    libc::signal(sig, libc::SIG_DFL);
+    libc::raise(sig);
+  };
+  if let Err(e) = spawn_cleanup(cleanup, exit) {
+    eprintln!("no cleanup on SIGINT/SIGTERM: {e}");
+    return;
+  }
   unsafe {
-    libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
-    libc::signal(libc::SIGTERM, sigint_handler as *const () as libc::sighandler_t);
+    libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+    libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
   }
 }
 
-extern "C" fn sigint_handler(sig: libc::c_int) {
-  // Signal handlers must be async-signal-safe. We do minimal work:
-  // uninstall_hooks only does file I/O (open, read, write), which is
-  // technically not async-signal-safe but is reliable in practice for
-  // single-threaded cleanup before exit.
-  ipc::cleanup_socket();
-
-  if let Ok(paths) = SIGNAL_CLEANUP_PATHS.lock() {
-    for path in paths.iter() {
-      let _ = jc_core::hooks_settings::uninstall_hooks(Flavor::current(), path);
+/// Start the thread that runs `cleanup` and then `then(signal)` once
+/// [`on_signal`] reports a signal. The cleanup takes the `.claude` lock, which
+/// the interrupted thread may hold (jc's start installs hooks under it), so it
+/// never runs inside the handler.
+fn spawn_cleanup(
+  cleanup: impl FnOnce() + Send + 'static,
+  then: impl FnOnce(libc::c_int) + Send + 'static,
+) -> std::io::Result<()> {
+  let (mut reader, writer) = std::io::pipe()?;
+  std::thread::Builder::new().name("jc-signal".into()).spawn(move || {
+    let mut sig = [0u8];
+    if reader.read_exact(&mut sig).is_ok() {
+      cleanup();
+      then(libc::c_int::from(sig[0]));
     }
-  }
+  })?;
+  SIGNAL_PIPE.store(writer.into_raw_fd(), Ordering::Release);
+  Ok(())
+}
 
-  // Re-raise with default handler for normal exit behavior.
-  unsafe {
-    libc::signal(sig, libc::SIG_DFL);
-    libc::raise(sig);
+/// The handler: one `write(2)`, which is async-signal-safe, and nothing that
+/// takes a lock.
+extern "C" fn on_signal(sig: libc::c_int) {
+  let fd = SIGNAL_PIPE.load(Ordering::Acquire);
+  if fd >= 0 {
+    let byte = sig as u8;
+    unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::time::Duration;
+
+  #[test]
+  fn a_signal_while_this_thread_holds_the_claude_lock_does_not_hang() {
+    let project = std::env::temp_dir().join(format!("jc-signal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    jc_core::hooks_settings::install_hooks(Flavor::Jc, &project, 1111).unwrap();
+    let settings = project.join(".claude/settings.local.json");
+    assert!(std::fs::read_to_string(&settings).unwrap().contains("/jc-hook/"));
+
+    let (done_tx, done_rx) = flume::unbounded();
+    let cleaned = project.clone();
+    spawn_cleanup(
+      move || jc_core::hooks_settings::uninstall_hooks(Flavor::Jc, &cleaned).unwrap(),
+      move |sig| done_tx.send(sig).unwrap(),
+    )
+    .unwrap();
+
+    let (returned_tx, returned_rx) = flume::unbounded();
+    let dir = project.join(".claude");
+    std::thread::spawn(move || {
+      // The signal lands while this thread is inside install_hooks, holding
+      // the lock on `.claude` (jc's start, on the main thread).
+      let lock = std::fs::File::open(&dir).unwrap();
+      lock.lock().unwrap();
+      on_signal(libc::SIGTERM);
+      returned_tx.send(()).unwrap();
+      drop(lock);
+    });
+    returned_rx
+      .recv_timeout(Duration::from_secs(10))
+      .expect("the signal handler waited on the .claude lock its own thread holds");
+    assert_eq!(done_rx.recv_timeout(Duration::from_secs(10)), Ok(libc::SIGTERM));
+    assert!(!std::fs::read_to_string(&settings).unwrap().contains("/jc-hook/"), "hooks removed");
+    std::fs::remove_dir_all(&project).unwrap();
   }
 }

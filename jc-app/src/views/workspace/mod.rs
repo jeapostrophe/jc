@@ -123,19 +123,23 @@ pub struct Workspace {
   /// runs of `claude` itself. Everything else about a session is asked of Cira.
   claude: Claude,
   /// jcc: the `cira` CLI every lifecycle request goes through. `None` in jc,
-  /// which never asks Cira for anything (`Flavor::cira`).
+  /// which never asks Cira for anything.
   cira_client: Option<jc_core::cira::Cira>,
   /// Cira as last read, and what jc remembers of its sessions.
   cira: sessions::CiraView,
-  /// Asks the Cira poll thread for a read now.
-  cira_kick: flume::Sender<()>,
-  /// Keeps `sessions.toml`, on a thread of its own.
-  records_tx: flume::Sender<jc_core::lifecycle::Records>,
+  /// jcc: asks the Cira poll thread for a read now.
+  cira_kick: Option<flume::Sender<()>>,
+  /// jcc: keeps `sessions.toml`, on a thread of its own.
+  records_tx: Option<flume::Sender<jc_core::lifecycle::Records>>,
   /// Hooks from a known project that matched no session, kept until the next
   /// Cira read teaches jc the uuid they carry.
   unmatched_hooks: VecDeque<HookEvent>,
   /// jcc: receives each `cira status --json` read by the Cira poll thread.
   _cira_poll_task: Option<Task<()>>,
+  /// The last project whose hooks could not be installed, and why: shown
+  /// until jc restarts, since its sessions send this app nothing.
+  hook_warning: Option<String>,
+  _hook_failure_task: Option<Task<()>>,
 }
 
 /// Unmatched hooks kept for re-dispatch; older ones are dropped.
@@ -226,17 +230,23 @@ impl Workspace {
       }));
     }
 
+    let (hook_failures_tx, hook_failures) = flume::unbounded::<String>();
     // Start hook server for Claude Code integration.
     let project_paths: Vec<PathBuf> = projects.iter().map(|p| p.path.clone()).collect();
     let (hook_server, hook_poll_task) = match HookServer::start(flavor, project_paths.clone()) {
       Ok(server) => {
         let port = server.port;
-        // Install hooks into each project's settings (fire and forget).
+        // Install hooks into each project's settings, off the main thread. A
+        // failure (a settings.local.json that does not parse is left alone)
+        // means no markers or notifications from that project: the window
+        // says so (`hook_warning`).
         for path in &project_paths {
           let path = path.clone();
+          let failed = hook_failures_tx.clone();
           std::thread::spawn(move || {
             if let Err(e) = jc_core::hooks_settings::install_hooks(flavor, &path, port) {
-              eprintln!("failed to install hooks for {}: {e}", path.display());
+              eprintln!("failed to install hooks for {}: {e:#}", path.display());
+              let _ = failed.send(format!("{}: hooks not installed: {e:#}", path.display()));
             }
           });
         }
@@ -312,7 +322,7 @@ impl Workspace {
     // TMUX-01/05/06), read on the poll's own thread, each read stamped with
     // when it began; only applying a read runs here. jc has no client, so no
     // poll: it never runs `cira`.
-    let cira_client = flavor.cira();
+    let cira_client = (flavor == Flavor::Jcc).then(jc_core::cira::Cira::default);
     let (cira_kick, cira_poll_task) = match cira_client.clone() {
       Some(reader) => {
         let (cira_rx, cira_kick) =
@@ -327,27 +337,26 @@ impl Workspace {
               }
             }
           });
-        (cira_kick, Some(task))
+        (Some(cira_kick), Some(task))
       }
-      None => (flume::unbounded().0, None),
+      None => (None, None),
     };
 
     // jcc: `sessions.toml` is read and written off the main thread: the saver
-    // writes the latest records it is sent. jc keeps no records.
-    let (records_tx, records_rx) = flume::unbounded::<jc_core::lifecycle::Records>();
-    let keeps_records = flavor == Flavor::Jcc;
-    std::thread::spawn(move || {
-      if !keeps_records {
-        return;
-      }
-      while let Ok(mut records) = records_rx.recv() {
-        while let Ok(newer) = records_rx.try_recv() {
-          records = newer;
+    // writes the latest records it is sent. jc keeps no records, so has no saver.
+    let records_tx = (flavor == Flavor::Jcc).then(|| {
+      let (records_tx, records_rx) = flume::unbounded::<jc_core::lifecycle::Records>();
+      std::thread::spawn(move || {
+        while let Ok(mut records) = records_rx.recv() {
+          while let Ok(newer) = records_rx.try_recv() {
+            records = newer;
+          }
+          if let Err(e) = jc_core::config::save_sessions(&records) {
+            eprintln!("sessions.toml: {e:#}");
+          }
         }
-        if let Err(e) = jc_core::config::save_sessions(&records) {
-          eprintln!("sessions.toml: {e:#}");
-        }
-      }
+      });
+      records_tx
     });
 
     let mut ws = Self {
@@ -388,11 +397,25 @@ impl Workspace {
       records_tx,
       unmatched_hooks: VecDeque::new(),
       _cira_poll_task: cira_poll_task,
+      hook_warning: None,
+      _hook_failure_task: None,
     };
 
     if flavor == Flavor::Jcc {
       ws.start_cira_client(window, cx);
     }
+    ws._hook_failure_task =
+      Some(cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+        while let Ok(failure) = hook_failures.recv_async().await {
+          let shown = this.update(cx, |ws, cx| {
+            ws.hook_warning = Some(failure);
+            cx.notify();
+          });
+          if shown.is_err() {
+            break;
+          }
+        }
+      }));
     ws.refresh_breadcrumb_observers(cx);
     ws.reconcile_schedules(window, cx);
     ws.start_schedule_reconcile_loop(window, cx);
@@ -537,7 +560,7 @@ impl Workspace {
   /// reason to ask: closing only detaches from background sessions, which
   /// keep running.
   fn try_close(&mut self, is_quit: bool, window: &mut Window, cx: &mut Context<Self>) {
-    let conflicts = self.save_all_dirty(cx);
+    let conflicts = self.save_all_dirty(window, cx);
     let active = self.active_session_count();
 
     if conflicts.is_empty() && active == 0 {
@@ -562,42 +585,33 @@ impl Workspace {
   }
 
   /// Save all dirty buffers (TODO views, code views, global TODO).
-  /// Returns a list of file names that had merge conflicts and couldn't be saved.
-  fn save_all_dirty(&mut self, cx: &mut Context<Self>) -> Vec<String> {
-    let mut conflicts = Vec::new();
-
+  /// Returns the files with unsaved edits that could not be saved: a merge
+  /// conflict, which nothing saves over until it is reloaded, or a failed write.
+  fn save_all_dirty(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<String> {
+    let mut unsaved = Vec::new();
     for project in &self.projects {
-      // TODO view
-      if project.todo_view.read(cx).is_dirty(cx) {
-        project.todo_view.update(cx, |tv, cx| tv.save(cx));
+      let named = |path: Option<&Path>| {
+        path.map(|p| p.strip_prefix(&project.path).unwrap_or(p).display().to_string())
+      };
+      if project.todo_view.read(cx).is_dirty(cx)
+        && !project.todo_view.update(cx, |tv, cx| tv.save(window, cx))
+      {
+        unsaved.extend(named(project.todo_view.read(cx).code_view().read(cx).file_path()));
       }
-
-      // Per-session code views
       for session in project.sessions.values() {
-        let cv = session.code_view.read(cx);
-        if cv.is_dirty(cx) {
-          if cv.has_conflict() {
-            if let Some(path) = cv.file_path() {
-              let relative = path.strip_prefix(&project.path).unwrap_or(path);
-              conflicts.push(relative.display().to_string());
-            }
-          } else {
-            session.code_view.update(cx, |v, cx| v.save(cx));
-          }
+        if session.code_view.read(cx).is_dirty(cx)
+          && !session.code_view.update(cx, |v, cx| v.save(window, cx))
+        {
+          unsaved.extend(named(session.code_view.read(cx).file_path()));
         }
       }
     }
-
-    // Global TODO
-    if self.global_todo_view.read(cx).is_dirty(cx) {
-      if self.global_todo_view.read(cx).has_conflict() {
-        conflicts.push("~/.claude/TODO.md".to_string());
-      } else {
-        self.global_todo_view.update(cx, |v, cx| v.save(cx));
-      }
+    if self.global_todo_view.read(cx).is_dirty(cx)
+      && !self.global_todo_view.update(cx, |v, cx| v.save(window, cx))
+    {
+      unsaved.push("~/.claude/TODO.md".to_string());
     }
-
-    conflicts
+    unsaved
   }
 
   fn show_close_confirm(
@@ -1265,14 +1279,14 @@ impl Workspace {
     match kind {
       Some(PaneContentKind::CodeViewer) => {
         if let Some(cv) = project.code_view() {
-          cv.update(cx, |v, cx| v.save(cx));
+          cv.update(cx, |v, cx| v.save(window, cx));
         }
       }
       Some(PaneContentKind::TodoEditor) => {
-        project.todo_view.update(cx, |v, cx| v.save(cx));
+        project.todo_view.update(cx, |v, cx| v.save(window, cx));
       }
       Some(PaneContentKind::GlobalTodo) => {
-        self.global_todo_view.update(cx, |v, cx| v.save(cx));
+        self.global_todo_view.update(cx, |v, cx| v.save(window, cx));
       }
       _ => {}
     }

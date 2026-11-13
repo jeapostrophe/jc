@@ -59,8 +59,48 @@ impl ProjectState {
     window: &mut Window,
     cx: &mut App,
   ) -> Self {
-    let todo_view = cx.new(|cx| TodoView::new(path.clone(), window, cx));
+    let flavor = Flavor::current();
+    // jc's TODO is the project's TODO.md; jcc's is its own todo.md in Cira's
+    // store, opened once a status read names the Cira project (`open_todo`).
+    let todo = flavor.todo_path(&path, None);
+    let todo_view = cx.new(|cx| TodoView::new(todo, window, cx));
+    // jc: one bucket scan for the whole project, cached on the struct and
+    // reused by every later `launch_for`.
+    let session_dirs = match flavor {
+      Flavor::Jc => Self::session_dirs(&path),
+      Flavor::Jcc => None,
+    };
+    let mut project = Self {
+      path,
+      name,
+      sessions: HashMap::new(),
+      active_session: None,
+      next_session_id: 0,
+      todo_view,
+      cira_open: None,
+      cira_known: HashSet::new(),
+      session_dirs,
+    };
+    project.restore_sessions(palette, window, cx);
+    project
+  }
 
+  /// jcc: open the todo.md a status read named for this project
+  /// (`Flavor::todo_path`), and start its sessions.
+  pub fn open_todo(&mut self, todo: PathBuf, palette: &Palette, window: &mut Window, cx: &mut App) {
+    self.todo_view.update(cx, |tv, cx| tv.open(todo, window, cx));
+    self.restore_sessions(palette, window, cx);
+  }
+
+  /// Whether this app's TODO for the project is open: always for jc; for jcc
+  /// once Cira has named the project.
+  pub fn todo_open(&self, cx: &App) -> bool {
+    self.todo_view.read(cx).is_open(cx)
+  }
+
+  /// Start a session for every active heading in the TODO, once it is open.
+  fn restore_sessions(&mut self, palette: &Palette, window: &mut Window, cx: &mut App) {
+    let todo_view = self.todo_view.clone();
     // Bound each session's message log first, so the session-restore loop
     // below sees the bounded document.
     todo_view.update(cx, |tv, cx| tv.truncate_logs(window, cx));
@@ -73,15 +113,7 @@ impl ProjectState {
     // attaches to is the job Cira names (`Workspace::drive_sessions`), and a
     // legacy `> uuid=` heading is first migrated through Cira.
     let flavor = Flavor::current();
-    // jc: one bucket scan for the whole project, cached on the struct and
-    // reused by every later `launch_for`.
-    let session_dirs = match flavor {
-      Flavor::Jc => Self::session_dirs(&path),
-      Flavor::Jcc => None,
-    };
     let document = todo_view.read(cx).document().clone();
-    let mut sessions = HashMap::new();
-    let mut next_session_id: SessionId = 0;
 
     // The active session is the one with the most recent `> last=` submit;
     // sessions without one sort as 0, so ties fall back to document order (first).
@@ -93,7 +125,7 @@ impl ProjectState {
     // The later duplicates are then *unreachable* rather than dormant — every
     // lookup resolves an id to the first match — and jc does not repair them.
     // Editing the id line by hand is the fix.
-    let mut adopted_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut adopted_ids: HashSet<&str> = HashSet::new();
 
     for todo_session in document
       .sessions
@@ -108,19 +140,19 @@ impl ProjectState {
       .filter(|s| !s.id.is_empty())
       .filter(|s| adopted_ids.insert(s.id.as_str()))
     {
-      let id = next_session_id;
-      next_session_id += 1;
+      let id = self.next_session_id;
+      self.next_session_id += 1;
 
       let start = match flavor {
-        Flavor::Jc => Start::Own {
-          launch: launch_from(session_dirs.as_deref(), &todo_session.id),
-          dangerous: todo_session.dangerous,
-        },
+        Flavor::Jc => {
+          let launch = launch_from(self.session_dirs.as_deref(), &todo_session.id);
+          Start::Own(jc_core::claude::claude_argv(&todo_session.id, launch, todo_session.dangerous))
+        }
         Flavor::Jcc => Start::Cira,
       };
       let state =
-        SessionState::create(id, Heading::of(todo_session), start, &path, palette, window, cx);
-      sessions.insert(id, state);
+        SessionState::create(id, Heading::of(todo_session), start, &self.path, palette, window, cx);
+      self.sessions.insert(id, state);
 
       let last = todo_session.last_active.unwrap_or(0);
       if best_active.is_none_or(|(_, best_last)| last > best_last) {
@@ -128,25 +160,11 @@ impl ProjectState {
       }
     }
 
-    let active_session = best_active.map(|(id, _)| id);
-
-    // Highlight the initial active session in the TODO view.
-    if let Some(id) = active_session
-      && let Some(session) = sessions.get(&id)
-    {
-      todo_view.update(cx, |tv, cx| tv.set_active_key(Some(&session.key), cx));
-    }
-
-    Self {
-      path,
-      name,
-      sessions,
-      active_session,
-      next_session_id,
-      todo_view,
-      cira_open: None,
-      cira_known: HashSet::new(),
-      session_dirs,
+    if let Some((id, _)) = best_active {
+      self.active_session = Some(id);
+      // Highlight the initial active session in the TODO view.
+      let key = self.sessions[&id].key.clone();
+      todo_view.update(cx, |tv, cx| tv.set_active_key(Some(&key), cx));
     }
   }
 

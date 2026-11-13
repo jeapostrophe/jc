@@ -127,8 +127,8 @@ pub fn uninstall_hooks(flavor: Flavor, project_path: &Path) -> Result<()> {
 /// Read, `edit` and write back a project's `.claude/settings.local.json`,
 /// which jc, jcc and Jay all edit: under an exclusive lock on the `.claude`
 /// directory, so jc and jcc changing their hooks at once never lose each
-/// other's change, and by a write to a temporary file renamed over it, so a
-/// reader never sees half a file. A file that does not parse is left alone
+/// other's change, and replaced whole ([`crate::replace`]: a reader never sees
+/// half a file, and a symlinked file stays a link). A file that does not parse is left alone
 /// (an error), never replaced by one holding only hooks. With `create` false
 /// a missing file stays missing.
 fn edit_settings(project_path: &Path, create: bool, edit: impl FnOnce(&mut Value)) -> Result<()> {
@@ -155,11 +155,7 @@ fn edit_settings(project_path: &Path, create: bool, edit: impl FnOnce(&mut Value
     anyhow::bail!("{} is not a JSON object; leaving it alone", path.display());
   }
   edit(&mut settings);
-  let temp = dir.join(format!(".settings.local.json.tmp-{}", std::process::id()));
-  std::fs::write(&temp, serde_json::to_string_pretty(&settings)?)?;
-  std::fs::rename(&temp, &path).inspect_err(|_| {
-    let _ = std::fs::remove_file(&temp);
-  })?;
+  crate::replace::write_replacing(&path, serde_json::to_string_pretty(&settings)?.as_bytes())?;
   Ok(())
 }
 
@@ -268,6 +264,31 @@ mod tests {
     assert!(urls(&project, Flavor::Jc) > 0, "jc's last install survives jcc's");
     assert!(urls(&project, Flavor::Jcc) > 0, "jcc's last install survives jc's");
     std::fs::remove_dir_all(&project).unwrap();
+  }
+
+  #[test]
+  fn a_symlinked_settings_file_stays_a_link_and_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("jc-hooks-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+    let target = root.join("elsewhere/settings.local.json");
+    std::fs::write(&target, "{\"permissions\": {\"allow\": [\"Bash(ls)\"]}}").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = project.join(".claude/settings.local.json");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    install_hooks(Flavor::Jc, &project, 1111).unwrap();
+    assert!(
+      std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+      "installing hooks replaced the symlinked settings.local.json with a file"
+    );
+    let text = std::fs::read_to_string(&target).unwrap();
+    assert!(text.contains("/jc-hook/") && text.contains("Bash(ls)"), "{text}");
+    assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
+    std::fs::remove_dir_all(&root).unwrap();
   }
 
   #[test]

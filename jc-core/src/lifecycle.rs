@@ -61,7 +61,7 @@ pub fn pane_action(
     return wait(&format!("waiting while Cira runs its {}…", op.op));
   }
   if s.mode_pending == ModePending::Due {
-    return wait(if s.dangerous { "becoming dangerous…" } else { "becoming normal…" });
+    return wait(if s.dangerous { "becoming dangerous…" } else { "becoming auto…" });
   }
   let Some(job) = &s.job else {
     return match s.op_error() {

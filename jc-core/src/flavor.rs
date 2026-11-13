@@ -1,33 +1,28 @@
 //! Which app this process is (Cira PLAN TMUX-07): `jc`, which runs each Claude
 //! session in a terminal of its own, or `jcc`, Cira's client, where Cira owns
 //! each session and jc attaches to it. One binary and one codebase; the flavor
-//! is chosen once at start from the program's name ([`Flavor::from_program`])
-//! and decides everything the two must not share, so both can run side by side
-//! on the same projects without acting on each other's sessions or state:
-//!
-//! - the config directory (`state.toml`, `sessions.toml`, the single-instance
-//!   `jc.sock`): [`Flavor::config_subdir`];
-//! - the hook URLs each installs into a project's `.claude/settings.local.json`,
-//!   which are also how each finds and removes only its own: [`Flavor::hook_prefix`];
-//! - the TODO.md section holding its session headings, and the id line those
-//!   headings carry: [`Flavor::section`], [`Flavor::id_kind`];
-//! - who runs a session: jc starts `claude` itself ([`Flavor::claude_command`]),
-//!   jcc asks Cira ([`Flavor::cira`]).
+//! is chosen once at start ([`Flavor::chosen`]) and names the app. What each
+//! app does differently is in ARCH.md ("Two Apps: jc and jcc"); what they must
+//! not share is decided here, so both run side by side on the same projects:
+//! the config directory ([`Flavor::config_subdir`]), the hook URLs
+//! ([`Flavor::hook_prefix`]), which headings are a session
+//! ([`Flavor::owns`], [`Flavor::id_kind`]) and the TODO file
+//! ([`Flavor::todo_path`]).
 
-use crate::claude::Launch;
+use crate::cira::Status;
 use crate::todo::IdKind;
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Flavor {
   /// `jc`: each Claude pane runs `claude --session-id|--resume <uuid>` in jc's
-  /// own terminal; its headings carry `> uuid=` under `# Claude`.
+  /// own terminal; its headings carry `> uuid=` in the project's TODO.md.
   #[default]
   Jc,
   /// `jcc`: Cira's client. Each Claude pane attaches to the job Cira names;
-  /// its headings carry `> cira=` under `# Cira`.
+  /// its headings carry `> cira=` in its own todo.md in Cira's store.
   Jcc,
 }
 
@@ -40,6 +35,20 @@ impl Flavor {
   pub fn from_program(argv0: Option<&OsStr>) -> Self {
     let name = argv0.and_then(|a| Path::new(a).file_name());
     if name == Some(OsStr::new("jcc")) { Self::Jcc } else { Self::Jc }
+  }
+
+  /// The flavor this process runs as: `JC_FLAVOR` (`jc` or `jcc`) when set,
+  /// for a development build (`cargo run` names its program `jc-app`), else
+  /// the program's name ([`Flavor::from_program`]). `Err` names a
+  /// `JC_FLAVOR` that is neither, along with the program's flavor, used instead.
+  pub fn chosen(argv0: Option<&OsStr>, env: Option<&OsStr>) -> Result<Self, (Self, String)> {
+    let program = Self::from_program(argv0);
+    match env.map(|v| v.to_string_lossy()) {
+      None => Ok(program),
+      Some(v) if v == "jc" => Ok(Self::Jc),
+      Some(v) if v == "jcc" => Ok(Self::Jcc),
+      Some(v) => Err((program, format!("JC_FLAVOR={v} is neither jc nor jcc"))),
+    }
   }
 
   /// Make `self` this process's flavor ([`Flavor::current`]); the first call
@@ -80,14 +89,16 @@ impl Flavor {
     }
   }
 
-  /// The top-level TODO.md section (`# <section>`) whose `##` headings are
-  /// this app's sessions. Everything else in the file is text to it, so jc
-  /// and jcc never act on the same heading, and a `jc` that predates jcc
-  /// (it reads only `# Claude`) never sees jcc's.
-  pub fn section(self) -> &'static str {
+  /// The TODO file this app keeps for the project at `project`, the only one
+  /// it reads or writes: jc's is the project's own `TODO.md`; jcc's is
+  /// `todo.md` beside the scratch pad of the Cira project holding `project`
+  /// (`$CIRA_HOME/projects/<name>/todo.md`, [`Status::todo_for`]), so the two
+  /// apps never write one file. `None` for jcc until a status read names that
+  /// project.
+  pub fn todo_path(self, project: &Path, status: Option<&Status>) -> Option<PathBuf> {
     match self {
-      Self::Jc => "Claude",
-      Self::Jcc => "Cira",
+      Self::Jc => Some(project.join("TODO.md")),
+      Self::Jcc => status?.todo_for(project),
     }
   }
 
@@ -99,32 +110,14 @@ impl Flavor {
     }
   }
 
-  /// Does a heading in this app's section with an id line of `kind` name one
-  /// of its sessions? jc never acts on a `> cira=` heading, wherever it is;
-  /// jcc's own are `> cira=`, and a `> uuid=` heading moved into its section
-  /// is a conversation it migrates to Cira (Cira PLAN TMUX-01).
+  /// Does a `# Claude` heading with an id line of `kind` name one of its
+  /// sessions? jc never acts on a `> cira=` heading; jcc's own are `> cira=`,
+  /// and a `> uuid=` heading pasted into its file is a conversation it
+  /// migrates to Cira (Cira PLAN TMUX-01).
   pub fn owns(self, kind: IdKind) -> bool {
     match self {
       Self::Jc => kind == IdKind::Uuid,
       Self::Jcc => true,
-    }
-  }
-
-  /// The `cira` client, for jcc only: jc never asks Cira for anything.
-  pub fn cira(self) -> Option<crate::cira::Cira> {
-    match self {
-      Self::Jc => None,
-      Self::Jcc => Some(crate::cira::Cira::default()),
-    }
-  }
-
-  /// What a Claude pane runs for the heading bound to `uuid`, for jc only
-  /// (`claude --session-id|--resume <uuid>`, see [`Launch`]). `None` for
-  /// jcc, whose panes run only the `claude attach` of the job Cira names.
-  pub fn claude_command(self, uuid: &str, launch: Launch, dangerous: bool) -> Option<Vec<String>> {
-    match self {
-      Self::Jc => Some(crate::claude::claude_argv(uuid, launch, dangerous)),
-      Self::Jcc => None,
     }
   }
 }
@@ -146,36 +139,53 @@ mod tests {
   }
 
   #[test]
-  fn jc_and_jcc_share_no_config_dir_hook_or_section() {
+  fn jc_flavor_overrides_the_program_name() {
+    let dev = Some(OsStr::new("target/debug/jc-app"));
+    let jcc = Some(OsStr::new("/x/jcc.app/Contents/MacOS/jcc"));
+    assert_eq!(Flavor::chosen(dev, None), Ok(Flavor::Jc));
+    assert_eq!(Flavor::chosen(dev, Some(OsStr::new("jcc"))), Ok(Flavor::Jcc));
+    assert_eq!(Flavor::chosen(jcc, Some(OsStr::new("jc"))), Ok(Flavor::Jc));
+    let (fallback, why) = Flavor::chosen(jcc, Some(OsStr::new("JCC"))).unwrap_err();
+    assert_eq!(fallback, Flavor::Jcc, "a bad value falls back to the program's name");
+    assert!(why.contains("JC_FLAVOR=JCC"), "{why}");
+  }
+
+  #[test]
+  fn jc_and_jcc_share_no_config_dir_or_hook() {
     assert_ne!(Flavor::Jc.config_subdir(), Flavor::Jcc.config_subdir());
-    assert_ne!(Flavor::Jc.section(), Flavor::Jcc.section());
     let (jc, jcc) = (Flavor::Jc.hook_prefix(), Flavor::Jcc.hook_prefix());
     // Each app finds its own hook entries by substring: neither may match the other's.
     assert!(!jc.contains(jcc) && !jcc.contains(jc), "{jc} vs {jcc}");
   }
 
-  #[test]
-  fn jc_runs_claude_itself_and_never_asks_cira() {
-    let jc = Flavor::Jc;
-    assert!(jc.cira().is_none(), "jc has no cira client");
-    assert_eq!(
-      jc.claude_command("u-1", Launch::Resume, true).unwrap(),
-      ["claude", "--resume", "u-1", "--dangerously-skip-permissions"]
-    );
-    assert_eq!(
-      jc.claude_command("u-1", Launch::New, false).unwrap(),
-      ["claude", "--session-id", "u-1"]
-    );
-    assert!(!jc.owns(IdKind::Cira), "jc never acts on a > cira= heading");
-    assert_eq!(jc.id_kind(), IdKind::Uuid);
+  /// A status read naming the Cira project `cira-proj` at `/w/proj`, in a
+  /// store at `/store`.
+  fn status() -> Status {
+    Status::parse(br#"{"home":"/store","projects":[{"name":"cira-proj","path":"/w/proj"}]}"#)
+      .unwrap()
   }
 
   #[test]
-  fn jcc_asks_cira_and_never_runs_claude_itself() {
-    let jcc = Flavor::Jcc;
-    assert!(jcc.cira().is_some());
-    assert_eq!(jcc.claude_command("u-1", Launch::Resume, true), None);
-    assert_eq!(jcc.claude_command("u-1", Launch::New, false), None);
-    assert_eq!(jcc.id_kind(), IdKind::Cira);
+  fn jc_keeps_the_projects_todo_and_never_jccs() {
+    let project = Path::new("/w/proj");
+    for status in [None, Some(status())] {
+      let jc = Flavor::Jc.todo_path(project, status.as_ref()).unwrap();
+      assert_eq!(jc, Path::new("/w/proj/TODO.md"));
+      assert!(!jc.starts_with("/store"), "jc never reads or writes Cira's store");
+    }
+  }
+
+  #[test]
+  fn jccs_todo_is_beside_the_scratch_pad_and_never_the_projects() {
+    let status = status();
+    let at = |p: &str| Flavor::Jcc.todo_path(Path::new(p), Some(&status));
+    assert_eq!(at("/w/proj").unwrap(), Path::new("/store/projects/cira-proj/todo.md"));
+    assert_eq!(at("/w/proj/sub").unwrap(), Path::new("/store/projects/cira-proj/todo.md"));
+    assert_eq!(at("/w/other"), None, "no Cira project holds it yet");
+    assert_eq!(Flavor::Jcc.todo_path(Path::new("/w/proj"), None), None, "no read yet");
+    // Whatever the read, jcc's file is never one under the project.
+    for p in ["/w/proj", "/w/proj/sub", "/w/other"] {
+      assert!(at(p).is_none_or(|todo| !todo.starts_with(p)), "{p}");
+    }
   }
 }

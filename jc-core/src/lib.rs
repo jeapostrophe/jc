@@ -7,5 +7,7 @@ pub mod hooks;
 pub mod hooks_settings;
 pub mod lifecycle;
 pub mod model;
+pub mod replace;
+pub mod shared_file;
 pub mod theme;
 pub mod todo;

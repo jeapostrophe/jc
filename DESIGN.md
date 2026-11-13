@@ -40,9 +40,13 @@ With the UUID always populated, every one of those callers already holds a uniqu
 
 ## Two Apps, One Codebase
 
-jc is built twice from one codebase (Cira PLAN TMUX-07; Jay, Q-196: *"Try to make it so the code is as shared as possible"*): **jc**, which runs each session's `claude` itself as above, and **jcc**, the client of Cira described next. The binary decides once at start from its own file name (`jc_core::flavor::Flavor`), and that one value chooses everything the two must not share: the config directory, the hook URL prefix, the TODO.md section and id line of its headings, and who runs a session. Everything else (TODO.md editing, sends, schedules, panes, pickers, the terminal) is the same code.
+jc is built twice from one codebase (Cira PLAN TMUX-07; Jay, Q-196: *"Try to make it so the code is as shared as possible"*): **jc**, which runs each session's `claude` itself as above, and **jcc**, the client of Cira described next. The binary decides once at start from its own file name, or `JC_FLAVOR` (`jc_core::flavor::Flavor`), and that one value chooses everything the two must not share: the config directory, the hook URL prefix, the TODO file and the id line of its headings, and who runs a session. Everything else (TODO.md editing, sends, schedules, panes, pickers, the terminal) is the same code.
 
-The two exist so Jay can move his projects to Cira one at a time while jc keeps running the rest, so they must run side by side on the same files without ever acting on one session twice. The TODO.md split is by **section**: jc's sessions are the `##` headings under `# Claude`, jcc's those under `# Cira`, and each app reads only its own. A split by id line alone (`> uuid=` for jc, `> cira=` for jcc, in one section) was rejected: the jc that is already running reads every heading under `# Claude`, takes a `> cira=` heading for an unbound one, and would offer it for adoption, minting a uuid into it. A section that jc has never read is invisible to every jc, old or new. Moving a session is moving its block between sections; jcc migrates a moved `> uuid=` heading to Cira only when no `claude` process still runs that conversation, because jc keeps a session running when its heading leaves `# Claude`.
+The two exist so Jay can move his projects to Cira one at a time while jc keeps running the rest, so they must run side by side on the same projects without ever acting on one session twice. **Each keeps its own TODO file** (Jay, 2026-11-12: *"We could have jcc use new TODO.md files in the .cira directory adjacent to the scratch file to prevent this conflict problem"*): jc the project's `TODO.md`, jcc `todo.md` beside the Cira project's scratch pad (`$CIRA_HOME/projects/<name>/todo.md`, the store directory as the status read reports it). Moving a session is cutting its block from one file and pasting it into the other; jcc migrates a pasted `> uuid=` heading to Cira only when no `claude` process still runs that conversation, because jc keeps a session running when its heading leaves its file.
+
+An earlier version shared the project's TODO.md and split it by section (`# Claude` for jc, `# Cira` for jcc). Both apps save that file routinely and on their own schedules (a send, a new heading, a label Cira changed), so each save risked writing over the other's: the review of that version found five ways to lose a heading (a save over a change the watcher had not reported yet; the 200 ms after each save in which the watcher ignored every change, the other app's included; a save over a known merge conflict; an in-place write a reader could catch half done; and a signal handler that could hang). Those are fixed for any writer (Saving, below), since Jay, a second jc or any editor can still save the same file; with one writer per file per app, a conflict needs a person editing it.
+
+**Saving** (`jc_core::shared_file`). Every save re-reads the file and three-way merges in whatever someone else saved since the pane last read it; a conflict writes nothing and stops every save from that pane until it is reloaded. A change is recognised as the pane's own when the disk holds what the pane last wrote, never by timing. The file is replaced whole (`jc_core::replace`: a temporary file, synced, renamed over it, through a symlink, keeping permissions), and a check just before the rename starts the save over if the file changed after its read; saves by this code also hold a lock on the file's directory.
 
 ## jcc: Background Sessions
 
@@ -120,8 +124,8 @@ that time.
 
 Design choices follow from the use case:
 
-- **The marker lives in TODO.md, not a side table.** jc is already the sole writer of
-  TODO.md and treats it as the durable session store, so a scheduled send is just a
+- **The marker lives in TODO.md, not a side table.** jc already writes TODO.md and
+  treats it as the durable session store, so a scheduled send is just a
   Message heading with an extra token. This gives persistence, restart re-arming, and
   cancel/edit (delete or retype the marker) for free, with no new state file.
 - **The body is live, delivered at fire time.** Because the queued text sits in an

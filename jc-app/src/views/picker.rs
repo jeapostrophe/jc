@@ -722,7 +722,7 @@ struct SessionPickerEntry {
   marker: Option<Marker>,
   /// The project's open Cira blocks (`4 blocks`), empty when none.
   blocks: String,
-  /// The session's mode badge from Cira (`dangerous`), empty when normal.
+  /// The session's mode badge from Cira (`dangerous`), empty when auto.
   mode: &'static str,
   /// Unix timestamp of the last TODO submit (from `> last=`). `0` if unknown.
   last_active: u64,
@@ -1150,19 +1150,13 @@ impl ProjectActionsPickerDelegate {
       // session is on it (its uuid after a `/clear`) or is being started on it,
       // or Cira lists a session on it: by its uuid, or by a job short id it
       // starts with (a background session's first uuid does).
+      // The other app's headings are in a file this app never reads: a
+      // conversation jc runs is caught when jcc adopts it
+      // (`claude::conversation_running`), and one jcc's background jobs run
+      // is left out below.
       let doc = todo_documents.get(active_project_index);
-      // A heading of the other app's (jc's under `# Claude`, jcc's under
-      // `# Cira`) names a conversation that app runs: never offered here.
-      let ids: HashSet<&str> = doc
-        .map(|doc| {
-          doc
-            .sessions
-            .iter()
-            .map(|s| s.id.as_str())
-            .chain(doc.foreign_ids.iter().map(String::as_str))
-            .collect()
-        })
-        .unwrap_or_default();
+      let ids: HashSet<&str> =
+        doc.map(|doc| doc.sessions.iter().map(|s| s.id.as_str()).collect()).unwrap_or_default();
       let running: HashSet<&str> = projects[active_project_index]
         .sessions
         .values()
@@ -1303,7 +1297,7 @@ fn mode_action(to: bool) -> String {
   if to {
     "Make this session dangerous (--dangerously-skip-permissions)".to_string()
   } else {
-    "Make this session normal".to_string()
+    "Make this session auto".to_string()
   }
 }
 

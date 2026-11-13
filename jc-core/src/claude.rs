@@ -70,12 +70,35 @@ pub fn is_worktree_bucket(encoded_root: &str, name: &str) -> bool {
   name.strip_prefix(encoded_root).is_some_and(|rest| rest.starts_with(WORKTREE_INFIX))
 }
 
+/// Is `path` Claude Code's executable: a file named `claude` (a link the
+/// installer made, or Node's `process.title`), or the native installer's
+/// versioned binary (`…/claude/versions/2.1.323`), which the link resolves to?
+fn is_claude_program(path: &str) -> bool {
+  let path = Path::new(path);
+  let named = |p: Option<&Path>, name: &str| p.and_then(Path::file_name).is_some_and(|n| n == name);
+  named(Some(path), "claude")
+    || (named(path.parent(), "versions") && named(path.parent().and_then(Path::parent), "claude"))
+}
+
+/// Claude Code's own arguments, when command line `args` (program first) runs
+/// it: by its executable, or as an interpreter's script — an npm install runs
+/// `node …/@anthropic-ai/claude-code/cli.js`, or the `claude` link to it, and
+/// any script named `claude` (a wrapper) counts too.
+fn claude_args<'a>(args: &'a [&'a str]) -> Option<&'a [&'a str]> {
+  let program = args.first()?;
+  if is_claude_program(program) {
+    return Some(&args[1..]);
+  }
+  let script = args.get(1)?;
+  let by_node = Path::new(program).file_name()?.to_string_lossy().starts_with("node");
+  (is_claude_program(script) || (by_node && script.contains("/@anthropic-ai/claude-code/")))
+    .then(|| &args[2..])
+}
+
 /// Is command line `args` (program first) a foreground `claude` — not a
 /// background job (`--bg`, Cira's) nor an attach client?
 fn is_foreground_claude(args: &[&str]) -> bool {
-  let is_claude =
-    args.first().and_then(|p| Path::new(p).file_name()).is_some_and(|n| n == "claude");
-  is_claude && !args.contains(&"--bg") && args.get(1) != Some(&"attach")
+  claude_args(args).is_some_and(|a| !a.contains(&"--bg") && a.first() != Some(&"attach"))
 }
 
 /// Does command line `args` run `claude` itself on conversation `uuid` in the
@@ -85,6 +108,7 @@ pub fn runs_conversation(args: &[&str], uuid: &str) -> bool {
   if uuid.is_empty() || !is_foreground_claude(args) {
     return false;
   }
+  let args = claude_args(args).unwrap_or_default();
   args.windows(2).any(|w| matches!(w[0], "--resume" | "-r" | "--session-id") && w[1] == uuid)
     || args.iter().any(|a| {
       a.strip_prefix("--resume=").or_else(|| a.strip_prefix("--session-id=")) == Some(uuid)
@@ -119,11 +143,24 @@ pub fn conversation_running(uuid: &str) -> bool {
     return false;
   };
   let text = String::from_utf8_lossy(&out.stdout);
+  // One per line, so the two iterate together.
+  let exes: Vec<Option<String>> =
+    text.lines().map(|line| executable(line.split_whitespace().next()?.parse().ok()?)).collect();
   let procs: Vec<(u32, Vec<&str>)> = text
     .lines()
-    .filter_map(|line| {
+    .zip(&exes)
+    .filter_map(|(line, exe)| {
       let mut words = line.split_whitespace();
-      Some((words.next()?.parse().ok()?, words.collect()))
+      let pid = words.next()?.parse().ok()?;
+      let mut args: Vec<&str> = words.collect();
+      // The command line shows how it was started (`claude`, a link, any
+      // path); the executable the kernel ran says what it is.
+      if let (Some(exe), Some(first)) = (exe.as_deref(), args.first_mut())
+        && is_claude_program(exe)
+      {
+        *first = exe;
+      }
+      Some((pid, args))
     })
     .collect();
   let registry = std::env::var_os("HOME")
@@ -141,6 +178,22 @@ pub fn conversation_running(uuid: &str) -> bool {
     })
     .collect::<Vec<_>>();
   conversation_running_in(&procs, &registry, uuid)
+}
+
+/// The file process `pid` executes, links resolved; `None` when it has gone
+/// or cannot be asked.
+fn executable(pid: u32) -> Option<String> {
+  #[cfg(target_os = "macos")]
+  {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len =
+      unsafe { libc::proc_pidpath(pid as libc::c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    (len > 0).then(|| String::from_utf8_lossy(&buf[..len as usize]).into_owned())
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.to_string_lossy().into_owned())
+  }
 }
 
 /// The conversations Claude Code's background jobs run, from
@@ -240,6 +293,35 @@ mod tests {
     assert_eq!(found, ["new-uuid", "moved-uuid"].map(String::from).into_iter().collect());
     assert!(background_conversations(&jobs.join("missing")).is_empty());
     std::fs::remove_dir_all(&jobs).unwrap();
+  }
+
+  #[test]
+  fn claude_is_found_however_it_was_installed() {
+    let procs = vec![
+      // npm: node runs the package's cli.js (or the `claude` link to it).
+      (
+        1,
+        vec![
+          "node",
+          "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+          "--resume",
+          "u-npm",
+        ],
+      ),
+      (2, vec!["/opt/homebrew/bin/node", "/opt/homebrew/bin/claude", "--session-id", "u-link"]),
+      // The native installer's versioned binary, run by its own path.
+      (3, vec!["/Users/x/.local/share/claude/versions/2.1.323", "--resume", "u-native"]),
+      // A wrapper script named claude, run by its interpreter.
+      (6, vec!["/bin/sh", "/x/bin/claude", "--resume", "u-wrapped"]),
+      // Not claude: another node script, and an attach client by any path.
+      (4, vec!["node", "/x/tsserver.js", "--resume", "u-other"]),
+      (5, vec!["/Users/x/.local/share/claude/versions/2.1.323", "attach", "c0ffee00"]),
+    ];
+    let registry = vec![];
+    for uuid in ["u-npm", "u-link", "u-native", "u-wrapped"] {
+      assert!(conversation_running_in(&procs, &registry, uuid), "{uuid} runs, and was not found");
+    }
+    assert!(!conversation_running_in(&procs, &registry, "u-other"), "a script that is not claude");
   }
 
   #[test]

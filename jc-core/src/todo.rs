@@ -11,18 +11,14 @@ use std::ops::Range;
 
 #[derive(Debug, Default, Clone)]
 pub struct TodoDocument {
-  /// Whose document this is: its sessions are the `##` headings under
-  /// `# <flavor.section()>` whose id line the flavor owns
-  /// ([`Flavor::owns`]), and its writers write that flavor's id line.
+  /// Whose document this is (jc's project TODO.md, or jcc's todo.md in
+  /// Cira's store: [`Flavor::todo_path`]): its sessions are the `##` headings
+  /// under `# Claude` whose id line the flavor owns ([`Flavor::owns`]), and
+  /// its writers write that flavor's id line.
   pub flavor: Flavor,
-  /// 1-based line of the `# <flavor.section()>` heading.
+  /// 1-based line of the `# Claude` heading.
   pub section_line: Option<u32>,
   pub sessions: Vec<TodoSession>,
-  /// Ids on the id lines of `##` headings that are not this flavor's
-  /// sessions: the other app's section, or a `> cira=` heading in jc's. Never
-  /// acted on; listed so a transcript one of them names is not offered for
-  /// adoption here.
-  pub foreign_ids: Vec<String>,
   /// `## [DELETED] …` headings that still name a session. They are never
   /// sessions themselves; jc lists them only so their removal reaches Cira
   /// (`cira session rm`, see [`TodoDocument::marks`]).
@@ -441,7 +437,6 @@ pub fn drop_schedule_marker(text: &str, message: &TodoMessage) -> String {
 /// The document as `flavor` reads it (see [`TodoDocument::flavor`]).
 pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
   let mut doc = TodoDocument { flavor, ..Default::default() };
-  let section = format!("# {}", flavor.section());
   let mut current_session: Option<TodoSession> = None;
   let mut byte_offset: usize = 0;
   // State: we just saw an `## Label` heading and are looking for its id line next.
@@ -449,13 +444,10 @@ pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
   // State: we just saw an `## [DELETED] Label` heading; its id line, if it is
   // the next line, goes to `doc.deleted`.
   let mut expecting_deleted_id = false;
-  // State: we just saw a `##` heading that is not one of ours; its id line, if
-  // it is the next line, goes to `doc.foreign_ids`.
-  let mut expecting_foreign_id = false;
   // State: we're inside a session's metadata block (after `> uuid=`); each line
   // starting with `> ` is parsed as metadata until we hit a non-metadata line.
   let mut in_metadata = false;
-  // Only create sessions for `##` headings inside the flavor's section.
+  // Only create sessions for `##` headings inside `# Claude`.
   let mut in_section = false;
 
   for (line_idx, line) in text.lines().enumerate() {
@@ -484,13 +476,6 @@ pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
     }
     in_metadata = false;
 
-    if std::mem::take(&mut expecting_foreign_id)
-      && let Some((_, id)) = id_line(line)
-      && !id.is_empty()
-    {
-      doc.foreign_ids.push(id.to_string());
-    }
-
     if std::mem::take(&mut expecting_deleted_id)
       && let Some((id_kind, id)) = id_line(line)
       && !id.is_empty()
@@ -500,13 +485,11 @@ pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
 
     // If we're expecting an id line after a heading:
     if let Some(ref mut pending) = expecting_id_for {
-      if let Some((id_kind, rest)) = id_line(line)
+      if let Some((id_kind, _)) = id_line(line)
         && !flavor.owns(id_kind)
       {
-        // Another app's heading: not a session, and nothing under it is ours.
-        if !rest.is_empty() {
-          doc.foreign_ids.push(rest.to_string());
-        }
+        // A heading jc does not own (a `> cira=` pasted into jc's file): not a
+        // session, and nothing under it is jc's.
         finalize_session(&mut doc, &mut current_session, line_start);
         expecting_id_for = None;
       } else if let Some((id_kind, rest)) = id_line(line) {
@@ -532,7 +515,7 @@ pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
     } else if line.starts_with("# ") {
       // Any top-level heading ends the current session and leaves the section.
       finalize_session(&mut doc, &mut current_session, line_start);
-      in_section = line == section;
+      in_section = line == "# Claude";
 
       if in_section {
         doc.section_line = Some(line_num);
@@ -541,11 +524,9 @@ pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
       // Any second-level heading ends the current session.
       finalize_session(&mut doc, &mut current_session, line_start);
 
-      // Only treat `##` headings as sessions inside the flavor's section.
+      // Only treat `##` headings as sessions inside `# Claude`.
       if !in_section {
-        // Not ours (the other app's section, or notes): only its id is kept,
-        // unless it is `[DELETED]`, which names nothing any more.
-        expecting_foreign_id = !after_h2.starts_with("[DELETED] ");
+        // Ignore — this heading is outside the Claude section.
       } else if after_h2.starts_with("[DELETED] ") {
         // Not a session; only its id line is wanted, for its removal.
         expecting_deleted_id = true;
@@ -717,8 +698,8 @@ pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
 /// Build new text with a `## <label>\n<id line>\n\n### WAIT\n` heading
 /// inserted, its id line the document flavor's (`> uuid=<id>` for jc,
 /// `> cira=<id>` for jcc: [`Flavor::id_kind`]).
-/// If the flavor's section (`# Claude`, `# Cira`) exists, the heading goes
-/// right after it. Otherwise that section is appended at the end of the text.
+/// If a `# Claude` section exists, the heading goes right after it. Otherwise
+/// a `# Claude` section is appended at the end of the text.
 ///
 /// `label` need not be unique: it is a display name, not an address (see
 /// [`SessionKey`]).
@@ -749,7 +730,7 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, id: &
     }
   }
 
-  // No section of ours; append one at the end.
+  // No `# Claude` section; append one at the end.
   let mut new_text = text.to_string();
   if !new_text.is_empty() && !new_text.ends_with('\n') {
     new_text.push('\n');
@@ -757,7 +738,7 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, id: &
   if !new_text.is_empty() {
     new_text.push('\n');
   }
-  new_text.push_str(&format!("# {}\n", doc.flavor.section()));
+  new_text.push_str("# Claude\n");
   new_text.push_str(&heading);
   new_text
 }
@@ -1167,6 +1148,8 @@ pub fn update_last_active(text: &str, session: &TodoSession, timestamp: u64) -> 
 
 #[cfg(test)]
 mod tests {
+  use super::*;
+
   /// The document as jc reads it.
   fn parse_jc(text: &str) -> TodoDocument {
     parse(text, Flavor::Jc)
@@ -1176,8 +1159,6 @@ mod tests {
   fn parse_jcc(text: &str) -> TodoDocument {
     parse(text, Flavor::Jcc)
   }
-
-  use super::*;
 
   /// Fixed local "now" for send tests that don't exercise scheduling.
   fn test_now() -> NaiveDateTime {
@@ -2668,7 +2649,7 @@ draft
   // is the heading's address, and a `> uuid=` heading is legacy.
   #[test]
   fn cira_line_is_the_session_address() {
-    let text = "# Cira\n## S\n> cira=c-1\n> last=5\n\n### WAIT\n";
+    let text = "# Claude\n## S\n> cira=c-1\n> last=5\n\n### WAIT\n";
     let doc = parse_jcc(text);
     let s = &doc.sessions[0];
     assert_eq!((s.id.as_str(), s.id_kind), ("c-1", IdKind::Cira));
@@ -2680,7 +2661,7 @@ draft
   #[test]
   fn uuid_line_is_a_legacy_address() {
     let text =
-      "# Cira\n## S\n> uuid=335b461a-eba5-485f-898c-f757fdb3f2bf\n> dangerous\n\n### WAIT\n";
+      "# Claude\n## S\n> uuid=335b461a-eba5-485f-898c-f757fdb3f2bf\n> dangerous\n\n### WAIT\n";
     let s = &parse_jcc(text).sessions[0];
     assert_eq!(s.id, "335b461a-eba5-485f-898c-f757fdb3f2bf");
     assert_eq!(s.id_kind, IdKind::Uuid);
@@ -2693,7 +2674,7 @@ draft
     // `[DELETED]` is never a session, but its Cira id must still be found so
     // the removal reaches Cira.
     let text = "\
-# Cira
+# Claude
 ## [DELETED] Old
 > cira=c-old
 
@@ -2718,7 +2699,7 @@ draft
   #[test]
   fn binding_a_legacy_heading_writes_its_cira_id_and_drops_dangerous() {
     let text = "\
-# Cira
+# Claude
 ## S
 > uuid=335b461a-eba5-485f-898c-f757fdb3f2bf
 > last=42
@@ -2739,7 +2720,7 @@ draft
     assert!(!s.dangerous);
     assert_eq!(s.messages.len(), 1);
     assert!(out.ends_with("### WAIT\ndraft\n"), "body untouched: {out}");
-    assert!(out.starts_with("# Cira\n## S\n> cira=c-9\n> last=42\n\n"), "{out}");
+    assert!(out.starts_with("# Claude\n## S\n> cira=c-9\n> last=42\n\n"), "{out}");
   }
 
   #[test]
@@ -2747,7 +2728,7 @@ draft
     // A hand-written heading with no id line: the id must land on the
     // session rather than being silently dropped.
     let text = "\
-# Cira
+# Claude
 ## My Session
 
 ### WAIT
@@ -2768,7 +2749,7 @@ draft
     // A label-keyed write hits the first heading twice and strands the second;
     // the index-keyed write must give each its own id.
     let text = "\
-# Cira
+# Claude
 ## New Session
 > uuid=
 ## New Session
@@ -2788,10 +2769,10 @@ draft
 
   #[test]
   fn renaming_a_heading_keeps_its_marker_and_body() {
-    let text = "# Cira\n## [D] Old name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n";
+    let text = "# Claude\n## [D] Old name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n";
     let doc = parse_jcc(text);
     let out = rename_heading_at(text, &doc, 0, "New name").expect("the heading is there");
-    assert_eq!(out, "# Cira\n## [D] New name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n");
+    assert_eq!(out, "# Claude\n## [D] New name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n");
     let doc = parse_jcc(&out);
     let out = rename_heading_at(&out, &doc, 1, "Renamed").unwrap();
     assert!(out.ends_with("## Renamed\n> cira=c-2\n"), "{out}");
@@ -2801,7 +2782,7 @@ draft
   fn a_label_that_would_read_as_a_marker_or_break_the_heading_is_not_written() {
     // Found in review: a page rename to `[DELETED] x`, written into the
     // heading, would make jc send `cira session rm`.
-    let text = "# Cira\n## Old\n> cira=c-1\n";
+    let text = "# Claude\n## Old\n> cira=c-1\n";
     let doc = parse_jcc(text);
     for label in ["[DELETED] x", "[D] x", "[X] x", "two\nlines", ""] {
       assert_eq!(rename_heading_at(text, &doc, 0, label), None, "{label:?}");
@@ -2812,7 +2793,7 @@ draft
   #[test]
   fn one_heading_speaks_for_each_cira_ids_label() {
     let text = "\
-# Cira
+# Claude
 ## [D] Copy
 > cira=c-1
 ## Live
@@ -2832,10 +2813,10 @@ draft
 
   #[test]
   fn update_last_active_lands_under_a_cira_line() {
-    let text = "# Cira\n## S\n> cira=c-1\n\n### WAIT\n";
+    let text = "# Claude\n## S\n> cira=c-1\n\n### WAIT\n";
     let doc = parse_jcc(text);
     let out = update_last_active(text, &doc.sessions[0], 7);
-    assert_eq!(out, "# Cira\n## S\n> cira=c-1\n> last=7\n\n### WAIT\n");
+    assert_eq!(out, "# Claude\n## S\n> cira=c-1\n> last=7\n\n### WAIT\n");
   }
 
   #[test]
@@ -2843,7 +2824,7 @@ draft
     // Two headings name c-1 (a copy-pasted block): marking the copy [DELETED]
     // or [D] must not stop or remove the session the other still runs.
     let text = "\
-# Cira
+# Claude
 ## Live
 > cira=c-1
 ## [DELETED] Copy
@@ -2875,7 +2856,7 @@ draft
   fn a_deferred_send_stays_pending_until_the_scheduled_path_delivers_it() {
     // A Cmd-Enter to a session that is not up yet must not read as sent, and
     // must survive a jc quit: it becomes a past-due scheduled send.
-    let text = "# Cira\n## S\n> cira=c-1\n\n### WAIT\nhello there\n";
+    let text = "# Claude\n## S\n> cira=c-1\n\n### WAIT\nhello there\n";
     let session = parse_jcc(text).sessions[0].clone();
     let sent = send_from_wait(text, &session, 0..0, Some(1), test_now()).unwrap();
     assert_eq!(sent.schedule, None);
@@ -2914,61 +2895,75 @@ draft
     assert_eq!(ids, vec!["u-a", "u-b"], "each session keeps its own uuid");
   }
 
-  // Cira PLAN TMUX-07: jc and jcc share one TODO.md and never one heading.
-  const BOTH: &str = "\
+  // Cira PLAN TMUX-07: jc reads the project's TODO.md, jcc its own todo.md in
+  // Cira's store; a session moves by cutting its block from one and pasting it
+  // into the other.
+  const JC_TODO: &str = "\
+# TODO
+notes
 # Claude
 ## jc session
 > uuid=u-jc
 
 ### WAIT
+## moving to jcc
+> uuid=u-moved
+> dangerous
+### Message 0
+hello
+### WAIT
+draft
 ## pasted from jcc
 > cira=c-pasted
-## [DELETED] released
-> uuid=u-released
-# Cira
-## jcc session
-> cira=c-jcc
-
-### WAIT
-## moved from jc
-> uuid=u-moved
-# Notes
-## not a session
-> uuid=u-notes
 ";
+  const JCC_TODO: &str = "# Claude\n## jcc session\n> cira=c-jcc\n\n### WAIT\n";
 
-  #[test]
-  fn jc_and_jcc_read_disjoint_headings_of_one_file() {
-    let ids = |doc: &TodoDocument| doc.sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
-    let jc = parse_jc(BOTH);
-    let jcc = parse_jcc(BOTH);
-    assert_eq!(ids(&jc), ["u-jc"], "jc: only `> uuid=` headings under # Claude");
-    assert_eq!(ids(&jcc), ["c-jcc", "u-moved"], "jcc: only headings under # Cira");
-    // What each does not own it only lists, so its transcripts are not
-    // offered for adoption; a `[DELETED]` heading has let its conversation go.
-    assert_eq!(jc.foreign_ids, ["c-pasted", "c-jcc", "u-moved", "u-notes"]);
-    assert_eq!(jcc.foreign_ids, ["u-jc", "c-pasted", "u-notes"]);
-    // A heading jc does not own takes nothing below it: no messages, no WAIT.
-    assert!(jc.sessions[0].wait.is_some());
+  fn ids(doc: &TodoDocument) -> Vec<String> {
+    doc.sessions.iter().map(|s| s.id.clone()).collect()
   }
 
   #[test]
-  fn each_flavor_writes_only_its_own_id_line_in_its_own_section() {
-    let jc = parse_jc(BOTH);
-    let out = insert_session_heading(BOTH, &jc, "new jc", "u-new");
+  fn jc_never_acts_on_a_cira_heading() {
+    let jc = parse_jc(JC_TODO);
+    assert_eq!(ids(&jc), ["u-jc", "u-moved"], "a `> cira=` heading is not jc's");
+    assert!(jc.sessions[1].wait.is_some(), "the heading jc skips takes nothing of the one before");
+    assert_eq!(bind_cira_at(JC_TODO, &jc, 0, "c-x"), None, "jc never writes a > cira= line");
+  }
+
+  #[test]
+  fn a_session_moves_by_cutting_its_block_into_jccs_todo() {
+    // Jay cuts `## moving to jcc` (to the next `##`) and pastes it into jcc's file.
+    let start = JC_TODO.find("## moving to jcc").unwrap();
+    let end = JC_TODO.find("## pasted from jcc").unwrap();
+    let block = &JC_TODO[start..end];
+    let jc_after = format!("{}{}", &JC_TODO[..start], &JC_TODO[end..]);
+    let jcc_after = format!("{JCC_TODO}{block}");
+
+    assert_eq!(ids(&parse_jc(&jc_after)), ["u-jc"], "jc no longer has it");
+    let jcc = parse_jcc(&jcc_after);
+    assert_eq!(ids(&jcc), ["c-jcc", "u-moved"], "jcc has it, by its uuid");
+    let moved = &jcc.sessions[1];
+    assert_eq!(moved.id_kind, IdKind::Uuid, "a heading jcc migrates to Cira");
+    assert!(moved.dangerous, "with its mode");
+    assert_eq!(moved.messages.len(), 1, "and its log");
+    // Migration rewrites only its id line (the next jcc start, or now).
+    let bound = bind_cira_at(&jcc_after, &jcc, 1, "c-new").unwrap();
+    let rebound = parse_jcc(&bound);
+    assert_eq!(ids(&rebound), ["c-jcc", "c-new"]);
+    assert_eq!(
+      update_session_uuid_at(&jcc_after, &jcc, 0, "u-x"),
+      None,
+      "jcc never rewrites a uuid"
+    );
+  }
+
+  #[test]
+  fn each_flavor_writes_its_own_id_line_under_claude() {
+    let out = insert_session_heading(JC_TODO, &parse_jc(JC_TODO), "new jc", "u-new");
     assert!(out.contains("# Claude\n## new jc\n> uuid=u-new\n"), "{out}");
-    assert_eq!(bind_cira_at(BOTH, &jc, 0, "c-x"), None, "jc never writes a > cira= line");
-
-    let jcc = parse_jcc(BOTH);
-    let out = insert_session_heading(BOTH, &jcc, "new jcc", "c-new");
-    assert!(out.contains("# Cira\n## new jcc\n> cira=c-new\n"), "{out}");
-    assert_eq!(parse_jc(&out).sessions.len(), 1, "jc does not see jcc's new heading");
-    assert_eq!(update_session_uuid_at(BOTH, &jcc, 0, "u-x"), None, "jcc never rewrites a uuid");
-
-    // A first jcc session in a file with only jc's section gets its own section.
-    let only_jc = "# Claude\n## a\n> uuid=u-a\n";
-    let out = insert_session_heading(only_jc, &parse_jcc(only_jc), "b", "c-b");
-    assert_eq!(out, "# Claude\n## a\n> uuid=u-a\n\n# Cira\n## b\n> cira=c-b\n\n### WAIT\n");
-    assert_eq!(parse_jc(&out).sessions.len(), 1);
+    // jcc makes its file on first use: an empty one gets a `# Claude` section.
+    let out = insert_session_heading("", &parse_jcc(""), "first", "c-1");
+    assert_eq!(out, "# Claude\n## first\n> cira=c-1\n\n### WAIT\n");
+    assert_eq!(ids(&parse_jcc(&out)), ["c-1"]);
   }
 }

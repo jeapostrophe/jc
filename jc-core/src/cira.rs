@@ -22,6 +22,10 @@ use std::time::{Duration, Instant, SystemTime};
 /// `cira status --json`, as much of it as jc uses.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Status {
+  /// The store's directory (`CIRA_HOME`, else `~/.cira`), as the daemon
+  /// resolved it.
+  #[serde(default)]
+  pub home: Option<PathBuf>,
   #[serde(default)]
   pub projects: Vec<Project>,
 }
@@ -69,7 +73,7 @@ pub struct Session {
   /// The desired mode: `--dangerously-skip-permissions`.
   #[serde(default)]
   pub dangerous: bool,
-  /// Its hooks report bypass while Cira wants it normal.
+  /// Its hooks report bypass while Cira wants it auto.
   #[serde(default)]
   pub drift: bool,
   /// The job Cira bound to it: what `claude attach` takes.
@@ -172,6 +176,14 @@ impl Status {
   /// directory contains it — Cira's own rule for the project of a working
   /// directory, so a jc project inside a registered repository (a worktree,
   /// a subdirectory) counts that repository's blocks.
+  /// jcc's TODO for the jc project at `path`: `todo.md` beside the scratch pad
+  /// of the Cira project holding it (`<home>/projects/<name>/todo.md`; Cira
+  /// DESIGN, "Scratch pads"). jcc makes it on first use.
+  pub fn todo_for(&self, path: &Path) -> Option<PathBuf> {
+    let name = &self.project_for(path)?.name;
+    Some(self.home.as_ref()?.join("projects").join(name).join("todo.md"))
+  }
+
   pub fn project_for(&self, path: &Path) -> Option<&Project> {
     self
       .projects
@@ -407,6 +419,14 @@ impl Cira {
     serde_json::from_slice(&out).map_err(|e| CallError::Malformed(e.to_string()))
   }
 
+  /// `cira project add NAME --path DIR`: register the jc project at `dir`, so
+  /// jcc has a Cira project, and with it a todo.md, before its first session.
+  /// The same name and path again changes nothing.
+  pub fn add_project(&self, name: &str, dir: &Path) -> Result<(), CallError> {
+    let path = format!("--path={}", dir.display());
+    self.call(&strs(&["project", "add", "--json", &path, "--", name]), self.call, None).map(drop)
+  }
+
   /// `cira session mode`: ask for `dangerous`, compare-and-set against the
   /// mode jc showed (`from`; exit 4 when it is no longer that).
   pub fn set_mode(&self, at: &At, id: &str, dangerous: bool, from: bool) -> Result<(), CallError> {
@@ -567,8 +587,10 @@ pub struct NewSession {
 
 impl NewSession {
   /// The arguments after `cira`. Values go as `--opt=value`, so a label that
-  /// starts with `-` is never read as a flag. Starting a dangerous session is
-  /// Jay's (Q-171), and jc acts for Jay, so it says `--from-jay`.
+  /// starts with `-` is never read as a flag. The mode is always named: Cira
+  /// starts a session dangerous unless asked for auto, and refuses a
+  /// `--resume` that names none (Cira PLAN SES-04). Starting a dangerous
+  /// session is Jay's (Q-171), and jc acts for Jay, so it says `--from-jay`.
   pub fn args(&self) -> Vec<String> {
     let mut args = strs(&["session", "new", "--json"]);
     args.push(format!("--cwd={}", self.cwd.display()));
@@ -578,6 +600,8 @@ impl NewSession {
     }
     if self.dangerous {
       args.extend(strs(&["--dangerous", "--from-jay"]));
+    } else {
+      args.push("--auto".into());
     }
     if self.wait {
       args.push("--wait".into());
@@ -614,7 +638,7 @@ fn jays_args(verb: &str, id: &str) -> Vec<String> {
 }
 
 fn mode_args(id: &str, dangerous: bool, from: bool) -> Vec<String> {
-  let mode = |d: bool| if d { "dangerous" } else { "normal" };
+  let mode = |d: bool| if d { "dangerous" } else { "auto" };
   let mut args = strs(&["session", "mode", "--json", "--from-jay"]);
   args.push(format!("--from={}", mode(from)));
   args.extend(strs(&["--", id, mode(dangerous)]));
@@ -696,6 +720,17 @@ mod tests {
 
   fn fixture() -> (Status, Value) {
     (Status::parse(FIXTURE).unwrap(), serde_json::from_slice(FIXTURE).unwrap())
+  }
+
+  #[test]
+  fn jccs_todo_is_in_the_store_cira_names() {
+    let (status, raw) = fixture();
+    let home = PathBuf::from(raw["home"].as_str().unwrap());
+    let project = &raw["projects"][0];
+    let dir = PathBuf::from(project["path"].as_str().unwrap());
+    let name = project["name"].as_str().unwrap();
+    assert_eq!(status.todo_for(&dir), Some(home.join("projects").join(name).join("todo.md")));
+    assert_eq!(status.todo_for(Path::new("/nowhere")), None);
   }
 
   #[test]
@@ -983,9 +1018,13 @@ mod tests {
     };
     assert_eq!(
       req.args(),
-      ["session", "new", "--json", "--cwd=/p/q r", "--label=-n surprise"],
-      "a plain start is anyone's: no --from-jay"
+      ["session", "new", "--json", "--cwd=/p/q r", "--label=-n surprise", "--auto"],
+      "an auto start names its mode (Cira SES-04: dangerous is the default) and is anyone's"
     );
+    // Cira SES-04: `--resume` without a mode is refused (exit 2), so a
+    // migrated heading without `> dangerous` says auto.
+    let resumed = NewSession { resume: Some("u".into()), ..req.clone() };
+    assert!(resumed.args().contains(&"--auto".to_string()), "{:?}", resumed.args());
     let req = NewSession {
       resume: Some("335b461a-eba5-485f-898c-f757fdb3f2bf".into()),
       dangerous: true,
@@ -1003,9 +1042,9 @@ mod tests {
   fn mode_stop_and_rm_are_jays_and_name_the_session_after_a_double_dash() {
     assert_eq!(
       mode_args("-c1", true, false),
-      ["session", "mode", "--json", "--from-jay", "--from=normal", "--", "-c1", "dangerous"]
+      ["session", "mode", "--json", "--from-jay", "--from=auto", "--", "-c1", "dangerous"]
     );
-    assert_eq!(mode_args("c1", false, true)[4..], ["--from=dangerous", "--", "c1", "normal"]);
+    assert_eq!(mode_args("c1", false, true)[4..], ["--from=dangerous", "--", "c1", "auto"]);
     assert_eq!(jays_args("stop", "c1"), ["session", "stop", "--json", "--from-jay", "--", "c1"]);
     assert_eq!(jays_args("rm", "c1")[1], "rm");
   }

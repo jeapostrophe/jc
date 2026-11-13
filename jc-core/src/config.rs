@@ -3,7 +3,6 @@ use crate::model::{Project, WindowLayout};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -126,39 +125,8 @@ fn save_toml<T: Serialize>(filename: &str, value: &T) -> Result<()> {
   let path = dir.join(filename);
   let contents =
     toml::to_string_pretty(value).with_context(|| format!("failed to serialize {filename}"))?;
-  write_replacing(&path, contents.as_bytes(), |file, bytes| file.write_all(bytes))
+  crate::replace::write_replacing(&path, contents.as_bytes())
     .with_context(|| format!("failed to write {}", path.display()))
-}
-
-/// Replace `path` with `bytes`, written by `write` (a seam for tests) to a
-/// temporary file beside it, synced, then renamed over it: a save cut off
-/// part way (jc killed, the disk full) leaves the old file whole, never a
-/// truncated one that would not parse. The temporary name is per process, so
-/// each file must have one writer thread.
-fn write_replacing(
-  path: &Path,
-  bytes: &[u8],
-  write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-  let dir = path.parent().unwrap_or(Path::new("."));
-  let mut name = std::ffi::OsString::from(".");
-  name.push(path.file_name().unwrap_or_default());
-  name.push(format!(".tmp-{}", std::process::id()));
-  let temp = dir.join(name);
-  let written = (|| {
-    let mut file = fs::File::create(&temp)?;
-    write(&mut file, bytes)?;
-    file.sync_all()?;
-    fs::rename(&temp, path)
-  })();
-  if written.is_err() {
-    let _ = fs::remove_file(&temp);
-  }
-  written?;
-  // The rename is durable once the directory is synced; the file is replaced
-  // either way, so a filesystem that cannot sync a directory fails no save.
-  let _ = fs::File::open(dir).and_then(|d| d.sync_all());
-  Ok(())
 }
 
 pub fn save_config(config: &AppConfig) -> Result<()> {
@@ -244,28 +212,6 @@ mod tests {
     fs::remove_file(&path).unwrap();
     let (_, kept) = load_toml_keeping_bad::<crate::lifecycle::Records>(&path, now).unwrap();
     assert!(kept.is_none());
-    fs::remove_dir_all(&dir).unwrap();
-  }
-
-  #[test]
-  fn a_save_cut_off_part_way_leaves_the_old_file_whole() {
-    let dir = std::env::temp_dir().join(format!("jc-cut-save-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("sessions.toml");
-    fs::write(&path, "old").unwrap();
-
-    let cut = write_replacing(&path, b"new contents", |file, bytes| {
-      file.write_all(&bytes[..3])?;
-      Err(std::io::Error::other("killed mid-write"))
-    });
-    assert!(cut.is_err());
-    assert_eq!(fs::read_to_string(&path).unwrap(), "old", "a cut-off save leaves the old file");
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "and no temporary file behind");
-
-    write_replacing(&path, b"new contents", |file, bytes| file.write_all(bytes)).unwrap();
-    assert_eq!(fs::read_to_string(&path).unwrap(), "new contents");
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
     fs::remove_dir_all(&dir).unwrap();
   }
 
