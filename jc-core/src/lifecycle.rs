@@ -74,9 +74,16 @@ pub fn pane_action(
     Some(_) => return PaneAction::Attach(job.short.clone()),
     None => {}
   }
-  let stopped_since = s.stopped().is_some_and(|at| since.is_none_or(|since| at > since));
+  let stopped = s.stopped();
+  let stopped_since = stopped.is_some_and(|at| since.is_none_or(|since| at > since));
+  // Cira lists jobs only when it may act, so a job a delivery woke can still
+  // read `stopped`; its hooks moving its state after the stop say it runs.
+  let woke = stopped.is_some_and(|stop| {
+    s.state != crate::cira::State::Gone && s.since().is_some_and(|at| at > stop)
+  });
   match job.state {
     JobState::Running => PaneAction::Attach(job.short.clone()),
+    _ if woke => PaneAction::Attach(job.short.clone()),
     _ if stopped_since => PaneAction::Hold(
       "stopped through Cira; it attaches again once it runs (a message wakes it), or by \
        \"Attach this session\" in Cmd-Shift-P"
@@ -177,7 +184,7 @@ mod tests {
   /// shape with `life` merged in.
   fn session(life: serde_json::Value) -> Session {
     let mut s = serde_json::json!({
-      "id": "c-1", "state": "idle", "state_since": "2026-11-12T10:00:00Z",
+      "id": "c-1", "state": "idle", "state_since": "1970-01-01T00:01:00Z",
       "owned": true, "dangerous": false, "mode_pending": "none",
     });
     for (k, v) in life.as_object().unwrap() {
@@ -250,6 +257,20 @@ mod tests {
       "job": job("aaaa1111", "running"), "stopped_at": STOPPED_AT_200
     }));
     assert_eq!(pane_action(Some(&s), true, None, Some(at(100))), attach("aaaa1111"));
+    // Woken, with Cira's listing taken before the respawn (measured against a
+    // dev daemon, 2026-11-12: the job still read `stopped`): its hooks moved
+    // its state after the stop, so it runs.
+    let s = session(serde_json::json!({
+      "job": job("aaaa1111", "stopped"), "stopped_at": STOPPED_AT_200,
+      "state": "working", "state_since": "1970-01-01T00:05:00Z"
+    }));
+    assert_eq!(pane_action(Some(&s), true, None, Some(at(100))), attach("aaaa1111"));
+    // ...but a session that only ended since is not running.
+    let s = session(serde_json::json!({
+      "job": job("aaaa1111", "stopped"), "stopped_at": STOPPED_AT_200,
+      "state": "gone", "state_since": "1970-01-01T00:05:00Z"
+    }));
+    assert!(matches!(pane_action(Some(&s), true, None, Some(at(100))), PaneAction::Hold(_)));
   }
 
   #[test]

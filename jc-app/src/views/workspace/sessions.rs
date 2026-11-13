@@ -80,6 +80,14 @@ impl Workspace {
     }
   }
 
+  /// Where a request about Cira session `id` of project `pi` is made from.
+  fn at(&self, pi: usize, id: &str) -> jc_core::cira::At {
+    jc_core::cira::At {
+      project: self.cira.status.as_ref().and_then(|s| s.project_of(id)).map(str::to_string),
+      dir: self.projects[pi].path.clone(),
+    }
+  }
+
   /// The record for Cira id `id`, created empty.
   fn record_mut(&mut self, id: &str) -> Option<&mut lifecycle::Record> {
     Some(self.cira.records.as_mut()?.sessions.entry(id.to_string()).or_default())
@@ -488,11 +496,11 @@ impl Workspace {
     let sid = session.id;
     let to = !from;
     let cira = self.cira_client.clone();
-    let id_for_work = id.clone();
+    let at = self.at(pi, &id);
     self.run_blocking(
       window,
       cx,
-      move || cira.set_mode(&id_for_work, to, from),
+      move || cira.set_mode(&at, &id, to, from),
       move |ws, result, _window, cx| {
         let Some(session) = ws.session_mut(&path, sid) else { return };
         let mode = if to { "dangerous" } else { "normal" };
@@ -691,7 +699,7 @@ impl Workspace {
         }
         let last = records.sessions.get(id).and_then(|r| r.mark);
         match lifecycle::mark_request(last, mark) {
-          Some(request) => requests.push((id.to_string(), mark, request)),
+          Some(request) => requests.push((pi, id.to_string(), mark, request)),
           None if last != Some(mark) => settled.push((id.to_string(), mark)),
           None => {}
         }
@@ -708,13 +716,14 @@ impl Workspace {
       }
       self.save_records();
     }
-    for (id, mark, request) in requests {
+    for (pi, id, mark, request) in requests {
       self.cira.in_flight.insert(id.clone());
       let cira = self.cira_client.clone();
       let id_for_work = id.clone();
+      let at = self.at(pi, &id);
       let work = move || match request {
-        MarkRequest::Stop => cira.stop(&id_for_work),
-        MarkRequest::Remove => cira.remove(&id_for_work),
+        MarkRequest::Stop => cira.stop(&at, &id_for_work),
+        MarkRequest::Remove => cira.remove(&at, &id_for_work),
       };
       self.run_blocking(window, cx, work, move |ws, result, _window, _cx| {
         ws.cira.in_flight.remove(&id);
@@ -763,7 +772,7 @@ impl Workspace {
             agreed.push((id.to_string(), heading.label.clone()))
           }
           LabelSync::Agreed => {}
-          LabelSync::Send => sends.push((id.to_string(), heading.label.clone())),
+          LabelSync::Send => sends.push((pi, id.to_string(), heading.label.clone())),
           LabelSync::Write(label) => writes.push((pi, index, id.to_string(), label)),
         }
       }
@@ -784,14 +793,15 @@ impl Workspace {
     if record {
       self.save_records();
     }
-    for (id, label) in sends {
+    for (pi, id, label) in sends {
       self.cira.in_flight.insert(id.clone());
       let cira = self.cira_client.clone();
       let (id_w, label_w) = (id.clone(), label.clone());
+      let at = self.at(pi, &id);
       self.run_blocking(
         window,
         cx,
-        move || cira.rename(&id_w, &label_w),
+        move || cira.rename(&at, &id_w, &label_w),
         move |ws, result, _window, _cx| {
           ws.cira.in_flight.remove(&id);
           match result {

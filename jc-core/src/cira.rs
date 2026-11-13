@@ -155,6 +155,11 @@ impl Status {
     serde_json::from_slice(json)
   }
 
+  /// The name of the Cira project that lists session `id`.
+  pub fn project_of(&self, id: &str) -> Option<&str> {
+    self.projects.iter().find(|p| p.sessions.iter().any(|s| s.id == id)).map(|p| p.name.as_str())
+  }
+
   /// The session with Cira id `id`, in whichever project holds it.
   pub fn session(&self, id: &str) -> Option<&Session> {
     self.projects.iter().flat_map(|p| &p.sessions).find(|s| s.id == id)
@@ -400,30 +405,38 @@ impl Cira {
   /// With `wait`, returns once the job has started or its start has failed.
   pub fn new_session(&self, req: &NewSession) -> Result<Created, CallError> {
     let timeout = if req.wait { Self::WAIT.max(self.call) } else { self.call };
-    let out = self.call(&req.args(), timeout)?;
+    let out = self.call(&req.args(), timeout, None)?;
     serde_json::from_slice(&out).map_err(|e| CallError::Malformed(e.to_string()))
   }
 
   /// `cira session mode`: ask for `dangerous`, compare-and-set against the
   /// mode jc showed (`from`; exit 4 when it is no longer that).
-  pub fn set_mode(&self, id: &str, dangerous: bool, from: bool) -> Result<(), CallError> {
-    self.call(&mode_args(id, dangerous, from), self.call).map(drop)
+  pub fn set_mode(&self, at: &At, id: &str, dangerous: bool, from: bool) -> Result<(), CallError> {
+    self.call_at(at, mode_args(id, dangerous, from))
   }
 
   /// `cira session stop`.
-  pub fn stop(&self, id: &str) -> Result<(), CallError> {
-    self.call(&jays_args("stop", id), self.call).map(drop)
+  pub fn stop(&self, at: &At, id: &str) -> Result<(), CallError> {
+    self.call_at(at, jays_args("stop", id))
   }
 
   /// `cira session rm`: terminal.
-  pub fn remove(&self, id: &str) -> Result<(), CallError> {
-    self.call(&jays_args("rm", id), self.call).map(drop)
+  pub fn remove(&self, at: &At, id: &str) -> Result<(), CallError> {
+    self.call_at(at, jays_args("rm", id))
   }
 
   /// `cira session label`: the label is Cira's (Q-159).
-  pub fn rename(&self, id: &str, label: &str) -> Result<(), CallError> {
-    let args = strs(&["session", "label", "--json", "--", id, label]);
-    self.call(&args, self.call).map(drop)
+  pub fn rename(&self, at: &At, id: &str, label: &str) -> Result<(), CallError> {
+    self.call_at(at, strs(&["session", "label", "--json", "--", id, label]))
+  }
+
+  /// A request about a session of `at`'s project: Cira finds a session's
+  /// project by name, else by the caller's directory.
+  fn call_at(&self, at: &At, mut args: Vec<String>) -> Result<(), CallError> {
+    if let Some(project) = &at.project {
+      args.insert(2, format!("--project={project}"));
+    }
+    self.call(&args, self.call, Some(&at.dir)).map(drop)
   }
 
   /// How long a request may take: `cira` waits up to 12 s for a daemon to
@@ -433,8 +446,18 @@ impl Cira {
   const WAIT: Duration = Duration::from_secs(2 * 180 + 60);
 
   /// Run `cira <args>`, its stdout on success.
-  fn call(&self, args: &[String], timeout: Duration) -> Result<Vec<u8>, CallError> {
-    let run = run_bounded(Command::new(&self.program).args(args), timeout);
+  fn call(
+    &self,
+    args: &[String],
+    timeout: Duration,
+    dir: Option<&Path>,
+  ) -> Result<Vec<u8>, CallError> {
+    let mut cmd = Command::new(&self.program);
+    cmd.args(args);
+    if let Some(dir) = dir {
+      cmd.current_dir(dir);
+    }
+    let run = run_bounded(&mut cmd, timeout);
     let (code, stdout, stderr) = run.ok_or(CallError::Unreachable)?;
     match code {
       Some(0) => Ok(stdout),
@@ -443,6 +466,15 @@ impl Cira {
       Some(code) => Err(CallError::Refused { code, message: stderr, stdout }),
     }
   }
+}
+
+/// Where a request about a session is made from: the Cira project that lists
+/// it, when jc knows it, and the jc project's directory, which Cira reads the
+/// project from otherwise (a request names a session within a project).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct At {
+  pub project: Option<String>,
+  pub dir: PathBuf,
 }
 
 /// Why a `cira session …` request did not succeed.
@@ -633,20 +665,66 @@ mod tests {
         assert_eq!(s.short.as_deref(), rs["short"].as_str());
         assert_eq!(s.uuid.as_deref(), rs["uuid"].as_str());
         assert!(s.since().is_some(), "{}: state_since {:?}", s.id, s.state_since);
-        // The generator names each session after the state it drove it to.
-        let driven = s.id.strip_prefix("fx-").unwrap();
+        // The generator names each hook-driven session after the state it
+        // drove it to; the `owned` project's are Cira's own.
+        let Some(driven) = s.id.strip_prefix("fx-") else { continue };
         let state: State = serde_json::from_value(Value::String(driven.to_string())).unwrap();
         assert_eq!(s.state, state, "{}", s.id);
         assert_ne!(s.state, State::Unknown, "{}", s.id);
       }
     }
     // Every state Cira has is in the fixture, so each one's parse is checked.
-    let mut states: Vec<_> =
-      status.projects.iter().flat_map(|p| &p.sessions).map(|s| s.state).collect();
+    let mut states: Vec<_> = status
+      .projects
+      .iter()
+      .flat_map(|p| &p.sessions)
+      .filter(|s| s.id.starts_with("fx-"))
+      .map(|s| s.state)
+      .collect();
     states.sort_by_key(|s| *s as u8);
     states.dedup();
     assert_eq!(states.len(), 5, "{states:?}");
     assert!(status.projects.iter().any(|p| p.open.blocks > 0));
+  }
+
+  /// The fixture's session labelled `label` (the `owned` project's), and its
+  /// raw JSON.
+  fn owned<'a>(status: &'a Status, raw: &'a Value, label: &str) -> (&'a Session, &'a Value) {
+    let s =
+      status.projects.iter().flat_map(|p| &p.sessions).find(|s| s.label.as_deref() == Some(label));
+    let s = s.unwrap_or_else(|| panic!("no session {label} in the fixture"));
+    let r =
+      raw["projects"].as_array().unwrap().iter().flat_map(|p| p["sessions"].as_array().unwrap());
+    (s, r.into_iter().find(|r| r["id"] == s.id.as_str()).unwrap())
+  }
+
+  #[test]
+  fn reads_the_lifecycle_of_sessions_cira_runs() {
+    let (status, raw) = fixture();
+    let job_state =
+      |r: &Value| -> JobState { serde_json::from_value(r["job"]["state"].clone()).unwrap() };
+    for label in ["owned-running", "owned-dangerous", "owned-stopped", "owned-removed"] {
+      let (s, r) = owned(&status, &raw, label);
+      let job = s.job.as_ref().expect("a job is bound");
+      assert_eq!(job.short, r["job"]["short"].as_str().unwrap(), "{label}");
+      assert_eq!(job.dangerous, r["job"]["dangerous"].as_bool().unwrap(), "{label}");
+      assert_eq!(job.state, job_state(r), "{label}");
+      assert_ne!(job.state, JobState::Unknown, "{label}");
+      assert_eq!(s.dangerous, r["dangerous"].as_bool().unwrap(), "{label}");
+      assert_eq!(s.stopped_at.as_deref(), r["stopped_at"].as_str(), "{label}");
+      assert_eq!(s.removed_at.as_deref(), r["removed_at"].as_str(), "{label}");
+      assert_eq!(s.op_running(), r["op"]["running"].as_bool().unwrap_or(false), "{label}");
+      assert_eq!(status.session(&s.id).map(|x| &x.id), Some(&s.id));
+      assert_eq!(status.project_of(&s.id), Some("owned"));
+    }
+    // What the generator did to each, as Cira reports it.
+    assert!(owned(&status, &raw, "owned-dangerous").0.dangerous);
+    assert!(owned(&status, &raw, "owned-stopped").0.stopped().is_some());
+    assert!(owned(&status, &raw, "owned-removed").0.removed_at.is_some());
+    assert_eq!(
+      owned(&status, &raw, "owned-running").0.job.as_ref().unwrap().state,
+      JobState::Running
+    );
   }
 
   #[test]
@@ -661,7 +739,12 @@ mod tests {
   #[test]
   fn a_jc_project_belongs_to_the_deepest_cira_project_containing_it() {
     let (status, _) = fixture();
-    let mut dirs: Vec<&Path> = status.projects.iter().filter_map(|p| p.path.as_deref()).collect();
+    let mut dirs: Vec<&Path> = status
+      .projects
+      .iter()
+      .filter(|p| p.name != "owned")
+      .filter_map(|p| p.path.as_deref())
+      .collect();
     dirs.sort_by_key(|d| d.components().count());
     let [outer, inner] = dirs[..] else { panic!("fixture has two nested projects: {dirs:?}") };
     assert!(inner.starts_with(outer));
@@ -888,13 +971,14 @@ mod tests {
   #[test]
   fn a_call_tells_unreachable_from_refused() {
     let t = Duration::from_secs(10);
+    let at = At { project: None, dir: std::env::temp_dir() };
     let gone = Cira::new("/nonexistent/jc-test/cira", t);
-    assert_eq!(gone.stop("c1"), Err(CallError::Unreachable), "not installed");
+    assert_eq!(gone.stop(&at, "c1"), Err(CallError::Unreachable), "not installed");
     // 125: no daemon accepted; nothing was sent.
     let no_daemon = Cira::new(script("no-daemon", "echo 'no daemon' >&2; exit 125"), t);
-    assert_eq!(no_daemon.stop("c1"), Err(CallError::Unreachable));
+    assert_eq!(no_daemon.stop(&at, "c1"), Err(CallError::Unreachable));
     let conflict = Cira::new(script("conflict", "echo 'mode is dangerous' >&2; exit 4"), t);
-    match conflict.set_mode("c1", true, false) {
+    match conflict.set_mode(&at, "c1", true, false) {
       Err(CallError::Refused { code: exit::CONFLICT, message, .. }) => {
         assert_eq!(message.trim(), "mode is dangerous")
       }
@@ -902,7 +986,37 @@ mod tests {
     }
     let slow =
       Cira::new(script("slow", "exec sleep 30"), t).with_call_timeout(Duration::from_millis(200));
-    assert_eq!(slow.rename("c1", "x"), Err(CallError::Unreachable), "no answer in time");
+    assert_eq!(slow.rename(&at, "c1", "x"), Err(CallError::Unreachable), "no answer in time");
+  }
+
+  #[test]
+  fn a_session_request_names_its_project_and_runs_in_the_projects_directory() {
+    // Found 2026-11-12 against a dev daemon: `cira session mode|stop|rm|label`
+    // resolve the session within the caller's project, and jc's own working
+    // directory is in none ("inside no registered project", exit 6).
+    let dir = std::env::temp_dir().join(format!("jc-cira-at-{}", std::process::id()));
+    let proj = dir.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let log = dir.join("log");
+    let echo = Cira::new(
+      script(
+        "echo-at",
+        &format!("pwd -P > '{}'; printf '%s\\n' \"$@\" >> '{}'", log.display(), log.display()),
+      ),
+      Duration::from_secs(10),
+    );
+    let at = At { project: Some("jcrework".into()), dir: proj.clone() };
+    echo.stop(&at, "c1").unwrap();
+    let logged = std::fs::read_to_string(&log).unwrap();
+    let mut lines = logged.lines();
+    assert_eq!(
+      lines.next(),
+      Some(proj.canonicalize().unwrap().to_str().unwrap()),
+      "runs in the project"
+    );
+    let args: Vec<&str> = lines.collect();
+    assert_eq!(args, ["session", "stop", "--project=jcrework", "--json", "--from-jay", "--", "c1"]);
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   #[test]
