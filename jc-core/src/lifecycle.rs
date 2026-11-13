@@ -349,8 +349,10 @@ mod tests {
     // Back to active: attaching resumes it; removal is terminal.
     assert_eq!(mark_request(Some(Disabled), Active), None);
     assert_eq!(mark_request(Some(Deleted), Disabled), None);
-    // No record: nothing to compare.
+    // No record (a first start, or a `sessions.toml` that did not parse):
+    // nothing to compare, so no `[D]` or `[DELETED]` heading asks anything.
     assert_eq!(mark_request(None, Disabled), None);
+    assert_eq!(mark_request(None, Deleted), None);
   }
 
   #[test]

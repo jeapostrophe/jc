@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// User-editable configuration (`config.toml` in [`config_dir`]).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -122,8 +123,37 @@ pub fn save_state(state: &AppState) -> Result<()> {
   save_toml("state.toml", state)
 }
 
-pub fn load_sessions() -> Result<crate::lifecycle::Records> {
-  load_toml(&sessions_path())
+/// The records, and where a `sessions.toml` that did not parse was kept.
+pub fn load_sessions() -> Result<(crate::lifecycle::Records, Option<PathBuf>)> {
+  load_toml_keeping_bad(&sessions_path(), SystemTime::now())
+}
+
+/// [`load_toml`] for a file jc rewrites from what it loaded: one that does not
+/// parse is renamed `<name>.bad-<unix secs>`, and the defaults come back with
+/// that path, so saving them loses nothing. An error means there is nothing
+/// safe to save over: the file could not be read, or could not be moved.
+fn load_toml_keeping_bad<T: Default + serde::de::DeserializeOwned>(
+  path: &Path,
+  now: SystemTime,
+) -> Result<(T, Option<PathBuf>)> {
+  let contents = match fs::read_to_string(path) {
+    Ok(contents) => contents,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((T::default(), None)),
+    Err(e) => return Err(anyhow::anyhow!("failed to read {}: {e}", path.display())),
+  };
+  match toml::from_str(&contents) {
+    Ok(value) => Ok((value, None)),
+    Err(e) => {
+      let secs = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+      let mut aside = path.as_os_str().to_owned();
+      aside.push(format!(".bad-{secs}"));
+      let aside = PathBuf::from(aside);
+      fs::rename(path, &aside).map_err(|io| {
+        anyhow::anyhow!("failed to parse {} ({e}), and to move it aside: {io}", path.display())
+      })?;
+      Ok((T::default(), Some(aside)))
+    }
+  }
 }
 
 pub fn save_sessions(records: &crate::lifecycle::Records) -> Result<()> {
@@ -133,6 +163,34 @@ pub fn save_sessions(records: &crate::lifecycle::Records) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_records_file_that_does_not_parse_is_kept_aside() {
+    let dir = std::env::temp_dir().join(format!("jc-bad-records-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sessions.toml");
+    let bad = "[sessions.c-1\nmark = \"Disabled\"\n";
+    fs::write(&path, bad).unwrap();
+    let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234);
+
+    let (records, kept) = load_toml_keeping_bad::<crate::lifecycle::Records>(&path, now).unwrap();
+    let aside = dir.join("sessions.toml.bad-1234");
+    assert_eq!(records, Default::default());
+    assert_eq!(kept.as_deref(), Some(aside.as_path()));
+    assert_eq!(
+      fs::read_to_string(&aside).ok().as_deref(),
+      Some(bad),
+      "the bad file is kept aside before jc saves its defaults over it"
+    );
+    assert!(!path.exists(), "the bad file is moved, not copied");
+
+    // A file that parses, or none at all, is not moved.
+    fs::write(&path, "").unwrap();
+    let (_, kept) = load_toml_keeping_bad::<crate::lifecycle::Records>(&path, now).unwrap();
+    assert!(path.exists() && kept.is_none());
+    fs::remove_dir_all(&dir).unwrap();
+  }
 
   #[test]
   fn jc_config_dir_overrides_home_config() {

@@ -378,15 +378,20 @@ impl Workspace {
     ws.run_blocking(
       window,
       cx,
-      || {
-        jc_core::config::load_sessions().unwrap_or_else(|e| {
-          eprintln!("sessions.toml: {e:#}; starting with no records");
-          Default::default()
-        })
-      },
-      |ws, records, _window, _cx| {
-        ws.cira.records = Some(records);
-        ws.kick_cira();
+      jc_core::config::load_sessions,
+      // With no records a marker asks nothing (`lifecycle::mark_request`),
+      // so starting empty is safe once a bad file is kept aside. When it
+      // could not be read or moved, `records` stays `None`: no marker or
+      // label is acted on and nothing is saved over the file.
+      |ws, loaded, _window, _cx| match loaded {
+        Ok((records, kept)) => {
+          if let Some(kept) = kept {
+            eprintln!("sessions.toml did not parse; kept it as {}", kept.display());
+          }
+          ws.cira.records = Some(records);
+          ws.kick_cira();
+        }
+        Err(e) => eprintln!("sessions.toml: {e:#}; acting on no markers or labels"),
       },
     );
     ws.refresh_breadcrumb_observers(cx);

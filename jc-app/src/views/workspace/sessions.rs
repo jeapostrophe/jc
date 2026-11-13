@@ -24,7 +24,8 @@ pub(super) struct CiraView {
   pub read_at: Option<SystemTime>,
   /// Whether the last read reached Cira; `None` before the first.
   pub reachable: Option<bool>,
-  /// What jc remembers per Cira id (`sessions.toml`); `None` until loaded.
+  /// What jc remembers per Cira id (`sessions.toml`); `None` until loaded, and
+  /// for good when it could not be read or kept aside (nothing is acted on).
   pub records: Option<Records>,
   /// Cira ids with a stop, rm or rename request in flight.
   pub in_flight: std::collections::HashSet<String>,
