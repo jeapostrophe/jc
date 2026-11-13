@@ -5,7 +5,7 @@ use gpui_component::input::Position;
 use jc_core::background::{self, Claude};
 use jc_core::cira::{self, HookState, Marker};
 use jc_core::hooks::HookEventKind;
-use jc_core::todo::{IdKind, SessionKey};
+use jc_core::todo::SessionKey;
 use jc_terminal::{ChildSpec, Palette, TerminalConfig, TerminalView};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -25,49 +25,48 @@ pub type SessionId = usize;
 pub struct SessionState {
   pub id: SessionId,
   /// The heading's address in TODO.md (`jc_core::todo::SessionKey`): its
-  /// `> bg=` short id, or — until the session is migrated — its legacy
-  /// `> uuid=`. Empty while a new session is still being started and has no
-  /// heading yet.
+  /// `> cira=` id, or — until the session is migrated — its legacy
+  /// `> uuid=`. Empty while a new session's heading is not written yet.
   pub key: String,
-  /// The background session the Claude pane attaches to (`claude attach
-  /// <bg>`). Empty until it is known; equal to `key` once the heading is bound.
-  pub bg: String,
-  /// The conversation uuid hooks report, learned from the first hook (it
-  /// starts with `bg`), a `/clear` pair, or `claude agents --json`. Empty until
-  /// learned. Never written to TODO.md.
-  pub uuid: String,
-  /// The stable id (`> cira=`), passed as `CIRA_SESSION`. Minted at creation
-  /// for a heading jc will start a session for (see [`Heading::new`]), so the
-  /// shell pane has it from the start; written to the heading when the
-  /// session is bound.
+  /// The id Cira minted for it (`> cira=`), its `CIRA_SESSION`. `None` until
+  /// Cira has answered `cira session new` for it.
   pub cira: Option<String>,
-  /// Whether the background session runs with `--dangerously-skip-permissions`
-  /// — the mode it was started with, compared against the heading's
-  /// `> dangerous` to notice a change.
-  pub dangerous: bool,
+  /// The short id the Claude pane's attach client runs on (`claude attach
+  /// <bg>`), empty while no client runs. Cira names it; jc never keeps it.
+  pub bg: String,
+  /// The conversation uuid hooks report, learned from Cira, a hook, or a
+  /// `/clear` pair. Empty until learned. Never written to TODO.md.
+  pub uuid: String,
   /// The session process is running, so text typed into the attach reaches
   /// it. Cleared whenever the attach client restarts, set again by
   /// `claude agents --json` or any hook from the session.
   pub live: bool,
-  /// A start, migration or `> dangerous` change is in flight. A session that
-  /// is changing is never removed: its completion still has to bind the
-  /// heading to whatever job it started.
-  pub changing: bool,
-  /// Its start failed or was refused; the pane says why. It no longer counts
-  /// as adopted, so the pickers offer the heading again.
+  /// A `cira session new` for it is in flight; nothing else is asked for it
+  /// until it answers.
+  pub asking: bool,
+  /// Its `cira session new` failed, or Cira holds it (the pane says why).
+  /// It no longer counts as adopted, so the pickers offer the heading again.
   pub failed: bool,
   /// A `claude agents --json` poll for `live` is in flight.
   pub watching_live: bool,
   /// For a session adopted from a heading an older jc left unbound: that
-  /// heading's verified-position address, used to write its `> bg=` line once
-  /// the session has started.
+  /// heading's verified-position address, used to write its `> cira=` line
+  /// once Cira has minted it.
   pub unbound_key: Option<SessionKey>,
-  /// For a session continuing a transcript no heading names: that
-  /// conversation's uuid, while its start is in flight.
+  /// For a session continuing a transcript: that conversation's uuid, while
+  /// Cira is asked to start it.
   pub adopting: Option<String>,
-  /// The `> dangerous` value a failed change targeted, so it is not retried
-  /// every reconcile tick. Cleared when the heading changes again.
-  pub refused_dangerous: Option<bool>,
+  /// Cira's view of it from the last `cira status --json`; `None` while
+  /// Cira is unreachable or does not list it.
+  pub cira_session: Option<cira::Session>,
+  /// When the Claude pane last attached, or Jay last asked it to: a stop
+  /// through Cira after this is not undone by attaching.
+  pub attach_since: Option<SystemTime>,
+  /// When its attach client last exited, and the pause before the next
+  /// attach (`jc_core::lifecycle::attach_delay`).
+  pub exited: Option<(SystemTime, Duration)>,
+  /// The last reason the pane showed for not attaching, so it is shown once.
+  pub shown: Option<String>,
   /// Cira's state for this session and since when, from the last `cira
   /// status --json`; `None` while Cira is unreachable or does not know it.
   pub cira_state: Option<(cira::State, Option<SystemTime>)>,
@@ -86,29 +85,16 @@ pub struct SessionState {
 }
 
 /// What a session is created from: its heading's id (empty for a session whose
-/// heading is written once it has started), label, stable id and mode.
+/// heading is written once Cira has answered), label, and Cira id.
 pub struct Heading {
   pub key: String,
   pub label: String,
   pub cira: Option<String>,
-  pub dangerous: bool,
 }
 
 impl Heading {
-  /// `cira` is minted here when jc is about to start a session for the
-  /// heading (a legacy `> uuid=`, an unbound or a new heading) and it has
-  /// none. A `> bg=` heading without one is left alone: its running session
-  /// was started without a `CIRA_SESSION`, and claiming one would be false.
-  pub fn new(
-    key: String,
-    kind: IdKind,
-    label: String,
-    cira: Option<String>,
-    dangerous: bool,
-  ) -> Self {
-    let starts = key.is_empty() || kind == IdKind::Uuid;
-    let cira = cira.or_else(|| starts.then(|| uuid::Uuid::new_v4().to_string()));
-    Self { key, label, cira, dangerous }
+  pub fn of(todo: &jc_core::todo::TodoSession) -> Self {
+    Self { key: todo.id.clone(), label: todo.label.clone(), cira: todo.cira().map(str::to_string) }
   }
 }
 
@@ -131,8 +117,17 @@ impl SessionState {
   }
 
   /// Does a hook naming conversation `hook_session` come from this session?
+  /// By the short id its pane attaches to, or the job Cira bound (a fork the
+  /// pane has not followed yet), else its current uuid.
   pub fn owns_hook(&self, hook_session: &str) -> bool {
+    let job = self.cira_session.as_ref().and_then(|s| s.job.as_ref()).map(|j| j.short.as_str());
     background::hook_matches(&self.bg, &self.uuid, hook_session)
+      || job.is_some_and(|short| background::hook_matches(short, "", hook_session))
+  }
+
+  /// Cira's desired mode for it, once Cira lists it.
+  pub fn dangerous(&self) -> Option<bool> {
+    self.cira_session.as_ref().map(|s| s.dangerous)
   }
 
   /// A session whose Claude pane waits for [`Self::attach`].
@@ -144,17 +139,15 @@ impl SessionState {
     window: &mut Window,
     cx: &mut App,
   ) -> Self {
-    let Heading { key, label, cira, dangerous } = heading;
-    let claude_config = TerminalConfig {
-      child: None,
-      respawn: true,
-      palette: Some(palette.clone()),
-      ..Default::default()
-    };
-    // The shell pane is JC's own (Cira Q-33); it carries the stable id too.
+    let Heading { key, label, cira } = heading;
+    let claude_config =
+      TerminalConfig { child: None, palette: Some(palette.clone()), ..Default::default() };
+    // The shell pane is JC's own (Cira Q-33) and carries the session's Cira id
+    // (TMUX-02), so it starts only once Cira has minted one.
     let general_config = TerminalConfig {
+      child: cira.is_some().then_some(ChildSpec::Shell),
       palette: Some(palette.clone()),
-      env: cira.iter().map(|c| ("CIRA_SESSION".to_string(), c.clone())).collect(),
+      env: shell_env(cira.as_deref()),
       ..Default::default()
     };
 
@@ -164,20 +157,26 @@ impl SessionState {
       cx.new(|cx| TerminalView::new(general_config, Some(&project), window, cx));
     let code_view = cx.new(|cx| CodeView::new(window, cx));
 
+    if cira.is_none() {
+      general_terminal
+        .update(cx, |t, cx| t.show_status("the shell starts once Cira has named this session", cx));
+    }
     Self {
       id,
       key,
+      cira,
       bg: String::new(),
       uuid: String::new(),
-      cira,
-      dangerous,
       live: false,
-      changing: false,
+      asking: false,
       failed: false,
       watching_live: false,
       unbound_key: None,
       adopting: None,
-      refused_dangerous: None,
+      cira_session: None,
+      attach_since: None,
+      exited: None,
+      shown: None,
       cira_state: None,
       hook_state: None,
       seen: None,
@@ -190,23 +189,44 @@ impl SessionState {
     }
   }
 
-  /// Attach the Claude pane to background session `short`, which is now this
-  /// session's address.
-  ///
-  /// The pane re-attaches whenever the client exits, and attaching resumes a
-  /// stopped job. So anything that stops or replaces the job must detach first
-  /// (drop the session, or `TerminalView::stop_child`), or the pane brings the
-  /// job straight back.
+  /// Cira has minted `cira` for this session, whose heading it now
+  /// addresses: start the shell pane with it as `CIRA_SESSION`.
+  pub fn bind(&mut self, cira: &str, cx: &mut App) {
+    self.key = cira.to_string();
+    self.cira = Some(cira.to_string());
+    let env = shell_env(Some(cira));
+    self.general_terminal.update(cx, |t, cx| {
+      t.set_env(env);
+      t.spawn(ChildSpec::Shell, cx);
+    });
+  }
+
+  /// Attach the Claude pane to the job `short` Cira names, replacing any
+  /// client it runs.
   pub fn attach(&mut self, short: &str, claude: &Claude, cx: &mut App) {
-    self.key = short.to_string();
     self.bg = short.to_string();
     self.live = false;
+    self.shown = None;
+    self.attach_since = Some(SystemTime::now());
     let argv = claude.attach_argv(short);
     self.claude_terminal.update(cx, |t, cx| t.spawn(ChildSpec::Command(argv), cx));
+  }
+
+  /// Show why the pane attaches nothing, once per reason.
+  pub fn show_once(&mut self, why: &str, cx: &mut App) {
+    if self.shown.as_deref() != Some(why) {
+      self.shown = Some(why.to_string());
+      self.status(why, cx);
+    }
   }
 
   /// Print a `[jc]` status line in the Claude pane.
   pub fn status(&self, text: &str, cx: &mut App) {
     self.claude_terminal.update(cx, |t, cx| t.show_status(text, cx));
   }
+}
+
+/// The shell pane's added environment: the session's Cira id.
+fn shell_env(cira: Option<&str>) -> Vec<(String, String)> {
+  cira.map(|c| vec![("CIRA_SESSION".to_string(), c.to_string())]).unwrap_or_default()
 }

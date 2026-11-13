@@ -5,7 +5,7 @@ use crate::views::todo_view::TodoView;
 use gpui::*;
 use jc_core::cira::{OpenCounts, Status};
 use jc_terminal::Palette;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// `$HOME` as a path, or `None` if unset/empty. With no home, Claude's
@@ -13,10 +13,6 @@ use std::path::{Path, PathBuf};
 /// "can't tell" rather than "nothing there".
 pub(crate) fn home_dir() -> Option<PathBuf> {
   std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
-}
-
-fn transcript_known(dirs: Option<&[PathBuf]>, uuid: &str) -> bool {
-  dirs.is_none_or(|dirs| jc_core::claude::transcript_in(dirs, uuid))
 }
 
 pub struct SavedPaneLayout {
@@ -35,6 +31,9 @@ pub struct ProjectState {
   /// `cira status --json`; `None` while Cira is unreachable or has no project
   /// containing this one.
   pub cira_open: Option<OpenCounts>,
+  /// Conversation uuids and job short ids of the sessions Cira lists for
+  /// this project, so the transcript picker does not offer them again.
+  pub cira_known: HashSet<String>,
 }
 
 impl ProjectState {
@@ -53,9 +52,8 @@ impl ProjectState {
 
     // Adopt every active TODO session so the full set of open sessions is
     // restored, not just one. Each starts with an empty Claude pane: what it
-    // attaches to (its running job, a migrated `> uuid=`, or a fresh session
-    // when its job is gone) needs `claude agents --json`, which
-    // `Workspace::launch_sessions` asks off the main thread.
+    // attaches to is the job Cira names (`Workspace::drive_sessions`), and a
+    // legacy `> uuid=` heading is first migrated through Cira.
     let document = todo_view.read(cx).document().clone();
     let mut sessions = HashMap::new();
     let mut next_session_id: SessionId = 0;
@@ -88,14 +86,7 @@ impl ProjectState {
       let id = next_session_id;
       next_session_id += 1;
 
-      let heading = Heading::new(
-        todo_session.id.clone(),
-        todo_session.id_kind,
-        todo_session.label.clone(),
-        todo_session.cira.clone(),
-        todo_session.dangerous,
-      );
-      let state = SessionState::create(id, heading, &path, palette, window, cx);
+      let state = SessionState::create(id, Heading::of(todo_session), &path, palette, window, cx);
       sessions.insert(id, state);
 
       let last = todo_session.last_active.unwrap_or(0);
@@ -113,7 +104,16 @@ impl ProjectState {
       todo_view.update(cx, |tv, cx| tv.set_active_key(Some(&session.key), cx));
     }
 
-    Self { path, name, sessions, active_session, next_session_id, todo_view, cira_open: None }
+    Self {
+      path,
+      name,
+      sessions,
+      active_session,
+      next_session_id,
+      todo_view,
+      cira_open: None,
+      cira_known: HashSet::new(),
+    }
   }
 
   /// All of Claude's JSONL session buckets for this project (root + worktrees),
@@ -130,14 +130,6 @@ impl ProjectState {
   /// whose start failed does not count, so its heading can be adopted again.
   pub fn is_adopted(&self, key: &str) -> bool {
     !key.is_empty() && self.sessions.values().any(|s| s.key == key && !s.failed)
-  }
-
-  /// Is conversation `uuid`'s transcript among this project's buckets? With
-  /// `$HOME` unset the buckets cannot be located, and the answer is yes: the
-  /// costly mistake is the other one, starting fresh over a conversation that
-  /// exists and so dropping the heading's only record of it.
-  pub fn has_transcript(project_path: &Path, uuid: &str) -> bool {
-    transcript_known(Self::session_dirs(project_path).as_deref(), uuid)
   }
 
   /// The earliest-created running session, or `None` if the project has none.
@@ -199,11 +191,31 @@ impl ProjectState {
     let project = status.and_then(|s| s.project_for(&self.path));
     let open = project.map(|p| p.open);
     let mut changed = std::mem::replace(&mut self.cira_open, open) != open;
+    self.cira_known = project
+      .into_iter()
+      .flat_map(|p| &p.sessions)
+      .flat_map(|s| [s.uuid.clone(), s.short.clone(), s.job.as_ref().map(|j| j.short.clone())])
+      .flatten()
+      .collect();
     for session in self.sessions.values_mut() {
-      let state = project
-        .and_then(|p| p.session(session.cira.as_deref(), &session.bg, &session.uuid))
-        .map(|s| (s.state, s.since()));
+      // A session jc made has its Cira id, found in whichever Cira project
+      // holds it; a legacy one, before its migration, only by short or uuid.
+      let listed = match &session.cira {
+        Some(id) => status.and_then(|s| s.session(id)),
+        None => project.and_then(|p| p.session(None, &session.bg, &session.uuid)),
+      };
+      let state = listed.map(|s| (s.state, s.since()));
       changed |= std::mem::replace(&mut session.cira_state, state) != state;
+      if session.cira.is_some() {
+        if let Some(uuid) = listed.and_then(|s| s.uuid.as_ref()) {
+          session.uuid.clone_from(uuid);
+        }
+        let listed = listed.cloned();
+        if session.cira_session != listed {
+          session.cira_session = listed;
+          changed = true;
+        }
+      }
     }
     changed
   }
@@ -214,17 +226,5 @@ impl ProjectState {
       return None;
     }
     self.sessions.iter().find(|(_, s)| s.key == key).map(|(&id, s)| (id, s))
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::transcript_known;
-
-  #[test]
-  fn an_unlocatable_transcript_counts_as_present() {
-    assert!(transcript_known(None, "335b461a-eba5-485f-898c-f757fdb3f2bf"));
-    let empty = std::env::temp_dir().join(format!("jc-no-buckets-{}", std::process::id()));
-    assert!(!transcript_known(Some(&[empty]), "335b461a-eba5-485f-898c-f757fdb3f2bf"));
   }
 }

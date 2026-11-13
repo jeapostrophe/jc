@@ -121,18 +121,16 @@ impl TodoView {
     }
   }
 
-  /// Insert a `## <label>` heading bound to background session `short` with
-  /// stable id `cira`, and save.
+  /// Insert a `## <label>` heading for Cira session `cira`, and save.
   pub fn insert_session_heading(
     &mut self,
     label: &str,
-    short: &str,
     cira: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let text = self.code_view.read(cx).editor_text(cx);
-    let new_text = todo::insert_session_heading(&text, &self.document, label, short, cira);
+    let new_text = todo::insert_session_heading(&text, &self.document, label, cira);
     self.set_text_and_save(new_text, window, cx);
   }
 
@@ -302,20 +300,32 @@ impl TodoView {
     }
   }
 
-  /// Bind the heading at `index` in the parsed document to background
-  /// session `short` (see [`todo::bind_bg_at`]) and save. Positional because
-  /// the heading's old id (a legacy `> uuid=`, an older short id, or none) is
-  /// about to stop being its address.
-  pub fn bind_bg_at(
+  /// Give the heading at `index` in the parsed document its Cira id (see
+  /// [`todo::bind_cira_at`]) and save. Positional because the heading's old
+  /// id (a legacy `> uuid=`, or none) is about to stop being its address.
+  pub fn bind_cira_at(
     &mut self,
     index: usize,
-    short: &str,
-    cira: Option<&str>,
+    cira: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let text = self.editor_text(cx);
-    if let Some(new_text) = todo::bind_bg_at(&text, &self.document, index, short, cira) {
+    if let Some(new_text) = todo::bind_cira_at(&text, &self.document, index, cira) {
+      self.set_text_and_save(new_text, window, cx);
+    }
+  }
+
+  /// Rename the heading at `index` (keeping its `[D]`) and save.
+  pub fn rename_heading_at(
+    &mut self,
+    index: usize,
+    label: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let text = self.editor_text(cx);
+    if let Some(new_text) = todo::rename_heading_at(&text, &self.document, index, label) {
       self.set_text_and_save(new_text, window, cx);
     }
   }

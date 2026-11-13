@@ -722,6 +722,8 @@ struct SessionPickerEntry {
   marker: Option<Marker>,
   /// The project's open Cira blocks (`4 blocks`), empty when none.
   blocks: String,
+  /// The session's mode badge from Cira (`dangerous`), empty when normal.
+  mode: &'static str,
   /// Unix timestamp of the last TODO submit (from `> last=`). `0` if unknown.
   last_active: u64,
 }
@@ -780,6 +782,7 @@ impl SessionPickerDelegate {
           key: None,
           marker: None,
           blocks: blocks.clone(),
+          mode: "",
           last_active: 0,
         });
         continue;
@@ -808,6 +811,7 @@ impl SessionPickerDelegate {
           // which needs you whether seen or not, marks it.
           marker: session.marker(last_active).filter(|m| !is_active || *m == Marker::Dialog),
           blocks: blocks.clone(),
+          mode: session.cira_session.as_ref().map_or("", mode_badge),
           last_active,
         });
       }
@@ -828,6 +832,7 @@ impl SessionPickerDelegate {
             key: Some(todo_session.key(index)),
             marker: None,
             blocks: blocks.clone(),
+            mode: "",
             last_active: todo_session.last_active.unwrap_or(0),
           });
         }
@@ -955,11 +960,11 @@ impl PickerDelegate for SessionPickerDelegate {
       SessionPickerEntryKind::Unadopted { .. } => "(adopt)",
       _ => "",
     };
-    let right = match (entry.blocks.as_str(), state) {
-      (blocks, "") => blocks.to_string(),
-      ("", state) => state.to_string(),
-      (blocks, state) => format!("{blocks}  {state}"),
-    };
+    let right = [entry.mode, entry.blocks.as_str(), state]
+      .into_iter()
+      .filter(|part| !part.is_empty())
+      .collect::<Vec<_>>()
+      .join("  ");
     let right_el = div().ml_auto().text_xs().text_color(muted_color).child(right);
 
     row.child(marker).child(main_text).child(right_el)
@@ -990,6 +995,16 @@ impl PickerDelegate for SessionPickerDelegate {
           div().child("Cmd-Shift-Bksp: toggle disable"),
         ]),
     )
+  }
+}
+
+/// A running session's mode as the picker shows it: Cira's desired mode, and
+/// a drift (bypass Cira did not ask for) when its hooks report one.
+fn mode_badge(session: &cira::Session) -> &'static str {
+  match (session.dangerous, session.drift) {
+    (_, true) => "bypass (drift)",
+    (true, false) => "dangerous",
+    (false, false) => "",
   }
 }
 
@@ -1030,6 +1045,10 @@ pub enum ProjectActionsResult {
   AdoptTodoSession(usize, SessionKey), // pi, heading address
   CreateNew,
   AdoptJsonlSession(String, String), // uuid, summary
+  /// Ask Cira to run the active session in the other mode (Cira Q-155).
+  ToggleDangerous,
+  /// Attach the active session's Claude pane again.
+  AttachAgain,
 }
 
 enum ProjectActionsEntry {
@@ -1040,6 +1059,11 @@ enum ProjectActionsEntry {
     label: String,
   },
   NewSession,
+  /// The active session's mode, changed through Cira: `to` is the new one.
+  Mode {
+    to: bool,
+  },
+  AttachAgain,
   /// A JSONL session not referenced in TODO.md.
   Unattached {
     uuid: String,
@@ -1089,14 +1113,27 @@ impl ProjectActionsPickerDelegate {
     labels.push("+ New session".to_string());
     entries.push(ProjectActionsEntry::NewSession);
 
-    // 3. Unattached JSONL sessions for current project (not in TODO.md). A
+    // 3. The active session's mode (Cira owns it, Q-155) and its pane.
+    if let Some(session) = projects[active_project_index].active_session() {
+      if let Some(dangerous) = session.dangerous() {
+        let to = !dangerous;
+        labels.push(format!("! {}", mode_action(to)));
+        entries.push(ProjectActionsEntry::Mode { to });
+      }
+      if session.cira.is_some() {
+        labels.push("> Attach this session".to_string());
+        entries.push(ProjectActionsEntry::AttachAgain);
+      }
+    }
+
+    // 4. Unattached JSONL sessions for current project (not in TODO.md). A
     //    project's transcripts live in its root bucket plus any git-worktree
     //    buckets (each transcript in exactly one bucket), so scan them all.
     {
       // A transcript is known when a heading names it (`> uuid=`), a running
       // session is on it (its uuid after a `/clear`) or is being started on it,
-      // or it was created by a heading's background session (its uuid starts
-      // with the `> bg=` short id).
+      // or Cira lists a session on it: by its uuid, or by a job short id it
+      // starts with (a background session's first uuid does).
       let doc = todo_documents.get(active_project_index);
       let ids: HashSet<&str> =
         doc.map(|doc| doc.sessions.iter().map(|s| s.id.as_str()).collect()).unwrap_or_default();
@@ -1106,10 +1143,12 @@ impl ProjectActionsPickerDelegate {
         .flat_map(|s| [Some(s.uuid.as_str()), s.adopting.as_deref()])
         .flatten()
         .collect();
+      let cira_known = &projects[active_project_index].cira_known;
       let known = |uuid: &str| {
         ids.contains(uuid)
           || running.contains(uuid)
-          || jc_core::background::short_of(uuid).is_some_and(|short| ids.contains(short))
+          || cira_known.contains(uuid)
+          || jc_core::background::short_of(uuid).is_some_and(|short| cira_known.contains(short))
       };
 
       let mut discovered: Vec<(String, String, std::time::SystemTime)> = Vec::new();
@@ -1163,6 +1202,8 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
         ProjectActionsResult::AdoptTodoSession(self.active_project_index, key.clone())
       }
       ProjectActionsEntry::NewSession => ProjectActionsResult::CreateNew,
+      ProjectActionsEntry::Mode { .. } => ProjectActionsResult::ToggleDangerous,
+      ProjectActionsEntry::AttachAgain => ProjectActionsResult::AttachAgain,
       ProjectActionsEntry::Unattached { uuid, summary } => {
         ProjectActionsResult::AdoptJsonlSession(uuid.clone(), summary.clone())
       }
@@ -1184,6 +1225,16 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
         let marker_color = if selected { theme.accent_foreground } else { theme.green };
         let marker = picker_marker_base().text_color(marker_color).child("+");
         row.child(marker).child("New session".to_string())
+      }
+      ProjectActionsEntry::Mode { to } => {
+        let marker_color = if selected { theme.accent_foreground } else { theme.red };
+        let marker = picker_marker_base().text_color(marker_color).child("!");
+        row.child(marker).child(mode_action(*to))
+      }
+      ProjectActionsEntry::AttachAgain => {
+        let marker_color = if selected { theme.accent_foreground } else { theme.green };
+        let marker = picker_marker_base().text_color(marker_color).child(">");
+        row.child(marker).child("Attach this session".to_string())
       }
       ProjectActionsEntry::Unattached { summary, .. } => {
         let marker_color = if selected { theme.accent_foreground } else { theme.yellow };
@@ -1212,6 +1263,15 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
           legend_item("~", theme.yellow, "unattached", muted),
         ]),
     )
+  }
+}
+
+/// The palette's mode action, naming the mode it asks for.
+fn mode_action(to: bool) -> String {
+  if to {
+    "Make this session dangerous (--dangerously-skip-permissions)".to_string()
+  } else {
+    "Make this session normal".to_string()
   }
 }
 

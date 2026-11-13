@@ -229,6 +229,8 @@ impl Workspace {
               ProjectActionsResult::AdoptJsonlSession(uuid, summary) => {
                 this.adopt_transcript(pi, uuid, &summary, window, cx);
               }
+              ProjectActionsResult::ToggleDangerous => this.toggle_active_dangerous(window, cx),
+              ProjectActionsResult::AttachAgain => this.attach_active_again(window, cx),
             }
             cx.notify();
           }

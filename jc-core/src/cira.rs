@@ -543,12 +543,8 @@ fn mode_args(id: &str, dangerous: bool, from: bool) -> Vec<String> {
 /// (`None` when killed or signalled), stdout and stderr. `None` when it could
 /// not be started.
 fn run_bounded(cmd: &mut Command, timeout: Duration) -> Option<(Option<i32>, Vec<u8>, String)> {
-  let mut child = cmd
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .ok()?;
+  let mut child =
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
   // Read on threads of their own, so a large answer cannot fill a pipe and
   // stall the child while this one waits for it to exit.
   let drain = |pipe: Option<Box<dyn Read + Send>>| {
@@ -904,8 +900,8 @@ mod tests {
       }
       other => panic!("expected a conflict, got {other:?}"),
     }
-    let slow = Cira::new(script("slow", "exec sleep 30"), t)
-      .with_call_timeout(Duration::from_millis(200));
+    let slow =
+      Cira::new(script("slow", "exec sleep 30"), t).with_call_timeout(Duration::from_millis(200));
     assert_eq!(slow.rename("c1", "x"), Err(CallError::Unreachable), "no answer in time");
   }
 
@@ -913,7 +909,10 @@ mod tests {
   fn new_session_reads_the_minted_id_and_the_status_a_failed_wait_prints() {
     let t = Duration::from_secs(10);
     let made = Cira::new(
-      script("made", r#"echo '{"project":"p","session":"s-1","recorded":true,"project_created":false}'"#),
+      script(
+        "made",
+        r#"echo '{"project":"p","session":"s-1","recorded":true,"project_created":false}'"#,
+      ),
       t,
     );
     let req = NewSession {
@@ -948,5 +947,4 @@ mod tests {
     rx.recv_timeout(Duration::from_secs(5)).expect("a second read well before 60 s");
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
   }
-
 }

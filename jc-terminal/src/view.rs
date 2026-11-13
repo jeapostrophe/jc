@@ -11,7 +11,7 @@ use gpui::{
   App, AsyncApp, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
   InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
   MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
-  Styled, Subscription, Task, Timer, WeakEntity, Window, actions, canvas, div, px,
+  Styled, Subscription, Timer, WeakEntity, Window, actions, canvas, div, px,
 };
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -23,23 +23,6 @@ const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const FONT_SIZE_STEP: Pixels = px(2.0);
 const FONT_SIZE_MIN: Pixels = px(8.0);
 const FONT_SIZE_MAX: Pixels = px(72.0);
-
-/// Bounds of the delay before a respawned child: [`RESPAWN_MIN`] after a
-/// child that ran at least [`RESPAWN_STABLE`], doubling up to [`RESPAWN_MAX`]
-/// while it keeps exiting sooner (an attach to a session that is gone, a
-/// missing binary).
-const RESPAWN_MIN: Duration = Duration::from_secs(1);
-const RESPAWN_MAX: Duration = Duration::from_secs(30);
-const RESPAWN_STABLE: Duration = Duration::from_secs(10);
-
-/// How long to wait before re-running a child that just exited after running
-/// for `lived`, given the delay used before it (`None` for a first start).
-fn respawn_delay(previous: Option<Duration>, lived: Duration) -> Duration {
-  match previous {
-    Some(previous) if lived < RESPAWN_STABLE => (previous * 2).clamp(RESPAWN_MIN, RESPAWN_MAX),
-    _ => RESPAWN_MIN,
-  }
-}
 
 /// The bytes a wheel movement of `lines` (positive = down) sends to a child
 /// that asked for mouse reporting or alternate scroll, reported at 1-based
@@ -75,8 +58,9 @@ pub enum ChildEvent {
   /// A child was (re)started.
   Spawned,
   /// The child exited and was reaped (`code` is `None` when it could not be
-  /// started or waited for). A terminal with `respawn` set restarts it.
-  Exited { code: Option<u32> },
+  /// started or waited for) after running for `lived`. Nothing restarts it:
+  /// for `claude attach`, the workspace asks Cira what to attach to next.
+  Exited { code: Option<u32>, lived: Duration },
 }
 
 actions!(
@@ -124,10 +108,6 @@ pub struct TerminalConfig {
   pub child: Option<ChildSpec>,
   /// Added to the child's environment.
   pub env: Vec<(String, String)>,
-  /// Re-run the child whenever it exits, after [`respawn_delay`]. Used for
-  /// `claude attach`, whose exit (Ctrl+Z, Esc from the agents view, a
-  /// `claude stop`) only detaches the client from a session that lives on.
-  pub respawn: bool,
 }
 
 impl Default for TerminalConfig {
@@ -141,7 +121,6 @@ impl Default for TerminalConfig {
       palette: None,
       child: Some(ChildSpec::Shell),
       env: Vec::new(),
-      respawn: false,
     }
   }
 }
@@ -180,9 +159,6 @@ pub struct TerminalView {
   spawned_at: Instant,
   /// `output_batches` when the current child started.
   batches_at_spawn: usize,
-  /// The delay used before the last respawn (see [`respawn_delay`]).
-  last_respawn_delay: Option<Duration>,
-  _respawn_task: Option<Task<()>>,
   palette: Palette,
   config: TerminalConfig,
   default_font_size: Pixels,
@@ -235,8 +211,6 @@ impl TerminalView {
       generation: 0,
       spawned_at: Instant::now(),
       batches_at_spawn: 0,
-      last_respawn_delay: None,
-      _respawn_task: None,
       term_events: event_rx,
       palette,
       config,
@@ -258,10 +232,9 @@ impl TerminalView {
   }
 
   /// Run `spec` in this terminal, hanging up any child it already runs, and
-  /// keep re-running it on exit if the terminal was made with `respawn`.
+  /// Its exit is reported as [`ChildEvent::Exited`].
   pub fn spawn(&mut self, spec: ChildSpec, cx: &mut Context<Self>) {
     self.config.child = Some(spec);
-    self.last_respawn_delay = None;
     self.start_child(cx);
   }
 
@@ -277,12 +250,11 @@ impl TerminalView {
     cx.notify();
   }
 
-  /// Drop the current child (hanging it up), any pending respawn, and any exit
+  /// Drop the current child (hanging it up) and any exit
   /// it has yet to report.
   fn hang_up(&mut self) {
     self.generation += 1;
     self.pty = None;
-    self._respawn_task = None;
   }
 
   /// Has the current child printed anything yet?
@@ -398,24 +370,9 @@ impl TerminalView {
       return; // a replaced child
     }
     self.pty = None;
-    cx.emit(ChildEvent::Exited { code });
+    cx.emit(ChildEvent::Exited { code, lived: self.spawned_at.elapsed() });
     let code = code.map_or("unknown".to_string(), |c| c.to_string());
-    if !self.config.respawn {
-      self.show_status(&format!("exited (code {code})"), cx);
-      return;
-    }
-    let delay = respawn_delay(self.last_respawn_delay, self.spawned_at.elapsed());
-    self.last_respawn_delay = Some(delay);
-    self.show_status(&format!("exited (code {code}); restarting in {}s", delay.as_secs()), cx);
-    self._respawn_task =
-      Some(cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
-        Timer::after(delay).await;
-        let _ = this.update(cx, |view, cx| {
-          if view.generation == generation {
-            view.start_child(cx);
-          }
-        });
-      }));
+    self.show_status(&format!("exited (code {code})"), cx);
   }
 
   /// Update the terminal color palette at runtime.
@@ -913,19 +870,6 @@ impl Render for TerminalView {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn respawn_backs_off_while_the_child_keeps_exiting_quickly() {
-    let quick = Duration::from_millis(200);
-    assert_eq!(respawn_delay(None, quick), RESPAWN_MIN);
-    let mut delay = respawn_delay(None, quick);
-    for _ in 0..10 {
-      delay = respawn_delay(Some(delay), quick);
-    }
-    assert_eq!(delay, RESPAWN_MAX, "doubles up to the cap");
-    // A child that ran a while (a long attach ended by Ctrl+Z) comes back fast.
-    assert_eq!(respawn_delay(Some(RESPAWN_MAX), RESPAWN_STABLE), RESPAWN_MIN);
-  }
 
   /// What `claude attach` asks for (SP-03): alt screen, mouse 1000/1002/1003
   /// with SGR encoding.

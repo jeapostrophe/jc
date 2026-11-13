@@ -45,7 +45,9 @@ impl IdKind {
 /// What a heading's marker says of its session, the state jc remembers per
 /// Cira id so that a change becomes one request to Cira (Cira DESIGN 12):
 /// `[D]` a `cira session stop`, `[DELETED]` a `cira session rm`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Mark {
   Deleted,
@@ -439,8 +441,7 @@ pub fn parse(text: &str) -> TodoDocument {
         session.last_active_line_range = Some(line_start..line_end);
       } else if rest == "dangerous" {
         session.dangerous = true;
-        session.dangerous_line_range =
-          Some(line_start..skip_newline(text.as_bytes(), line_end));
+        session.dangerous_line_range = Some(line_start..skip_newline(text.as_bytes(), line_end));
       }
       // Unknown metadata keys are silently consumed so future additions
       // don't break older parsers.
@@ -668,12 +669,7 @@ pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
 ///
 /// `label` need not be unique: it is a display name, not an address (see
 /// [`SessionKey`]).
-pub fn insert_session_heading(
-  text: &str,
-  doc: &TodoDocument,
-  label: &str,
-  cira: &str,
-) -> String {
+pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, cira: &str) -> String {
   let heading = format!("## {label}\n> cira={cira}\n\n### WAIT\n");
 
   if let Some(claude_line) = doc.claude_section_line {
@@ -2582,7 +2578,8 @@ draft
 
   #[test]
   fn uuid_line_is_a_legacy_address() {
-    let text = "# Claude\n## S\n> uuid=335b461a-eba5-485f-898c-f757fdb3f2bf\n> dangerous\n\n### WAIT\n";
+    let text =
+      "# Claude\n## S\n> uuid=335b461a-eba5-485f-898c-f757fdb3f2bf\n> dangerous\n\n### WAIT\n";
     let s = &parse(text).sessions[0];
     assert_eq!(s.id, "335b461a-eba5-485f-898c-f757fdb3f2bf");
     assert_eq!(s.id_kind, IdKind::Uuid);

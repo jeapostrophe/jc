@@ -262,7 +262,10 @@ esac
 
   #[test]
   fn attach_is_one_argument_vector() {
-    assert_eq!(Claude::new("/x/claude").attach_argv("335b461a"), ["/x/claude", "attach", "335b461a"]);
+    assert_eq!(
+      Claude::new("/x/claude").attach_argv("335b461a"),
+      ["/x/claude", "attach", "335b461a"]
+    );
   }
 
   #[test]

@@ -226,7 +226,8 @@ mod tests {
     assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Wait(_)));
     // A client still on the job is left for the operation to end.
     assert_eq!(pane_action(Some(&s), true, Some("aaaa1111"), None), PaneAction::Keep);
-    let s = session(serde_json::json!({ "job": job("aaaa1111", "stopped"), "mode_pending": "due" }));
+    let s =
+      session(serde_json::json!({ "job": job("aaaa1111", "stopped"), "mode_pending": "due" }));
     assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Wait(_)));
     // Waiting for idle: the job still runs in its old mode, so attach.
     let s = session(serde_json::json!({
