@@ -56,8 +56,7 @@ A **project** is a code repository registered with jc. Each project has one or m
 ```markdown
 # Claude
 ## Refactor auth module
-> bg=35a13d68
-> cira=8e565675-baa4-4f27-8d89-6ae89c563046
+> cira=cira-8e565675baa4
 ### Message 0
 first instruction sent to claude
 ### Message 1
@@ -72,11 +71,11 @@ The log is bounded: each send keeps the 25 most recent messages of that session 
 
 One exception: truncation stops at a message still waiting on a `@jc(...)` scheduled send, so it can never cancel one. That session's log stays as long as it needs to until the send fires. Numbers are never reused, so a message keeps the number it was sent under. jc never sends TODO.md to Claude — messages are delivered to the session terminal and Claude resumes from its own transcript — so dropping old entries costs it no context.
 
-Each session is a Claude Code **background session** (`claude --bg`), and its Claude pane is `claude attach` to it. Quitting jc only detaches: sessions keep running (Claude Code retires one after an hour idle with nothing attached, keeping its conversation), and the next start attaches every heading's session again. A new session is started with `claude --bg`, and its heading is written once Claude Code has printed the session's short id. If Claude Code no longer knows a heading's session, jc starts a fresh one behind the same heading — you lose the conversation, but the heading, its message log, and its WAIT notes stay exactly where they were. A heading an older jc wrote with `> uuid=` is moved to a background session on the first start, continuing its conversation, unless a running `claude` still holds it (quit the old jc first).
+Each session is owned by **Cira** (`~/Dev/cira`, the mailbox between you and your sessions): Cira starts it as a Claude Code **background session**, keeps it in the mode you chose, and stops and removes it; jc is Cira's native client, and each Claude pane is `claude attach` to the job Cira names. jc asks Cira for everything else with `cira session new|mode|stop|rm|label`. Quitting jc only detaches: sessions keep running, and the next start attaches every heading's session again. While Cira is unreachable a banner says so, and no pane attaches anything new. A heading an older jc wrote with `> uuid=` is moved to Cira once, continuing its conversation (`cira session new --resume`).
 
-Per-session metadata lives on `> ` lines under the heading. `> bg=` (the background session's short id), `> cira=` (the stable id, exported as `CIRA_SESSION` to Claude and the terminal pane) and `> last=` are managed by jc; add or remove `> dangerous` by hand to run that session with `--dangerously-skip-permissions`, and jc recreates the session in the new mode, keeping its conversation. Disabling a session (`[D]`) stops it; renaming the heading to `## [DELETED] …` removes it. See `ARCH.md` for the full list.
+Per-session metadata lives on `> ` lines under the heading. `> cira=` (the id Cira minted, exported as `CIRA_SESSION` to the terminal pane) and `> last=` are managed by jc. The mode is Cira's: Cmd-Shift-P → "Make this session dangerous" (or "normal") asks Cira, which forks the session in the new mode once it is idle, keeping its conversation; the Cmd-P picker marks a dangerous session. Disabling a session (`[D]`) stops it; renaming the heading to `## [DELETED] …` removes it — each once, when the marker changes, even if you edit it while jc is closed. Renaming the heading renames the session in Cira, and a rename made on Cira's page renames the heading. See `ARCH.md` for the full list.
 
-The `> bg=` line, not the heading text, is what identifies a session — everything jc writes into TODO.md is addressed by it. Rename a heading to whatever you like, and give two headings the same name if that is what you want; sends and scheduled deliveries still land on the right one.
+The `> cira=` line, not the heading text, is what identifies a session — everything jc writes into TODO.md is addressed by it. Rename a heading to whatever you like, and give two headings the same name if that is what you want; sends and scheduled deliveries still land on the right one.
 
 ### Session Activity
 

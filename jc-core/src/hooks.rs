@@ -10,7 +10,7 @@ pub struct HookEvent {
   pub project_path: Option<PathBuf>,
   pub kind: HookEventKind,
   /// When the hook server received it. A hook that matched no session is
-  /// replayed later (`Workspace::refresh_session_uuids`); this is still when
+  /// replayed after the next Cira read (`Workspace::retry_unmatched_hooks`); this is still when
   /// it happened.
   pub received: SystemTime,
 }

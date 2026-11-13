@@ -20,7 +20,7 @@ What survives is the part that earns its keep: TODO.md as durable per-session st
 
 ## Assigned Session UUIDs
 
-*Superseded in part by **Background Sessions** below: jc no longer launches `claude` itself, so `--session-id`, `Launch` and `launch_for` are gone. The label-is-not-an-address reasoning stands, with the `> bg=` short id as the address.*
+*Superseded in part by **Background Sessions** below: jc no longer launches `claude` itself, so `--session-id`, `Launch` and `launch_for` are gone. The label-is-not-an-address reasoning stands, with the `> cira=` id as the address.*
 
 jc used to *detect* a session's identity: launch a bare `claude`, write a blank `> uuid=` line into TODO.md, and wait for the first hook event to tell it which UUID the CLI had picked. That single choice paid for a surprising amount of machinery — an `Option<String>` UUID threaded through every session code path, a "one pending UUID-less session per project" constraint so hook events could be matched by `cwd`, and a window where a session existed but could not be addressed by anything.
 
@@ -40,15 +40,17 @@ With the UUID always populated, every one of those callers already holds a uniqu
 
 ## Background Sessions
 
-Each Claude pane is a client of a Claude Code background session (Cira DESIGN 12; Jay, 2026-11-11): `claude --bg` starts it under Claude Code's per-user supervisor, and the pane runs `claude attach <short>`. The session outlives jc, so quitting jc stops nothing, and a jc restart attaches again instead of relaunching. The terminal pane stays jc's own shell.
+Each Claude pane is a client of a Claude Code background session, and **Cira owns the session** (Cira DESIGN 12; Jay, Q-154: *"claude <-> claude daemon <-> cira <-> jc & web"* — jc is the native client). Cira starts the job (`claude --bg`), keeps it in the desired mode, stops and removes it; jc asks for each change with `cira session new|mode|stop|rm|label` and attaches the pane with `claude attach <short>` to the job `cira status --json` names. The session outlives jc, so quitting jc stops nothing, and a jc restart attaches again. The terminal pane stays jc's own shell.
 
-That moves the session's identity. `--bg` ignores `--session-id`, so jc no longer chooses the conversation uuid, and a `/clear` made in another attach while jc is closed changes it where jc cannot see. The short id `--bg` prints does not change through `/clear`, stop, respawn or retirement, so it is the address: `> bg=<short>` replaces `> uuid=`, and the uuid becomes something jc learns (a hook's `session_id` starts with the short id until a `/clear`; after one, the `/clear` hook pair or `claude agents --json` says). The stable id Cira keys on is a third thing, `> cira=`, because the short id itself changes when `> dangerous` does.
+jc first ran the lifecycle itself (start, the `> dangerous` fork, stop, rm). That made two processes run `claude` on one job with nothing ordering them — jc forking a session while Cira respawned the old job for a delivery could leave two live jobs on one conversation (read from the code, not measured) — and an edit to `> dangerous` made while jc was closed was never applied (Cira Q-61). With one owner both go: Cira runs one operation per session at a time, and the mode lives in Cira, not in TODO.md (Q-155).
 
-Three consequences follow from Claude Code's behaviour, each measured (Cira SP-03):
+What that leaves jc, and why each piece is shaped as it is:
 
-- **A job keeps its saved options.** Passing `--dangerously-skip-permissions` to an existing session is impossible; resuming its conversation with different flags starts a copy under a new short id. So toggling `> dangerous` recreates the session: stop it, start the copy (with `--permission-mode default` to turn bypass off, since passing nothing keeps the saved mode), point the heading at it, and remove the old job.
-- **`--resume` on a held conversation forks.** Migrating a `> uuid=` heading by `claude --bg --resume <uuid>` continues the same conversation only when no process holds it. jc therefore migrates on start, after the old jc has quit, and refuses for a uuid an interactive `claude` still holds.
-- **The attach client is disposable.** It exits on Ctrl+Z, on Esc from the ← agents view, and when the session is stopped; the session does not. So the pane reaps and restarts its child, and attaching resumes a stopped session. Typing into a client that is still connecting is lost, so sends wait until the session is live rather than for a fixed grace.
+- **The heading's address is the id Cira mints** (`> cira=`), which is also `CIRA_SESSION`. The job's short id changes on every mode change, so jc never stores it (no `> bg=` cache, Q-158); it reads it from Cira each time it attaches.
+- **Attaching follows Cira, never a remembered short id.** The attach client exits on Ctrl+Z, on Esc from the ← agents view, and when Cira stops or forks the job; attaching resumes a stopped job. So after an exit the pane attaches again only once a status read *begun after the exit* names the job, waits while an operation runs or a fork is due (attaching then would resume the job being replaced), and does not undo a stop made through Cira — it follows the session when something wakes it, or when Jay asks.
+- **`[D]` and `[DELETED]` are requests, sent when the marker changes** (remembered per id in jc's `sessions.toml`), so an edit made while jc is closed applies at its next start, and a stale `[D]` never stops a session started again from Cira's page. A level-triggered marker would make jc fight the page: the two-writer bug again.
+- **The label is Cira's (Q-159);** jc writes it into the heading when it changes on the page and sends a heading rename to Cira, remembering the label both last agreed on to tell which side moved.
+- **Sends wait for a live session.** Typing into a client that is still connecting is lost, so sends wait until the session is live rather than for a fixed grace.
 
 ## The Session Marker Comes From State
 
