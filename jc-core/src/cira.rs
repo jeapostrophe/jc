@@ -63,6 +63,9 @@ pub struct Session {
   /// Its name, Cira's (Q-159); jc shows it and sends renames.
   #[serde(default)]
   pub label: Option<String>,
+  /// Cira runs its job: it was made by `cira session new`.
+  #[serde(default)]
+  pub owned: bool,
   /// The desired mode: `--dangerously-skip-permissions`.
   #[serde(default)]
   pub dangerous: bool,
@@ -181,15 +184,10 @@ impl Status {
 }
 
 impl Project {
-  /// The session a jc session is. One jc started with a stable id (`> cira=`)
-  /// passed it as `CIRA_SESSION`, which is then its Cira id, so it is matched
-  /// by that alone: before Cira has seen it, its short id or uuid could only
-  /// find another session (the one a migration resumed from). One without is
-  /// matched by its short id, else its current uuid. Empty values match nothing.
-  pub fn session(&self, cira: Option<&str>, short: &str, uuid: &str) -> Option<&Session> {
-    if let Some(cira) = cira.filter(|c| !c.is_empty()) {
-      return self.sessions.iter().find(|s| s.id == cira);
-    }
+  /// The session a jc session with no Cira id yet (a legacy heading) is, by
+  /// its short id, else its current uuid. Empty values match nothing. One with
+  /// a Cira id is found by that alone ([`Status::session`]).
+  pub fn session(&self, short: &str, uuid: &str) -> Option<&Session> {
     let by = |value: &str, field: fn(&Session) -> Option<&str>| {
       (!value.is_empty()).then(|| self.sessions.iter().find(|s| field(s) == Some(value))).flatten()
     };
@@ -440,8 +438,8 @@ impl Cira {
   }
 
   /// How long a request may take: `cira` waits up to 12 s for a daemon to
-  /// accept, then the request itself.
-  pub const CALL: Duration = Duration::from_secs(30);
+  /// accept and 30 s for its answer (exit 124 after that), and a margin.
+  pub const CALL: Duration = Duration::from_secs(12 + 30 + 18);
   /// `session new --wait`: Cira waits two starts and a margin (its `WAIT`).
   const WAIT: Duration = Duration::from_secs(2 * 180 + 60);
 
@@ -461,8 +459,8 @@ impl Cira {
     let (code, stdout, stderr) = run.ok_or(CallError::Unreachable)?;
     match code {
       Some(0) => Ok(stdout),
-      // 125: no daemon accepted, nothing sent; 124: no answer.
-      Some(124) | Some(125) | None => Err(CallError::Unreachable),
+      Some(exit::NOT_SENT) => Err(CallError::Unreachable),
+      Some(exit::NO_ANSWER) | None => Err(CallError::NoAnswer),
       Some(code) => Err(CallError::Refused { code, message: stderr, stdout }),
     }
   }
@@ -480,8 +478,11 @@ pub struct At {
 /// Why a `cira session …` request did not succeed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
-  /// Not installed, no daemon, no answer in time: nothing known recorded.
+  /// Not installed, or no daemon accepted (exit 125): nothing was sent.
   Unreachable,
+  /// Sent, with no answer (exit 124, or jc stopped waiting): it may have been
+  /// recorded.
+  NoAnswer,
   /// Cira answered with exit `code` (`cira_proto::exit`: 4 conflict, 5
   /// invalid, 6 not found, …); `message` is its stderr. `stdout` is what it
   /// printed anyway (`new --wait --json` prints the session when its job
@@ -491,10 +492,27 @@ pub enum CallError {
   Malformed(String),
 }
 
+impl CallError {
+  /// Whether asking again is how this is answered: Cira was not reached, did
+  /// not answer, or recorded nothing for a reason that passes (its own error,
+  /// `not_recorded`, `version`, `read_only`). A refusal of the request itself
+  /// (conflict, invalid, not found) is an answer.
+  pub fn retry(&self) -> bool {
+    match self {
+      CallError::Unreachable | CallError::NoAnswer => true,
+      CallError::Refused { code, .. } => {
+        matches!(*code, exit::ERROR | exit::NOT_RECORDED | exit::VERSION | exit::READ_ONLY)
+      }
+      CallError::Malformed(_) => false,
+    }
+  }
+}
+
 impl std::fmt::Display for CallError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       CallError::Unreachable => write!(f, "Cira is unreachable"),
+      CallError::NoAnswer => write!(f, "Cira did not answer; it may have recorded the request"),
       CallError::Refused { code, message, .. } => write!(f, "{} (exit {code})", message.trim()),
       CallError::Malformed(e) => write!(f, "Cira's answer did not parse: {e}"),
     }
@@ -510,6 +528,17 @@ pub mod exit {
   /// Refused, e.g. `--resume` of a conversation with no transcript, or a
   /// removed session asked to stop.
   pub const INVALID: i32 = 5;
+  pub const NOT_FOUND: i32 = 6;
+  /// The store failed and nothing was written.
+  pub const NOT_RECORDED: i32 = 7;
+  /// The daemon does not speak this request (another build).
+  pub const VERSION: i32 = 8;
+  /// The project refuses writes until a remedy is done.
+  pub const READ_ONLY: i32 = 9;
+  /// Sent, no answer: may have been recorded.
+  pub const NO_ANSWER: i32 = 124;
+  /// No daemon accepted: nothing was sent.
+  pub const NOT_SENT: i32 = 125;
 }
 
 /// A `cira session new` request.
@@ -574,7 +603,10 @@ fn mode_args(id: &str, dangerous: bool, from: bool) -> Vec<String> {
 /// Run `cmd` with stdin closed, killing it after `timeout`: its exit code
 /// (`None` when killed or signalled), stdout and stderr. `None` when it could
 /// not be started.
-fn run_bounded(cmd: &mut Command, timeout: Duration) -> Option<(Option<i32>, Vec<u8>, String)> {
+pub(crate) fn run_bounded(
+  cmd: &mut Command,
+  timeout: Duration,
+) -> Option<(Option<i32>, Vec<u8>, String)> {
   let mut child =
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
   // Read on threads of their own, so a large answer cannot fill a pipe and
@@ -760,20 +792,19 @@ mod tests {
   }
 
   #[test]
-  fn a_jc_session_is_found_by_cira_id_alone_else_short_then_uuid() {
+  fn a_legacy_session_is_found_by_short_then_uuid() {
     let (status, _) = fixture();
     let p = status.projects.iter().find(|p| p.sessions.len() > 1).unwrap();
     let [a, b, ..] = &p.sessions[..] else { unreachable!() };
     let id = |s: Option<&Session>| s.map(|s| s.id.clone());
     let uuid_a = a.uuid.as_deref().unwrap();
     let (short_b, uuid_b) = (b.short.as_deref().unwrap(), b.uuid.as_deref().unwrap());
-    assert_eq!(id(p.session(Some(&a.id), short_b, uuid_b)), Some(a.id.clone()));
-    // A stable id Cira has not seen yet finds nothing, never a session that
-    // merely shares its short id or uuid.
-    assert_eq!(id(p.session(Some("not-seen-yet"), short_b, uuid_b)), None);
-    assert_eq!(id(p.session(None, short_b, uuid_a)), Some(b.id.clone()), "short beats uuid");
-    assert_eq!(id(p.session(Some(""), "", uuid_b)), Some(b.id.clone()));
-    assert_eq!(id(p.session(None, "", "")), None);
+    assert_eq!(id(p.session(short_b, uuid_a)), Some(b.id.clone()), "short beats uuid");
+    assert_eq!(id(p.session("", uuid_b)), Some(b.id.clone()));
+    assert_eq!(id(p.session("", "")), None);
+    // One with a Cira id is found by that alone, in whichever project.
+    assert_eq!(status.session(&a.id).map(|s| &s.id), Some(&a.id));
+    assert_eq!(status.session("not-listed"), None);
   }
 
   #[test]
@@ -880,15 +911,6 @@ mod tests {
     let missing = Cira::new("/nonexistent/jc-test/cira", Duration::from_secs(1));
     assert_eq!(missing.status(), None);
     // A `cira` that exits 125, as one with no daemon does, after printing JSON.
-    let dir = std::env::temp_dir().join(format!("jc-cira-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let script = |name: &str, body: &str| {
-      let path = dir.join(name);
-      std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-      use std::os::unix::fs::PermissionsExt;
-      std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-      path
-    };
     let failing = script("failing", "echo '{\"projects\":[]}'; exit 125");
     assert_eq!(Cira::new(failing, Duration::from_secs(5)).status(), None);
     let hanging = script("hanging", "exec sleep 30");
@@ -898,7 +920,6 @@ mod tests {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cira/status.json");
     let answering = script("answering", &format!("cat '{path}'"));
     assert_eq!(Cira::new(answering, Duration::from_secs(5)).status(), Some(fixture().0));
-    let _ = std::fs::remove_dir_all(&dir);
   }
 
   #[test]
@@ -986,7 +1007,25 @@ mod tests {
     }
     let slow =
       Cira::new(script("slow", "exec sleep 30"), t).with_call_timeout(Duration::from_millis(200));
-    assert_eq!(slow.rename(&at, "c1", "x"), Err(CallError::Unreachable), "no answer in time");
+    assert_eq!(slow.rename(&at, "c1", "x"), Err(CallError::NoAnswer), "no answer in time");
+    let sent = Cira::new(script("sent", "exit 124"), t);
+    assert_eq!(sent.stop(&at, "c1"), Err(CallError::NoAnswer), "124: may have been recorded");
+  }
+
+  #[test]
+  fn refusals_that_record_nothing_are_asked_again() {
+    let refused = |code| CallError::Refused { code, message: String::new(), stdout: vec![] };
+    // Found in review: a `[D]` met by a store that could not write (7) was
+    // recorded as done, and the stop never sent again.
+    for code in [exit::ERROR, exit::NOT_RECORDED, exit::VERSION, exit::READ_ONLY] {
+      assert!(refused(code).retry(), "exit {code}");
+    }
+    assert!(CallError::Unreachable.retry());
+    assert!(CallError::NoAnswer.retry());
+    for code in [exit::CONFLICT, exit::INVALID, exit::NOT_FOUND, 2] {
+      assert!(!refused(code).retry(), "exit {code} answers the request");
+    }
+    assert!(!CallError::Malformed(String::new()).retry());
   }
 
   #[test]

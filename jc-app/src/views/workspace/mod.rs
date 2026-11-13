@@ -1430,10 +1430,9 @@ impl Workspace {
 
   /// Spawn the periodic task that reconciles jc's state against the live TODO
   /// documents: scheduled-send timers (so time edits are picked up without
-  /// waiting for the original, possibly later, timer to fire), background
-  /// and each running session's label
-  /// (so a heading renamed in TODO.md takes effect). The main thread does no
-  /// I/O here; `claude` commands run on their own threads.
+  /// waiting for the original, possibly later, timer to fire) and each running
+  /// session's label (so a heading renamed in TODO.md takes effect). It does
+  /// no I/O. What jc asks of Cira follows each Cira read (`Workspace::on_cira`).
   fn start_schedule_reconcile_loop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let task = cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
       loop {

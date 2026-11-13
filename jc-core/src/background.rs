@@ -11,7 +11,7 @@
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// One entry of `claude agents --json --all`. Background entries carry `id`
@@ -111,27 +111,27 @@ impl Claude {
     vec![self.program.to_string_lossy().into_owned(), "attach".into(), short.into()]
   }
 
-  fn run_ok(&self, args: &[String]) -> Result<Output> {
-    let out = Command::new(&self.program)
-      .args(args)
-      .stdin(Stdio::null())
-      .output()
-      .with_context(|| format!("running {} {}", self.program.display(), args.join(" ")))?;
-    if !out.status.success() {
-      bail!(
-        "claude {} failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr).trim().to_string()
-          + String::from_utf8_lossy(&out.stdout).trim()
-      );
+  /// How long one `claude` call may take before jc gives up on it.
+  const TIMEOUT: Duration = Duration::from_secs(30);
+
+  /// `claude <args>`'s stdout, or why it failed (including no answer within
+  /// [`Self::TIMEOUT`]).
+  fn run_ok(&self, args: &[&str]) -> Result<Vec<u8>> {
+    let mut cmd = Command::new(&self.program);
+    let what = || format!("claude {}", args.join(" "));
+    let (code, stdout, stderr) = crate::cira::run_bounded(cmd.args(args), Self::TIMEOUT)
+      .with_context(|| format!("running {}", self.program.display()))?;
+    match code {
+      Some(0) => Ok(stdout),
+      Some(code) => bail!("{} failed (exit {code}): {}", what(), stderr.trim()),
+      None => bail!("{} gave no answer in {:?}", what(), Self::TIMEOUT),
     }
-    Ok(out)
   }
 
   /// `claude agents --json --all`.
   pub fn agents(&self) -> Result<Vec<Agent>> {
-    let out = self.run_ok(&["agents".into(), "--json".into(), "--all".into()])?;
-    serde_json::from_slice(&out.stdout).context("parsing claude agents --json")
+    let out = self.run_ok(&["agents", "--json", "--all"])?;
+    serde_json::from_slice(&out).context("parsing claude agents --json")
   }
 
   /// Poll `claude agents --json --all` until `short` is live, has settled

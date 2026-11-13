@@ -202,7 +202,7 @@ impl ProjectState {
       // holds it; a legacy one, before its migration, only by short or uuid.
       let listed = match &session.cira {
         Some(id) => status.and_then(|s| s.session(id)),
-        None => project.and_then(|p| p.session(None, &session.bg, &session.uuid)),
+        None => project.and_then(|p| p.session(&session.bg, &session.uuid)),
       };
       let state = listed.map(|s| (s.state, s.since()));
       changed |= std::mem::replace(&mut session.cira_state, state) != state;

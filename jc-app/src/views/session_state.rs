@@ -44,9 +44,12 @@ pub struct SessionState {
   /// A `cira session new` for it is in flight; nothing else is asked for it
   /// until it answers.
   pub asking: bool,
-  /// Its `cira session new` failed, or Cira holds it (the pane says why).
-  /// It no longer counts as adopted, so the pickers offer the heading again.
+  /// Its `cira session new` failed (the pane says why). It no longer counts
+  /// as adopted, so the pickers offer the heading again.
   pub failed: bool,
+  /// When its `cira session new` went unanswered: the next status read is
+  /// searched for the session it may have made.
+  pub lost: Option<SystemTime>,
   /// A `claude agents --json` poll for `live` is in flight.
   pub watching_live: bool,
   /// For a session adopted from a heading an older jc left unbound: that
@@ -170,6 +173,7 @@ impl SessionState {
       live: false,
       asking: false,
       failed: false,
+      lost: None,
       watching_live: false,
       unbound_key: None,
       adopting: None,

@@ -283,6 +283,24 @@ impl TodoDocument {
     marks
   }
 
+  /// One heading per Cira id, the one that speaks for its label: the first
+  /// of its most alive headings, as [`Self::marks`] counts them. A copied
+  /// block names one session under several headings, and syncing each would
+  /// rename the session back and forth.
+  pub fn label_headings(&self) -> Vec<(usize, &TodoSession)> {
+    let mut best: Vec<(usize, &TodoSession)> = Vec::new();
+    for (index, session) in self.sessions.iter().enumerate() {
+      let Some(id) = session.cira() else { continue };
+      match best.iter_mut().find(|(_, s)| s.cira() == Some(id)) {
+        Some(slot) if session.mark() > slot.1.mark() => *slot = (index, session),
+        Some(_) => {}
+        None => best.push((index, session)),
+      }
+    }
+    best.sort_by_key(|(index, _)| *index);
+    best
+  }
+
   /// The session `key` names.
   pub fn session_of(&self, key: &SessionKey) -> Option<&TodoSession> {
     self.sessions.get(self.index_of(key)?)
@@ -761,13 +779,19 @@ pub fn bind_cira_at(text: &str, doc: &TodoDocument, index: usize, cira: &str) ->
   Some(splice(&text, line_start..session.id_byte_range.end, &line))
 }
 
-/// Rename the heading at `index` to `label`, keeping its `[D]` marker.
+/// Rename the heading at `index` to `label`, keeping its `[D]` marker. A
+/// label that would read as a marker (`[D] `, `[X] `, `[DELETED] `), is empty,
+/// or would split the heading line is not written (`None`).
 pub fn rename_heading_at(
   text: &str,
   doc: &TodoDocument,
   index: usize,
   label: &str,
 ) -> Option<String> {
+  let marker_like = ["[D] ", "[X] ", "[DELETED] "].iter().any(|m| label.starts_with(m));
+  if label.trim().is_empty() || marker_like || label.contains(['\n', '\r']) {
+    return None;
+  }
   let session = doc.sessions.get(index)?;
   let marker = if session.is_disabled() { "[D] " } else { "" };
   Some(splice(text, session.heading_byte_range.clone(), &format!("## {marker}{label}")))
@@ -2694,6 +2718,39 @@ draft
     let doc = parse(&out);
     let out = rename_heading_at(&out, &doc, 1, "Renamed").unwrap();
     assert!(out.ends_with("## Renamed\n> cira=c-2\n"), "{out}");
+  }
+
+  #[test]
+  fn a_label_that_would_read_as_a_marker_or_break_the_heading_is_not_written() {
+    // Found in review: a page rename to `[DELETED] x`, written into the
+    // heading, would make jc send `cira session rm`.
+    let text = "# Claude\n## Old\n> cira=c-1\n";
+    let doc = parse(text);
+    for label in ["[DELETED] x", "[D] x", "[X] x", "two\nlines", ""] {
+      assert_eq!(rename_heading_at(text, &doc, 0, label), None, "{label:?}");
+    }
+    assert!(rename_heading_at(text, &doc, 0, "[draft] fine").is_some());
+  }
+
+  #[test]
+  fn one_heading_speaks_for_each_cira_ids_label() {
+    let text = "\
+# Claude
+## [D] Copy
+> cira=c-1
+## Live
+> cira=c-1
+## Live 2
+> cira=c-1
+## Other
+> cira=c-2
+## Legacy
+> uuid=u-1
+";
+    let doc = parse(text);
+    let picked: Vec<(usize, &str)> =
+      doc.label_headings().into_iter().map(|(i, s)| (i, s.label.as_str())).collect();
+    assert_eq!(picked, vec![(1, "Live"), (3, "Other")]);
   }
 
   #[test]

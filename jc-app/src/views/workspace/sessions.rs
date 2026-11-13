@@ -5,10 +5,11 @@
 //! into requests. Every `cira` and `claude` call runs on a thread of its own.
 
 use super::Workspace;
+use crate::views::project_state::ProjectState;
 use crate::views::session_state::{Heading, SessionId, SessionState};
 use gpui::*;
 use jc_core::background::{Poll, Settled};
-use jc_core::cira::{CallError, Created, NewSession, Status, exit};
+use jc_core::cira::{At, CallError, Created, NewSession, Status, exit};
 use jc_core::lifecycle::{self, LabelSync, MarkRequest, PaneAction, Records};
 use jc_core::todo::{SessionKey, TodoSession};
 use jc_terminal::{ChildEvent, TerminalView};
@@ -136,9 +137,16 @@ impl Workspace {
     let reachable = self.cira_reachable();
     let now = SystemTime::now();
     let mut migrate = Vec::new();
+    let mut lost = Vec::new();
     for project in &mut self.projects {
       for session in project.sessions.values_mut() {
         if session.asking || session.failed {
+          continue;
+        }
+        if let Some(at) = session.lost {
+          if reachable && read_at > at {
+            lost.push((project.path.clone(), session.id));
+          }
           continue;
         }
         if session.cira.is_none() {
@@ -176,6 +184,41 @@ impl Workspace {
     for (path, sid) in migrate {
       self.migrate(path, sid, window, cx);
     }
+    for (path, sid) in lost {
+      self.find_lost(&path, sid, window, cx);
+    }
+  }
+
+  /// `cira session new` for `sid` went unanswered, and may have made the
+  /// session anyway: take the one Cira lists under its label that no heading
+  /// names, rather than asking again and making a second.
+  fn find_lost(
+    &mut self,
+    path: &Path,
+    sid: SessionId,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let Some(pi) = self.project_index(path) else { return };
+    let project = &self.projects[pi];
+    let Some(session) = project.sessions.get(&sid) else { return };
+    let doc = project.todo_view.read(cx).document();
+    let named =
+      |id: &str| doc.session_by_id(id).is_some() || doc.deleted.iter().any(|d| d.id == id);
+    let found = self
+      .cira
+      .status
+      .as_ref()
+      .and_then(|s| s.project_for(path))
+      .and_then(|p| lifecycle::lost_session(p, &session.label, named))
+      .map(|s| s.id.clone());
+    let made = found.map(|session| Created { session, status: None }).ok_or_else(|| {
+      CallError::Malformed("Cira did not answer and lists no session made for this".into())
+    });
+    if let Some(session) = self.session_mut(path, sid) {
+      session.lost = None;
+    }
+    self.session_answered(path, sid, made, false, window, cx);
   }
 
   // ---------------------------------------------------------------------------
@@ -232,26 +275,36 @@ impl Workspace {
     session.failed = false;
     session.status(why, cx);
     let cira = self.cira_client.clone();
+    let cwd = path.clone();
     let work = move || {
       let made = cira.new_session(&req);
-      match made {
-        // `--resume` of a conversation Claude Code has no transcript of.
-        Err(CallError::Refused { code: exit::INVALID, .. }) if req.resume.is_some() => {
-          cira.new_session(&NewSession { resume: None, wait: false, ..req })
+      match (made, &req.resume) {
+        // Cira refuses a `--resume` it finds no transcript for (exit 5). Its
+        // 5 has other causes too, and Cira may not find Claude Code's config:
+        // only a conversation jc cannot find either starts fresh, since
+        // binding a fresh session drops the heading's only link to it.
+        (Err(CallError::Refused { code: exit::INVALID, .. }), Some(uuid))
+          if ProjectState::session_dirs(&cwd)
+            .is_some_and(|dirs| !jc_core::claude::transcript_in(&dirs, uuid)) =>
+        {
+          (cira.new_session(&NewSession { resume: None, ..req }), true)
         }
-        made => made,
+        (made, resume) => (made, resume.is_none()),
       }
     };
-    self.run_blocking(window, cx, work, move |ws, made, window, cx| {
-      ws.session_answered(&path, sid, made, window, cx)
+    self.run_blocking(window, cx, work, move |ws, (made, fresh), window, cx| {
+      ws.session_answered(&path, sid, made, fresh, window, cx)
     });
   }
 
+  /// Cira answered `sid`'s `cira session new` (`fresh`: one without
+  /// `--resume`, which is not idempotent).
   fn session_answered(
     &mut self,
     path: &Path,
     sid: SessionId,
     made: Result<Created, CallError>,
+    fresh: bool,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -263,36 +316,55 @@ impl Workspace {
     session.asking = false;
     let created = match made {
       Ok(created) => created,
+      Err(CallError::NoAnswer) if fresh => {
+        // Asking again could make a second session: look for this one first.
+        session.lost = Some(SystemTime::now());
+        session.status("Cira did not answer; looking for the session it may have made…", cx);
+        return;
+      }
       Err(e) => {
-        let job_failed = matches!(e, CallError::Refused { code: exit::ERROR, .. });
+        let why = match &e {
+          CallError::Refused { code: exit::ERROR, stdout, .. } => {
+            let failed = serde_json::from_slice::<Created>(stdout).ok().and_then(|c| c.status);
+            let error = failed.as_ref().and_then(|s| s.op_error()).map(str::to_string);
+            format!(
+              "Cira could not start this session's job: {}. Adopt it again to retry.",
+              error.unwrap_or_else(|| e.to_string())
+            )
+          }
+          e => format!("could not ask Cira for a session: {e}"),
+        };
         session.failed = true;
-        session.status(
-          &if job_failed {
-            format!("Cira could not start this session's job: {e}. Adopt it again to retry.")
-          } else {
-            format!("could not ask Cira for a session: {e}")
-          },
-          cx,
-        );
+        session.adopting = None;
+        session.status(&why, cx);
         cx.notify();
         return;
       }
     };
     let id = created.session;
     let doc = todo_view.read(cx).document();
-    let index = match (&session.unbound_key, session.key.is_empty()) {
-      (Some(key), _) => doc.index_of(key),
-      (None, false) => doc.index_by_id(&session.key),
-      (None, true) => None,
+    let heading = match (&session.unbound_key, session.key.is_empty()) {
+      (Some(key), _) => doc.index_of(key).map(Some),
+      (None, false) => doc.index_by_id(&session.key).map(Some),
+      (None, true) => Some(None),
     };
-    match index {
-      Some(index) => todo_view.update(cx, |tv, cx| tv.bind_cira_at(index, &id, window, cx)),
-      None if session.key.is_empty() && session.unbound_key.is_none() => {
+    match heading {
+      Some(Some(index)) => todo_view.update(cx, |tv, cx| tv.bind_cira_at(index, &id, window, cx)),
+      Some(None) => {
         let label = session.label.clone();
         todo_view.update(cx, |tv, cx| tv.insert_session_heading(&label, &id, window, cx));
       }
       None => {
-        eprintln!("cira: the heading for {} moved; session {id} is not recorded", session.key)
+        // Its heading went while Cira was asked (deleted, or its id line
+        // edited): nothing names the new session. One marked `[DELETED]`
+        // is removed in Cira too; any other is left for the page.
+        let deleted = doc.deleted.iter().any(|d| d.id == session.key);
+        eprintln!("cira: the heading for {} went; session {id} is not recorded", session.key);
+        self.remove_running_session(pi, sid, window, cx);
+        if deleted {
+          self.ask_cira(pi, id, |cira, at, id| cira.remove(at, id), |_, _| {}, window, cx);
+        }
+        return;
       }
     }
     session.unbound_key = None;
@@ -381,6 +453,16 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    // A failed start with no heading has nothing to retry: make way.
+    let dead: Vec<SessionId> = self.projects[pi]
+      .sessions
+      .values()
+      .filter(|s| s.failed && s.key.is_empty() && s.unbound_key.is_none())
+      .map(|s| s.id)
+      .collect();
+    for sid in dead {
+      self.remove_running_session(pi, sid, window, cx);
+    }
     let heading = Heading { key: String::new(), label: label.clone(), cira: None };
     let sid = self.add_pending_session(pi, heading, window, cx);
     let path = self.projects[pi].path.clone();
@@ -717,40 +799,62 @@ impl Workspace {
       self.save_records();
     }
     for (pi, id, mark, request) in requests {
-      self.cira.in_flight.insert(id.clone());
-      let cira = self.cira_client.clone();
-      let id_for_work = id.clone();
-      let at = self.at(pi, &id);
-      let work = move || match request {
-        MarkRequest::Stop => cira.stop(&at, &id_for_work),
-        MarkRequest::Remove => cira.remove(&at, &id_for_work),
+      let call = move |cira: &jc_core::cira::Cira, at: &At, id: &str| match request {
+        MarkRequest::Stop => cira.stop(at, id),
+        MarkRequest::Remove => cira.remove(at, id),
       };
-      self.run_blocking(window, cx, work, move |ws, result, _window, _cx| {
-        ws.cira.in_flight.remove(&id);
-        match result {
-          // Unreachable: asked again at the next read.
-          Err(CallError::Unreachable) => return,
-          Ok(()) => eprintln!("cira: {request:?} {id}"),
-          // Refused (a removed session asked to stop, one Cira does not
-          // list): it is answered, and asking again would not change that.
-          Err(e) => eprintln!("cira: {request:?} {id}: {e}"),
-        }
-        if let Some(record) = ws.record_mut(&id) {
+      let done = move |ws: &mut Self, id: &str| {
+        eprintln!("cira: {request:?} {id}");
+        if let Some(record) = ws.record_mut(id) {
           record.mark = Some(mark);
         }
-        ws.save_records();
-        ws.kick_cira();
-      });
+      };
+      self.ask_cira(pi, id, call, done, window, cx);
     }
+  }
+
+  /// Ask Cira `call` about session `id` of project `pi`, one request per id
+  /// at a time, then `done` once it is answered — done, or refused for good
+  /// (a removed session asked to stop: asking again would not change that).
+  /// What records nothing for now (unreachable, no answer, a store that could
+  /// not write) is asked again at a later read.
+  fn ask_cira(
+    &mut self,
+    pi: usize,
+    id: String,
+    call: impl FnOnce(&jc_core::cira::Cira, &At, &str) -> Result<(), CallError> + Send + 'static,
+    done: impl FnOnce(&mut Self, &str) + 'static,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    self.cira.in_flight.insert(id.clone());
+    let cira = self.cira_client.clone();
+    let at = self.at(pi, &id);
+    let id_for_work = id.clone();
+    let work = move || call(&cira, &at, &id_for_work);
+    self.run_blocking(window, cx, work, move |ws, result, _window, _cx| {
+      ws.cira.in_flight.remove(&id);
+      match result {
+        Err(e) if e.retry() => return,
+        Err(e) => eprintln!("cira: {id}: {e}"),
+        Ok(()) => {}
+      }
+      done(ws, &id);
+      ws.save_records();
+      ws.kick_cira();
+    });
   }
 
   /// Keep each heading's label and Cira's in step (Q-159): a heading renamed
   /// in TODO.md is sent with `cira session label`; a label Cira changed (the
-  /// page) is written into the heading. Cira's wins when both moved.
+  /// page) is written into the heading. Cira's wins when both moved. One
+  /// heading speaks for each id (`TodoDocument::label_headings`).
   fn sync_labels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let read_at = self.cira.read_at.unwrap_or(SystemTime::UNIX_EPOCH);
+    // A read begun after a rename was answered has the new label.
+    self.cira.renamed_at.retain(|_, at| read_at <= *at);
     let Some(status) = &self.cira.status else { return };
     let Some(records) = &self.cira.records else { return };
-    let read_at = self.cira.read_at.unwrap_or(SystemTime::UNIX_EPOCH);
     let mut sends = Vec::new();
     let mut writes = Vec::new();
     let mut agreed = Vec::new();
@@ -759,11 +863,10 @@ impl Workspace {
       if tv.is_dirty(cx) {
         continue;
       }
-      for (index, heading) in tv.document().sessions.iter().enumerate() {
+      for (index, heading) in tv.document().label_headings() {
         let Some(id) = heading.cira() else { continue };
         let Some(listed) = status.session(id) else { continue };
-        let stale = self.cira.renamed_at.get(id).is_some_and(|at| read_at <= *at);
-        if self.cira.in_flight.contains(id) || stale {
+        if self.cira.in_flight.contains(id) || self.cira.renamed_at.contains_key(id) {
           continue;
         }
         let last = records.sessions.get(id).and_then(|r| r.label.as_deref());
@@ -785,7 +888,12 @@ impl Workspace {
     }
     for (pi, index, id, label) in writes {
       let tv = self.projects[pi].todo_view.clone();
-      tv.update(cx, |tv, cx| tv.rename_heading_at(index, &label, window, cx));
+      // A label jc will not write into a heading (one that reads as a
+      // marker) is still recorded as Cira's, so the next read sends the
+      // heading's own label back instead.
+      if !tv.update(cx, |tv, cx| tv.rename_heading_at(index, &label, window, cx)) {
+        eprintln!("cira: session {id}'s label {label:?} is not written into its heading");
+      }
       if let Some(r) = self.record_mut(&id) {
         r.label = Some(label);
       }
@@ -794,29 +902,17 @@ impl Workspace {
       self.save_records();
     }
     for (pi, id, label) in sends {
-      self.cira.in_flight.insert(id.clone());
-      let cira = self.cira_client.clone();
-      let (id_w, label_w) = (id.clone(), label.clone());
-      let at = self.at(pi, &id);
-      self.run_blocking(
-        window,
-        cx,
-        move || cira.rename(&at, &id_w, &label_w),
-        move |ws, result, _window, _cx| {
-          ws.cira.in_flight.remove(&id);
-          match result {
-            Err(CallError::Unreachable) => return,
-            Ok(()) => {}
-            Err(e) => eprintln!("cira: rename {id}: {e}"),
-          }
-          ws.cira.renamed_at.insert(id.clone(), SystemTime::now());
-          if let Some(r) = ws.record_mut(&id) {
-            r.label = Some(label);
-          }
-          ws.save_records();
-          ws.kick_cira();
-        },
-      );
+      let call = {
+        let label = label.clone();
+        move |cira: &jc_core::cira::Cira, at: &At, id: &str| cira.rename(at, id, &label)
+      };
+      let done = move |ws: &mut Self, id: &str| {
+        ws.cira.renamed_at.insert(id.to_string(), SystemTime::now());
+        if let Some(r) = ws.record_mut(id) {
+          r.label = Some(label);
+        }
+      };
+      self.ask_cira(pi, id, call, done, window, cx);
     }
   }
 }

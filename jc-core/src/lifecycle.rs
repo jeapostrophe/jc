@@ -57,7 +57,7 @@ pub fn pane_action(
       None => PaneAction::Hold("removed through Cira".into()),
     };
   }
-  if let Some(op) = s.op.as_ref().filter(|o| o.running) {
+  if let Some(op) = s.op.as_ref().filter(|_| s.op_running()) {
     return wait(&format!("waiting while Cira runs its {}…", op.op));
   }
   if s.mode_pending == ModePending::Due {
@@ -77,24 +77,37 @@ pub fn pane_action(
   let stopped = s.stopped();
   let stopped_since = stopped.is_some_and(|at| since.is_none_or(|since| at > since));
   // Cira lists jobs only when it may act, so a job a delivery woke can still
-  // read `stopped`; its hooks moving its state after the stop say it runs.
-  let woke = stopped.is_some_and(|stop| {
-    s.state != crate::cira::State::Gone && s.since().is_some_and(|at| at > stop)
-  });
+  // read `stopped`; a turn its hooks began after the stop says it runs (a
+  // turn that merely ended then does not: it may have raced the stop).
+  let turn = matches!(s.state, crate::cira::State::Working | crate::cira::State::Dialog);
+  let woke = turn && stopped.is_some_and(|stop| s.since().is_some_and(|at| at > stop));
   match job.state {
     JobState::Running => PaneAction::Attach(job.short.clone()),
+    JobState::Absent => PaneAction::Hold(format!("its job {} is gone", job.short)),
+    JobState::Failed => {
+      PaneAction::Hold(s.op_error().unwrap_or("its job failed to start").to_string())
+    }
     _ if woke => PaneAction::Attach(job.short.clone()),
     _ if stopped_since => PaneAction::Hold(
       "stopped through Cira; it attaches again once it runs (a message wakes it), or by \
        \"Attach this session\" in Cmd-Shift-P"
         .into(),
     ),
-    JobState::Absent => PaneAction::Hold(format!("its job {} is gone", job.short)),
-    JobState::Failed => {
-      PaneAction::Hold(s.op_error().unwrap_or("its job failed to start").to_string())
-    }
     JobState::Stopped | JobState::Unknown => PaneAction::Attach(job.short.clone()),
   }
+}
+
+/// The session `cira session new` made for a heading labelled `label` when jc
+/// heard no answer: one Cira runs in that project under that label, not
+/// removed, that no heading names yet (`named`).
+pub fn lost_session<'a>(
+  project: &'a crate::cira::Project,
+  label: &str,
+  named: impl Fn(&str) -> bool,
+) -> Option<&'a Session> {
+  project.sessions.iter().find(|s| {
+    s.owned && s.removed_at.is_none() && s.label.as_deref() == Some(label) && !named(&s.id)
+  })
 }
 
 /// Bounds of the pause before a pane attaches again after its client exited:
@@ -265,10 +278,23 @@ mod tests {
       "state": "working", "state_since": "1970-01-01T00:05:00Z"
     }));
     assert_eq!(pane_action(Some(&s), true, None, Some(at(100))), attach("aaaa1111"));
-    // ...but a session that only ended since is not running.
+    // ...but a session that only ended since is not running, and neither is
+    // one whose turn ended just after the stop (found in review: a Stop hook
+    // racing the stop would have been taken as a wake).
+    for state in ["gone", "idle"] {
+      let s = session(serde_json::json!({
+        "job": job("aaaa1111", "stopped"), "stopped_at": STOPPED_AT_200,
+        "state": state, "state_since": "1970-01-01T00:05:00Z"
+      }));
+      assert!(
+        matches!(pane_action(Some(&s), true, None, Some(at(100))), PaneAction::Hold(_)),
+        "{state}"
+      );
+    }
+    // A job Claude Code no longer lists is held even if hooks moved after the stop.
     let s = session(serde_json::json!({
-      "job": job("aaaa1111", "stopped"), "stopped_at": STOPPED_AT_200,
-      "state": "gone", "state_since": "1970-01-01T00:05:00Z"
+      "job": job("aaaa1111", "absent"), "stopped_at": STOPPED_AT_200,
+      "state": "working", "state_since": "1970-01-01T00:05:00Z"
     }));
     assert!(matches!(pane_action(Some(&s), true, None, Some(at(100))), PaneAction::Hold(_)));
   }
@@ -335,6 +361,33 @@ mod tests {
     assert_eq!(label_sync("C", Some("B"), Some("A")), LabelSync::Write("B".into()), "both");
     assert_eq!(label_sync("C", Some("B"), None), LabelSync::Write("B".into()), "no record");
     assert_eq!(label_sync("C", None, None), LabelSync::Send, "Cira has no label");
+  }
+
+  #[test]
+  fn a_session_made_while_jc_heard_no_answer_is_found_by_its_label() {
+    let status = |sessions: serde_json::Value| {
+      let raw = serde_json::json!({ "projects": [{ "name": "p", "sessions": sessions }] });
+      Status::parse(raw.to_string().as_bytes()).unwrap()
+    };
+    let s = |id: &str, label: &str, extra: serde_json::Value| {
+      let mut v = serde_json::json!({
+        "id": id, "label": label, "state": "idle", "state_since": "1970-01-01T00:01:00Z", "owned": true
+      });
+      for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+      }
+      v
+    };
+    let st = status(serde_json::json!([
+      s("c-named", "New Session", serde_json::json!({})),
+      s("c-gone", "New Session", serde_json::json!({ "removed_at": STOPPED_AT_200 })),
+      s("c-other", "Other", serde_json::json!({})),
+      s("c-lost", "New Session", serde_json::json!({})),
+    ]));
+    let named = |id: &str| id == "c-named";
+    let found = lost_session(&st.projects[0], "New Session", named).map(|s| s.id.as_str());
+    assert_eq!(found, Some("c-lost"), "owned, not removed, named by no heading");
+    assert_eq!(lost_session(&st.projects[0], "Missing", named).map(|s| s.id.as_str()), None);
   }
 
   #[test]

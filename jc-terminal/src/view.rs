@@ -231,8 +231,8 @@ impl TerminalView {
     view
   }
 
-  /// Run `spec` in this terminal, hanging up any child it already runs, and
-  /// Its exit is reported as [`ChildEvent::Exited`].
+  /// Run `spec` in this terminal, hanging up any child it already runs. Its
+  /// exit is reported as [`ChildEvent::Exited`].
   pub fn spawn(&mut self, spec: ChildSpec, cx: &mut Context<Self>) {
     self.config.child = Some(spec);
     self.start_child(cx);
@@ -250,8 +250,7 @@ impl TerminalView {
     cx.notify();
   }
 
-  /// Drop the current child (hanging it up) and any exit
-  /// it has yet to report.
+  /// Drop the current child (hanging it up) and any exit it has yet to report.
   fn hang_up(&mut self) {
     self.generation += 1;
     self.pty = None;

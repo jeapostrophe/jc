@@ -316,18 +316,22 @@ impl TodoView {
     }
   }
 
-  /// Rename the heading at `index` (keeping its `[D]`) and save.
+  /// Rename the heading at `index` (keeping its `[D]`) and save; `false`
+  /// when the label is not one jc writes into a heading
+  /// ([`todo::rename_heading_at`]).
   pub fn rename_heading_at(
     &mut self,
     index: usize,
     label: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
-  ) {
+  ) -> bool {
     let text = self.editor_text(cx);
-    if let Some(new_text) = todo::rename_heading_at(&text, &self.document, index, label) {
-      self.set_text_and_save(new_text, window, cx);
-    }
+    let Some(new_text) = todo::rename_heading_at(&text, &self.document, index, label) else {
+      return false;
+    };
+    self.set_text_and_save(new_text, window, cx);
+    true
   }
 
   /// Re-parse the document and refresh highlights. Called by [`Self::set_text`]
