@@ -14,6 +14,8 @@ pub enum TerminalEvent {
   ChildExit,
   PtyWrite(String),
   CursorBlinkingChange,
+  /// The child asked to put this text on the clipboard (OSC 52).
+  ClipboardStore(String),
 }
 
 /// Forwards alacritty events to a flume channel.
@@ -36,6 +38,8 @@ impl EventListener for EventProxy {
       Event::ChildExit(_) => TerminalEvent::ChildExit,
       Event::PtyWrite(s) => TerminalEvent::PtyWrite(s),
       Event::CursorBlinkingChange => TerminalEvent::CursorBlinkingChange,
+      // macOS has one clipboard: a selection store (`p`, `s`) goes there too.
+      Event::ClipboardStore(_, text) => TerminalEvent::ClipboardStore(text),
       _ => return,
     };
     let _ = self.tx.send(terminal_event);
@@ -89,8 +93,52 @@ impl TerminalState {
     f(&mut term)
   }
 
+  /// The last line with text at or above the cursor, trimmed: what a child
+  /// that exited said last (a tmux client's reason).
+  pub fn last_text_line(&self) -> Option<String> {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    self.with_term(|term| {
+      let grid = term.grid();
+      let top = -(grid.history_size() as i32);
+      let cursor = grid.cursor.point.line.0;
+      (top..=cursor).rev().find_map(|line| {
+        let row = &grid[Line(line)];
+        let text: String = (0..grid.columns()).map(|c| row[Column(c)].c).collect();
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+      })
+    })
+  }
+
   /// Get a clone of the Arc for use in canvas closures.
   pub fn term_handle(&self) -> Arc<Mutex<Term<EventProxy>>> {
     self.term.clone()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn printed(bytes: &[u8]) -> TerminalState {
+    let (tx, _rx) = flume::unbounded();
+    let state = TerminalState::new(40, 6, tx);
+    let mut processor = alacritty_terminal::vte::ansi::Processor::<
+      alacritty_terminal::vte::ansi::StdSyncHandler,
+    >::default();
+    state.with_term_mut(|term| processor.advance(term, bytes));
+    state
+  }
+
+  #[test]
+  fn the_last_line_a_child_printed_is_its_reason() {
+    // What a tmux client that lost its server leaves on screen.
+    let state = printed(b"$ ls\r\nfile\r\n[lost server]\r\n");
+    assert_eq!(state.last_text_line().as_deref(), Some("[lost server]"));
+    // Lines scrolled into history still count.
+    let state = printed(b"no server running on /h/tmux.sock\r\n\r\n\r\n\r\n\r\n\r\n\r\n");
+    assert_eq!(state.last_text_line().as_deref(), Some("no server running on /h/tmux.sock"));
+    assert_eq!(printed(b"").last_text_line(), None);
   }
 }

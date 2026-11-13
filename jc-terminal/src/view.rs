@@ -53,14 +53,15 @@ fn wheel_bytes(mode: TermMode, lines: i32, col: usize, row: usize) -> Option<Vec
 }
 
 /// What happened to a terminal's child process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildEvent {
   /// A child was (re)started.
   Spawned,
   /// The child exited and was reaped (`code` is `None` when it could not be
   /// started or waited for) after running for `lived`. Nothing restarts it:
   /// for `claude attach`, the workspace asks Cira what to attach to next.
-  Exited { code: Option<u32>, lived: Duration },
+  /// `said` is the last line of text on screen as it exited.
+  Exited { code: Option<u32>, lived: Duration, said: Option<String> },
 }
 
 actions!(
@@ -164,6 +165,8 @@ pub struct TerminalView {
   default_font_size: Pixels,
   focus: FocusHandle,
   last_size: Arc<Mutex<(u16, u16)>>,
+  /// Laid out at least once, so `last_size` is the pane's real size.
+  sized: Arc<AtomicBool>,
   focused: bool,
   cursor_visible: bool,
   cursor_reset_at: Instant,
@@ -217,6 +220,7 @@ impl TerminalView {
       default_font_size,
       focus,
       last_size: Arc::new(Mutex::new((cols, rows))),
+      sized: Arc::new(AtomicBool::new(false)),
       focused: false,
       cursor_visible: true,
       cursor_reset_at: Instant::now(),
@@ -254,6 +258,12 @@ impl TerminalView {
   fn hang_up(&mut self) {
     self.generation += 1;
     self.pty = None;
+  }
+
+  /// Has the view been laid out, so a child started now gets the pane's real
+  /// size? A pane never shown has jc's default 80x24.
+  pub fn is_sized(&self) -> bool {
+    self.sized.load(Ordering::Relaxed)
   }
 
   /// Has the current child printed anything yet?
@@ -306,6 +316,15 @@ impl TerminalView {
     let output_batches_for_bg = self.output_batches.clone();
     let bytes_rx = child.bytes;
     let (notify_tx, notify_rx) = flume::unbounded::<()>(); // one signal per parsed batch
+    // OSC 52 from the child (a drag in Cira's tmux, Claude's /copy): the
+    // clipboard is written on the main thread.
+    let (clip_tx, clip_rx) = flume::unbounded::<String>();
+    cx.spawn(async move |_, cx: &mut AsyncApp| {
+      while let Ok(text) = clip_rx.recv_async().await {
+        let _ = cx.update(|cx: &mut App| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+      }
+    })
+    .detach();
     std::thread::spawn(move || {
       let mut processor = alacritty_terminal::vte::ansi::Processor::<
         alacritty_terminal::vte::ansi::StdSyncHandler,
@@ -328,13 +347,20 @@ impl TerminalView {
           processor.advance(&mut *term, &all_bytes);
         }
         output_batches_for_bg.fetch_add(1, Ordering::Relaxed);
-        // Handle terminal events. PtyWrite is answered here on the VTE thread;
-        // the rest only matter as "something changed, repaint".
+        // Handle terminal events. PtyWrite is answered here on the VTE thread
+        // and a clipboard store goes to the main thread; the rest only
+        // matter as "something changed, repaint".
         while let Ok(event) = term_events.try_recv() {
-          if let TerminalEvent::PtyWrite(s) = event
-            && let Some(pty) = pty_for_write.upgrade()
-          {
-            let _ = pty.write_all(s.as_bytes());
+          match event {
+            TerminalEvent::PtyWrite(s) => {
+              if let Some(pty) = pty_for_write.upgrade() {
+                let _ = pty.write_all(s.as_bytes());
+              }
+            }
+            TerminalEvent::ClipboardStore(text) => {
+              let _ = clip_tx.send(text);
+            }
+            _ => {}
           }
         }
         if notify_tx.send(()).is_err() {
@@ -369,7 +395,8 @@ impl TerminalView {
       return; // a replaced child
     }
     self.pty = None;
-    cx.emit(ChildEvent::Exited { code, lived: self.spawned_at.elapsed() });
+    let said = self.state.last_text_line();
+    cx.emit(ChildEvent::Exited { code, lived: self.spawned_at.elapsed(), said });
     let code = code.map_or("unknown".to_string(), |c| c.to_string());
     self.show_status(&format!("exited (code {code})"), cx);
   }
@@ -821,6 +848,7 @@ impl Render for TerminalView {
             let palette = self.palette.clone();
             let pty_for_resize = self.pty.clone();
             let last_size = self.last_size.clone();
+            let sized = self.sized.clone();
             move |_bounds: Bounds<Pixels>,
                   (prep_bounds, layout, font_family): (Bounds<Pixels>, CellLayout, SharedString),
                   window: &mut Window,
@@ -835,6 +863,9 @@ impl Render for TerminalView {
               let new_cols = (visible.size.width / layout.width).floor() as u16;
               let new_rows = (visible.size.height / layout.height).floor() as u16;
               let mut last = last_size.lock();
+              if new_cols > 0 && new_rows > 0 {
+                sized.store(true, Ordering::Relaxed);
+              }
               if new_cols > 0 && new_rows > 0 && (new_cols != last.0 || new_rows != last.1) {
                 *last = (new_cols, new_rows);
                 let pixel_width = f32::from(visible.size.width) as u16;

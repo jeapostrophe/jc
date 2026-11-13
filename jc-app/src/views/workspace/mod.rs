@@ -851,6 +851,7 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) {
     self.set_active_pane_view(PaneContentKind::GeneralTerminal, window, cx);
+    self.kick_cira(); // a shell pane shown for the first time asks for its shell
   }
 
   fn show_code_viewer(&mut self, _: &ShowCodeViewer, window: &mut Window, cx: &mut Context<Self>) {

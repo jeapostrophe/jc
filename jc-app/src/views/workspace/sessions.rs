@@ -8,11 +8,11 @@
 
 use super::Workspace;
 use crate::views::project_state::ProjectState;
-use crate::views::session_state::{Heading, SessionId, SessionState, ShellRun};
+use crate::views::session_state::{Heading, SessionId, SessionState};
 use gpui::*;
 use jc_core::background::{Poll, Settled};
 use jc_core::cira::{At, CallError, Created, NewSession, Status, exit};
-use jc_core::lifecycle::{self, LabelSync, MarkRequest, PaneAction, Records, ShellChild};
+use jc_core::lifecycle::{self, LabelSync, MarkRequest, PaneAction, Records};
 use jc_core::todo::{SessionKey, TodoSession};
 use jc_terminal::{ChildEvent, TerminalView};
 use std::path::{Path, PathBuf};
@@ -125,7 +125,7 @@ impl Workspace {
     self.cira.read_at = Some(read_at);
     self.retry_unmatched_hooks(window, cx);
     self.drive_sessions(read_at, window, cx);
-    changed |= self.drive_shells(window, cx);
+    self.drive_shells(window, cx);
     if self.cira_reachable() {
       self.reconcile_marks(window, cx);
       self.sync_labels(window, cx);
@@ -167,8 +167,7 @@ impl Workspace {
           continue;
         }
         if session.bg.is_empty()
-          && (session.exited.is_some_and(|(exited, _)| exited > read_at)
-            || lifecycle::backing_off(session.exited, now))
+          && (session.exited.exited_after(read_at) || session.exited.waiting(now))
         {
           continue; // a read from before the exit, or still backing off
         }
@@ -193,28 +192,20 @@ impl Workspace {
     }
   }
 
-  /// Give every shell pane that runs nothing a child: ask `cira session
-  /// shell` (asked again at each attach, so a shell Jay ended with `exit` is
-  /// made again), and run what the answer says ([`lifecycle::shell_child`]).
-  /// A pane whose child exited waits out its pause first, as a Claude pane
-  /// does. Whether any pane changed what it shows.
-  fn drive_shells(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-    let reachable = self.cira_reachable();
+  /// Ask `cira session shell` for every shell pane that runs nothing and is
+  /// past its pause ([`lifecycle::ShellPane`]), and run what the answer says.
+  /// Asked again at each attach, so a shell Jay ended with `exit` is made
+  /// again. Only a pane that has been laid out asks: one never shown would
+  /// attach at jc's default size, and attached clients share the latest
+  /// one's size (Cira's tmux.conf), the page's included.
+  fn drive_shells(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let now = SystemTime::now();
-    let mut changed = false;
     let mut ask = Vec::new();
     for (pi, project) in self.projects.iter_mut().enumerate() {
       for session in project.sessions.values_mut() {
         let Some(id) = &session.cira else { continue };
-        if session.shell != ShellRun::Idle || lifecycle::backing_off(session.shell_exited, now) {
-          continue;
-        }
-        if reachable {
-          session.shell = ShellRun::Asking;
+        if session.general_terminal.read(cx).is_sized() && session.shell.ask(id, now) {
           ask.push((pi, project.path.clone(), session.id, id.clone()));
-        } else {
-          session.run_shell(ShellChild::Own(CallError::Unreachable.to_string()), cx);
-          changed = true;
         }
       }
     }
@@ -227,18 +218,23 @@ impl Workspace {
         cx,
         move || cira.session_shell(&at, &asked),
         move |ws, answer, _window, cx| {
+          let removed = ws
+            .cira
+            .status
+            .as_ref()
+            .and_then(|s| s.session(&id))
+            .is_some_and(|s| s.removed_at.is_some());
           let Some(session) = ws.session_mut(&path, sid) else { return };
-          if session.shell != ShellRun::Asking || session.cira.as_deref() != Some(id.as_str()) {
+          let Some(child) = session.shell.answered(&id, answer, removed, SystemTime::now()) else {
             return;
-          }
-          session.run_shell(lifecycle::shell_child(answer), cx);
-          if session.shell == ShellRun::Own {
+          };
+          session.run_shell(child, cx);
+          if session.shell_not_shared() {
             cx.notify(); // the header says "not shared"
           }
         },
       );
     }
-    changed
   }
 
   /// `cira session new` for `sid` went unanswered, and may have made the
@@ -610,7 +606,7 @@ impl Workspace {
     let Some(session) = self.projects[pi].active_session_mut() else { return };
     session.attach_since = Some(SystemTime::now());
     session.failed = false;
-    session.exited = None;
+    session.exited.clear();
     session.shown = None;
     self.kick_cira();
     self.panes[self.active_pane_index].read(cx).focus_content(window);
@@ -658,60 +654,69 @@ impl Workspace {
   /// yet, so an attach client's exit is noticed ([`Self::on_claude_child`],
   /// [`Self::on_shell_child`]).
   pub(super) fn observe_panes(&mut self, pi: usize, window: &mut Window, cx: &mut Context<Self>) {
+    self.observe(
+      pi,
+      |s| &s.claude_terminal,
+      |s| &mut s.claude_child_events,
+      Self::on_claude_child,
+      window,
+      cx,
+    );
+    self.observe(
+      pi,
+      |s| &s.general_terminal,
+      |s| &mut s.shell_child_events,
+      Self::on_shell_child,
+      window,
+      cx,
+    );
+  }
+
+  /// Send the child events of each session's `terminal` in project `pi` that
+  /// has no subscription in `events` yet to `on`.
+  fn observe(
+    &mut self,
+    pi: usize,
+    terminal: fn(&SessionState) -> &Entity<TerminalView>,
+    events: fn(&mut SessionState) -> &mut Option<Subscription>,
+    on: fn(&mut Self, &Path, SessionId, &ChildEvent, &mut Window, &mut Context<Self>),
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
     let path = self.projects[pi].path.clone();
-    let unwatched: Vec<(SessionId, Entity<TerminalView>)> = self.projects[pi]
-      .sessions
-      .iter()
-      .filter(|(_, s)| s.claude_child_events.is_none())
-      .map(|(&sid, s)| (sid, s.claude_terminal.clone()))
-      .collect();
-    for (sid, terminal) in unwatched {
-      let path = path.clone();
-      let sub = cx.subscribe_in(&terminal, window, move |ws, _, event: &ChildEvent, window, cx| {
-        ws.on_claude_child(&path, sid, *event, window, cx);
-      });
-      if let Some(session) = self.projects[pi].sessions.get_mut(&sid) {
-        session.claude_child_events = Some(sub);
+    for session in self.projects[pi].sessions.values_mut() {
+      if events(session).is_some() {
+        continue;
       }
-    }
-    let unwatched: Vec<(SessionId, Entity<TerminalView>)> = self.projects[pi]
-      .sessions
-      .iter()
-      .filter(|(_, s)| s.shell_child_events.is_none())
-      .map(|(&sid, s)| (sid, s.general_terminal.clone()))
-      .collect();
-    for (sid, terminal) in unwatched {
-      let path = path.clone();
-      let sub = cx.subscribe_in(&terminal, window, move |ws, _, event: &ChildEvent, _, cx| {
-        ws.on_shell_child(&path, sid, *event, cx);
+      let (path, sid) = (path.clone(), session.id);
+      let sub = cx.subscribe_in(terminal(session), window, move |ws, _, event, window, cx| {
+        on(ws, &path, sid, event, window, cx)
       });
-      if let Some(session) = self.projects[pi].sessions.get_mut(&sid) {
-        session.shell_child_events = Some(sub);
-      }
+      *events(session) = Some(sub);
     }
   }
 
   /// The shell pane's child exited: Jay ended the shell (`exit`), the tmux
-  /// client lost its server, or jc's own shell ended. It asks Cira again
-  /// once its pause is over ([`Self::drive_shells`]).
+  /// client failed or lost its server, or jc's own shell ended. It asks Cira
+  /// again once its pause is over ([`Self::drive_shells`]), or runs jc's own
+  /// shell after the shared client kept failing ([`lifecycle::ShellPane`]).
   fn on_shell_child(
     &mut self,
     path: &Path,
     sid: SessionId,
-    event: ChildEvent,
+    event: &ChildEvent,
+    _window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let ChildEvent::Exited { lived, .. } = event else { return };
+    let ChildEvent::Exited { code, lived, said } = event else { return };
     let Some(session) = self.session_mut(path, sid) else { return };
-    if !matches!(session.shell, ShellRun::Shared | ShellRun::Own) {
-      return;
+    let was_own = session.shell_not_shared();
+    let child = session.shell.exited(*code, *lived, SystemTime::now(), said.as_deref());
+    if let Some(child) = child {
+      session.run_shell(child, cx);
     }
-    let was_own = session.shell == ShellRun::Own;
-    session.shell = ShellRun::Idle;
-    let previous = session.shell_exited.map(|(_, delay)| delay);
-    session.shell_exited = Some((SystemTime::now(), lifecycle::attach_delay(previous, lived)));
-    if was_own {
-      cx.notify(); // the header drops "not shared"
+    if was_own != session.shell_not_shared() {
+      cx.notify(); // the header's "not shared"
     }
     self.kick_cira();
   }
@@ -725,7 +730,7 @@ impl Workspace {
     &mut self,
     path: &Path,
     sid: SessionId,
-    event: ChildEvent,
+    event: &ChildEvent,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -736,8 +741,7 @@ impl Workspace {
       ChildEvent::Exited { lived, .. } => {
         session.bg.clear();
         session.shown = None;
-        let previous = session.exited.map(|(_, delay)| delay);
-        session.exited = Some((SystemTime::now(), lifecycle::attach_delay(previous, lived)));
+        session.exited.exited(*lived, SystemTime::now());
         self.kick_cira();
       }
     }

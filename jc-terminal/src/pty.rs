@@ -213,7 +213,7 @@ mod tests {
       .chain(["/opt/homebrew/bin".into(), "/usr/local/bin".into()])
       .map(|dir| dir.join("tmux"))
       .find(|t| t.is_file())
-      .expect("the Terminal pane's test attaches to a real tmux: brew install tmux")
+      .expect("the Terminal pane's tests attach to a real tmux: brew install tmux")
   }
 
   /// Read `child`'s output until it contains `want`, or panic with what it printed.
@@ -229,84 +229,142 @@ mod tests {
     }
   }
 
-  #[test]
-  fn the_terminal_pane_attaches_to_the_shell_cira_names() {
-    // Cira PLAN TMUX-02: a fake `cira` answers `session shell` as Cira does,
-    // for a shell in a real tmux server on a private socket. jc runs `argv`
-    // as an argument list; through zsh, `=s-c-1` would be a path lookup.
-    use jc_core::cira::{At, Cira};
-    use jc_core::lifecycle::{ShellChild, shell_child};
-    let dir = std::env::temp_dir().join(format!("jc-shell-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let tmux = tmux();
-    let sock = dir.join("tmux.sock");
-    let server = |args: &[&str]| {
-      std::process::Command::new(&tmux).arg("-S").arg(&sock).args(args).output().unwrap()
-    };
-    // Ends the server and its directory however the test ends.
-    struct Server<'a>(&'a dyn Fn(&[&str]) -> std::process::Output, &'a Path);
-    impl Drop for Server<'_> {
-      fn drop(&mut self) {
-        (self.0)(&["kill-server"]);
-        let _ = std::fs::remove_dir_all(self.1);
+  /// A tmux server set up as Cira's (its `tmux.conf`), on a private socket in
+  /// a directory whose name a shell would split and expand; ended on drop.
+  struct CiraTmux {
+    tmux: std::path::PathBuf,
+    dir: std::path::PathBuf,
+  }
+
+  impl CiraTmux {
+    /// With one shell, `s-<id>`, running `command` with `CIRA_SESSION=<id>`.
+    fn new(name: &str, id: &str, command: &str) -> Self {
+      let dir = std::env::temp_dir().join(format!("jc {name} $HOME {}", std::process::id()));
+      let _ = std::fs::remove_dir_all(&dir);
+      std::fs::create_dir_all(&dir).unwrap();
+      let t = Self { tmux: tmux(), dir };
+      let conf = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cira-tmux.conf");
+      let session = format!("s-{id}");
+      let env = format!("CIRA_SESSION={id}");
+      let made = t.run(&[
+        "-f",
+        conf,
+        "new-session",
+        "-d",
+        "-s",
+        &session,
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "-e",
+        &env,
+        command,
+      ]);
+      assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+      t
+    }
+
+    fn sock(&self) -> String {
+      self.dir.join("tmux.sock").to_str().unwrap().to_string()
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+      std::process::Command::new(&self.tmux).arg("-S").arg(self.sock()).args(args).output().unwrap()
+    }
+
+    /// A fake `cira` that answers `session shell` for `id` as Cira does: its
+    /// answer is the captured one (jc-core's fixture) with this server's paths.
+    fn fake_cira(&self, id: &str) -> std::path::PathBuf {
+      let raw = include_bytes!("../../jc-core/tests/fixtures/cira/session-shell.json");
+      let mut answer: serde_json::Value = serde_json::from_slice(raw).unwrap();
+      let argv = answer["argv"].as_array_mut().unwrap();
+      argv[0] = self.tmux.to_str().unwrap().into();
+      argv[3] = self.sock().into();
+      argv[6] = format!("=s-{id}").into();
+      let answer_file = self.dir.join("answer.json");
+      std::fs::write(&answer_file, answer.to_string()).unwrap();
+      let fake = self.dir.join("cira");
+      std::fs::write(&fake, format!("#!/bin/sh\nexec cat '{}'\n", answer_file.display())).unwrap();
+      use std::os::unix::fs::PermissionsExt;
+      std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+      fake
+    }
+
+    /// What jc runs for `id`: asked of the fake `cira` through jc's client.
+    fn attach_argv(&self, id: &str) -> Vec<String> {
+      use jc_core::cira::{At, Cira};
+      use jc_core::lifecycle::{ShellChild, shell_child};
+      let cira = Cira::new(self.fake_cira(id), Duration::from_secs(10));
+      let at = At { project: Some("p".into()), dir: self.dir.clone() };
+      match shell_child(cira.session_shell(&at, id), false) {
+        ShellChild::Shared(argv) => argv,
+        other => panic!("Cira named a shell, jc made {other:?} of it"),
       }
     }
-    let _server = Server(&server, &dir);
-    let made = server(&[
-      "-f",
-      "/dev/null",
-      "new-session",
-      "-d",
-      "-s",
-      "s-c-1",
-      "-x",
-      "80",
-      "-y",
-      "24",
-      "-e",
-      "CIRA_SESSION=c-real",
-      "/bin/sh",
-    ]);
-    assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
-    let argv = serde_json::json!([
-      tmux.to_str().unwrap(),
-      "-u",
-      "-S",
-      sock.to_str().unwrap(),
-      "attach-session",
-      "-t",
-      "=s-c-1"
-    ]);
-    let answer = serde_json::json!({
-      "project": "p", "session": "c-1", "name": "s-c-1", "socket": sock, "argv": argv,
-      "created": false
-    });
-    let fake = dir.join("cira");
-    std::fs::write(&fake, format!("#!/bin/sh\necho '{answer}'\n")).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+  }
 
-    let cira = Cira::new(&fake, Duration::from_secs(10));
-    let at = At { project: Some("p".into()), dir: dir.clone() };
-    let ShellChild::Shared(argv) = shell_child(cira.session_shell(&at, "c-1")) else {
-      panic!("Cira named a shell")
-    };
+  impl Drop for CiraTmux {
+    fn drop(&mut self) {
+      self.run(&["kill-server"]);
+      let _ = std::fs::remove_dir_all(&self.dir);
+    }
+  }
+
+  #[test]
+  fn the_terminal_pane_attaches_to_the_shell_cira_names() {
+    // Cira PLAN TMUX-02. jc runs `argv` as an argument list: the socket's
+    // directory has a space and a `$` (a shell would split and expand it),
+    // and `=s-…` is a path lookup in zsh.
+    let server = CiraTmux::new("shell", "c-1", "/bin/sh");
+    let argv = server.attach_argv("c-1");
     // JC's own environment says otherwise: what answers is the shared shell.
-    let child = PtyChild::spawn(
-      &ChildSpec::Command(argv),
-      &[("CIRA_SESSION".into(), "c-jc".into())],
-      80,
-      24,
-      None,
-    )
-    .unwrap();
+    let env = [("CIRA_SESSION".into(), "c-jc".into())];
+    let child = PtyChild::spawn(&ChildSpec::Command(argv), &env, 80, 24, None).unwrap();
     child.handle.write_all(b"echo X=$CIRA_SESSION=X\r").unwrap();
-    read_until(&child, "X=c-real=X");
+    read_until(&child, "X=c-1=X");
     // Jay's `exit` ends the shell and so the client: the pane asks again.
     child.handle.write_all(b"exit\r").unwrap();
-    let exited = child.exited.recv_timeout(Duration::from_secs(10));
-    assert!(exited.is_ok(), "the attach client exits with the shell");
+    let code = child.exited.recv_timeout(Duration::from_secs(10)).expect("the client exits");
+    assert_eq!(code, Some(0), "an exit is not a failure (lifecycle::ShellPane::exited)");
+  }
+
+  #[test]
+  fn a_drag_in_ciras_tmux_reaches_the_terminal_as_a_clipboard_store() {
+    // Cira's tmux.conf turns the mouse on, so a drag selects in tmux, which
+    // sends the copy back as OSC 52 (measured, tmux 3.8: `ESC ] 52 ; ; …`).
+    let server =
+      CiraTmux::new("clip", "c-2", "/bin/sh -c 'printf \"clip-me-text\\n\"; exec sleep 60'");
+    let argv = server.attach_argv("c-2");
+    let child = PtyChild::spawn(&ChildSpec::Command(argv), &[], 80, 24, None).unwrap();
+    let (tx, events) = flume::unbounded();
+    let state = crate::terminal::TerminalState::new(80, 24, tx);
+    let mut processor = alacritty_terminal::vte::ansi::Processor::<
+      alacritty_terminal::vte::ansi::StdSyncHandler,
+    >::default();
+    let mut feed = |until: std::time::Instant| {
+      while let Ok(bytes) =
+        child.bytes.recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+      {
+        state.with_term_mut(|term| processor.advance(term, &bytes));
+      }
+    };
+    let soon = || std::time::Instant::now() + Duration::from_millis(800);
+    feed(soon());
+    // Press on column 1 of row 1, drag to column 8, release.
+    for event in ["\x1b[<0;1;1M", "\x1b[<32;8;1M", "\x1b[<0;8;1m"] {
+      child.handle.write_all(event.as_bytes()).unwrap();
+      feed(std::time::Instant::now() + Duration::from_millis(200));
+    }
+    feed(soon());
+    let stored: Vec<String> = events
+      .try_iter()
+      .filter_map(|e| match e {
+        crate::terminal::TerminalEvent::ClipboardStore(text) => Some(text),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(stored, ["clip-me-"], "the drag's text, as the clipboard store");
   }
 
   #[test]

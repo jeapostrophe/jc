@@ -90,9 +90,7 @@ impl Workspace {
         PaneHeader { title, breadcrumbs: cv.breadcrumb().to_vec() }
       }
       Some(PaneContentKind::GeneralTerminal)
-        if project
-          .active_session()
-          .is_some_and(|s| s.shell == crate::views::session_state::ShellRun::Own) =>
+        if project.active_session().is_some_and(|s| s.shell_not_shared()) =>
       {
         PaneHeader { title: "Terminal · not shared".to_string(), breadcrumbs: Vec::new() }
       }
