@@ -5,6 +5,7 @@ use gpui_component::input::Position;
 use jc_core::background::{self, Claude};
 use jc_core::cira::{self, HookState, Marker};
 use jc_core::hooks::HookEventKind;
+use jc_core::lifecycle::ShellChild;
 use jc_core::todo::SessionKey;
 use jc_terminal::{ChildSpec, Palette, TerminalConfig, TerminalView};
 use std::path::Path;
@@ -21,6 +22,22 @@ pub struct SavedViewState {
 }
 
 pub type SessionId = usize;
+
+/// What the Terminal pane runs (Cira PLAN TMUX-02).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShellRun {
+  /// Nothing: it asks `cira session shell` at the next status read.
+  #[default]
+  Idle,
+  /// A `cira session shell` for it is in flight.
+  Asking,
+  /// Attached to the session's shell in Cira's tmux server.
+  Shared,
+  /// jc's own shell, "not shared": Cira gave none.
+  Own,
+  /// Nothing, for good: the session has no shell (removed through Cira).
+  Held,
+}
 
 pub struct SessionState {
   pub id: SessionId,
@@ -85,6 +102,12 @@ pub struct SessionState {
   pub saved_view: Option<SavedViewState>,
   /// The Claude pane's child events, observed by the workspace.
   pub claude_child_events: Option<Subscription>,
+  /// What the Terminal pane runs.
+  pub shell: ShellRun,
+  /// When its child last exited, and the pause before it asks again.
+  pub shell_exited: Option<(SystemTime, Duration)>,
+  /// The Terminal pane's child events, observed by the workspace.
+  pub shell_child_events: Option<Subscription>,
 }
 
 /// What a session is created from: its heading's id (empty for a session whose
@@ -145,10 +168,11 @@ impl SessionState {
     let Heading { key, label, cira } = heading;
     let claude_config =
       TerminalConfig { child: None, palette: Some(palette.clone()), ..Default::default() };
-    // The shell pane is JC's own (Cira Q-33) and carries the session's Cira id
-    // (TMUX-02), so it starts only once Cira has minted one.
+    // The shell pane attaches to the session's shell in Cira's tmux server
+    // (TMUX-02), asked for by its Cira id at the first status read once Cira
+    // has minted one ([`ShellRun`]).
     let general_config = TerminalConfig {
-      child: cira.is_some().then_some(ChildSpec::Shell),
+      child: None,
       palette: Some(palette.clone()),
       env: shell_env(cira.as_deref()),
       ..Default::default()
@@ -190,18 +214,44 @@ impl SessionState {
       code_view,
       saved_view: None,
       claude_child_events: None,
+      shell: ShellRun::Idle,
+      shell_exited: None,
+      shell_child_events: None,
     }
   }
 
   /// Cira has minted `cira` for this session, whose heading it now
-  /// addresses: start the shell pane with it as `CIRA_SESSION`.
+  /// addresses; the shell pane asks for its shell at the next status read.
   pub fn bind(&mut self, cira: &str, cx: &mut App) {
     self.key = cira.to_string();
     self.cira = Some(cira.to_string());
     let env = shell_env(Some(cira));
+    self.general_terminal.update(cx, |t, _| t.set_env(env));
+  }
+
+  /// Run what Cira's answer to `cira session shell` says in the shell pane.
+  /// jc's own shell keeps `CIRA_SESSION` and says it is not shared.
+  pub fn run_shell(&mut self, child: ShellChild, cx: &mut App) {
+    let (run, spec, why) = match child {
+      ShellChild::Shared(argv) => (ShellRun::Shared, Some(ChildSpec::Command(argv)), None),
+      ShellChild::Own(why) => (
+        ShellRun::Own,
+        Some(ChildSpec::Shell),
+        Some(format!(
+          "not shared: {why}. This shell is jc's own and ends when jc quits; exit it to ask \
+           Cira again."
+        )),
+      ),
+      ShellChild::Held(why) => (ShellRun::Held, None, Some(format!("no shell: {why}"))),
+    };
+    self.shell = run;
     self.general_terminal.update(cx, |t, cx| {
-      t.set_env(env);
-      t.spawn(ChildSpec::Shell, cx);
+      if let Some(why) = why {
+        t.show_status(&why, cx);
+      }
+      if let Some(spec) = spec {
+        t.spawn(spec, cx);
+      }
     });
   }
 

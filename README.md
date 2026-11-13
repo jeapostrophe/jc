@@ -73,7 +73,7 @@ One exception: truncation stops at a message still waiting on a `@jc(...)` sched
 
 Each session is owned by **Cira** (`~/Dev/cira`, the mailbox between you and your sessions): Cira starts it as a Claude Code **background session**, keeps it in the mode you chose, and stops and removes it; jc is Cira's native client, and each Claude pane is `claude attach` to the job Cira names. jc asks Cira for everything else with `cira session new|mode|stop|rm|label`. Quitting jc only detaches: sessions keep running, and the next start attaches every heading's session again. While Cira is unreachable a banner says so, and no pane attaches anything new. A heading an older jc wrote with `> uuid=` is moved to Cira once, continuing its conversation (`cira session new --resume`).
 
-Per-session metadata lives on `> ` lines under the heading. `> cira=` (the id Cira minted, exported as `CIRA_SESSION` to the terminal pane) and `> last=` are managed by jc. The mode is Cira's: Cmd-Shift-P → "Make this session dangerous" (or "normal") asks Cira, which forks the session in the new mode once it is idle, keeping its conversation; the Cmd-P picker marks a dangerous session. Disabling a session (`[D]`) stops it; renaming the heading to `## [DELETED] …` removes it — each once, when the marker changes from what jc last saw, even if you edit it while jc is closed. Renaming the heading renames the session in Cira, and a rename made on Cira's page renames the heading. See `ARCH.md` for the full list.
+Per-session metadata lives on `> ` lines under the heading. `> cira=` (the id Cira minted, `CIRA_SESSION` in the terminal pane's shell) and `> last=` are managed by jc. The mode is Cira's: Cmd-Shift-P → "Make this session dangerous" (or "normal") asks Cira, which forks the session in the new mode once it is idle, keeping its conversation; the Cmd-P picker marks a dangerous session. Disabling a session (`[D]`) stops it; renaming the heading to `## [DELETED] …` removes it — each once, when the marker changes from what jc last saw, even if you edit it while jc is closed. Renaming the heading renames the session in Cira, and a rename made on Cira's page renames the heading. See `ARCH.md` for the full list.
 
 The `> cira=` line, not the heading text, is what identifies a session — everything jc writes into TODO.md is addressed by it. Rename a heading to whatever you like, and give two headings the same name if that is what you want; sends and scheduled deliveries still land on the right one.
 
@@ -103,7 +103,7 @@ The window has **1, 2, or 3 panes** (Cmd-1/2/3). Any of the five views can go in
 | View | Description |
 |---|---|
 | **Claude Terminal** | Claude Code CLI in an embedded terminal. |
-| **General Terminal** | Separate shell per session for running tests, inspecting output. |
+| **General Terminal** | The session's shell, kept by Cira and shared with its page (`s`); it outlives jc. Headed "Terminal · not shared" when Cira gives none and jc runs its own. |
 | **Code Viewer** | Syntax-highlighted source with tree-sitter outline navigation. |
 | **TODO Editor** | Markdown editor for session notes. Drafting area below WAIT, message history above. |
 | **Global TODO** | View of `~/.claude/TODO.md`. |

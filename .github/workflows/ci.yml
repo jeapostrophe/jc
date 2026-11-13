@@ -32,5 +32,8 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: tmux (the Terminal pane's test attaches to a real one)
+        run: command -v tmux || brew install tmux
+
       - name: Test
         run: cargo test --workspace

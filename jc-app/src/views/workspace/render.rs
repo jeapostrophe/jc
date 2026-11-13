@@ -89,6 +89,13 @@ impl Workspace {
         let title = format!("Global TODO{dirty}");
         PaneHeader { title, breadcrumbs: cv.breadcrumb().to_vec() }
       }
+      Some(PaneContentKind::GeneralTerminal)
+        if project
+          .active_session()
+          .is_some_and(|s| s.shell == crate::views::session_state::ShellRun::Own) =>
+      {
+        PaneHeader { title: "Terminal · not shared".to_string(), breadcrumbs: Vec::new() }
+      }
       Some(kind) => PaneHeader { title: kind.label().to_string(), breadcrumbs: Vec::new() },
       None => PaneHeader { title: "Empty".to_string(), breadcrumbs: Vec::new() },
     }

@@ -373,7 +373,7 @@ impl Workspace {
     };
 
     for pi in 0..ws.projects.len() {
-      ws.observe_claude_panes(pi, window, cx);
+      ws.observe_panes(pi, window, cx);
     }
     ws.run_blocking(
       window,
@@ -915,7 +915,7 @@ impl Workspace {
     self.projects.push(project);
 
     let project_idx = self.projects.len() - 1;
-    self.observe_claude_panes(project_idx, window, cx);
+    self.observe_panes(project_idx, window, cx);
     self.kick_cira();
     let active = self.projects[project_idx].active_session;
     self.switch_to_session(project_idx, active, window, cx);
