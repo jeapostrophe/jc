@@ -3857,6 +3857,7 @@ dependencies = [
  "jc-core",
  "parking_lot",
  "portable-pty",
+ "serde_json",
 ]
 
 [[package]]

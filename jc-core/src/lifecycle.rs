@@ -394,7 +394,8 @@ mod tests {
       ShellChild::Own(why) => assert_eq!(why, "Cira is unreachable"),
       other => panic!("{other:?}"),
     }
-    let no_tmux = CallError::Refused { code: exit::ERROR, message: "no tmux\n".into(), stdout: vec![] };
+    let no_tmux =
+      CallError::Refused { code: exit::ERROR, message: "no tmux\n".into(), stdout: vec![] };
     assert!(matches!(shell_child(Err(no_tmux)), ShellChild::Own(why) if why.contains("no tmux")));
     // A removed session has no shell; a stand-in would carry its id for nothing.
     let removed =

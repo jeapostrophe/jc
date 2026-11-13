@@ -206,6 +206,109 @@ mod tests {
     assert!(out.contains("X=c-shell-9=X"), "shell output: {out}");
   }
 
+  /// tmux's full path, as Cira names it in `argv`.
+  fn tmux() -> std::path::PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+      .chain(["/opt/homebrew/bin".into(), "/usr/local/bin".into()])
+      .map(|dir| dir.join("tmux"))
+      .find(|t| t.is_file())
+      .expect("the Terminal pane's test attaches to a real tmux: brew install tmux")
+  }
+
+  /// Read `child`'s output until it contains `want`, or panic with what it printed.
+  fn read_until(child: &PtyChild, want: &str) {
+    let mut out = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !String::from_utf8_lossy(&out).contains(want) {
+      let left = deadline.saturating_duration_since(std::time::Instant::now());
+      match child.bytes.recv_timeout(left) {
+        Ok(chunk) => out.extend(chunk),
+        Err(_) => panic!("no {want:?} in: {}", String::from_utf8_lossy(&out)),
+      }
+    }
+  }
+
+  #[test]
+  fn the_terminal_pane_attaches_to_the_shell_cira_names() {
+    // Cira PLAN TMUX-02: a fake `cira` answers `session shell` as Cira does,
+    // for a shell in a real tmux server on a private socket. jc runs `argv`
+    // as an argument list; through zsh, `=s-c-1` would be a path lookup.
+    use jc_core::cira::{At, Cira};
+    use jc_core::lifecycle::{ShellChild, shell_child};
+    let dir = std::env::temp_dir().join(format!("jc-shell-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmux = tmux();
+    let sock = dir.join("tmux.sock");
+    let server = |args: &[&str]| {
+      std::process::Command::new(&tmux).arg("-S").arg(&sock).args(args).output().unwrap()
+    };
+    // Ends the server and its directory however the test ends.
+    struct Server<'a>(&'a dyn Fn(&[&str]) -> std::process::Output, &'a Path);
+    impl Drop for Server<'_> {
+      fn drop(&mut self) {
+        (self.0)(&["kill-server"]);
+        let _ = std::fs::remove_dir_all(self.1);
+      }
+    }
+    let _server = Server(&server, &dir);
+    let made = server(&[
+      "-f",
+      "/dev/null",
+      "new-session",
+      "-d",
+      "-s",
+      "s-c-1",
+      "-x",
+      "80",
+      "-y",
+      "24",
+      "-e",
+      "CIRA_SESSION=c-real",
+      "/bin/sh",
+    ]);
+    assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+    let argv = serde_json::json!([
+      tmux.to_str().unwrap(),
+      "-u",
+      "-S",
+      sock.to_str().unwrap(),
+      "attach-session",
+      "-t",
+      "=s-c-1"
+    ]);
+    let answer = serde_json::json!({
+      "project": "p", "session": "c-1", "name": "s-c-1", "socket": sock, "argv": argv,
+      "created": false
+    });
+    let fake = dir.join("cira");
+    std::fs::write(&fake, format!("#!/bin/sh\necho '{answer}'\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cira = Cira::new(&fake, Duration::from_secs(10));
+    let at = At { project: Some("p".into()), dir: dir.clone() };
+    let ShellChild::Shared(argv) = shell_child(cira.session_shell(&at, "c-1")) else {
+      panic!("Cira named a shell")
+    };
+    // JC's own environment says otherwise: what answers is the shared shell.
+    let child = PtyChild::spawn(
+      &ChildSpec::Command(argv),
+      &[("CIRA_SESSION".into(), "c-jc".into())],
+      80,
+      24,
+      None,
+    )
+    .unwrap();
+    child.handle.write_all(b"echo X=$CIRA_SESSION=X\r").unwrap();
+    read_until(&child, "X=c-real=X");
+    // Jay's `exit` ends the shell and so the client: the pane asks again.
+    child.handle.write_all(b"exit\r").unwrap();
+    let exited = child.exited.recv_timeout(Duration::from_secs(10));
+    assert!(exited.is_ok(), "the attach client exits with the shell");
+  }
+
   #[test]
   fn an_exited_child_is_reaped_and_reports_its_code() {
     let child = PtyChild::spawn(&sh("exit 3"), &[], 80, 24, None).unwrap();

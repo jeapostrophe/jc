@@ -1138,7 +1138,10 @@ mod tests {
     assert_eq!(shell.argv.last().map(String::as_str), Some("=s-c-1"), "argv kept word for word");
     assert_eq!(shell.argv.len(), 7);
     assert!(shell.created);
-    let removed = Cira::new(script("shell-removed", "echo 'session c-1 is removed' >&2; exit 5"), Duration::from_secs(10));
+    let removed = Cira::new(
+      script("shell-removed", "echo 'session c-1 is removed' >&2; exit 5"),
+      Duration::from_secs(10),
+    );
     assert!(matches!(
       removed.session_shell(&at, "c-1"),
       Err(CallError::Refused { code: exit::INVALID, .. })
