@@ -2,13 +2,14 @@ use crate::colors::Palette;
 use crate::input::keystroke_to_bytes;
 use crate::pty::{ChildSpec, PtyChild, PtyHandle};
 use crate::render::{CellLayout, TerminalRenderState, measure_cell, paint_terminal};
+use crate::settle::{LaunchSettle, SettleStep, SettleWindow};
 use crate::terminal::{TerminalEvent, TerminalState};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::TermMode;
 use gpui::{
-  App, AsyncApp, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
+  App, AsyncApp, Bounds, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, FutureExt,
   InteractiveElement, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
   MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, ScrollWheelEvent, SharedString,
   Styled, Subscription, Timer, WeakEntity, Window, actions, canvas, div, px,
@@ -109,6 +110,18 @@ pub struct TerminalConfig {
   pub child: Option<ChildSpec>,
   /// Added to the child's environment.
   pub env: Vec<(String, String)>,
+  /// Discount each child's launch output from [`TerminalView::has_unseen_output`],
+  /// so the flag means "it printed something while you were away" rather than
+  /// "jc started it".
+  ///
+  /// `None` (the default) counts every batch from the moment the child starts.
+  /// `Some(policy)` opens a launch-settle window at each start: the baseline
+  /// is taken once the child has printed something and then held still for
+  /// `policy.quiet`, or unconditionally at `policy.give_up`. Both exits clear,
+  /// for the reason recorded on `SettleWindow::step`. The caller supplies the
+  /// durations because what counts as settled is a fact about the child being
+  /// run.
+  pub launch_settle: Option<LaunchSettle>,
 }
 
 impl Default for TerminalConfig {
@@ -122,6 +135,7 @@ impl Default for TerminalConfig {
       palette: None,
       child: Some(ChildSpec::Shell),
       env: Vec::new(),
+      launch_settle: None,
     }
   }
 }
@@ -177,8 +191,24 @@ pub struct TerminalView {
   /// aggressively and the notification relay skips `cx.notify()`.
   visible: Arc<AtomicBool>,
   /// Batches of child output parsed so far, bumped by the VTE thread; compared
-  /// with `batches_at_spawn` by [`TerminalView::has_output_since_spawn`].
+  /// with `batches_at_spawn` by [`TerminalView::has_output_since_spawn`], and
+  /// with `seen_batches` to answer "did anything happen since you last
+  /// looked?" without any per-chunk main-thread work.
   output_batches: Arc<AtomicUsize>,
+  /// Value of `output_batches` at the last [`TerminalView::clear_output_seen`].
+  /// Main-thread only — the VTE thread never reads or writes it, so this is a
+  /// plain atomic for `&self` interior mutability, not shared state.
+  seen_batches: AtomicUsize,
+  /// Launch-settle window, opened at each child start from
+  /// `TerminalConfig::launch_settle`, or `None` when none is open — the case
+  /// for a terminal that asked for no window, and again once the notification
+  /// relay (which both stamps batches onto it and drives it) has seen one
+  /// through to its end.
+  ///
+  /// Main-thread only, like `seen_batches`: the VTE thread never touches it,
+  /// and the relay runs on the foreground executor. The lock is for `&self`
+  /// interior mutability across two owners, not for cross-thread contention.
+  settle: Arc<Mutex<Option<SettleWindow>>>,
   /// Events the emulator raises (terminal replies), drained by the VTE thread.
   term_events: flume::Receiver<TerminalEvent>,
   _subscriptions: Vec<Subscription>,
@@ -228,6 +258,8 @@ impl TerminalView {
       canvas_origin: Arc::new(Mutex::new(gpui::Point::default())),
       visible: Arc::new(AtomicBool::new(true)),
       output_batches: Arc::new(AtomicUsize::new(0)),
+      seen_batches: AtomicUsize::new(0),
+      settle: Arc::new(Mutex::new(None)),
       _subscriptions,
       _blink_task: None,
     };
@@ -369,19 +401,72 @@ impl TerminalView {
       }
     });
 
-    // Lightweight main-thread relay: notify GPUI to repaint after each batch.
+    // Lightweight main-thread relay: notify GPUI for repaint, and drive the
+    // launch-settle window off the same batch signal. One task, two wake
+    // sources — the batch that would reset a debounce is exactly the batch this
+    // loop already waits on.
+    //
+    // The window is installed HERE, before the relay exists, rather than being
+    // poked in afterwards: a window that arrived after the relay had already
+    // parked on an unbounded receive would never be serviced, and a child that
+    // then went quiet would leave the marker set for the life of the process.
     let visible_for_relay = self.visible.clone();
+    *self.settle.lock() =
+      self.config.launch_settle.map(|policy| SettleWindow::new(policy, Instant::now()));
+    let settle_for_relay = self.settle.clone();
     let exited = child.exited;
     cx.spawn(async move |this: WeakEntity<TerminalView>, cx: &mut AsyncApp| {
-      // Until the VTE thread is gone: the child has closed the PTY.
-      while notify_rx.recv_async().await.is_ok() {
-        // Skip repaint for hidden terminals — no point rendering offscreen content.
-        if visible_for_relay.load(Ordering::Relaxed) {
-          let _ = cx.update(|cx: &mut App| {
-            if let Some(entity) = this.upgrade() {
-              cx.notify(entity.entity_id());
+      loop {
+        // Service the settle window first: it either wants the baseline taken
+        // now, or says how long this loop may wait before it needs asking
+        // again. With no window open there is nothing to time out on.
+        let step = settle_for_relay.lock().as_mut().map(|window| window.step(Instant::now()));
+        let deadline = match step {
+          Some(SettleStep::Wait(duration)) => Some(duration),
+          Some(SettleStep::Clear) => {
+            if this.update(cx, |view, _| view.clear_output_seen()).is_err() {
+              return; // view dropped
             }
-          });
+            *settle_for_relay.lock() = None;
+            None
+          }
+          Some(SettleStep::Done) => {
+            *settle_for_relay.lock() = None;
+            None
+          }
+          None => None,
+        };
+
+        // A ready batch beats a ready deadline (`WithTimeout` polls the inner
+        // future first), so a wake is never dropped in the tie.
+        let woke = match deadline {
+          Some(duration) => {
+            notify_rx.recv_async().with_timeout(duration, cx.background_executor()).await
+          }
+          None => Ok(notify_rx.recv_async().await),
+        };
+
+        match woke {
+          // The child printed. Restart the quiet wait — even while hidden,
+          // since a backgrounded session's child is still settling and the
+          // marker it feeds is read from the picker.
+          Ok(Ok(())) => {
+            if let Some(window) = settle_for_relay.lock().as_mut() {
+              window.note_batch(Instant::now());
+            }
+            // Skip repaint for hidden terminals — no point rendering offscreen content.
+            if visible_for_relay.load(Ordering::Relaxed) {
+              let _ = cx.update(|cx: &mut App| {
+                if let Some(entity) = this.upgrade() {
+                  cx.notify(entity.entity_id());
+                }
+              });
+            }
+          }
+          // The settle window's next decision point came first — go ask it.
+          Err(_) => {}
+          // The VTE thread is gone: the child has closed the PTY.
+          Ok(Err(_)) => break,
         }
       }
       let code = exited.recv_async().await.ok().flatten();
@@ -404,6 +489,28 @@ impl TerminalView {
   /// Update the terminal color palette at runtime.
   pub fn set_palette(&mut self, palette: Palette) {
     self.palette = palette;
+  }
+
+  /// Has the child written anything since the last [`Self::clear_output_seen`]?
+  pub fn has_unseen_output(&self) -> bool {
+    self.output_batches.load(Ordering::Relaxed) != self.seen_batches.load(Ordering::Relaxed)
+  }
+
+  /// Take everything printed so far as seen — the user is looking at it now.
+  pub fn clear_output_seen(&self) {
+    self.seen_batches.store(self.output_batches.load(Ordering::Relaxed), Ordering::Relaxed);
+  }
+
+  /// End the launch-settle window WITHOUT clearing, because the user has given
+  /// this session work: from here on everything the child prints answers
+  /// something you asked for, so it is activity by definition. Without this a
+  /// prompt sent during the window keeps restarting the quiet wait, and the
+  /// baseline lands exactly when Claude finishes — wiping the marker for the
+  /// work you were waiting on.
+  pub fn cancel_launch_settle(&self) {
+    if let Some(window) = self.settle.lock().as_mut() {
+      window.cancel();
+    }
   }
 
   /// Mark this terminal as visible or hidden.  Hidden terminals still process

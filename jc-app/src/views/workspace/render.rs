@@ -104,6 +104,10 @@ impl Workspace {
     let project = self.active_project();
 
     let mut title = project.name.clone();
+    // jcc says which app it is, so it is never mistaken for jc beside it.
+    if self.flavor == jc_core::flavor::Flavor::Jcc {
+      title = format!("jcc · {title}");
+    }
     if let Some(session) = project.active_session() {
       title = format!("{} > {}", title, session.label);
     }

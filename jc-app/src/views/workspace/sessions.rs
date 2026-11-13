@@ -1,4 +1,5 @@
-//! Claude panes as clients of Cira (Cira DESIGN 12, PLAN TMUX-01/02): Cira
+//! jcc's Claude panes, as clients of Cira (Cira DESIGN 12, PLAN TMUX-01/02,
+//! TMUX-07; none of this runs in jc, whose own lifecycle is `own.rs`): Cira
 //! owns each session's lifecycle, and jc asks it for every change
 //! (`cira session new|mode|stop|rm|label`), attaches each Claude pane to the
 //! job `cira status --json` names, and turns TODO.md marker edits and renames
@@ -8,7 +9,7 @@
 
 use super::Workspace;
 use crate::views::project_state::ProjectState;
-use crate::views::session_state::{Heading, SessionId, SessionState};
+use crate::views::session_state::{Heading, SessionId, SessionState, Start};
 use gpui::*;
 use jc_core::background::{Poll, Settled};
 use jc_core::cira::{At, CallError, Created, NewSession, Status, exit};
@@ -59,6 +60,34 @@ impl Workspace {
     .detach();
   }
 
+  /// jcc, at start: follow every pane's child, and load `sessions.toml`.
+  pub(super) fn start_cira_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    for pi in 0..self.projects.len() {
+      self.observe_panes(pi, window, cx);
+    }
+    self.run_blocking(
+      window,
+      cx,
+      jc_core::config::load_sessions,
+      // With no records a marker asks nothing (`lifecycle::mark_request`),
+      // so starting empty sends no stop or rm once a bad file is kept aside
+      // (a marker or rename made while jc was closed is not acted on, and
+      // Cira's label wins: `lifecycle::label_sync`). When it
+      // could not be read or moved, `records` stays `None`: no marker or
+      // label is acted on and nothing is saved over the file.
+      |ws, loaded, _window, _cx| match loaded {
+        Ok((records, kept)) => {
+          if let Some(kept) = kept {
+            eprintln!("sessions.toml did not parse; kept it as {}", kept.display());
+          }
+          ws.cira.records = Some(records);
+          ws.kick_cira();
+        }
+        Err(e) => eprintln!("sessions.toml: {e:#}; acting on no markers or labels"),
+      },
+    );
+  }
+
   pub(super) fn project_index(&self, path: &Path) -> Option<usize> {
     self.projects.iter().position(|p| p.path == path)
   }
@@ -70,6 +99,7 @@ impl Workspace {
 
   /// Ask for a fresh `cira status --json` now.
   pub(super) fn kick_cira(&self) {
+    // jc has no poll thread: the receiver is gone and this sends nothing.
     let _ = self.cira_kick.send(());
   }
 
@@ -210,7 +240,7 @@ impl Workspace {
       }
     }
     for (pi, path, sid, id) in ask {
-      let cira = self.cira_client.clone();
+      let Some(cira) = self.cira_client.clone() else { continue };
       let at = self.at(pi, &id);
       let asked = id.clone();
       self.run_blocking(
@@ -273,11 +303,15 @@ impl Workspace {
   // Asking Cira for a session
   // ---------------------------------------------------------------------------
 
-  /// Move legacy heading `sid` (`> uuid=U`) to a session Cira runs: `cira
-  /// session new --resume U --wait`, carrying `> dangerous`. A conversation
-  /// with no transcript (it never took a prompt) starts fresh. Its heading is
-  /// rewritten only once Cira has a job for it, so a failed start is asked
-  /// again — which retries it — at the next jc start or adoption.
+  /// Move legacy heading `sid` (`> uuid=U`, moved by Jay from jc's `# Claude`
+  /// into jcc's `# Cira`) to a session Cira runs: `cira session new --resume U
+  /// --wait`, carrying `> dangerous`. A conversation with no transcript (it
+  /// never took a prompt) starts fresh. Its heading is rewritten only once
+  /// Cira has a job for it, so a failed start is asked again — which retries
+  /// it — at the next jcc start or adoption. Not while a `claude` process
+  /// still runs U in the foreground (jc's pane, most likely): resuming it in
+  /// Cira too would run one conversation twice, so the pane says so and the
+  /// next status read asks again.
   fn migrate(
     &mut self,
     path: PathBuf,
@@ -296,13 +330,34 @@ impl Workspace {
       dangerous,
       wait: true,
     };
-    self.request_session(
-      path,
-      sid,
-      req,
-      "moving this conversation to a session Cira runs…",
+    let uuid = session.key.clone();
+    if let Some(session) = self.session_mut(&path, sid) {
+      session.asking = true; // nothing else is asked for it until this answers
+    }
+    self.run_blocking(
       window,
       cx,
+      move || jc_core::claude::conversation_running(&uuid),
+      move |ws, running, window, cx| {
+        let Some(session) = ws.session_mut(&path, sid) else { return };
+        session.asking = false;
+        if running {
+          session.show_once(
+            "a `claude` process still runs this conversation (jc?); end it there first. It \
+             moves to Cira once none does.",
+            cx,
+          );
+          return;
+        }
+        ws.request_session(
+          path,
+          sid,
+          req,
+          "moving this conversation to a session Cira runs…",
+          window,
+          cx,
+        );
+      },
     );
   }
 
@@ -318,11 +373,11 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    let Some(cira) = self.cira_client.clone() else { return };
     let Some(session) = self.session_mut(&path, sid) else { return };
     session.asking = true;
     session.failed = false;
     session.status(why, cx);
-    let cira = self.cira_client.clone();
     let cwd = path.clone();
     let work = move || {
       let made = cira.new_session(&req);
@@ -445,7 +500,8 @@ impl Workspace {
     let project = &mut self.projects[pi];
     let id = project.next_session_id;
     project.next_session_id += 1;
-    let session = SessionState::create(id, heading, &project_path, &palette, window, cx);
+    let session =
+      SessionState::create(id, heading, Start::Cira, &project_path, &palette, window, cx);
     project.sessions.insert(id, session);
     self.observe_panes(pi, window, cx);
     self.switch_to_session(pi, Some(id), window, cx);
@@ -454,7 +510,7 @@ impl Workspace {
 
   /// A brand-new session: Cira mints it and starts its job; its heading is
   /// written as soon as Cira answers with the id.
-  pub(super) fn create_new_session(
+  pub(super) fn cira_new_session(
     &mut self,
     pi: usize,
     window: &mut Window,
@@ -470,7 +526,7 @@ impl Workspace {
 
   /// Continue transcript `uuid`, which no heading names, as a session Cira
   /// runs under a new heading labelled from `summary`.
-  pub(super) fn adopt_transcript(
+  pub(super) fn cira_adopt_transcript(
     &mut self,
     pi: usize,
     uuid: String,
@@ -529,7 +585,7 @@ impl Workspace {
   /// document, so a key taken from a picker snapshot cannot write to a
   /// heading that has moved since. Adopting is Jay asking, so it attaches
   /// even a session stopped through Cira.
-  pub(super) fn adopt_session(
+  pub(super) fn cira_adopt_session(
     &mut self,
     pi: usize,
     key: &SessionKey,
@@ -625,7 +681,7 @@ impl Workspace {
     };
     let sid = session.id;
     let to = !from;
-    let cira = self.cira_client.clone();
+    let Some(cira) = self.cira_client.clone() else { return };
     let at = self.at(pi, &id);
     self.run_blocking(
       window,
@@ -794,7 +850,7 @@ impl Workspace {
   /// stop` ([`Self::reconcile_marks`]). Never addressed by label: with two
   /// same-labelled headings a label-keyed toggle marks the wrong one and
   /// stops a live session (see `SessionKey`).
-  pub(super) fn toggle_session_disabled(
+  pub(super) fn cira_toggle_session_disabled(
     &mut self,
     pi: usize,
     key: &SessionKey,
@@ -919,8 +975,8 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    let Some(cira) = self.cira_client.clone() else { return };
     self.cira.in_flight.insert(id.clone());
-    let cira = self.cira_client.clone();
     let at = self.at(pi, &id);
     let id_for_work = id.clone();
     let work = move || call(&cira, &at, &id_for_work);

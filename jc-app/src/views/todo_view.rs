@@ -3,6 +3,7 @@ use chrono::NaiveDateTime;
 use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::input::{InputEvent, RopeExt as _};
+use jc_core::flavor::Flavor;
 use jc_core::todo::{self, SessionKey, TodoDocument};
 use std::path::PathBuf;
 
@@ -27,6 +28,8 @@ pub struct TodoView {
   code_view: Entity<CodeView>,
   file_path: PathBuf,
   document: TodoDocument,
+  /// Whose sessions the document holds (`jc_core::flavor::Flavor::section`).
+  flavor: Flavor,
   active_key: Option<String>,
   _editor_subscription: Subscription,
 }
@@ -48,7 +51,7 @@ impl TodoView {
       cx.subscribe(&editor_entity, |this: &mut Self, _, event: &InputEvent, cx| {
         if matches!(event, InputEvent::Change) {
           let text = this.code_view.read(cx).editor_text(cx);
-          this.document = todo::parse(&text);
+          this.document = todo::parse(&text, this.flavor);
           this.apply_session_highlights(cx);
           cx.notify();
         }
@@ -56,9 +59,10 @@ impl TodoView {
 
     // Initial parse.
     let text = code_view.read(cx).editor_text(cx);
-    let document = todo::parse(&text);
+    let flavor = Flavor::current();
+    let document = todo::parse(&text, flavor);
 
-    Self { code_view, file_path, document, active_key: None, _editor_subscription }
+    Self { code_view, file_path, document, flavor, active_key: None, _editor_subscription }
   }
 
   pub fn code_view(&self) -> &Entity<super::code_view::CodeView> {
@@ -121,16 +125,17 @@ impl TodoView {
     }
   }
 
-  /// Insert a `## <label>` heading for Cira session `cira`, and save.
+  /// Insert a `## <label>` heading with id `id` (a uuid for jc, a Cira id for
+  /// jcc: [`todo::insert_session_heading`]), and save.
   pub fn insert_session_heading(
     &mut self,
     label: &str,
-    cira: &str,
+    id: &str,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let text = self.code_view.read(cx).editor_text(cx);
-    let new_text = todo::insert_session_heading(&text, &self.document, label, cira);
+    let new_text = todo::insert_session_heading(&text, &self.document, label, id);
     self.set_text_and_save(new_text, window, cx);
   }
 
@@ -146,7 +151,7 @@ impl TodoView {
   /// owner -- a `.bak` must never outlive a rewrite that did not reach disk.
   pub fn truncate_logs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let text = self.editor_text(cx);
-    let Some(new_text) = todo::truncate_all_sessions(&text, todo::MAX_MESSAGES) else {
+    let Some(new_text) = todo::truncate_all_sessions(&text, self.flavor, todo::MAX_MESSAGES) else {
       return;
     };
 
@@ -254,7 +259,7 @@ impl TodoView {
     cx: &mut Context<Self>,
   ) -> ScheduledFire {
     let text = self.editor_text(cx);
-    match todo::fire_scheduled(&text, uuid, now_local, now_unix_secs()) {
+    match todo::fire_scheduled(&text, self.flavor, uuid, now_local, now_unix_secs()) {
       todo::FireOutcome::Deliver { new_text, body } => {
         self.set_text_and_save(new_text, window, cx);
         ScheduledFire::Deliver(body)
@@ -316,6 +321,22 @@ impl TodoView {
     }
   }
 
+  /// Write `new_uuid` onto jc's session at `index` in the parsed document
+  /// ([`todo::update_session_uuid_at`]). Positional because the caller minting
+  /// a uuid has no uuid to key on yet. The caller saves.
+  pub fn update_session_uuid_at(
+    &mut self,
+    index: usize,
+    new_uuid: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let text = self.editor_text(cx);
+    if let Some(new_text) = todo::update_session_uuid_at(&text, &self.document, index, new_uuid) {
+      self.set_text(new_text, window, cx);
+    }
+  }
+
   /// Rename the heading at `index` (keeping its `[D]`) and save; `false`
   /// when the label is not one jc writes into a heading
   /// ([`todo::rename_heading_at`]).
@@ -338,7 +359,7 @@ impl TodoView {
   /// after every jc-authored edit; not run on every keystroke, since it re-parses.
   pub fn reparse(&mut self, cx: &mut Context<Self>) {
     let text = self.code_view.read(cx).editor_text(cx);
-    self.document = todo::parse(&text);
+    self.document = todo::parse(&text, self.flavor);
     self.apply_session_highlights(cx);
   }
 

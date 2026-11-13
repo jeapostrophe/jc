@@ -1,3 +1,4 @@
+use crate::flavor::Flavor;
 #[cfg(test)]
 use chrono::NaiveDate;
 use chrono::{NaiveDateTime, NaiveTime, Timelike};
@@ -10,8 +11,18 @@ use std::ops::Range;
 
 #[derive(Debug, Default, Clone)]
 pub struct TodoDocument {
-  pub claude_section_line: Option<u32>,
+  /// Whose document this is: its sessions are the `##` headings under
+  /// `# <flavor.section()>` whose id line the flavor owns
+  /// ([`Flavor::owns`]), and its writers write that flavor's id line.
+  pub flavor: Flavor,
+  /// 1-based line of the `# <flavor.section()>` heading.
+  pub section_line: Option<u32>,
   pub sessions: Vec<TodoSession>,
+  /// Ids on the id lines of `##` headings that are not this flavor's
+  /// sessions: the other app's section, or a `> cira=` heading in jc's. Never
+  /// acted on; listed so a transcript one of them names is not offered for
+  /// adoption here.
+  pub foreign_ids: Vec<String>,
   /// `## [DELETED] …` headings that still name a session. They are never
   /// sessions themselves; jc lists them only so their removal reaches Cira
   /// (`cira session rm`, see [`TodoDocument::marks`]).
@@ -427,8 +438,10 @@ pub fn drop_schedule_marker(text: &str, message: &TodoMessage) -> String {
 // Parser
 // ---------------------------------------------------------------------------
 
-pub fn parse(text: &str) -> TodoDocument {
-  let mut doc = TodoDocument::default();
+/// The document as `flavor` reads it (see [`TodoDocument::flavor`]).
+pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
+  let mut doc = TodoDocument { flavor, ..Default::default() };
+  let section = format!("# {}", flavor.section());
   let mut current_session: Option<TodoSession> = None;
   let mut byte_offset: usize = 0;
   // State: we just saw an `## Label` heading and are looking for its id line next.
@@ -436,11 +449,14 @@ pub fn parse(text: &str) -> TodoDocument {
   // State: we just saw an `## [DELETED] Label` heading; its id line, if it is
   // the next line, goes to `doc.deleted`.
   let mut expecting_deleted_id = false;
+  // State: we just saw a `##` heading that is not one of ours; its id line, if
+  // it is the next line, goes to `doc.foreign_ids`.
+  let mut expecting_foreign_id = false;
   // State: we're inside a session's metadata block (after `> uuid=`); each line
   // starting with `> ` is parsed as metadata until we hit a non-metadata line.
   let mut in_metadata = false;
-  // Only create sessions for `##` headings inside a `# Claude` section.
-  let mut in_claude_section = false;
+  // Only create sessions for `##` headings inside the flavor's section.
+  let mut in_section = false;
 
   for (line_idx, line) in text.lines().enumerate() {
     let line_num = line_idx as u32 + 1;
@@ -468,6 +484,13 @@ pub fn parse(text: &str) -> TodoDocument {
     }
     in_metadata = false;
 
+    if std::mem::take(&mut expecting_foreign_id)
+      && let Some((_, id)) = id_line(line)
+      && !id.is_empty()
+    {
+      doc.foreign_ids.push(id.to_string());
+    }
+
     if std::mem::take(&mut expecting_deleted_id)
       && let Some((id_kind, id)) = id_line(line)
       && !id.is_empty()
@@ -477,7 +500,16 @@ pub fn parse(text: &str) -> TodoDocument {
 
     // If we're expecting an id line after a heading:
     if let Some(ref mut pending) = expecting_id_for {
-      if let Some((id_kind, rest)) = id_line(line) {
+      if let Some((id_kind, rest)) = id_line(line)
+        && !flavor.owns(id_kind)
+      {
+        // Another app's heading: not a session, and nothing under it is ours.
+        if !rest.is_empty() {
+          doc.foreign_ids.push(rest.to_string());
+        }
+        finalize_session(&mut doc, &mut current_session, line_start);
+        expecting_id_for = None;
+      } else if let Some((id_kind, rest)) = id_line(line) {
         pending.id = rest.to_string();
         pending.id_kind = id_kind;
         pending.id_line = line_num;
@@ -498,20 +530,22 @@ pub fn parse(text: &str) -> TodoDocument {
     if expecting_id_for.is_some() {
       // Already handled above, skip normal parsing for this line.
     } else if line.starts_with("# ") {
-      // Any top-level heading ends the current session and leaves the Claude section.
+      // Any top-level heading ends the current session and leaves the section.
       finalize_session(&mut doc, &mut current_session, line_start);
-      in_claude_section = line == "# Claude";
+      in_section = line == section;
 
-      if in_claude_section {
-        doc.claude_section_line = Some(line_num);
+      if in_section {
+        doc.section_line = Some(line_num);
       }
     } else if let Some(after_h2) = line.strip_prefix("## ") {
       // Any second-level heading ends the current session.
       finalize_session(&mut doc, &mut current_session, line_start);
 
-      // Only treat `##` headings as sessions inside `# Claude`.
-      if !in_claude_section {
-        // Ignore — this heading is outside the Claude section.
+      // Only treat `##` headings as sessions inside the flavor's section.
+      if !in_section {
+        // Not ours (the other app's section, or notes): only its id is kept,
+        // unless it is `[DELETED]`, which names nothing any more.
+        expecting_foreign_id = !after_h2.starts_with("[DELETED] ");
       } else if after_h2.starts_with("[DELETED] ") {
         // Not a session; only its id line is wanted, for its removal.
         expecting_deleted_id = true;
@@ -680,17 +714,18 @@ pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
   (2..).map(|n| format!("{base} {n}")).find(|c| !taken(c)).unwrap()
 }
 
-/// Build new text with a `## <label>\n> cira=<cira>\n\n### WAIT\n` heading
-/// inserted.
-/// If a `# Claude` section exists, the heading goes right after it. Otherwise
-/// a `# Claude` section is appended at the end of the text.
+/// Build new text with a `## <label>\n<id line>\n\n### WAIT\n` heading
+/// inserted, its id line the document flavor's (`> uuid=<id>` for jc,
+/// `> cira=<id>` for jcc: [`Flavor::id_kind`]).
+/// If the flavor's section (`# Claude`, `# Cira`) exists, the heading goes
+/// right after it. Otherwise that section is appended at the end of the text.
 ///
 /// `label` need not be unique: it is a display name, not an address (see
 /// [`SessionKey`]).
-pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, cira: &str) -> String {
-  let heading = format!("## {label}\n> cira={cira}\n\n### WAIT\n");
+pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, id: &str) -> String {
+  let heading = format!("## {label}\n{}{id}\n\n### WAIT\n", doc.flavor.id_kind().prefix());
 
-  if let Some(claude_line) = doc.claude_section_line {
+  if let Some(claude_line) = doc.section_line {
     // Find byte offset right after the `# Claude` line.
     let mut offset = 0;
     for (i, line) in text.lines().enumerate() {
@@ -714,7 +749,7 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, cira:
     }
   }
 
-  // No `# Claude` section; append one at the end.
+  // No section of ours; append one at the end.
   let mut new_text = text.to_string();
   if !new_text.is_empty() && !new_text.ends_with('\n') {
     new_text.push('\n');
@@ -722,7 +757,7 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, cira:
   if !new_text.is_empty() {
     new_text.push('\n');
   }
-  new_text.push_str("# Claude\n");
+  new_text.push_str(&format!("# {}\n", doc.flavor.section()));
   new_text.push_str(&heading);
   new_text
 }
@@ -761,7 +796,12 @@ pub fn toggle_session_disabled_at(text: &str, doc: &TodoDocument, index: usize) 
 ///
 /// Positional rather than label-keyed — see [`SessionKey`]. Callers holding an
 /// id resolve it with [`TodoDocument::index_by_id`].
+///
+/// `None` for a jc document: jc never writes a `> cira=` line.
 pub fn bind_cira_at(text: &str, doc: &TodoDocument, index: usize, cira: &str) -> Option<String> {
+  if doc.flavor != Flavor::Jcc {
+    return None;
+  }
   let session = doc.sessions.get(index)?;
   let line = format!("> cira={cira}");
   // The later range first, so the earlier one's offsets still hold.
@@ -777,6 +817,32 @@ pub fn bind_cira_at(text: &str, doc: &TodoDocument, index: usize, cira: &str) ->
   }
   let line_start = session.id_byte_range.start - session.id_kind.prefix().len();
   Some(splice(&text, line_start..session.id_byte_range.end, &line))
+}
+
+/// Write `new_uuid` onto the jc session at `index` in `doc.sessions` (jc's own
+/// lifecycle: a uuid minted for an unbound heading, or the one a `/clear`
+/// moved to). Positional rather than label-keyed — see [`SessionKey`]. Callers
+/// holding a uuid resolve it with [`TodoDocument::index_by_id`].
+///
+/// `None` for a jcc document: a jcc heading's address is its Cira id, which
+/// no uuid replaces.
+pub fn update_session_uuid_at(
+  text: &str,
+  doc: &TodoDocument,
+  index: usize,
+  new_uuid: &str,
+) -> Option<String> {
+  if doc.flavor != Flavor::Jc {
+    return None;
+  }
+  let session = doc.sessions.get(index)?;
+  // A hand-written heading may have no `> uuid=` line at all; give it one
+  // directly below the heading rather than dropping the uuid on the floor.
+  if session.id_byte_range == (0..0) {
+    let at = session.heading_byte_range.end;
+    return Some(splice(text, at..at, &format!("\n> uuid={new_uuid}")));
+  }
+  Some(splice(text, session.id_byte_range.clone(), new_uuid))
 }
 
 /// Rename the heading at `index` to `label`, keeping its `[D]` marker. A
@@ -958,8 +1024,8 @@ pub fn send_from_wait(
 /// Sends bound only the session being written to, which leaves a session that
 /// has gone quiet holding whatever it had accumulated. This is the sweep for
 /// those, meant for startup, before anything else reads the document.
-pub fn truncate_all_sessions(text: &str, keep: usize) -> Option<String> {
-  let doc = parse(text);
+pub fn truncate_all_sessions(text: &str, flavor: Flavor, keep: usize) -> Option<String> {
+  let doc = parse(text, flavor);
   // `parse` yields sessions in document order and each span sits inside its own
   // session's log, so the spans come out ascending and disjoint.
   let spans: Vec<Range<usize>> =
@@ -1033,11 +1099,12 @@ pub enum FireOutcome {
 /// callers never reason about byte-range validity across intermediate strings.
 pub fn fire_scheduled(
   text: &str,
+  flavor: Flavor,
   uuid: &str,
   now_local: NaiveDateTime,
   now_secs: u64,
 ) -> FireOutcome {
-  let doc = parse(text);
+  let doc = parse(text, flavor);
   let Some(session) = doc.session_by_id(uuid) else {
     return FireOutcome::Cancelled { new_text: None };
   };
@@ -1100,6 +1167,16 @@ pub fn update_last_active(text: &str, session: &TodoSession, timestamp: u64) -> 
 
 #[cfg(test)]
 mod tests {
+  /// The document as jc reads it.
+  fn parse_jc(text: &str) -> TodoDocument {
+    parse(text, Flavor::Jc)
+  }
+
+  /// The document as jcc reads it.
+  fn parse_jcc(text: &str) -> TodoDocument {
+    parse(text, Flavor::Jcc)
+  }
+
   use super::*;
 
   /// Fixed local "now" for send tests that don't exercise scheduling.
@@ -1109,8 +1186,8 @@ mod tests {
 
   #[test]
   fn empty_document() {
-    let doc = parse("");
-    assert!(doc.claude_section_line.is_none());
+    let doc = parse_jc("");
+    assert!(doc.section_line.is_none());
     assert!(doc.sessions.is_empty());
     assert!(doc.first_session().is_none());
     assert!(doc.session_ids().is_empty());
@@ -1131,7 +1208,7 @@ more notes
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert_eq!(doc.sessions.len(), 1);
     assert_eq!(doc.sessions[0].label, "Real Session");
     assert_eq!(doc.sessions[0].id, "abc");
@@ -1151,9 +1228,9 @@ more body text
 ### WAIT
 draft content here
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
 
-    assert_eq!(doc.claude_section_line, Some(1));
+    assert_eq!(doc.section_line, Some(1));
     assert_eq!(doc.sessions.len(), 1);
 
     let session = &doc.sessions[0];
@@ -1188,7 +1265,7 @@ body
 ### WAIT
 wait body
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
 
     assert_eq!(doc.sessions.len(), 2);
     assert_eq!(doc.sessions[0].id, "aaa");
@@ -1211,7 +1288,7 @@ body text
 ### Message 1
 more body
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
 
     assert_eq!(doc.sessions.len(), 1);
     let session = &doc.sessions[0];
@@ -1230,7 +1307,7 @@ more body
 ### WAIT
 some wait body
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
 
     assert_eq!(doc.sessions.len(), 1);
     let session = &doc.sessions[0];
@@ -1257,7 +1334,7 @@ body
 > uuid=ccc
 
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
 
     assert_eq!(doc.session_ids(), vec!["aaa", "bbb", "ccc"]);
     assert_eq!(doc.session_by_id("bbb").unwrap().label, "Second");
@@ -1275,7 +1352,7 @@ body
 > uuid=second
 
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
 
     let first = doc.first_session().unwrap();
     assert_eq!(first.id, "first");
@@ -1285,7 +1362,7 @@ body
   #[test]
   fn id_byte_range_covers_the_id_text() {
     let text = "# Claude\n## My Label\n> uuid=my-uuid\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = &doc.sessions[0];
     assert_eq!(&text[session.id_byte_range.clone()], "my-uuid");
   }
@@ -1293,7 +1370,7 @@ body
   #[test]
   fn last_active_parsed() {
     let text = "# Claude\n## S\n> uuid=abc\n> last=1700000000\n\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = &doc.sessions[0];
     assert_eq!(session.last_active, Some(1700000000));
     let range = session.last_active_line_range.as_ref().unwrap();
@@ -1303,7 +1380,7 @@ body
   #[test]
   fn last_active_missing() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = &doc.sessions[0];
     assert_eq!(session.last_active, None);
     assert!(session.last_active_line_range.is_none());
@@ -1312,14 +1389,14 @@ body
   #[test]
   fn dangerous_flag_parsed() {
     let text = "# Claude\n## S\n> uuid=abc\n> dangerous\n\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert!(doc.sessions[0].dangerous);
   }
 
   #[test]
   fn dangerous_flag_default_false() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert!(!doc.sessions[0].dangerous);
   }
 
@@ -1327,12 +1404,12 @@ body
   fn dangerous_flag_with_last_active_any_order() {
     // dangerous before last
     let text1 = "# Claude\n## S\n> uuid=abc\n> dangerous\n> last=42\n\n### WAIT\n";
-    let s1 = &parse(text1).sessions[0];
+    let s1 = &parse_jc(text1).sessions[0];
     assert!(s1.dangerous);
     assert_eq!(s1.last_active, Some(42));
     // last before dangerous
     let text2 = "# Claude\n## S\n> uuid=abc\n> last=42\n> dangerous\n\n### WAIT\n";
-    let s2 = &parse(text2).sessions[0];
+    let s2 = &parse_jc(text2).sessions[0];
     assert!(s2.dangerous);
     assert_eq!(s2.last_active, Some(42));
   }
@@ -1341,7 +1418,7 @@ body
   fn unknown_metadata_keys_ignored() {
     // Unknown keys are silently consumed; subsequent known keys still parse.
     let text = "# Claude\n## S\n> uuid=abc\n> futureKey=xyz\n> dangerous\n\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert!(doc.sessions[0].dangerous);
   }
 
@@ -1356,7 +1433,7 @@ body
 ### WAIT
 body here
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = &doc.sessions[0];
     assert_eq!(session.last_active, Some(1700000000));
     let body = &text[session.wait.as_ref().unwrap().body_byte_range.clone()];
@@ -1366,12 +1443,12 @@ body here
   #[test]
   fn update_last_active_inserts() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = &doc.sessions[0];
     let updated = update_last_active(text, session, 1700000000);
     assert!(updated.contains("> last=1700000000\n"));
     // Re-parse to verify round-trip.
-    let doc2 = parse(&updated);
+    let doc2 = parse_jc(&updated);
     assert_eq!(doc2.sessions[0].last_active, Some(1700000000));
     // WAIT body should still be parseable.
     assert!(doc2.sessions[0].wait.is_some());
@@ -1380,20 +1457,20 @@ body here
   #[test]
   fn update_last_active_replaces() {
     let text = "# Claude\n## S\n> uuid=abc\n> last=1000\n\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = &doc.sessions[0];
     assert_eq!(session.last_active, Some(1000));
     let updated = update_last_active(text, session, 2000);
     assert!(updated.contains("> last=2000"));
     assert!(!updated.contains("> last=1000"));
-    let doc2 = parse(&updated);
+    let doc2 = parse_jc(&updated);
     assert_eq!(doc2.sessions[0].last_active, Some(2000));
   }
 
   #[test]
   fn heading_byte_range_covers_full_line() {
     let text = "# Claude\n## Test Label\n> uuid=test\nsome body\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = &doc.sessions[0];
     assert_eq!(&text[session.heading_byte_range.clone()], "## Test Label");
   }
@@ -1411,7 +1488,7 @@ body here
 > uuid=outside
 
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     // `## Inside` is under `# Claude`, but `## Outside` is under `# Other Section`.
     assert_eq!(doc.sessions.len(), 1);
     assert_eq!(doc.sessions[0].id, "inside");
@@ -1431,7 +1508,7 @@ wait content
 > uuid=b
 
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
 
     let session_a = doc.session_by_label("A").unwrap();
     let wait = session_a.wait.as_ref().unwrap();
@@ -1456,7 +1533,7 @@ two
 three
 ## More
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let wait = doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
     let line = wait.body_end_line(text);
     // "three" is on line 7 (0-indexed).
@@ -1480,7 +1557,7 @@ three
 
 ## More
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let wait = doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
     let line = wait.body_end_line(text);
     let lines: Vec<&str> = text.lines().collect();
@@ -1500,7 +1577,7 @@ three
 ### WAIT
 only line
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let wait = doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
     let line = wait.body_end_line(text);
     let lines: Vec<&str> = text.lines().collect();
@@ -1518,7 +1595,7 @@ only line
 ### WAIT
 ## Next
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let wait = doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
     let line = wait.body_end_line(text);
     let lines: Vec<&str> = text.lines().collect();
@@ -1537,13 +1614,13 @@ some notes
 
 # Claude
 ";
-    let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "My Label", "c-1");
-    assert!(result.contains("# Claude\n## My Label\n> cira=c-1\n"));
+    let doc = parse_jc(text);
+    let result = insert_session_heading(text, &doc, "My Label", "my-uuid");
+    assert!(result.contains("# Claude\n## My Label\n> uuid=my-uuid\n"));
     // Verify it re-parses correctly.
-    let new_doc = parse(&result);
+    let new_doc = parse_jc(&result);
     assert_eq!(new_doc.sessions.len(), 1);
-    assert_eq!(new_doc.sessions[0].cira(), Some("c-1"));
+    assert_eq!(new_doc.sessions[0].id, "my-uuid");
     assert!(new_doc.sessions[0].wait.is_some());
   }
 
@@ -1553,23 +1630,23 @@ some notes
 # TODO
 some notes
 ";
-    let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "Test Label", "c-2");
-    assert!(result.contains("# Claude\n## Test Label\n> cira=c-2\n"));
-    let new_doc = parse(&result);
+    let doc = parse_jc(text);
+    let result = insert_session_heading(text, &doc, "Test Label", "test-uuid");
+    assert!(result.contains("# Claude\n## Test Label\n> uuid=test-uuid\n"));
+    let new_doc = parse_jc(&result);
     assert_eq!(new_doc.sessions.len(), 1);
-    assert_eq!(new_doc.sessions[0].id, "c-2");
+    assert_eq!(new_doc.sessions[0].id, "test-uuid");
   }
 
   #[test]
   fn insert_session_heading_empty_document() {
     let text = "";
-    let doc = parse(text);
-    let result = insert_session_heading(text, &doc, "Fresh", "c-3");
-    assert_eq!(result, "# Claude\n## Fresh\n> cira=c-3\n\n### WAIT\n");
-    let new_doc = parse(&result);
+    let doc = parse_jc(text);
+    let result = insert_session_heading(text, &doc, "Fresh", "");
+    assert_eq!(result, "# Claude\n## Fresh\n> uuid=\n\n### WAIT\n");
+    let new_doc = parse_jc(&result);
     assert_eq!(new_doc.sessions.len(), 1);
-    assert_eq!(new_doc.sessions[0].id, "c-3");
+    assert_eq!(new_doc.sessions[0].id, "");
     assert_eq!(new_doc.sessions[0].label, "Fresh");
   }
 
@@ -1583,10 +1660,10 @@ some notes
 ### WAIT
 notes
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let result = insert_session_heading(text, &doc, "New Label", "new-uuid");
     // New heading should be inserted right after `# Claude`, before the old session.
-    let new_doc = parse(&result);
+    let new_doc = parse_jc(&result);
     assert_eq!(new_doc.sessions.len(), 2);
     assert_eq!(new_doc.sessions[0].id, "new-uuid");
     assert_eq!(new_doc.sessions[1].id, "old");
@@ -1608,7 +1685,7 @@ hello
 ### WAIT
 draft text
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let wait = session.wait.as_ref().unwrap();
 
@@ -1623,7 +1700,7 @@ draft text
     assert!(result.new_text.contains("### Message 1\ndraft text\n### WAIT\n"));
 
     // Re-parse to verify structure.
-    let new_doc = parse(&result.new_text);
+    let new_doc = parse_jc(&result.new_text);
     let new_session = new_doc.session_by_label("S").unwrap();
     assert_eq!(new_session.messages.len(), 2);
     assert!(new_session.wait.is_some());
@@ -1639,7 +1716,7 @@ draft text
 ### WAIT
 all body content
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
 
     // Empty selection (collapsed cursor) → send entire body.
@@ -1661,7 +1738,7 @@ line one
 line two
 line three
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let wait = session.wait.as_ref().unwrap();
     let body = &text[wait.body_byte_range.clone()];
@@ -1675,7 +1752,7 @@ line three
     assert_eq!(result.message_text, "line two");
 
     // Remaining body should have line one and line three.
-    let new_doc = parse(&result.new_text);
+    let new_doc = parse_jc(&result.new_text);
     let new_wait = new_doc.session_by_label("S").unwrap().wait.as_ref().unwrap();
     let new_body = &result.new_text[new_wait.body_byte_range.clone()];
     assert!(new_body.contains("line one"));
@@ -1693,7 +1770,7 @@ line three
 ### WAIT
 one two three
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let wait = session.wait.as_ref().unwrap();
     // Place cursor after "one two" — find the exact position.
@@ -1703,7 +1780,7 @@ one two three
     let result = send_from_wait(text, session, cursor..cursor, None, test_now()).unwrap();
     assert_eq!(result.message_text, "one two");
     // The remaining text ("three\n") stays in the WAIT body.
-    let new_doc = parse(&result.new_text);
+    let new_doc = parse_jc(&result.new_text);
     let new_session = new_doc.session_by_label("S").unwrap();
     let new_body = &result.new_text[new_session.wait.as_ref().unwrap().body_byte_range.clone()];
     assert_eq!(new_body.trim(), "three");
@@ -1721,7 +1798,7 @@ line one
 line two
 line three
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let wait = session.wait.as_ref().unwrap();
     // Place cursor at the start of "line two" — should send "line one".
@@ -1730,7 +1807,7 @@ line three
     let cursor = wait.body_byte_range.start + offset_in_body;
     let result = send_from_wait(text, session, cursor..cursor, None, test_now()).unwrap();
     assert_eq!(result.message_text, "line one");
-    let new_doc = parse(&result.new_text);
+    let new_doc = parse_jc(&result.new_text);
     let new_session = new_doc.session_by_label("S").unwrap();
     let new_body = &result.new_text[new_session.wait.as_ref().unwrap().body_byte_range.clone()];
     assert!(new_body.contains("line two"));
@@ -1746,7 +1823,7 @@ line three
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
 
     // Empty body → should return None.
@@ -1763,7 +1840,7 @@ line three
 ### Message 0
 hello
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     assert!(send_from_wait(text, session, 0..0, None, test_now()).is_none());
   }
@@ -1782,7 +1859,7 @@ second
 ### WAIT
 third
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let result = send_from_wait(text, session, 0..0, None, test_now()).unwrap();
     assert_eq!(result.message_index, 2);
@@ -1807,7 +1884,7 @@ third
   }
 
   fn parsed_session(text: &str) -> TodoSession {
-    parse(text).session_by_label("S").unwrap().clone()
+    parse_jc(text).session_by_label("S").unwrap().clone()
   }
 
   /// Everything below `### WAIT` is draft. Quoting an old message there is
@@ -1909,9 +1986,9 @@ quoted
       text.push_str(&format!("### WAIT\ndraft for session {n}\n"));
     }
 
-    let out = truncate_all_sessions(&text, MAX_MESSAGES).unwrap();
-    let before = parse(&text);
-    let doc = parse(&out);
+    let out = truncate_all_sessions(&text, Flavor::Jc, MAX_MESSAGES).unwrap();
+    let before = parse_jc(&text);
+    let doc = parse_jc(&out);
 
     assert_eq!(doc.sessions.len(), counts.len());
     for ((n, session), count) in doc.sessions.iter().enumerate().zip(counts.iter()) {
@@ -1931,7 +2008,7 @@ quoted
     }
 
     // Idempotent: a second sweep finds nothing to do.
-    assert!(truncate_all_sessions(&out, MAX_MESSAGES).is_none());
+    assert!(truncate_all_sessions(&out, Flavor::Jc, MAX_MESSAGES).is_none());
   }
 
   /// A pending `@jc(...)` marker pins everything from it onward, and the pin
@@ -1945,8 +2022,8 @@ quoted
     let total = MAX_MESSAGES + 20;
     let text = session_log(total, Some(pinned), "draft\n");
 
-    let first = truncate_all_sessions(&text, MAX_MESSAGES).unwrap();
-    let after = parse(&first);
+    let first = truncate_all_sessions(&text, Flavor::Jc, MAX_MESSAGES).unwrap();
+    let after = parse_jc(&first);
     let session = after.session_by_label("S").unwrap();
 
     // Exactly the entries above the marker went; the marker leads what remains.
@@ -1956,7 +2033,7 @@ quoted
     assert!(session.messages.len() > MAX_MESSAGES, "still above the bound, by design");
 
     // And it is now stuck there until the send fires.
-    assert!(truncate_all_sessions(&first, MAX_MESSAGES).is_none());
+    assert!(truncate_all_sessions(&first, Flavor::Jc, MAX_MESSAGES).is_none());
   }
 
   #[test]
@@ -2009,11 +2086,11 @@ quoted
   fn send_from_wait_bounds_message_log() {
     let existing = MAX_MESSAGES + 10;
     let text = session_log(existing, None, "next up\n");
-    let doc = parse(&text);
+    let doc = parse_jc(&text);
     let session = doc.session_by_label("S").unwrap();
 
     let result = send_from_wait(&text, session, 0..0, None, test_now()).unwrap();
-    let after = parse(&result.new_text);
+    let after = parse_jc(&result.new_text);
     let session = after.session_by_label("S").unwrap();
 
     assert_eq!(session.messages.len(), MAX_MESSAGES);
@@ -2030,14 +2107,14 @@ quoted
   #[test]
   fn send_from_wait_offset_survives_truncation() {
     let text = session_log(MAX_MESSAGES + 10, None, "next up\n");
-    let doc = parse(&text);
+    let doc = parse_jc(&text);
     let session = doc.session_by_label("S").unwrap();
 
     let result = send_from_wait(&text, session, 0..0, None, test_now()).unwrap();
 
     // Derive the expectation from the truncated document rather than counting
     // bytes by hand.
-    let after = parse(&result.new_text);
+    let after = parse_jc(&result.new_text);
     let wait = after.session_by_label("S").unwrap().wait.as_ref().unwrap();
     let body_start = skip_newline(result.new_text.as_bytes(), wait.heading_byte_range.end);
     assert_eq!(result.wait_body_offset, body_start);
@@ -2048,11 +2125,11 @@ quoted
   #[test]
   fn send_from_wait_bounds_log_and_stamps_timestamp() {
     let text = session_log(MAX_MESSAGES + 4, None, "next up\n");
-    let doc = parse(&text);
+    let doc = parse_jc(&text);
     let session = doc.session_by_label("S").unwrap();
 
     let result = send_from_wait(&text, session, 0..0, Some(1700000000), test_now()).unwrap();
-    let after = parse(&result.new_text);
+    let after = parse_jc(&result.new_text);
     let session = after.session_by_label("S").unwrap();
 
     assert_eq!(session.last_active, Some(1700000000));
@@ -2063,24 +2140,24 @@ quoted
   #[test]
   fn send_from_wait_stamps_timestamp() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\nhello\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let result = send_from_wait(text, session, 0..0, Some(1700000000), test_now()).unwrap();
     assert!(result.new_text.contains("> last=1700000000\n"));
-    let doc2 = parse(&result.new_text);
+    let doc2 = parse_jc(&result.new_text);
     assert_eq!(doc2.sessions[0].last_active, Some(1700000000));
   }
 
   #[test]
   fn send_from_wait_updates_existing_timestamp() {
     let text = "# Claude\n## S\n> uuid=abc\n> last=1000\n\n### WAIT\nhello\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     assert_eq!(session.last_active, Some(1000));
     let result = send_from_wait(text, session, 0..0, Some(2000), test_now()).unwrap();
     assert!(result.new_text.contains("> last=2000"));
     assert!(!result.new_text.contains("> last=1000"));
-    let doc2 = parse(&result.new_text);
+    let doc2 = parse_jc(&result.new_text);
     assert_eq!(doc2.sessions[0].last_active, Some(2000));
   }
 
@@ -2139,7 +2216,7 @@ quoted
   #[test]
   fn send_from_wait_schedules_message() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n@jc(07:30) fix the parser\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(9, 0, 0).unwrap();
     let result = send_from_wait(text, session, 0..0, Some(1700000000), now).unwrap();
@@ -2155,7 +2232,7 @@ quoted
     assert!(!result.new_text.contains("> last="));
 
     // Re-parsing surfaces the pending schedule on the message.
-    let doc2 = parse(&result.new_text);
+    let doc2 = parse_jc(&result.new_text);
     let session2 = doc2.session_by_label("S").unwrap();
     let pending = session2.pending_scheduled().unwrap();
     assert_eq!(pending.index, 0);
@@ -2168,7 +2245,7 @@ quoted
   #[test]
   fn scheduled_message_body_is_readable_and_editable() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-14 07:30)\nfix the parser\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let pending = session.pending_scheduled().unwrap();
     let body = text[pending.body_byte_range.clone()].trim();
@@ -2178,7 +2255,7 @@ quoted
   #[test]
   fn empty_schedule_marker_does_not_send() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### WAIT\n@jc(07:30)\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(9, 0, 0).unwrap();
     assert!(send_from_wait(text, session, 0..0, Some(1), now).is_none());
@@ -2188,7 +2265,7 @@ quoted
   fn fire_scheduled_delivers_when_due() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-13 07:30)\nfix the parser\n### WAIT\n";
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 31, 0).unwrap();
-    match fire_scheduled(text, "abc", now, 1700000000) {
+    match fire_scheduled(text, Flavor::Jc, "abc", now, 1700000000) {
       FireOutcome::Deliver { new_text, body } => {
         assert_eq!(body, "fix the parser");
         assert!(new_text.contains("### Message 0\n")); // marker dropped
@@ -2204,7 +2281,7 @@ quoted
     let text =
       "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-13 09:00)\nbody\n### WAIT\n";
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 0, 0).unwrap();
-    match fire_scheduled(text, "abc", now, 1) {
+    match fire_scheduled(text, Flavor::Jc, "abc", now, 1) {
       FireOutcome::Reschedule(when) => {
         assert_eq!(
           when,
@@ -2219,7 +2296,7 @@ quoted
   fn fire_scheduled_empty_body_cancels_but_drops_marker() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-13 07:30)\n\n### WAIT\n";
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 31, 0).unwrap();
-    match fire_scheduled(text, "abc", now, 1) {
+    match fire_scheduled(text, Flavor::Jc, "abc", now, 1) {
       FireOutcome::Cancelled { new_text: Some(nt) } => {
         assert!(!nt.contains("@jc(")); // marker dropped so session isn't locked
         assert!(!nt.contains("> last=")); // nothing delivered → no stamp
@@ -2233,7 +2310,7 @@ quoted
     let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0\nbody\n### WAIT\n";
     let now = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap().and_hms_opt(7, 31, 0).unwrap();
     assert!(matches!(
-      fire_scheduled(text, "abc", now, 1),
+      fire_scheduled(text, Flavor::Jc, "abc", now, 1),
       FireOutcome::Cancelled { new_text: None }
     ));
   }
@@ -2241,14 +2318,14 @@ quoted
   #[test]
   fn drop_schedule_marker_delivers() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(2026-07-14 07:30)\nfix the parser\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     let pending = session.pending_scheduled().unwrap();
     let delivered = drop_schedule_marker(text, pending);
     assert!(delivered.contains("### Message 0\n"));
     assert!(!delivered.contains("@jc("));
     // Now no longer pending, body preserved.
-    let doc2 = parse(&delivered);
+    let doc2 = parse_jc(&delivered);
     let session2 = doc2.session_by_label("S").unwrap();
     assert!(session2.pending_scheduled().is_none());
     assert_eq!(session2.messages[0].index, 0);
@@ -2257,7 +2334,7 @@ quoted
   #[test]
   fn malformed_heading_marker_kept_as_plain_message() {
     let text = "# Claude\n## S\n> uuid=abc\n\n### Message 0 @jc(not-a-date)\nbody\n### WAIT\n";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
     // Message still parsed (not dropped), just with no schedule.
     assert_eq!(session.messages.len(), 1);
@@ -2278,7 +2355,7 @@ quoted
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert_eq!(doc.sessions.len(), 2);
     assert_eq!(doc.sessions[0].label, "Dormant Session");
     assert!(doc.sessions[0].status == SessionStatus::Disabled);
@@ -2296,13 +2373,13 @@ quoted
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert_ne!(doc.sessions[0].status, SessionStatus::Disabled);
 
     // Disable it.
     let disabled_text = toggle_session_disabled_at(text, &doc, 0).unwrap();
     assert!(disabled_text.contains("## [D] My Session"));
-    let doc2 = parse(&disabled_text);
+    let doc2 = parse_jc(&disabled_text);
     assert_eq!(doc2.sessions[0].label, "My Session");
     assert!(doc2.sessions[0].status == SessionStatus::Disabled);
 
@@ -2310,7 +2387,7 @@ quoted
     let enabled_text = toggle_session_disabled_at(&disabled_text, &doc2, 0).unwrap();
     assert!(enabled_text.contains("## My Session"));
     assert!(!enabled_text.contains("[D]"));
-    let doc3 = parse(&enabled_text);
+    let doc3 = parse_jc(&enabled_text);
     assert_ne!(doc3.sessions[0].status, SessionStatus::Disabled);
   }
 
@@ -2326,9 +2403,9 @@ quoted
 ## New Session
 > uuid=second
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let toggled = toggle_session_disabled_at(text, &doc, 1).unwrap();
-    let after = parse(&toggled);
+    let after = parse_jc(&toggled);
     assert_eq!(after.sessions[0].id, "first");
     assert_eq!(after.sessions[0].status, SessionStatus::Active, "first session untouched");
     assert_eq!(after.sessions[1].id, "second");
@@ -2344,7 +2421,7 @@ quoted
 ## New Session 2
 > uuid=b
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert_eq!(unique_label(&doc, "Fresh"), "Fresh");
     // `New Session` and `New Session 2` are taken, so the next free one is 3.
     assert_eq!(unique_label(&doc, "New Session"), "New Session 3");
@@ -2363,7 +2440,7 @@ quoted
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert_eq!(doc.sessions.len(), 2);
     assert!(doc.sessions.iter().all(|s| s.id.is_empty()), "both headings unbound");
     assert_eq!(doc.index_by_id(""), None, "an empty uuid names no session");
@@ -2374,11 +2451,11 @@ quoted
     // The document moved under the key: refuse rather than write to whatever
     // now sits at that index. Each case re-parses a document the user could
     // have produced between a picker snapshot and its confirm.
-    let renamed = parse("# Claude\n## S\n\n### WAIT\n## T\n\n### WAIT\n");
+    let renamed = parse_jc("# Claude\n## S\n\n### WAIT\n## T\n\n### WAIT\n");
     assert_eq!(renamed.index_of(&second), None, "the label at index 1 changed");
-    let bound = parse("# Claude\n## S\n\n### WAIT\n## S\n> uuid=bbb\n\n### WAIT\n");
+    let bound = parse_jc("# Claude\n## S\n\n### WAIT\n## S\n> uuid=bbb\n\n### WAIT\n");
     assert_eq!(bound.index_of(&second), None, "the heading at index 1 is bound now");
-    let shorter = parse("# Claude\n## S\n\n### WAIT\n");
+    let shorter = parse_jc("# Claude\n## S\n\n### WAIT\n");
     assert_eq!(shorter.index_of(&second), None, "index 1 no longer exists");
   }
 
@@ -2421,10 +2498,10 @@ hello
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert!(doc.sessions[0].pending_scheduled().is_none(), "no marker on the first heading");
     assert!(doc.sessions[1].pending_scheduled().is_some(), "the marker is on the second");
-    match fire_scheduled(text, &doc.sessions[1].id, test_now(), 1700000000) {
+    match fire_scheduled(text, Flavor::Jc, &doc.sessions[1].id, test_now(), 1700000000) {
       FireOutcome::Deliver { body, .. } => assert_eq!(body, "hello"),
       _ => panic!("the second heading's scheduled send was not delivered"),
     }
@@ -2442,13 +2519,13 @@ one
 ## S
 > uuid=bbb
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert!(doc.sessions[0].wait.is_some(), "the first heading already has a WAIT");
     assert!(doc.sessions[1].wait.is_none(), "only the second heading lacks one");
 
     let new_text = insert_wait_section(text, &doc, &doc.sessions[1].id)
       .expect("the second heading needs a WAIT inserted");
-    let after = parse(&new_text);
+    let after = parse_jc(&new_text);
     assert!(after.sessions[1].wait.is_some(), "the second heading got a WAIT");
     // Everything above the second heading must be byte-identical: both spans are
     // taken from the parse, so nothing here restates how the insert works.
@@ -2462,7 +2539,7 @@ one
   #[test]
   fn wait_cursor_addresses_the_second_of_two_same_labelled_headings() {
     let text = two_same_labelled_headings();
-    let doc = parse(text);
+    let doc = parse_jc(text);
     // `TodoView::wait_line` is exactly this composition: resolve the session by
     // UUID, then ask its WAIT where the body ends.
     let wait = doc
@@ -2495,7 +2572,7 @@ one
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert_eq!(doc.sessions.len(), 1);
     assert_eq!(doc.sessions[0].label, "Active Session");
   }
@@ -2514,7 +2591,7 @@ stale draft
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert_eq!(doc.sessions.len(), 1);
     assert_eq!(doc.sessions[0].label, "Active Session");
   }
@@ -2528,7 +2605,7 @@ stale draft
 ## Active Session
 > uuid=active
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert_eq!(doc.sessions.len(), 2);
     assert_eq!(doc.sessions[0].label, "GC'd Session");
     assert_eq!(doc.sessions[0].status, SessionStatus::Disabled);
@@ -2543,11 +2620,11 @@ stale draft
 ## [X] GC'd Session
 > uuid=gone
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let enabled = toggle_session_disabled_at(text, &doc, 0).unwrap();
     assert!(enabled.contains("## GC'd Session"));
     assert!(!enabled.contains("[X]"));
-    let doc2 = parse(&enabled);
+    let doc2 = parse_jc(&enabled);
     assert_eq!(doc2.sessions[0].status, SessionStatus::Active);
     assert_eq!(doc2.sessions[0].label, "GC'd Session");
   }
@@ -2564,7 +2641,7 @@ hello
 ### WAIT
 draft
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     let session = doc.session_by_label("S").unwrap();
 
     // Selection entirely before the WAIT body.
@@ -2580,7 +2657,7 @@ draft
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jc(text);
     assert_eq!(doc.sessions.len(), 1);
     let session = &doc.sessions[0];
     assert_eq!(session.id, "");
@@ -2591,8 +2668,8 @@ draft
   // is the heading's address, and a `> uuid=` heading is legacy.
   #[test]
   fn cira_line_is_the_session_address() {
-    let text = "# Claude\n## S\n> cira=c-1\n> last=5\n\n### WAIT\n";
-    let doc = parse(text);
+    let text = "# Cira\n## S\n> cira=c-1\n> last=5\n\n### WAIT\n";
+    let doc = parse_jcc(text);
     let s = &doc.sessions[0];
     assert_eq!((s.id.as_str(), s.id_kind), ("c-1", IdKind::Cira));
     assert_eq!(s.cira(), Some("c-1"));
@@ -2603,8 +2680,8 @@ draft
   #[test]
   fn uuid_line_is_a_legacy_address() {
     let text =
-      "# Claude\n## S\n> uuid=335b461a-eba5-485f-898c-f757fdb3f2bf\n> dangerous\n\n### WAIT\n";
-    let s = &parse(text).sessions[0];
+      "# Cira\n## S\n> uuid=335b461a-eba5-485f-898c-f757fdb3f2bf\n> dangerous\n\n### WAIT\n";
+    let s = &parse_jcc(text).sessions[0];
     assert_eq!(s.id, "335b461a-eba5-485f-898c-f757fdb3f2bf");
     assert_eq!(s.id_kind, IdKind::Uuid);
     assert_eq!(s.cira(), None, "a legacy heading has no Cira id until it is migrated");
@@ -2616,7 +2693,7 @@ draft
     // `[DELETED]` is never a session, but its Cira id must still be found so
     // the removal reaches Cira.
     let text = "\
-# Claude
+# Cira
 ## [DELETED] Old
 > cira=c-old
 
@@ -2627,7 +2704,7 @@ draft
 > uuid=cccc3333-0000-0000-0000-000000000000
 ## [DELETED] Bare
 ";
-    let doc = parse(text);
+    let doc = parse_jcc(text);
     let ids: Vec<&str> = doc.sessions.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, vec!["c-live"]);
     let deleted: Vec<(&str, IdKind)> =
@@ -2641,7 +2718,7 @@ draft
   #[test]
   fn binding_a_legacy_heading_writes_its_cira_id_and_drops_dangerous() {
     let text = "\
-# Claude
+# Cira
 ## S
 > uuid=335b461a-eba5-485f-898c-f757fdb3f2bf
 > last=42
@@ -2652,17 +2729,17 @@ hi
 ### WAIT
 draft
 ";
-    let doc = parse(text);
+    let doc = parse_jcc(text);
     let out = bind_cira_at(text, &doc, 0, "c-9").expect("the heading is there");
     assert!(!out.contains("> uuid="), "the legacy line is replaced, not kept: {out}");
     assert!(!out.contains("> dangerous"), "the mode is Cira's now (Q-155): {out}");
-    let s = &parse(&out).sessions[0];
+    let s = &parse_jcc(&out).sessions[0];
     assert_eq!(s.cira(), Some("c-9"));
     assert_eq!(s.last_active, Some(42));
     assert!(!s.dangerous);
     assert_eq!(s.messages.len(), 1);
     assert!(out.ends_with("### WAIT\ndraft\n"), "body untouched: {out}");
-    assert!(out.starts_with("# Claude\n## S\n> cira=c-9\n> last=42\n\n"), "{out}");
+    assert!(out.starts_with("# Cira\n## S\n> cira=c-9\n> last=42\n\n"), "{out}");
   }
 
   #[test]
@@ -2670,15 +2747,15 @@ draft
     // A hand-written heading with no id line: the id must land on the
     // session rather than being silently dropped.
     let text = "\
-# Claude
+# Cira
 ## My Session
 
 ### WAIT
 ";
-    let doc = parse(text);
+    let doc = parse_jcc(text);
     assert_eq!(doc.sessions[0].id, "");
     let updated = bind_cira_at(text, &doc, 0, "c-2").expect("the heading is there");
-    let new_doc = parse(&updated);
+    let new_doc = parse_jcc(&updated);
     assert_eq!(new_doc.sessions.len(), 1);
     assert_eq!(new_doc.sessions[0].label, "My Session");
     assert_eq!(new_doc.sessions[0].cira(), Some("c-2"));
@@ -2691,31 +2768,31 @@ draft
     // A label-keyed write hits the first heading twice and strands the second;
     // the index-keyed write must give each its own id.
     let text = "\
-# Claude
+# Cira
 ## New Session
 > uuid=
 ## New Session
 > uuid=
 ";
-    let doc = parse(text);
+    let doc = parse_jcc(text);
     assert_eq!(doc.sessions.len(), 2);
 
     let once = bind_cira_at(text, &doc, 0, "c-a").unwrap();
-    let doc = parse(&once);
+    let doc = parse_jcc(&once);
     let twice = bind_cira_at(&once, &doc, 1, "c-b").unwrap();
 
-    let final_doc = parse(&twice);
+    let final_doc = parse_jcc(&twice);
     let ids: Vec<&str> = final_doc.sessions.iter().map(|s| s.id.as_str()).collect();
     assert_eq!(ids, vec!["c-a", "c-b"], "each session keeps its own id");
   }
 
   #[test]
   fn renaming_a_heading_keeps_its_marker_and_body() {
-    let text = "# Claude\n## [D] Old name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n";
-    let doc = parse(text);
+    let text = "# Cira\n## [D] Old name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n";
+    let doc = parse_jcc(text);
     let out = rename_heading_at(text, &doc, 0, "New name").expect("the heading is there");
-    assert_eq!(out, "# Claude\n## [D] New name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n");
-    let doc = parse(&out);
+    assert_eq!(out, "# Cira\n## [D] New name\n> cira=c-1\n\n### WAIT\nx\n## Other\n> cira=c-2\n");
+    let doc = parse_jcc(&out);
     let out = rename_heading_at(&out, &doc, 1, "Renamed").unwrap();
     assert!(out.ends_with("## Renamed\n> cira=c-2\n"), "{out}");
   }
@@ -2724,8 +2801,8 @@ draft
   fn a_label_that_would_read_as_a_marker_or_break_the_heading_is_not_written() {
     // Found in review: a page rename to `[DELETED] x`, written into the
     // heading, would make jc send `cira session rm`.
-    let text = "# Claude\n## Old\n> cira=c-1\n";
-    let doc = parse(text);
+    let text = "# Cira\n## Old\n> cira=c-1\n";
+    let doc = parse_jcc(text);
     for label in ["[DELETED] x", "[D] x", "[X] x", "two\nlines", ""] {
       assert_eq!(rename_heading_at(text, &doc, 0, label), None, "{label:?}");
     }
@@ -2735,7 +2812,7 @@ draft
   #[test]
   fn one_heading_speaks_for_each_cira_ids_label() {
     let text = "\
-# Claude
+# Cira
 ## [D] Copy
 > cira=c-1
 ## Live
@@ -2747,7 +2824,7 @@ draft
 ## Legacy
 > uuid=u-1
 ";
-    let doc = parse(text);
+    let doc = parse_jcc(text);
     let picked: Vec<(usize, &str)> =
       doc.label_headings().into_iter().map(|(i, s)| (i, s.label.as_str())).collect();
     assert_eq!(picked, vec![(1, "Live"), (3, "Other")]);
@@ -2755,10 +2832,10 @@ draft
 
   #[test]
   fn update_last_active_lands_under_a_cira_line() {
-    let text = "# Claude\n## S\n> cira=c-1\n\n### WAIT\n";
-    let doc = parse(text);
+    let text = "# Cira\n## S\n> cira=c-1\n\n### WAIT\n";
+    let doc = parse_jcc(text);
     let out = update_last_active(text, &doc.sessions[0], 7);
-    assert_eq!(out, "# Claude\n## S\n> cira=c-1\n> last=7\n\n### WAIT\n");
+    assert_eq!(out, "# Cira\n## S\n> cira=c-1\n> last=7\n\n### WAIT\n");
   }
 
   #[test]
@@ -2766,7 +2843,7 @@ draft
     // Two headings name c-1 (a copy-pasted block): marking the copy [DELETED]
     // or [D] must not stop or remove the session the other still runs.
     let text = "\
-# Claude
+# Cira
 ## Live
 > cira=c-1
 ## [DELETED] Copy
@@ -2785,7 +2862,7 @@ draft
 > uuid=dddd4444-0000-0000-0000-000000000000
 ## Unbound
 ";
-    let doc = parse(text);
+    let doc = parse_jcc(text);
     let marks: Vec<(&str, Mark)> = doc.marks().into_iter().collect();
     assert_eq!(
       marks,
@@ -2798,20 +2875,100 @@ draft
   fn a_deferred_send_stays_pending_until_the_scheduled_path_delivers_it() {
     // A Cmd-Enter to a session that is not up yet must not read as sent, and
     // must survive a jc quit: it becomes a past-due scheduled send.
-    let text = "# Claude\n## S\n> cira=c-1\n\n### WAIT\nhello there\n";
-    let session = parse(text).sessions[0].clone();
+    let text = "# Cira\n## S\n> cira=c-1\n\n### WAIT\nhello there\n";
+    let session = parse_jcc(text).sessions[0].clone();
     let sent = send_from_wait(text, &session, 0..0, Some(1), test_now()).unwrap();
     assert_eq!(sent.schedule, None);
-    let doc = parse(&sent.new_text);
+    let doc = parse_jcc(&sent.new_text);
     let deferred =
       defer_message(&sent.new_text, &doc, "c-1", sent.message_index, test_now()).unwrap();
 
-    let s = &parse(&deferred).sessions[0];
+    let s = &parse_jcc(&deferred).sessions[0];
     let pending = s.pending_scheduled().expect("the message is pending, not sent");
     assert_eq!(pending.index, sent.message_index);
-    match fire_scheduled(&deferred, "c-1", test_now(), 2) {
+    match fire_scheduled(&deferred, Flavor::Jcc, "c-1", test_now(), 2) {
       FireOutcome::Deliver { body, .. } => assert_eq!(body, sent.message_text),
       _ => panic!("expected delivery"),
     }
+  }
+
+  #[test]
+  fn update_session_uuid_adds_missing_uuid_line() {
+    // jc: a hand-written heading with no `> uuid=` line gets one minted.
+    let text = "# Claude\n## My Session\n\n### WAIT\n";
+    let doc = parse_jc(text);
+    let updated = update_session_uuid_at(text, &doc, 0, "minted").expect("the heading is there");
+    let new_doc = parse_jc(&updated);
+    assert_eq!(new_doc.sessions[0].id, "minted");
+    assert!(new_doc.sessions[0].wait.is_some(), "WAIT survived the insert");
+  }
+
+  #[test]
+  fn update_session_uuid_targets_the_right_duplicate_label() {
+    let text = "# Claude\n## New Session\n> uuid=\n## New Session\n> uuid=\n";
+    let doc = parse_jc(text);
+    let once = update_session_uuid_at(text, &doc, 0, "u-a").unwrap();
+    let doc = parse_jc(&once);
+    let twice = update_session_uuid_at(&once, &doc, 1, "u-b").unwrap();
+    let ids: Vec<String> = parse_jc(&twice).sessions.iter().map(|s| s.id.clone()).collect();
+    assert_eq!(ids, vec!["u-a", "u-b"], "each session keeps its own uuid");
+  }
+
+  // Cira PLAN TMUX-07: jc and jcc share one TODO.md and never one heading.
+  const BOTH: &str = "\
+# Claude
+## jc session
+> uuid=u-jc
+
+### WAIT
+## pasted from jcc
+> cira=c-pasted
+## [DELETED] released
+> uuid=u-released
+# Cira
+## jcc session
+> cira=c-jcc
+
+### WAIT
+## moved from jc
+> uuid=u-moved
+# Notes
+## not a session
+> uuid=u-notes
+";
+
+  #[test]
+  fn jc_and_jcc_read_disjoint_headings_of_one_file() {
+    let ids = |doc: &TodoDocument| doc.sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+    let jc = parse_jc(BOTH);
+    let jcc = parse_jcc(BOTH);
+    assert_eq!(ids(&jc), ["u-jc"], "jc: only `> uuid=` headings under # Claude");
+    assert_eq!(ids(&jcc), ["c-jcc", "u-moved"], "jcc: only headings under # Cira");
+    // What each does not own it only lists, so its transcripts are not
+    // offered for adoption; a `[DELETED]` heading has let its conversation go.
+    assert_eq!(jc.foreign_ids, ["c-pasted", "c-jcc", "u-moved", "u-notes"]);
+    assert_eq!(jcc.foreign_ids, ["u-jc", "c-pasted", "u-notes"]);
+    // A heading jc does not own takes nothing below it: no messages, no WAIT.
+    assert!(jc.sessions[0].wait.is_some());
+  }
+
+  #[test]
+  fn each_flavor_writes_only_its_own_id_line_in_its_own_section() {
+    let jc = parse_jc(BOTH);
+    let out = insert_session_heading(BOTH, &jc, "new jc", "u-new");
+    assert!(out.contains("# Claude\n## new jc\n> uuid=u-new\n"), "{out}");
+    assert_eq!(bind_cira_at(BOTH, &jc, 0, "c-x"), None, "jc never writes a > cira= line");
+
+    let jcc = parse_jcc(BOTH);
+    let out = insert_session_heading(BOTH, &jcc, "new jcc", "c-new");
+    assert!(out.contains("# Cira\n## new jcc\n> cira=c-new\n"), "{out}");
+    assert_eq!(parse_jc(&out).sessions.len(), 1, "jc does not see jcc's new heading");
+    assert_eq!(update_session_uuid_at(BOTH, &jcc, 0, "u-x"), None, "jcc never rewrites a uuid");
+
+    // A first jcc session in a file with only jc's section gets its own section.
+    let only_jc = "# Claude\n## a\n> uuid=u-a\n";
+    let out = insert_session_heading(only_jc, &parse_jcc(only_jc), "b", "c-b");
+    assert_eq!(out, "# Claude\n## a\n> uuid=u-a\n\n# Cira\n## b\n> cira=c-b\n\n### WAIT\n");
+    assert_eq!(parse_jc(&out).sessions.len(), 1);
   }
 }

@@ -1,9 +1,11 @@
 use crate::views::code_view::CodeView;
 use crate::views::pane::PaneContentKind;
-use crate::views::session_state::{Heading, SessionId, SessionState};
+use crate::views::session_state::{Heading, SessionId, SessionState, Start};
 use crate::views::todo_view::TodoView;
 use gpui::*;
 use jc_core::cira::{OpenCounts, Status};
+use jc_core::claude::Launch;
+use jc_core::flavor::Flavor;
 use jc_terminal::Palette;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -13,6 +15,16 @@ use std::path::{Path, PathBuf};
 /// "can't tell" rather than "nothing there".
 pub(crate) fn home_dir() -> Option<PathBuf> {
   std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+}
+
+/// jc: the launch flag for `uuid` given `dirs`, the project's transcript
+/// buckets. `None` dirs means `$HOME` is unset, so nothing can be located at
+/// all; assume the common case and resume.
+fn launch_from(dirs: Option<&[PathBuf]>, uuid: &str) -> Launch {
+  match dirs {
+    Some(dirs) if !jc_core::claude::transcript_in(dirs, uuid) => Launch::New,
+    _ => Launch::Resume,
+  }
 }
 
 pub struct SavedPaneLayout {
@@ -34,6 +46,9 @@ pub struct ProjectState {
   /// Conversation uuids and job short ids of the sessions Cira lists for
   /// this project, so the transcript picker does not offer them again.
   pub cira_known: HashSet<String>,
+  /// jc: cached transcript buckets for this project (see [`Self::launch_for`]).
+  /// `None` when `$HOME` is unset, and always for jcc, which asks Cira.
+  session_dirs: Option<Vec<PathBuf>>,
 }
 
 impl ProjectState {
@@ -51,9 +66,19 @@ impl ProjectState {
     todo_view.update(cx, |tv, cx| tv.truncate_logs(window, cx));
 
     // Adopt every active TODO session so the full set of open sessions is
-    // restored, not just one. Each starts with an empty Claude pane: what it
+    // restored, not just one. jc runs `claude` on each at once; a session whose
+    // transcript Claude has since garbage-collected is revived rather than
+    // retired: `launch_for` sees the missing `<uuid>.jsonl` and claims the uuid
+    // with `--session-id`. jcc starts each with an empty Claude pane: what it
     // attaches to is the job Cira names (`Workspace::drive_sessions`), and a
     // legacy `> uuid=` heading is first migrated through Cira.
+    let flavor = Flavor::current();
+    // jc: one bucket scan for the whole project, cached on the struct and
+    // reused by every later `launch_for`.
+    let session_dirs = match flavor {
+      Flavor::Jc => Self::session_dirs(&path),
+      Flavor::Jcc => None,
+    };
     let document = todo_view.read(cx).document().clone();
     let mut sessions = HashMap::new();
     let mut next_session_id: SessionId = 0;
@@ -86,7 +111,15 @@ impl ProjectState {
       let id = next_session_id;
       next_session_id += 1;
 
-      let state = SessionState::create(id, Heading::of(todo_session), &path, palette, window, cx);
+      let start = match flavor {
+        Flavor::Jc => Start::Own {
+          launch: launch_from(session_dirs.as_deref(), &todo_session.id),
+          dangerous: todo_session.dangerous,
+        },
+        Flavor::Jcc => Start::Cira,
+      };
+      let state =
+        SessionState::create(id, Heading::of(todo_session), start, &path, palette, window, cx);
       sessions.insert(id, state);
 
       let last = todo_session.last_active.unwrap_or(0);
@@ -113,7 +146,29 @@ impl ProjectState {
       todo_view,
       cira_open: None,
       cira_known: HashSet::new(),
+      session_dirs,
     }
+  }
+
+  /// jc: start `claude` on `uuid` the only way that works: `--resume` needs the
+  /// transcript to exist, and `--session-id` needs it not to (see [`Launch`]).
+  ///
+  /// Answers from the bucket list cached at construction, which costs only a
+  /// few `stat`s — enumerating buckets means a `read_dir` of the shared
+  /// `~/.claude/projects`, and this runs on the main thread from a picker
+  /// confirm. A *miss* is the dangerous direction (resuming as new would fail
+  /// on an existing conversation) and is also the case a stale cache causes, so
+  /// the scan is paid exactly there: a worktree bucket created since startup is
+  /// picked up before concluding the transcript is gone.
+  ///
+  /// With `$HOME` unset no bucket can be located at all; assume the common case
+  /// and resume.
+  pub fn launch_for(&mut self, uuid: &str) -> Launch {
+    if launch_from(self.session_dirs.as_deref(), uuid) == Launch::Resume {
+      return Launch::Resume;
+    }
+    self.session_dirs = Self::session_dirs(&self.path);
+    launch_from(self.session_dirs.as_deref(), uuid)
   }
 
   /// All of Claude's JSONL session buckets for this project (root + worktrees),

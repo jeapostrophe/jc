@@ -1,3 +1,4 @@
+use crate::flavor::Flavor;
 use crate::model::{Project, WindowLayout};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -47,17 +48,23 @@ impl AppState {
   }
 }
 
-/// JC's config and state directory: `$JC_CONFIG_DIR` when set and non-empty, else
-/// `~/.config/jc`. The override lets a second JC build run beside the installed one
-/// without sharing its `state.toml` or its single-instance socket (`jc.sock`).
+/// The app's config and state directory: `$JC_CONFIG_DIR` when set and
+/// non-empty, else the flavor's own under `$HOME` (`~/.config/jc`, or
+/// `~/.config/jcc`: [`Flavor::config_subdir`]). So `jc` and `jcc` never share a
+/// `state.toml` (their project lists), a `sessions.toml` or the single-instance
+/// socket (`jc.sock`), and the override lets a development build run beside both.
 pub fn config_dir() -> PathBuf {
-  config_dir_from(std::env::var_os("JC_CONFIG_DIR"), dirs::home_dir())
+  config_dir_from(Flavor::current(), std::env::var_os("JC_CONFIG_DIR"), dirs::home_dir())
 }
 
-fn config_dir_from(over: Option<std::ffi::OsString>, home: Option<PathBuf>) -> PathBuf {
+fn config_dir_from(
+  flavor: Flavor,
+  over: Option<std::ffi::OsString>,
+  home: Option<PathBuf>,
+) -> PathBuf {
   match over.filter(|d| !d.is_empty()) {
     Some(dir) => PathBuf::from(dir),
-    None => home.expect("could not determine home directory").join(".config/jc"),
+    None => home.expect("could not determine home directory").join(flavor.config_subdir()),
   }
 }
 
@@ -265,11 +272,33 @@ mod tests {
   #[test]
   fn jc_config_dir_overrides_home_config() {
     let home = Path::new("/home/someone");
+    for flavor in [Flavor::Jc, Flavor::Jcc] {
+      assert_eq!(
+        config_dir_from(flavor, Some("/tmp/jc-scratch".into()), Some(home.to_path_buf())),
+        PathBuf::from("/tmp/jc-scratch")
+      );
+    }
     assert_eq!(
-      config_dir_from(Some("/tmp/jc-scratch".into()), Some(home.to_path_buf())),
-      PathBuf::from("/tmp/jc-scratch")
+      config_dir_from(Flavor::Jc, Some("".into()), Some(home.to_path_buf())),
+      home.join(".config/jc")
     );
-    assert_eq!(config_dir_from(Some("".into()), Some(home.to_path_buf())), home.join(".config/jc"));
-    assert_eq!(config_dir_from(None, Some(home.to_path_buf())), home.join(".config/jc"));
+    assert_eq!(
+      config_dir_from(Flavor::Jc, None, Some(home.to_path_buf())),
+      home.join(".config/jc")
+    );
+  }
+
+  #[test]
+  fn jcc_keeps_its_own_config_dir_beside_jc() {
+    let home = Some(PathBuf::from("/home/someone"));
+    let jc = config_dir_from(Flavor::Jc, None, home.clone());
+    let jcc = config_dir_from(Flavor::Jcc, None, home);
+    assert_eq!(jcc, Path::new("/home/someone/.config/jcc"));
+    assert!(
+      !jcc.starts_with(&jc) && !jc.starts_with(&jcc),
+      "{} vs {}",
+      jc.display(),
+      jcc.display()
+    );
   }
 }

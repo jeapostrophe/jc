@@ -4,10 +4,12 @@ use gpui::*;
 use gpui_component::input::Position;
 use jc_core::background::{self, Claude};
 use jc_core::cira::{self, HookState, Marker};
+use jc_core::claude::Launch;
+use jc_core::flavor::Flavor;
 use jc_core::hooks::HookEventKind;
 use jc_core::lifecycle::{Backoff, ShellChild, ShellPane, ShellRun};
 use jc_core::todo::SessionKey;
-use jc_terminal::{ChildSpec, Palette, TerminalConfig, TerminalView};
+use jc_terminal::{ChildSpec, LaunchSettle, Palette, TerminalConfig, TerminalView};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -23,20 +25,49 @@ pub struct SavedViewState {
 
 pub type SessionId = usize;
 
+/// Discounts `claude`'s own startup output from jc's Cmd-P activity marker: its
+/// banner, and the transcript replay on `--resume`, are jc launching the
+/// session rather than work done while you were away.
+///
+/// `quiet` is longer than a moment because `claude --resume` pauses between
+/// printing the banner and replaying a long transcript, and that pause must not
+/// end the window. `give_up` bounds it, so a child that never goes quiet is
+/// baselined anyway rather than tracked for the life of the process. These are
+/// facts about the Claude CLI, which is why they live here and not in the
+/// terminal crate.
+const CLAUDE_LAUNCH_SETTLE: LaunchSettle =
+  LaunchSettle { quiet: Duration::from_secs(4), give_up: Duration::from_secs(30) };
+
+/// How a session's panes start, by flavor (`jc_core::flavor::Flavor`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+  /// jc: the Claude pane runs `claude` itself on the heading's uuid
+  /// (`Flavor::claude_command`), the Terminal pane jc's own shell.
+  Own { launch: Launch, dangerous: bool },
+  /// jcc: the Claude pane waits for [`SessionState::attach`] to the job Cira
+  /// names, the Terminal pane for the shell Cira keeps.
+  Cira,
+}
+
 pub struct SessionState {
   pub id: SessionId,
-  /// The heading's address in TODO.md (`jc_core::todo::SessionKey`): its
-  /// `> cira=` id, or — until the session is migrated — its legacy
-  /// `> uuid=`. Empty while a new session's heading is not written yet.
+  /// The heading's address in TODO.md (`jc_core::todo::SessionKey`): for jc
+  /// its `> uuid=`; for jcc its `> cira=` id, or — until the session is
+  /// migrated — a legacy `> uuid=`. Empty while a new jcc session's heading is
+  /// not written yet.
   pub key: String,
+  /// jc only: Claude is working (set by a send and the `UserPromptSubmit`
+  /// hook, cleared by `Stop`/`StopFailure`/`IdlePrompt`), so quitting asks first.
+  pub busy: bool,
   /// The id Cira minted for it (`> cira=`), its `CIRA_SESSION`. `None` until
   /// Cira has answered `cira session new` for it.
   pub cira: Option<String>,
   /// The short id the Claude pane's attach client runs on (`claude attach
   /// <bg>`), empty while no client runs. Cira names it; jc never keeps it.
   pub bg: String,
-  /// The conversation uuid hooks report, learned from Cira, a hook, or a
-  /// `/clear` pair. Empty until learned. Never written to TODO.md.
+  /// The conversation uuid hooks report. jc: the heading's, followed through
+  /// a `/clear`. jcc: learned from Cira, a hook, or a `/clear` pair; empty
+  /// until learned, and never written to TODO.md.
   pub uuid: String,
   /// The session process is running, so text typed into the attach reaches
   /// it. Cleared whenever the attach client restarts, set again by
@@ -107,6 +138,15 @@ impl Heading {
 }
 
 impl SessionState {
+  /// jc: note that the user has given this session work.
+  ///
+  /// Ends the Claude terminal's launch-settle window WITHOUT clearing its
+  /// marker — see [`TerminalView::cancel_launch_settle`].
+  pub fn mark_user_input(&mut self, cx: &App) {
+    self.busy = true;
+    self.claude_terminal.read(cx).cancel_launch_settle();
+  }
+
   /// Record what a hook received at `at` says about the session's state, if
   /// it says anything (`jc_core::cira::note_hook`).
   pub fn note_hook(&mut self, kind: &HookEventKind, at: SystemTime) {
@@ -138,27 +178,48 @@ impl SessionState {
     self.cira_session.as_ref().map(|s| s.dangerous)
   }
 
-  /// A session whose Claude pane waits for [`Self::attach`].
+  /// A session started as `start` says: jc's runs `claude` at once, jcc's
+  /// waits for [`Self::attach`].
+  #[allow(clippy::too_many_arguments)]
   pub fn create(
     id: SessionId,
     heading: Heading,
+    start: Start,
     project_path: &Path,
     palette: &Palette,
     window: &mut Window,
     cx: &mut App,
   ) -> Self {
     let Heading { key, label, cira } = heading;
-    let claude_config =
-      TerminalConfig { child: None, palette: Some(palette.clone()), ..Default::default() };
-    // The shell pane attaches to the session's shell in Cira's tmux server
-    // (TMUX-02), asked for by its Cira id at the first status read once Cira
-    // has minted one (`ShellPane`).
-    let general_config = TerminalConfig {
-      child: None,
-      palette: Some(palette.clone()),
-      env: shell_env(cira.as_deref()),
-      ..Default::default()
+    // jc's own `claude`, only ever from the flavor: in jcc this is `None`.
+    let own = match start {
+      Start::Own { launch, dangerous } => Flavor::current().claude_command(&key, launch, dangerous),
+      Start::Cira => None,
     };
+    let (claude_config, general_config) = match own {
+      Some(argv) => (
+        TerminalConfig {
+          child: Some(ChildSpec::Command(argv)),
+          palette: Some(palette.clone()),
+          launch_settle: Some(CLAUDE_LAUNCH_SETTLE),
+          ..Default::default()
+        },
+        TerminalConfig { palette: Some(palette.clone()), ..Default::default() },
+      ),
+      None => (
+        TerminalConfig { child: None, palette: Some(palette.clone()), ..Default::default() },
+        // The shell pane attaches to the session's shell in Cira's tmux server
+        // (TMUX-02), asked for by its Cira id at the first status read once Cira
+        // has minted one (`ShellPane`).
+        TerminalConfig {
+          child: None,
+          palette: Some(palette.clone()),
+          env: shell_env(cira.as_deref()),
+          ..Default::default()
+        },
+      ),
+    };
+    let is_own = claude_config.child.is_some();
 
     let project = project_path.to_path_buf();
     let claude_terminal = cx.new(|cx| TerminalView::new(claude_config, Some(&project), window, cx));
@@ -166,16 +227,17 @@ impl SessionState {
       cx.new(|cx| TerminalView::new(general_config, Some(&project), window, cx));
     let code_view = cx.new(|cx| CodeView::new(window, cx));
 
-    if cira.is_none() {
+    if !is_own && cira.is_none() {
       general_terminal
         .update(cx, |t, cx| t.show_status("the shell starts once Cira has named this session", cx));
     }
     Self {
       id,
+      uuid: if is_own { key.clone() } else { String::new() },
       key,
+      busy: false,
       cira,
       bg: String::new(),
-      uuid: String::new(),
       live: false,
       asking: false,
       failed: false,

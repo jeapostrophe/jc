@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
-pub const HOOK_PATH_PREFIX: &str = "/jc-hook/";
+use crate::flavor::Flavor;
 
 #[derive(Debug, Clone)]
 pub struct HookEvent {
@@ -62,7 +62,9 @@ struct ClearStash {
 }
 
 impl HookServer {
-  pub fn start(project_paths: Vec<PathBuf>) -> anyhow::Result<Self> {
+  /// Serve the hooks `flavor` installs (its [`Flavor::hook_prefix`]) for
+  /// `project_paths` on a free local port.
+  pub fn start(flavor: Flavor, project_paths: Vec<PathBuf>) -> anyhow::Result<Self> {
     let server = tiny_http::Server::http("127.0.0.1:0")
       .map_err(|e| anyhow::anyhow!("failed to bind hook server: {e}"))?;
     let port = match server.server_addr() {
@@ -75,7 +77,7 @@ impl HookServer {
 
     let listener = server.clone();
     std::thread::spawn(move || {
-      accept_loop(&listener, tx, &project_paths);
+      accept_loop(&listener, tx, flavor.hook_prefix(), &project_paths);
     });
 
     eprintln!("hook server listening on port {port}");
@@ -91,6 +93,7 @@ impl HookServer {
 fn accept_loop(
   server: &tiny_http::Server,
   tx: flume::Sender<HookEvent>,
+  prefix: &str,
   project_paths: &[PathBuf],
 ) {
   // Stash for correlating SessionEnd(clear) → SessionStart(clear) pairs.
@@ -100,12 +103,12 @@ fn accept_loop(
   for mut request in server.incoming_requests() {
     let path = request.url().to_string();
 
-    if !path.starts_with(HOOK_PATH_PREFIX) {
+    if !path.starts_with(prefix) {
       let _ = request.respond(json_response(404, r#"{"error":"not found"}"#));
       continue;
     }
 
-    let route = &path[HOOK_PATH_PREFIX.len()..];
+    let route = &path[prefix.len()..];
 
     // Read body
     let mut body = String::default();

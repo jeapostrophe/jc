@@ -766,9 +766,11 @@ impl SessionPickerDelegate {
     projects: &[ProjectState],
     active_project_index: usize,
     todo_documents: &[&TodoDocument],
+    cx: &App,
   ) -> Self {
     let mut entries = Vec::new();
     let mut active_entry = None;
+    let flavor = jc_core::flavor::Flavor::current();
 
     for (pi, project) in projects.iter().enumerate() {
       let blocks = cira::blocks_label(project.cira_open);
@@ -808,8 +810,17 @@ impl SessionPickerDelegate {
           // starting has no heading yet.
           key: (!session.key.is_empty()).then(|| SessionKey::Id(session.key.clone())),
           // The session on screen is the one you're looking at: only a dialog,
-          // which needs you whether seen or not, marks it.
-          marker: session.marker(last_active).filter(|m| !is_active || *m == Marker::Dialog),
+          // which needs you whether seen or not, marks it. jc's marker is
+          // "Claude printed something since this session was last on screen"
+          // (shown as finished, `*`); jcc's comes from Cira's session state.
+          marker: match flavor {
+            jc_core::flavor::Flavor::Jc => (!is_active
+              && session.claude_terminal.read(cx).has_unseen_output())
+            .then_some(Marker::Finished),
+            jc_core::flavor::Flavor::Jcc => {
+              session.marker(last_active).filter(|m| !is_active || *m == Marker::Dialog)
+            }
+          },
           blocks: blocks.clone(),
           mode: session.cira_session.as_ref().map_or("", mode_badge),
           last_active,
@@ -983,11 +994,16 @@ impl PickerDelegate for SessionPickerDelegate {
         .gap_y_0p5()
         .text_xs()
         .text_color(muted)
+        .children(match jc_core::flavor::Flavor::current() {
+          jc_core::flavor::Flavor::Jc => vec![legend_item("*", theme.red, "activity", muted)],
+          jc_core::flavor::Flavor::Jcc => vec![
+            legend_item("!", theme.red, "permission", muted),
+            legend_item("*", theme.red, "finished", muted),
+            legend_item("~", muted, "agents", muted),
+            legend_item("x", muted, "gone", muted),
+          ],
+        })
         .children([
-          legend_item("!", theme.red, "permission", muted),
-          legend_item("*", theme.red, "finished", muted),
-          legend_item("~", muted, "agents", muted),
-          legend_item("x", muted, "gone", muted),
           legend_item(">", theme.green, "active", muted),
           legend_item("~", theme.yellow, "adopt", muted),
           legend_item("~", theme.muted_foreground, "disabled", muted),
@@ -1135,8 +1151,18 @@ impl ProjectActionsPickerDelegate {
       // or Cira lists a session on it: by its uuid, or by a job short id it
       // starts with (a background session's first uuid does).
       let doc = todo_documents.get(active_project_index);
-      let ids: HashSet<&str> =
-        doc.map(|doc| doc.sessions.iter().map(|s| s.id.as_str()).collect()).unwrap_or_default();
+      // A heading of the other app's (jc's under `# Claude`, jcc's under
+      // `# Cira`) names a conversation that app runs: never offered here.
+      let ids: HashSet<&str> = doc
+        .map(|doc| {
+          doc
+            .sessions
+            .iter()
+            .map(|s| s.id.as_str())
+            .chain(doc.foreign_ids.iter().map(String::as_str))
+            .collect()
+        })
+        .unwrap_or_default();
       let running: HashSet<&str> = projects[active_project_index]
         .sessions
         .values()
@@ -1144,8 +1170,14 @@ impl ProjectActionsPickerDelegate {
         .flatten()
         .collect();
       let cira_known = &projects[active_project_index].cira_known;
+      // A conversation a background job runs is Cira's (jcc's): jc resuming it
+      // too would run it twice.
+      let background = crate::views::project_state::home_dir()
+        .map(|home| jc_core::claude::background_conversations(&home.join(".claude/jobs")))
+        .unwrap_or_default();
       let known = |uuid: &str| {
         ids.contains(uuid)
+          || background.contains(uuid)
           || running.contains(uuid)
           || cira_known.contains(uuid)
           || jc_core::background::short_of(uuid).is_some_and(|short| cira_known.contains(short))

@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-APP_BUNDLE="$PROJECT_ROOT/target/release/jc.app"
-CONTENTS_DIR="$APP_BUNDLE/Contents"
-MACOS_DIR="$CONTENTS_DIR/MacOS"
-RESOURCES_DIR="$CONTENTS_DIR/Resources"
+# One binary, two apps (Cira PLAN TMUX-07): jc.app runs it as `jc-app` (jc,
+# its own Claude sessions); jcc.app runs the same binary named `jcc`, which
+# makes it Cira's client, with its own bundle id (com.jc.app.jcc), config
+# directory (~/.config/jcc) and TODO.md section (`# Cira`).
 
 echo "Building jc-app (release)..."
 (cd "$PROJECT_ROOT" && cargo build --release -p jc-app)
@@ -47,20 +47,18 @@ if [ ! -f "$ICON_CACHE" ] || [ "$PROJECT_ROOT/icon.png" -nt "$ICON_CACHE" ]; the
   rm -rf "$ICON_TMP"
 fi
 
-rm -rf "$APP_BUNDLE"
+# bundle APP EXECUTABLE PLIST: one app bundle around the release binary.
+bundle() {
+  local app="$PROJECT_ROOT/target/release/$1"
+  rm -rf "$app"
+  mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+  cp "$PROJECT_ROOT/jc-app/$3" "$app/Contents/Info.plist"
+  cp "$PROJECT_ROOT/target/release/jc-app" "$app/Contents/MacOS/$2"
+  cp "$ICON_CACHE" "$app/Contents/Resources/AppIcon.icns"
+  # Ad-hoc codesign
+  codesign --force --sign - "$app"
+  echo "Bundle created at: $app"
+}
 
-# Create bundle structure
-mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
-
-# Copy Info.plist
-cp "$PROJECT_ROOT/jc-app/Info.plist" "$CONTENTS_DIR/Info.plist"
-
-# Copy binary
-cp "$PROJECT_ROOT/target/release/jc-app" "$MACOS_DIR/jc-app"
-
-cp "$ICON_CACHE" "$RESOURCES_DIR/AppIcon.icns"
-
-# Ad-hoc codesign
-codesign --force --sign - "$APP_BUNDLE"
-
-echo "Bundle created at: $APP_BUNDLE"
+bundle jc.app jc-app Info.plist
+bundle jcc.app jcc Info-jcc.plist

@@ -2,6 +2,7 @@ pub mod background;
 pub mod cira;
 pub mod claude;
 pub mod config;
+pub mod flavor;
 pub mod hooks;
 pub mod hooks_settings;
 pub mod lifecycle;

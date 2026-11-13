@@ -9,21 +9,21 @@ data/
   light_theme.toml                  # unified light theme (Tomorrow)
   fonts/                            # bundled Lilex font (Regular, Bold, Italic, BoldItalic)
 scripts/
-  bundle.sh                         # release build + macOS .app bundle + icon + codesign
+  bundle.sh                         # release build + jc.app and jcc.app bundles + icon + codesign
   update-outline-queries.sh         # fetch outline.scm files from Zed repo
   update-gpui-component.sh          # re-vendor gpui-component from cargo cache + apply patches
   backup-todos.sh                   # one-time TODO.md.bak snapshot before the log-bound sweep
 jc-core/                            # data model + config persistence
-  src/lib.rs, background.rs, cira.rs, claude.rs, config.rs, model.rs,
-      theme.rs, todo.rs, hooks.rs, hooks_settings.rs
+  src/lib.rs, background.rs, cira.rs, claude.rs, config.rs, flavor.rs,
+      lifecycle.rs, model.rs, theme.rs, todo.rs, hooks.rs, hooks_settings.rs
   tests/fixtures/cira/                # `cira status --json` captured from a dev daemon (make-status.sh)
 jc-terminal/                        # embedded terminal emulator
-  src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, view.rs
+  src/lib.rs, colors.rs, input.rs, terminal.rs, pty.rs, render.rs, settle.rs, view.rs
   examples/terminal_window.rs
 jc-app/                             # binary: CLI + GPUI app
   src/main.rs, app.rs, outline.rs, language.rs, ipc.rs, file_watcher.rs, notify.rs
   src/views/
-    workspace/{mod,pickers,render}.rs
+    workspace/{mod,own,sessions,pickers,render}.rs   # own: jc's lifecycle; sessions: jcc's
     pane.rs, picker.rs, project_state.rs, session_state.rs
     code_view.rs, todo_view.rs
     close_confirm.rs, keybinding_help.rs
@@ -46,12 +46,12 @@ vendor/
 | Symbol navigation | tree-sitter custom `outline.scm` queries (sourced from Zed) |
 | Project file listing | `git2` 0.20.x (vendored libgit2) — index + status, read once per Cmd-O picker open |
 | External-edit merge | `diffy` 0.4 three-way merge in `CodeView::try_merge` when a watched file changes under unsaved edits |
-| Claude sessions | Claude Code background sessions owned by Cira: requests through `cira session …` and reads of `cira status --json` (`jc_core::cira`), `claude attach` and the read-only `claude agents --json` (`jc_core::background`) — argument vectors, off the main thread |
-| Cira | `cira status --json` polled on a thread of its own (`jc_core::cira::poll`): pending counts and session states |
-| IPC | Unix socket (`~/.config/jc/jc.sock`) — multiple `jc .` invocations route to one running instance |
+| Claude sessions | jc: `claude --session-id <uuid>` or `--resume <uuid>` in each Claude pane, uuids minted by jc (`uuid` v4). jcc: Claude Code background sessions owned by Cira, requests through `cira session …` and reads of `cira status --json` (`jc_core::cira`), `claude attach` and the read-only `claude agents --json` (`jc_core::background`) — argument vectors, off the main thread |
+| Cira (jcc) | `cira status --json` polled on a thread of its own (`jc_core::cira::poll`): pending counts and session states |
+| IPC | Unix socket (`jc.sock` in the config dir) — multiple `jc .` (or `jcc .`) invocations route to one running instance of that app |
 | File watching | `notify` 7.x with debouncing, per open `CodeView` (which is also what backs `TodoView`) |
 | Desktop notifications | macOS native: `UNUserNotificationCenter` banners (bundled .app) + dock bounce fallback |
-| Persistent state | `~/.config/jc/` — project registry, window layout; session state in TODO.md |
+| Persistent state | `~/.config/jc/` (jcc: `~/.config/jcc/`, both overridden by `$JC_CONFIG_DIR`) — project registry, window layout, jcc's `sessions.toml`; session state in TODO.md |
 
 ## Session Model
 
@@ -65,7 +65,36 @@ The workspace has an active project with an active session. The active session d
 
 **Active pane:** real keyboard focus is the source of truth for which pane is "active". The pane border and Cmd-[/Cmd-] navigation derive from `focused_pane_index()` (which queries gpui focus); `active_pane_index` is only a cache, kept in sync by an `on_focus_in` subscription per pane (resolved by pane *entity*, not a captured index, so `set_layout` reordering can't make it stale) and resynced before cache-dependent actions like Cmd-Enter/Cmd-S.
 
-### Session Lifecycle
+### Two Apps: jc and jcc
+
+One binary, two apps (Cira PLAN TMUX-07): `jc_core::flavor::Flavor` is chosen in `main` from the program's file name (`jcc` → `Flavor::Jcc`, else `Flavor::Jc`; `jcc.app` names its executable `jcc`) and read through `Flavor::current()`. It decides, and is the only thing that decides:
+
+| | `Flavor::Jc` | `Flavor::Jcc` |
+|---|---|---|
+| Who runs a session | jc: `Flavor::claude_command` (`claude --session-id` or `--resume <uuid>`), `workspace/own.rs` | Cira: `Flavor::cira` is jcc's only `cira` client, `workspace/sessions.rs` |
+| TODO.md | `##` under `# Claude` with `> uuid=` (`Flavor::section`, `Flavor::id_kind`, `Flavor::owns`) | `##` under `# Cira`; `> cira=`, or a moved `> uuid=` it migrates |
+| Config dir | `~/.config/jc` | `~/.config/jcc` (`Flavor::config_subdir`; `$JC_CONFIG_DIR` overrides either) |
+| Hook URLs | `/jc-hook/` | `/jcc-hook/` (`Flavor::hook_prefix`) |
+| Bundle | `jc.app`, `com.jc.app` | `jcc.app`, `com.jc.app.jcc` (`jc-app/Info-jcc.plist`) |
+
+`todo::parse(text, flavor)` returns only the flavor's sessions; ids of other `##` headings go to `TodoDocument::foreign_ids` (never acted on, kept out of the transcript picker). The writers check the document's flavor: `todo::bind_cira_at` writes nothing in a jc document, `todo::update_session_uuid_at` nothing in a jcc one. `Workspace` dispatches each lifecycle entry point on `Workspace::flavor` (`create_new_session`, `adopt_session`, `adopt_transcript`, `toggle_session_disabled`, hooks); jc builds no Cira poll, keeps no `sessions.toml` and observes no pane exits. `hooks_settings` edits `settings.local.json` under an exclusive lock on the project's `.claude` directory and by rename, removing only its own prefix's entries, so both apps' hooks coexist. jcc's `Workspace::migrate` refuses while `claude::conversation_running` finds a foreground `claude` on the uuid (its command line, or `~/.claude/sessions/<pid>.json` after a `/clear`).
+
+### Session Lifecycle: jc
+
+- **UUID assignment:** jc mints the UUID. `SessionState::create` takes a `Launch` discriminant: `Launch::New` spawns `claude --session-id <uuid>`, `Launch::Resume` spawns `claude --resume <uuid>`. The two are not interchangeable — `--resume` on a UUID with no transcript exits with "No conversation found", and `--session-id` needs the UUID to be free — so every adoption path picks between them with `ProjectState::launch_for`, which tests `jc_core::claude::transcript_in` over the project's buckets. `SessionState::uuid` is therefore always populated — there is no pending, UUID-less state and no `cwd`-based matching of a first hook event. A `> dangerous` metadata line appends `--dangerously-skip-permissions` to either form.
+- **Project init:** `ProjectState::create` bounds every session's message log (`TodoView::truncate_logs`), then adopts **every** `SessionStatus::Active` session in TODO.md, each with the flag `launch_for` picks for it; `[D]` and `[DELETED]` are skipped, as is any heading repeating a `> uuid=` already adopted this pass (a copy-pasted block would otherwise put two `claude` processes on one transcript). The active session is the one with the most recent `> last=` timestamp (ties fall back to document order).
+- **New session:** `Workspace::own_new_session` (Cmd-Shift-P → "New session", or confirming an empty project in Cmd-P) generates a UUID, spawns with `Launch::New`, and writes the heading plus `> uuid=` into TODO.md in the same update. The label is just `New Session`; it is a display name, not an address, and need not be unique (see **Session addressing** below).
+- **Legacy blank UUIDs:** an older jc created a heading with an empty `> uuid=` and filled it from the first hook event; if that hook never landed, the heading is unbound while its real conversation lives under a UUID Claude chose. jc does **not** mint one at startup — doing so would bind the heading to an empty conversation and orphan the real one, rewriting the file before the user saw anything. Such headings are simply not launched, and both pickers list them as adoptable; `Workspace::own_adopt_session` mints and records the UUID at that point, so it is a choice the user made. (The real transcript, if there is one, is still offered separately under "unattached".)
+- **Session addressing:** every operation that *writes* to a heading keys on the UUID; a label is a display name and is never an address. The one exception is a heading an older jc left unbound (empty `> uuid=`), addressed by *verified position*. **The `todo::SessionKey` doc comment in `jc-core/src/todo.rs` is the canonical statement of why and how — read it there, not here.** (Historically jc kept labels unique instead, via `unique_label` at each creation point plus a `dedupe_labels` startup repair; `DESIGN.md` records why that could not hold.)
+- **Adopt:** `Workspace::own_adopt_session` starts a TODO.md session that isn't running, with the flag `launch_for` picks for it. If the heading was `[D]`, the prefix is cleared first.
+- **No expiry.** A session whose transcript Claude has garbage-collected is relaunched, not retired: `launch_for` sees the missing `<uuid>.jsonl` and claims the UUID with `--session-id`, so the heading, message log, and WAIT block stay usable behind a fresh conversation. There is no `SessionStatus::Expired`. The transcript check still exists, but it now only picks a launch flag — a wrong answer costs one bad spawn, not a permanently retired session.
+- **Transcript buckets:** Claude stores each session at `~/.claude/projects/<bucket>/<uuid>.jsonl`, where `<bucket>` is the launch cwd with every non-`[A-Za-z0-9-]` char mapped to `-`. A git worktree at `<root>/.claude/worktrees/<branch>` therefore lands in its **own sibling bucket** `<encoded_root>--claude-worktrees-<branch>`. So a project's sessions can be spread across the root bucket and any worktree buckets. `jc_core::claude::session_dirs` enumerates all of them. Two callers depend on that: the Cmd-Shift-P scan for unattached JSONL sessions (a worktree conversation is invisible there otherwise), and `ProjectState::launch_for`, where missing a bucket makes `transcript_in` answer `false` and jc claims an already-live UUID with `--session-id` — so this is now load-bearing, not just discovery.
+- **`/clear` handling:** `SessionEnd(reason=clear)` is stashed by the hook server. When `SessionStart(source=clear)` arrives within 10s for the same project, the pair is emitted as `HookEventKind::SessionClear` and `Workspace::own_session_clear` rewrites the session's UUID in memory and in TODO.md. No terminal relaunch — the same Claude process continues. This is the only post-launch UUID change.
+- **Disable:** Cmd-Shift-Backspace in the session picker carries a `todo::SessionKey` through `SessionPickerResult::ToggleDisabled` to `todo::toggle_session_disabled_at`, flipping the `[D]` prefix on that heading. The key is the UUID, or — for a heading that has none — its position in the parsed document, re-verified against the live document at write time (label unchanged, still unbound) so the write cannot land on a heading that moved since the picker snapshot. Disabled sessions skip auto-attach on startup but remain in the picker.
+- **Delete:** Manually change `[D]` to `[DELETED]` in TODO.md. jc's sessions ignore these entirely.
+- **Quit** asks first when a session is working (`SessionState::busy`), since closing jc ends its `claude` processes.
+
+### Session Lifecycle: jcc
 
 Every Claude pane is a client of a Claude Code **background session that Cira owns** (Cira DESIGN 12): Cira starts, forks, stops and removes the job, and the pane runs `claude attach <short>` to the job Cira names. Quitting jc only detaches; the sessions keep running, and the next start attaches again. The general terminal runs the `argv` of `cira session shell` (`jc_core::cira::Cira::session_shell`, an argument list, never through a shell), attaching to the session's shell in Cira's tmux server; `jc_core::lifecycle::ShellPane` decides. A pane asks only once it has been laid out (`TerminalView::is_sized`): one never shown would attach at 80x24, and attached clients share the latest one's size, the page's included. When an ask fails, or the shared client fails quickly three times in a row (`lifecycle::SHARED_FAILURES`, saying the last line tmux printed), it runs jc's own shell with `CIRA_SESSION`, headed "Terminal · not shared", until that shell exits. Only a removal holds the pane for good; another exit-5 refusal is asked again. Both panes wait out the same pause after a child exits (`lifecycle::Backoff`). A child's OSC 52 store (a drag in Cira's tmux, which has the mouse on) is written to the macOS clipboard. jc runs no lifecycle verb of `claude` itself: `jc_core::background::Claude` has only `attach_argv`, `agents` and `wait_settled`. Every request is a `cira session …` call (`jc_core::cira::Cira`, which says `--from-jay` where Cira requires it: jc acts for Jay), run in the jc project's directory with `--project` naming the Cira project that lists the session. The decisions are pure functions in `jc_core::lifecycle`, driven by `jc-app/src/views/workspace/sessions.rs`.
 
@@ -102,7 +131,28 @@ Every Claude pane is a client of a Claude Code **background session that Cira ow
 
 Each row's right side also carries its project's open Cira blocks (`4 blocks`, `jc_core::cira::blocks_label`), and the TODO pane header says `TODO · 4 blocks` (`blocks_suffix`).
 
-**The marker comes from session state, not terminal output** (Cira PLAN TMUX-06; why: `DESIGN.md`, "The Session Marker Comes From State"). `jc_core::cira::marker` holds the rule. Its inputs are three `SessionState` fields: `cira_state` (from the last `cira status --json`, matched by `cira::Project::session` within the Cira project that contains the jc project, `cira::Status::project_for`), `hook_state` (jc's own hooks, `SessionState::note_hook`, stamped with the time the hook server received them), and `seen`, stamped by `Workspace::switch_to_session` on the *outgoing* session, which is what makes it "since you last had it on screen" however the switch was made. Until jc has switched away once, the heading's `> last=` stands in.
+**jc's marker is terminal activity:** red `*` alone (the legend says `activity`), for a running session with unseen Claude terminal output. The rows below this paragraph's table that name `!`, `~` and `x`, the blocks count and the mode badge are jcc's.
+
+**jc: the activity marker.** `TerminalView` keeps two counters: `output_batches`, bumped by the VTE background thread once per coalesced batch it parses (hidden terminals still parse, so a backgrounded session still records activity), and `seen_batches`, the value `clear_output_seen` snapshotted. `TerminalView::has_unseen_output` is just the two being unequal. The counters themselves are private to `jc-terminal`; the app crate sees only `has_unseen_output`, which the picker reads on each session's *Claude* terminal, and `clear_output_seen`. The baseline is taken from two places.
+
+The first is `Workspace::switch_to_session`, on the session being switched *away from*. Clearing on the way out rather than the way in is what makes the marker mean "since you last had it on screen" no matter how the switch was made (picker, Cmd-\`, notification click). The session currently on screen is excluded by the picker itself (`is_active`), since you are looking at it.
+
+The second is the **launch-settle window**. A freshly spawned `claude` prints a banner and, when resuming, replays its transcript; that is jc launching the session, not work done while you were away. `SessionState::create` asks for one by setting `TerminalConfig::launch_settle` on the Claude terminal (the general terminal leaves it `None`), and `TerminalView::new` installs the `SettleWindow` before spawning the relay that drives it — a window poked in afterwards could arrive after the relay had already parked on an unbounded receive, and would then never be serviced.
+
+The relay already blocks on the batch signal to schedule repaints, so it is woken by exactly the event the window needs: there is no second task and no poll. Each pass asks the window what to do, then waits for either the next batch or the window's own deadline, whichever comes first (gpui's `FutureExt::with_timeout`, which polls the receive first so a batch wins the tie). A batch restarts the quiet wait; a deadline means the window is due to decide.
+
+The mechanism is `settle.rs`'s and the numbers are the caller's: `SessionState::CLAUDE_LAUNCH_SETTLE` sets 4 s of quiet after the child has printed *something*, bounded at 30 s. What counts as settled is a fact about the Claude CLI, not about terminal emulation, so the durations live in `jc-app` and travel in as a `LaunchSettle`. `SettleWindow` itself is pure — it observes `Instant`s and answers `Clear`/`Wait`/`Done` — so the policy is unit-tested without a PTY, against fixture durations rather than a second copy of the shipped ones.
+
+Four properties the window holds, each of which was once a bug:
+
+- A child that has printed *nothing* is slow to start, not quiet, so it is never baselined early — otherwise its banner lands above the baseline.
+- The quiet wait restarts at every batch, so the pause `claude --resume` takes between banner and transcript replay does not end the window.
+- The give-up path *clears* rather than merely stopping. A child still printing re-marks itself on its next batch, whereas a marker left set never retires (only switching away clears one), and `has_activity` is the picker's primary sort key.
+- A session is baselined exactly once, so real output arriving after it settles is never silently swallowed.
+
+`SessionState::mark_user_input` — called from `Workspace::send_to_terminal`, `Workspace::fire_scheduled_send` and the `PromptSubmit` hook — ends the window through `TerminalView::cancel_launch_settle` *without* clearing: once you have given a session work, everything it prints is a response to something you asked for. The window is per terminal, so a project restored mid-run by `Workspace::open_project` gets its own.
+
+**jcc: the marker comes from session state, not terminal output** (Cira PLAN TMUX-06; why: `DESIGN.md`, "The Session Marker Comes From State"). `jc_core::cira::marker` holds the rule. Its inputs are three `SessionState` fields: `cira_state` (from the last `cira status --json`, matched by `cira::Project::session` within the Cira project that contains the jc project, `cira::Status::project_for`), `hook_state` (jc's own hooks, `SessionState::note_hook`, stamped with the time the hook server received them), and `seen`, stamped by `Workspace::switch_to_session` on the *outgoing* session, which is what makes it "since you last had it on screen" however the switch was made. Until jc has switched away once, the heading's `> last=` stands in.
 
 The poll: `Workspace::new` starts `cira::poll`, which calls `Cira::status` (`cira status --json`, given `Cira::TIMEOUT`) on its own thread every `CIRA_POLL`; a main-thread task applies each read (`Workspace::apply_cira`, `ProjectState::apply_cira`) and notifies only when something shown changed. Any failure reads as unreachable: counts disappear and markers fall back to the hooks. `cira` is found on `PATH`, like `claude`, and finds its daemon through `CIRA_HOME` in jc's environment, else `~/.cira`.
 
@@ -173,7 +223,7 @@ Sessions that have gone quiet are caught by a startup sweep:
 `todo::truncate_all_sessions` runs in `ProjectState::create` immediately after
 the TODO.md buffer is read, before the session-restore loop. It applies the same bound to every session in the
 document and is idempotent. It only reaches sessions the parser sees: `##`
-headings inside the `# Claude` section. A `## [DELETED] …` heading is skipped by
+headings inside the app's own section (`# Claude`; jcc's `# Cira`). A `## [DELETED] …` heading is skipped by
 `parse`, so such a session's log is never bounded and keeps whatever size it had.
 
 Truncation stops at a message still carrying an undelivered `@jc(...)` marker, so
@@ -189,7 +239,7 @@ pending schedule stays above the bound until that send fires.
 |---|---|---|
 | `## Label` | Active | Normal session |
 | `## [D] Label` | Disabled | Skipped on startup, visible in picker |
-| `## [DELETED] Label` | Deleted | Not a session; its background job is stopped and removed (`TodoDocument::deleted`) |
+| `## [DELETED] Label` | Deleted | Not a session; in jcc its background job is stopped and removed (`TodoDocument::deleted`) |
 
 `[X]` was a third prefix, written when Claude had garbage-collected a session's
 transcript. Since such a session can always be restarted behind its heading, it

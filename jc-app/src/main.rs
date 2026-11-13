@@ -6,8 +6,9 @@ mod notify;
 mod outline;
 mod views;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use jc_core::config;
+use jc_core::flavor::Flavor;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -22,12 +23,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-  /// Remove stale jc hooks from all configured projects.
+  /// Remove this app's stale hooks from all its configured projects (jc's or
+  /// jcc's; the other's are left alone).
   CleanHooks,
 }
 
 fn main() -> anyhow::Result<()> {
-  let cli = Cli::parse();
+  // `jcc` (the jcc.app bundle's executable) is Cira's client; any other name
+  // is jc (Cira PLAN TMUX-07). Chosen before anything reads config or TODO.md.
+  let flavor = Flavor::from_program(std::env::args_os().next().as_deref()).init();
+  let matches = Cli::command().name(flavor.name()).get_matches();
+  let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
   if let Some(Command::CleanHooks) = cli.command {
     return cmd_clean_hooks();
@@ -85,7 +91,7 @@ fn cmd_clean_hooks() -> anyhow::Result<()> {
   }
 
   for path in &paths {
-    match jc_core::hooks_settings::uninstall_hooks(path) {
+    match jc_core::hooks_settings::uninstall_hooks(Flavor::current(), path) {
       Ok(()) => eprintln!("cleaned hooks for {}", path.display()),
       Err(e) => eprintln!("failed to clean hooks for {}: {e}", path.display()),
     }
@@ -115,7 +121,7 @@ extern "C" fn sigint_handler(sig: libc::c_int) {
 
   if let Ok(paths) = SIGNAL_CLEANUP_PATHS.lock() {
     for path in paths.iter() {
-      let _ = jc_core::hooks_settings::uninstall_hooks(path);
+      let _ = jc_core::hooks_settings::uninstall_hooks(Flavor::current(), path);
     }
   }
 

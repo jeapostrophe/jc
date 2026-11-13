@@ -13,6 +13,39 @@
 
 use std::path::{Path, PathBuf};
 
+/// How jc (`Flavor::Jc`) starts the Claude CLI on a session uuid.
+///
+/// The two are NOT interchangeable, and picking wrong leaves a dead pane.
+/// Measured 2026-08-27: `claude --resume <uuid>` with no `<uuid>.jsonl` on disk
+/// prints "No conversation found with session ID: <uuid>" and exits — that is
+/// true both for a uuid Claude has garbage-collected and for one jc minted but
+/// never sent a prompt to. `claude --session-id <uuid>` on that same uuid starts
+/// a fresh conversation under it. So the choice is made by whether the
+/// transcript exists ([`transcript_in`]), and a session whose transcript
+/// vanished is revived rather than retired — which is why jc has no "expired"
+/// state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Launch {
+  /// `--session-id <uuid>`: claim a uuid with no conversation behind it.
+  New,
+  /// `--resume <uuid>`: continue an existing conversation. Requires the
+  /// transcript to be present.
+  Resume,
+}
+
+/// jc's own `claude` command line for `uuid` (see [`Launch`]).
+pub fn claude_argv(uuid: &str, launch: Launch, dangerous: bool) -> Vec<String> {
+  let flag = match launch {
+    Launch::New => "--session-id",
+    Launch::Resume => "--resume",
+  };
+  let mut argv = vec!["claude".to_string(), flag.to_string(), uuid.to_string()];
+  if dangerous {
+    argv.push("--dangerously-skip-permissions".to_string());
+  }
+  argv
+}
+
 /// Encode a project path the way Claude Code names its `~/.claude/projects/<dir>`
 /// bucket: every character that is not ASCII alphanumeric or `-` becomes `-`.
 pub fn encode_project_path(project_path: &Path) -> String {
@@ -35,6 +68,98 @@ const WORKTREE_INFIX: &str = "--claude-worktrees-";
 /// buckets read `<encoded_root>-2--claude-worktrees-…`, not `<encoded_root>--…`.
 pub fn is_worktree_bucket(encoded_root: &str, name: &str) -> bool {
   name.strip_prefix(encoded_root).is_some_and(|rest| rest.starts_with(WORKTREE_INFIX))
+}
+
+/// Is command line `args` (program first) a foreground `claude` — not a
+/// background job (`--bg`, Cira's) nor an attach client?
+fn is_foreground_claude(args: &[&str]) -> bool {
+  let is_claude =
+    args.first().and_then(|p| Path::new(p).file_name()).is_some_and(|n| n == "claude");
+  is_claude && !args.contains(&"--bg") && args.get(1) != Some(&"attach")
+}
+
+/// Does command line `args` run `claude` itself on conversation `uuid` in the
+/// foreground — `claude --resume <uuid>` or `--session-id <uuid>`, as jc's own
+/// panes start it?
+pub fn runs_conversation(args: &[&str], uuid: &str) -> bool {
+  if uuid.is_empty() || !is_foreground_claude(args) {
+    return false;
+  }
+  args.windows(2).any(|w| matches!(w[0], "--resume" | "-r" | "--session-id") && w[1] == uuid)
+    || args.iter().any(|a| {
+      a.strip_prefix("--resume=").or_else(|| a.strip_prefix("--session-id=")) == Some(uuid)
+    })
+}
+
+/// Given the running processes (`pid`, command line) and Claude Code's
+/// registry of interactive sessions (`pid`, current `sessionId`, from
+/// `~/.claude/sessions/<pid>.json`), is a foreground `claude` on conversation
+/// `uuid`? By its command line, or — after a `/clear` moved it to a uuid its
+/// command line does not show — by the registry, for a pid that is still a
+/// foreground `claude` (not a reused pid).
+pub fn conversation_running_in(
+  procs: &[(u32, Vec<&str>)],
+  registry: &[(u32, String)],
+  uuid: &str,
+) -> bool {
+  procs.iter().any(|(_, args)| runs_conversation(args, uuid))
+    || registry.iter().any(|(pid, session)| {
+      session == uuid && procs.iter().any(|(p, args)| p == pid && is_foreground_claude(args))
+    })
+}
+
+/// Is any process on this machine running `claude` on `uuid` in the
+/// foreground ([`conversation_running_in`])? jcc asks before migrating a
+/// heading moved out of jc's section, so a conversation jc still runs is never
+/// run twice (Cira PLAN TMUX-07). `false` when `ps` cannot run.
+pub fn conversation_running(uuid: &str) -> bool {
+  let Ok(out) =
+    std::process::Command::new("/bin/ps").args(["-axww", "-o", "pid=,command="]).output()
+  else {
+    return false;
+  };
+  let text = String::from_utf8_lossy(&out.stdout);
+  let procs: Vec<(u32, Vec<&str>)> = text
+    .lines()
+    .filter_map(|line| {
+      let mut words = line.split_whitespace();
+      Some((words.next()?.parse().ok()?, words.collect()))
+    })
+    .collect();
+  let registry = std::env::var_os("HOME")
+    .and_then(|home| std::fs::read_dir(Path::new(&home).join(".claude/sessions")).ok())
+    .into_iter()
+    .flatten()
+    .flatten()
+    .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+    .filter_map(|e| {
+      let v: serde_json::Value = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+      Some((
+        u32::try_from(v.get("pid")?.as_u64()?).ok()?,
+        v.get("sessionId")?.as_str()?.to_string(),
+      ))
+    })
+    .collect::<Vec<_>>();
+  conversation_running_in(&procs, &registry, uuid)
+}
+
+/// The conversations Claude Code's background jobs run, from
+/// `<jobs>/<short>/state.json` (`sessionId`, and `resumeSessionId`, the one a
+/// job was resumed from; measured 2026-11-12 on Claude Code 2.1.322). jc's
+/// transcript picker leaves them out: they are Cira's (jcc's), and resuming one
+/// in jc would run it twice. Unreadable entries are skipped.
+pub fn background_conversations(jobs: &Path) -> std::collections::HashSet<String> {
+  let Ok(dir) = std::fs::read_dir(jobs) else { return Default::default() };
+  dir
+    .flatten()
+    .filter_map(|e| std::fs::read(e.path().join("state.json")).ok())
+    .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    .flat_map(|v| {
+      ["sessionId", "resumeSessionId"]
+        .map(|k| v.get(k).and_then(|id| id.as_str()).map(str::to_string))
+    })
+    .flatten()
+    .collect()
 }
 
 /// `~/.claude/projects` under `home`.
@@ -82,6 +207,59 @@ pub fn transcript_in(dirs: &[PathBuf], uuid: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_foreground_claude_on_the_uuid_is_running_it() {
+    let u = "335b461a-eba5-485f-898c-f757fdb3f2bf";
+    let runs = |line: &str| runs_conversation(&line.split_whitespace().collect::<Vec<_>>(), u);
+    assert!(runs(&format!("claude --resume {u}")));
+    assert!(runs(&format!(
+      "/Users/x/.local/bin/claude --session-id {u} --dangerously-skip-permissions"
+    )));
+    assert!(runs(&format!("claude --resume={u}")));
+    assert!(!runs(&format!("claude --bg -n x --resume {u}")), "Cira's job, not jc's");
+    assert!(!runs(&format!("claude --resume {u}0")));
+    assert!(!runs(&format!("vim {u}.jsonl")));
+    assert!(!runs(&format!("grep --resume {u}")));
+    assert!(!runs_conversation(&["claude", "--resume", ""], ""));
+  }
+
+  #[test]
+  fn background_jobs_name_their_conversations() {
+    let jobs = std::env::temp_dir().join(format!("jc-bg-jobs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&jobs);
+    std::fs::create_dir_all(jobs.join("2c49e0b3")).unwrap();
+    std::fs::create_dir_all(jobs.join("broken")).unwrap();
+    std::fs::write(
+      jobs.join("2c49e0b3/state.json"),
+      r#"{"state":"working","sessionId":"new-uuid","resumeSessionId":"moved-uuid","daemonShort":"2c49e0b3"}"#,
+    )
+    .unwrap();
+    std::fs::write(jobs.join("broken/state.json"), "{").unwrap();
+    let found = background_conversations(&jobs);
+    assert_eq!(found, ["new-uuid", "moved-uuid"].map(String::from).into_iter().collect());
+    assert!(background_conversations(&jobs.join("missing")).is_empty());
+    std::fs::remove_dir_all(&jobs).unwrap();
+  }
+
+  #[test]
+  fn a_cleared_conversation_is_found_through_claudes_registry() {
+    // jc started `claude --resume A`; a `/clear` moved it to B, which jc wrote
+    // into the heading. Measured 2026-11-12: `~/.claude/sessions/<pid>.json`
+    // follows the clear while the command line keeps A.
+    let procs = vec![
+      (21768, vec!["/Users/x/.local/bin/claude", "--resume", "a-uuid"]),
+      (300, vec!["claude", "attach", "c0ffee00"]),
+      (400, vec!["vim"]),
+    ];
+    let registry =
+      vec![(21768, "b-uuid".to_string()), (300, "c-uuid".to_string()), (400, "d-uuid".to_string())];
+    assert!(conversation_running_in(&procs, &registry, "b-uuid"), "found by the registry");
+    assert!(conversation_running_in(&procs, &registry, "a-uuid"), "and by the command line");
+    assert!(!conversation_running_in(&procs, &registry, "c-uuid"), "an attach client is Cira's");
+    assert!(!conversation_running_in(&procs, &registry, "d-uuid"), "a reused pid is not claude");
+    assert!(!conversation_running_in(&procs, &[(999, "b-uuid".into())], "b-uuid"), "a dead pid");
+  }
 
   #[test]
   fn encode_maps_slash_and_dot_to_dash() {

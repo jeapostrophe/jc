@@ -28,7 +28,7 @@ Claude takes minutes per task. If you wait, you get four cycles an hour. If you 
 
 jc keeps your place outside your head. Each session's notes live in the project's TODO.md, under a `### WAIT` marker: you type the next instruction there whenever you think of it, and Cmd-Enter sends it and files it into the message log. Coming back to a session means reading what you already wrote, not reconstructing it.
 
-Switching is cheap. Cmd-P lists every session in every project; each session keeps its own pane layout, cursor position, and terminal scrollback, restored on switch-back. A red `*` marks the sessions that finished a turn since you last had them on screen, so the picker tells you where the work moved while you were elsewhere. Desktop notifications stay out of the way — only a blocked session (permission prompt, API error) interrupts you, and only when jc isn't the front app.
+Switching is cheap. Cmd-P lists every session in every project; each session keeps its own pane layout, cursor position, and terminal scrollback, restored on switch-back. A red `*` marks the sessions whose Claude terminal has printed something since you last had it on screen, so the picker tells you where the work moved while you were elsewhere. Desktop notifications stay out of the way — only a blocked session (permission prompt, API error) interrupts you, and only when jc isn't the front app.
 
 See [DESIGN.md](DESIGN.md) for the full rationale.
 
@@ -45,7 +45,7 @@ cargo run -p jc-app
 cargo run -p jc-app -- .
 ```
 
-Config and state live in `~/.config/jc/` (`config.toml`, `state.toml`, `theme.toml`).
+Config and state live in `~/.config/jc/` (`config.toml`, `state.toml`, `theme.toml`), or `$JC_CONFIG_DIR` when it is set. `./make.sh` also builds `jcc.app`, jc as Cira's client: see [jcc](#jcc-jc-as-ciras-client).
 
 ## Core Concepts
 
@@ -56,7 +56,7 @@ A **project** is a code repository registered with jc. Each project has one or m
 ```markdown
 # Claude
 ## Refactor auth module
-> cira=cira-8e565675baa4
+> uuid=abc123-def456-...
 ### Message 0
 first instruction sent to claude
 ### Message 1
@@ -71,30 +71,48 @@ The log is bounded: each send keeps the 25 most recent messages of that session 
 
 One exception: truncation stops at a message still waiting on a `@jc(...)` scheduled send, so it can never cancel one. That session's log stays as long as it needs to until the send fires. Numbers are never reused, so a message keeps the number it was sent under. jc never sends TODO.md to Claude — messages are delivered to the session terminal and Claude resumes from its own transcript — so dropping old entries costs it no context.
 
-Each session is owned by **Cira** (`~/Dev/cira`, the mailbox between you and your sessions): Cira starts it as a Claude Code **background session**, keeps it in the mode you chose, and stops and removes it; jc is Cira's native client, and each Claude pane is `claude attach` to the job Cira names. jc asks Cira for everything else with `cira session new|mode|stop|rm|label`. Quitting jc only detaches: sessions keep running, and the next start attaches every heading's session again. While Cira is unreachable a banner says so, and no pane attaches anything new. A heading an older jc wrote with `> uuid=` is moved to Cira once, continuing its conversation (`cira session new --resume`).
+jc mints the session UUID itself. A new session launches `claude --session-id <uuid>` under a freshly generated v4 UUID that is written to TODO.md at the same moment; existing sessions are resumed on startup with `claude --resume <uuid>`. If Claude has since garbage-collected a session's transcript, jc relaunches it with `--session-id` under the same UUID instead — you lose the conversation, but the heading, its message log, and its WAIT notes stay exactly where they were. `/clear` is handled transparently — the UUID in TODO.md is rewritten in place, with no terminal relaunch.
 
-Per-session metadata lives on `> ` lines under the heading. `> cira=` (the id Cira minted, `CIRA_SESSION` in the terminal pane's shell) and `> last=` are managed by jc. The mode is Cira's: Cmd-Shift-P → "Make this session dangerous" (or "normal") asks Cira, which forks the session in the new mode once it is idle, keeping its conversation; the Cmd-P picker marks a dangerous session. Disabling a session (`[D]`) stops it; renaming the heading to `## [DELETED] …` removes it — each once, when the marker changes from what jc last saw, even if you edit it while jc is closed. Renaming the heading renames the session in Cira, and a rename made on Cira's page renames the heading. See `ARCH.md` for the full list.
+Per-session metadata lives on `> ` lines under the heading. `> uuid=` and `> last=` are managed by jc; add `> dangerous` by hand to spawn that session's `claude` with `--dangerously-skip-permissions` (takes effect on next spawn). See `ARCH.md` for the full list.
 
-The `> cira=` line, not the heading text, is what identifies a session — everything jc writes into TODO.md is addressed by it. Rename a heading to whatever you like, and give two headings the same name if that is what you want; sends and scheduled deliveries still land on the right one.
+The `> uuid=` line, not the heading text, is what identifies a session — everything jc writes into TODO.md is addressed by it. Rename a heading to whatever you like, and give two headings the same name if that is what you want; sends and scheduled deliveries still land on the right one.
 
 ### Session Activity
 
-The Cmd-P session picker marks each session with a single character. A running session's mark comes from its state — from Cira (the mailbox between you and your sessions, at `~/Dev/cira`; optional) when Cira knows the session, else from jc's own hooks — never from what its terminal prints, so a ticking "3m 42s" is not activity:
+The Cmd-P session picker marks each session with a single character:
 
 | Marker | Meaning |
 |---|---|
-| bold red `!` | A permission dialog is waiting, whether or not you have seen it |
-| red `*` | It finished a turn (or stopped on an API error) since you last had it on screen |
-| grey `~` | Its turn is over, and background agents it started are still running |
-| grey `x` | The session process has ended |
+| red `*` | This session's Claude terminal has printed output since you last had it on screen |
 | green `>` | The session you're on now |
 | yellow `~` | In TODO.md but not running — pick it to adopt |
 | grey `~` | Disabled (`[D]`) |
 | blue `+` | A registered project with no sessions yet |
 
-Sessions with a permission dialog sort first, from any project; then this project's sessions and then the others', each finished-first and then by recency; the session you're on sorts last, since you're already there. Switching away from a session clears its `*`, so it always means "since you last had it on screen"; until jc has switched away from a session once, that is the last time you sent to it (`> last=`). The session you're on shows only `!`.
+Sessions sort activity-first, then by recency; the session you're on sorts last, since you're already there. The marker clears when you switch away from a session, so it always means "since you last had it on screen", and the session you're currently on never shows one.
 
-When Cira is running, each row also shows its project's open Cira blocks (`4 blocks`), and the TODO pane's header says the same (`TODO · 4 blocks`). jc reads both with `cira status --json` every 2 seconds, off the main thread; without Cira it shows no counts and marks sessions from its hooks alone.
+## jcc: jc as Cira's client
+
+**jcc** is a second app built from this same code: jc as the native client of **Cira** (`~/Dev/cira`, the mailbox between you and your sessions). It runs beside jc, so you can move projects to it one at a time while jc keeps running yours. One binary decides which app it is from its file name: run as `jcc` (the `jcc.app` bundle's executable, or `make.sh` through a link named `jcc`) it is jcc; under any other name it is jc. `./make.sh` (`scripts/bundle.sh`) builds both `jc.app` and `jcc.app`.
+
+**What changes in jcc.** Each session is owned by Cira: Cira starts it as a Claude Code **background session**, keeps it in the mode you chose, and stops and removes it; each Claude pane is `claude attach` to the job Cira names, and jcc asks Cira for everything else with `cira session new|mode|stop|rm|label`. Quitting jcc only detaches: sessions keep running, and the next start attaches every heading's session again. While Cira is unreachable a banner says so, and no pane attaches anything new.
+
+- A heading's id line is `> cira=<id>` (the id Cira minted, `CIRA_SESSION` in the terminal pane's shell), and that line, not the heading text, addresses it. The mode is Cira's: Cmd-Shift-P → "Make this session dangerous" (or "normal") asks Cira, which forks the session in the new mode once it is idle, keeping its conversation; the Cmd-P picker marks a dangerous session. Disabling a session (`[D]`) stops it; renaming the heading to `## [DELETED] …` removes it — each once, when the marker changes from what jcc last saw, even if you edit it while jcc is closed. Renaming the heading renames the session in Cira, and a rename made on Cira's page renames the heading.
+- The **General Terminal** is the session's shell, kept by Cira and shared with its page (`s`); it outlives jcc. It is headed "Terminal · not shared" when Cira gives none and jcc runs its own.
+- The Cmd-P marker comes from the session's state — from Cira when Cira knows the session, else from jcc's own hooks — never from what the terminal prints, so a ticking "3m 42s" is not activity: bold red `!` a permission dialog is waiting (sorted first, from any project, and shown even on the session you are on), red `*` it finished a turn (or stopped on an API error) since you last had it on screen, grey `~` its turn is over and background agents it started still run, grey `x` the session process has ended. Each row also shows its project's open Cira blocks (`4 blocks`), and the TODO pane's header says the same (`TODO · 4 blocks`), read with `cira status --json` every 2 seconds, off the main thread.
+
+**How jc and jcc stay apart.** Nothing either app acts on is shared:
+
+| | jc | jcc |
+|---|---|---|
+| Sessions in TODO.md | `##` headings under `# Claude`, with `> uuid=` | `##` headings under `# Cira`, with `> cira=` |
+| Config and state (`state.toml` with its project list, `jc.sock`, jcc's `sessions.toml`) | `~/.config/jc` | `~/.config/jcc` |
+| Hooks in a project's `.claude/settings.local.json` | URLs under `/jc-hook/` | URLs under `/jcc-hook/` |
+| Bundle id (notifications) | `com.jc.app` | `com.jc.app.jcc` |
+
+Each app reads only its own section of TODO.md (the rest is text to it), so the two never act on the same heading, and a jc older than jcc, which reads only `# Claude`, never sees jcc's. jc also ignores a `> cira=` heading anywhere. Each app installs, finds and removes only hooks under its own prefix, under a lock on the project's `.claude` directory, so both can have one project open and quitting either leaves the other's hooks. `JC_CONFIG_DIR` overrides the config directory of whichever app it is set for; never set one value for both. Neither app's transcript list (Cmd-Shift-P) offers a conversation the other's headings name, or one a background job runs.
+
+**Moving a session from jc to jcc.** Cut its heading block from `# Claude` and paste it under `# Cira` (the first jcc session in a project starts the `# Cira` section). jcc moves its conversation to Cira once (`cira session new --resume <uuid>`) and rewrites the line to `> cira=`, but not while a `claude` process still runs that conversation (jc's pane, found by its command line or Claude Code's session registry): the pane says so until you end it in jc. Renaming a project's `# Claude` line to `# Cira` moves all its sessions at once, which is the step for when you no longer run jc on it.
 
 ## Views
 
@@ -103,7 +121,7 @@ The window has **1, 2, or 3 panes** (Cmd-1/2/3). Any of the five views can go in
 | View | Description |
 |---|---|
 | **Claude Terminal** | Claude Code CLI in an embedded terminal. |
-| **General Terminal** | The session's shell, kept by Cira and shared with its page (`s`); it outlives jc. Headed "Terminal · not shared" when Cira gives none and jc runs its own. |
+| **General Terminal** | Separate shell per session for running tests, inspecting output. |
 | **Code Viewer** | Syntax-highlighted source with tree-sitter outline navigation. |
 | **TODO Editor** | Markdown editor for session notes. Drafting area below WAIT, message history above. |
 | **Global TODO** | View of `~/.claude/TODO.md`. |
@@ -161,7 +179,7 @@ Press **Cmd-?** for the in-app overlay.
 2. Type the next instruction there. It's a plain Markdown buffer — write it over several sittings if you like, while Claude works on the last one.
 3. **Cmd-Enter** sends the draft to the Claude terminal, files it as `### Message N`, and stamps `> last=`.
 4. **Cmd-P** to move to another session while that one runs. Your panes, cursor, and terminal scrollback come back when you return.
-5. Sessions that finished a turn while you were away carry a red `*` in the picker, and one waiting on a permission dialog a bold red `!`.
+5. Sessions that printed something while you were away carry a red `*` in the picker.
 
 ### Navigate Code
 

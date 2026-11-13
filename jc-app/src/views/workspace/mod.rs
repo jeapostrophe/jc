@@ -1,3 +1,4 @@
+mod own;
 mod pickers;
 mod render;
 mod sessions;
@@ -14,9 +15,10 @@ use gpui_component::input::InputState;
 use gpui_component::theme::Theme;
 use jc_core::background::Claude;
 use jc_core::config::{AppConfig, AppState};
+use jc_core::flavor::Flavor;
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
 use jc_core::theme::Appearance;
-use jc_core::todo::TodoDocument;
+use jc_core::todo::{SessionKey, TodoDocument};
 use jc_terminal::{Palette, TerminalView};
 use std::collections::VecDeque;
 use std::ops::DerefMut;
@@ -114,11 +116,15 @@ pub struct Workspace {
   pre_close_confirm_focus: Option<FocusHandle>,
   /// Whether the pending close is a quit (vs window close).
   close_confirm_is_quit: bool,
-  /// `claude attach` and the read-only `claude agents --json`: all jc runs
-  /// of `claude` itself. Everything else about a session is asked of Cira.
+  /// Which app this is (Cira PLAN TMUX-07): `jc` runs each session's
+  /// `claude` itself (`own.rs`); `jcc` is Cira's client (`sessions.rs`).
+  flavor: Flavor,
+  /// jcc: `claude attach` and the read-only `claude agents --json`, all jcc
+  /// runs of `claude` itself. Everything else about a session is asked of Cira.
   claude: Claude,
-  /// The `cira` CLI every lifecycle request goes through.
-  cira_client: jc_core::cira::Cira,
+  /// jcc: the `cira` CLI every lifecycle request goes through. `None` in jc,
+  /// which never asks Cira for anything (`Flavor::cira`).
+  cira_client: Option<jc_core::cira::Cira>,
   /// Cira as last read, and what jc remembers of its sessions.
   cira: sessions::CiraView,
   /// Asks the Cira poll thread for a read now.
@@ -128,8 +134,8 @@ pub struct Workspace {
   /// Hooks from a known project that matched no session, kept until the next
   /// Cira read teaches jc the uuid they carry.
   unmatched_hooks: VecDeque<HookEvent>,
-  /// Receives each `cira status --json` read by the Cira poll thread.
-  _cira_poll_task: Task<()>,
+  /// jcc: receives each `cira status --json` read by the Cira poll thread.
+  _cira_poll_task: Option<Task<()>>,
 }
 
 /// Unmatched hooks kept for re-dispatch; older ones are dropped.
@@ -146,6 +152,7 @@ impl Workspace {
     cx: &mut Context<Self>,
   ) -> Self {
     let palette = palette_from_window(window);
+    let flavor = Flavor::current();
     let claude = Claude::default();
 
     // Build a ProjectState per registered project.
@@ -221,14 +228,14 @@ impl Workspace {
 
     // Start hook server for Claude Code integration.
     let project_paths: Vec<PathBuf> = projects.iter().map(|p| p.path.clone()).collect();
-    let (hook_server, hook_poll_task) = match HookServer::start(project_paths.clone()) {
+    let (hook_server, hook_poll_task) = match HookServer::start(flavor, project_paths.clone()) {
       Ok(server) => {
         let port = server.port;
         // Install hooks into each project's settings (fire and forget).
         for path in &project_paths {
           let path = path.clone();
           std::thread::spawn(move || {
-            if let Err(e) = jc_core::hooks_settings::install_hooks(&path, port) {
+            if let Err(e) = jc_core::hooks_settings::install_hooks(flavor, &path, port) {
               eprintln!("failed to install hooks for {}: {e}", path.display());
             }
           });
@@ -301,28 +308,38 @@ impl Workspace {
         }
       });
 
-    // Cira's counts, session states and lifecycle (Cira PLAN TMUX-01/05/06),
-    // read on the poll's own thread, each read stamped with when it began;
-    // only applying a read runs here.
-    let cira_client = jc_core::cira::Cira::default();
-    let reader = cira_client.clone();
-    let (cira_rx, cira_kick) =
-      jc_core::cira::poll(CIRA_POLL, move || (SystemTime::now(), reader.status()));
-    let cira_poll_task =
-      cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
-        while let Ok((read_at, status)) = cira_rx.recv_async().await {
-          let applied =
-            this.update_in(cx, |ws, window, cx| ws.on_cira(read_at, status, window, cx));
-          if applied.is_err() {
-            break; // workspace dropped; dropping the receiver ends the poll thread
-          }
-        }
-      });
+    // jcc only: Cira's counts, session states and lifecycle (Cira PLAN
+    // TMUX-01/05/06), read on the poll's own thread, each read stamped with
+    // when it began; only applying a read runs here. jc has no client, so no
+    // poll: it never runs `cira`.
+    let cira_client = flavor.cira();
+    let (cira_kick, cira_poll_task) = match cira_client.clone() {
+      Some(reader) => {
+        let (cira_rx, cira_kick) =
+          jc_core::cira::poll(CIRA_POLL, move || (SystemTime::now(), reader.status()));
+        let task =
+          cx.spawn_in(window, async move |this: WeakEntity<Self>, cx: &mut AsyncWindowContext| {
+            while let Ok((read_at, status)) = cira_rx.recv_async().await {
+              let applied =
+                this.update_in(cx, |ws, window, cx| ws.on_cira(read_at, status, window, cx));
+              if applied.is_err() {
+                break; // workspace dropped; dropping the receiver ends the poll thread
+              }
+            }
+          });
+        (cira_kick, Some(task))
+      }
+      None => (flume::unbounded().0, None),
+    };
 
-    // `sessions.toml` is read and written off the main thread: the saver
-    // writes the latest records it is sent.
+    // jcc: `sessions.toml` is read and written off the main thread: the saver
+    // writes the latest records it is sent. jc keeps no records.
     let (records_tx, records_rx) = flume::unbounded::<jc_core::lifecycle::Records>();
+    let keeps_records = flavor == Flavor::Jcc;
     std::thread::spawn(move || {
+      if !keeps_records {
+        return;
+      }
       while let Ok(mut records) = records_rx.recv() {
         while let Ok(newer) = records_rx.try_recv() {
           records = newer;
@@ -363,6 +380,7 @@ impl Workspace {
       close_confirm: None,
       pre_close_confirm_focus: None,
       close_confirm_is_quit: false,
+      flavor,
       claude,
       cira_client,
       cira: sessions::CiraView::default(),
@@ -372,30 +390,9 @@ impl Workspace {
       _cira_poll_task: cira_poll_task,
     };
 
-    for pi in 0..ws.projects.len() {
-      ws.observe_panes(pi, window, cx);
+    if flavor == Flavor::Jcc {
+      ws.start_cira_client(window, cx);
     }
-    ws.run_blocking(
-      window,
-      cx,
-      jc_core::config::load_sessions,
-      // With no records a marker asks nothing (`lifecycle::mark_request`),
-      // so starting empty sends no stop or rm once a bad file is kept aside
-      // (a marker or rename made while jc was closed is not acted on, and
-      // Cira's label wins: `lifecycle::label_sync`). When it
-      // could not be read or moved, `records` stays `None`: no marker or
-      // label is acted on and nothing is saved over the file.
-      |ws, loaded, _window, _cx| match loaded {
-        Ok((records, kept)) => {
-          if let Some(kept) = kept {
-            eprintln!("sessions.toml did not parse; kept it as {}", kept.display());
-          }
-          ws.cira.records = Some(records);
-          ws.kick_cira();
-        }
-        Err(e) => eprintln!("sessions.toml: {e:#}; acting on no markers or labels"),
-      },
-    );
     ws.refresh_breadcrumb_observers(cx);
     ws.reconcile_schedules(window, cx);
     ws.start_schedule_reconcile_loop(window, cx);
@@ -535,13 +532,15 @@ impl Workspace {
   }
 
   /// Auto-save dirty buffers and close/quit. Shows confirm dialog if there
-  /// are buffers with merge conflicts that can't be saved. Working sessions
-  /// are no reason to ask: closing only detaches from background sessions,
-  /// which keep running.
+  /// are buffers with merge conflicts that can't be saved, or, in jc, active
+  /// sessions, which quitting terminates. In jcc working sessions are no
+  /// reason to ask: closing only detaches from background sessions, which
+  /// keep running.
   fn try_close(&mut self, is_quit: bool, window: &mut Window, cx: &mut Context<Self>) {
     let conflicts = self.save_all_dirty(cx);
+    let active = self.active_session_count();
 
-    if conflicts.is_empty() {
+    if conflicts.is_empty() && active == 0 {
       // Nothing to warn about — just close.
       if is_quit {
         cx.quit();
@@ -549,8 +548,17 @@ impl Workspace {
         window.remove_window();
       }
     } else {
-      self.show_close_confirm(conflicts, is_quit, window, cx);
+      self.show_close_confirm(active, conflicts, is_quit, window, cx);
     }
+  }
+
+  /// jc: count sessions that are actively working (not idle/stopped). Always
+  /// 0 in jcc, where quitting stops nothing.
+  fn active_session_count(&self) -> usize {
+    if self.flavor != Flavor::Jc {
+      return 0;
+    }
+    self.projects.iter().flat_map(|p| p.sessions.values()).filter(|s| s.busy).count()
   }
 
   /// Save all dirty buffers (TODO views, code views, global TODO).
@@ -594,6 +602,7 @@ impl Workspace {
 
   fn show_close_confirm(
     &mut self,
+    session_count: usize,
     conflicts: Vec<String>,
     is_quit: bool,
     window: &mut Window,
@@ -601,7 +610,7 @@ impl Workspace {
   ) {
     self.close_confirm_is_quit = is_quit;
     self.pre_close_confirm_focus = window.focused(cx);
-    let view = cx.new(|cx| CloseConfirm::new(conflicts, is_quit, cx));
+    let view = cx.new(|cx| CloseConfirm::new(session_count, conflicts, is_quit, cx));
     let sub = cx.subscribe_in(&view, window, |this: &mut Self, _, event, window, cx| match event {
       CloseConfirmEvent::Confirmed => {
         this.close_confirm = None;
@@ -916,8 +925,10 @@ impl Workspace {
     self.projects.push(project);
 
     let project_idx = self.projects.len() - 1;
-    self.observe_panes(project_idx, window, cx);
-    self.kick_cira();
+    if self.flavor == Flavor::Jcc {
+      self.observe_panes(project_idx, window, cx);
+      self.kick_cira();
+    }
     let active = self.projects[project_idx].active_session;
     self.switch_to_session(project_idx, active, window, cx);
 
@@ -956,11 +967,15 @@ impl Workspace {
       });
       session.claude_terminal.read(cx).set_visible(false);
       session.general_terminal.read(cx).set_visible(false);
-      // Whatever this session finished while it was on screen has been seen,
-      // so it must not come back marked in the Cmd-P picker. Stamping on the
-      // way OUT rather than on the way in is what makes that true regardless
-      // of how the switch was made (picker, Cmd-`, a notification click).
-      session.seen = Some(SystemTime::now());
+      // Whatever this session printed (jc) or finished (jcc) while it was on
+      // screen has been seen, so it must not come back marked in the Cmd-P
+      // picker. Doing it on the way OUT rather than on the way in is what makes
+      // that true regardless of how the switch was made (picker, Cmd-`, a
+      // notification click).
+      match self.flavor {
+        Flavor::Jc => session.claude_terminal.read(cx).clear_output_seen(),
+        Flavor::Jcc => session.seen = Some(SystemTime::now()),
+      }
     }
 
     self.active_project_index = project_idx;
@@ -1115,6 +1130,62 @@ impl Workspace {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Session lifecycle: jc's own (`own.rs`) or Cira's (`sessions.rs`)
+  // ---------------------------------------------------------------------------
+
+  /// A brand new session: jc mints a uuid and runs `claude` on it; jcc asks
+  /// Cira for one.
+  fn create_new_session(&mut self, pi: usize, window: &mut Window, cx: &mut Context<Self>) {
+    match self.flavor {
+      Flavor::Jc => self.own_new_session(pi, window, cx),
+      Flavor::Jcc => self.cira_new_session(pi, window, cx),
+    }
+  }
+
+  /// Continue transcript `uuid`, which no heading names, under a new heading.
+  fn adopt_transcript(
+    &mut self,
+    pi: usize,
+    uuid: String,
+    summary: &str,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    match self.flavor {
+      Flavor::Jc => self.own_adopt_transcript(pi, uuid, summary, window, cx),
+      Flavor::Jcc => self.cira_adopt_transcript(pi, uuid, summary, window, cx),
+    }
+  }
+
+  /// Give the heading `key` names, which has no pane, its session.
+  fn adopt_session(
+    &mut self,
+    pi: usize,
+    key: &SessionKey,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    match self.flavor {
+      Flavor::Jc => self.own_adopt_session(pi, key, window, cx),
+      Flavor::Jcc => self.cira_adopt_session(pi, key, window, cx),
+    }
+  }
+
+  /// Toggle `[D]` on the heading `key` names.
+  fn toggle_session_disabled(
+    &mut self,
+    pi: usize,
+    key: &SessionKey,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    match self.flavor {
+      Flavor::Jc => self.own_toggle_session_disabled(pi, key, window, cx),
+      Flavor::Jcc => self.cira_toggle_session_disabled(pi, key, window, cx),
+    }
+  }
+
   /// Drop running session `sid` from project `pi` — its attach client is hung
   /// up, the background session itself is untouched — and show another
   /// session if it was on screen.
@@ -1227,7 +1298,7 @@ impl Workspace {
     let uuid = session.key.clone();
     let claude_terminal = session.claude_terminal.clone();
     let todo_view = project.todo_view.clone();
-    let ready = Self::ready_for_input(session, cx);
+    let ready = Self::ready_for_input(self.flavor, session, cx);
 
     // Block all sends while a scheduled message is pending on this session
     // (including one waiting for the session to come up, below) — a second
@@ -1278,16 +1349,25 @@ impl Workspace {
         session.status("the message is sent once the session is up", cx);
       }
     } else {
+      // jc: mark busy (quitting asks first) and end the launch-settle window.
+      if self.flavor == Flavor::Jc
+        && let Some(session) = self.projects[self.active_project_index].active_session_mut()
+      {
+        session.mark_user_input(cx);
+      }
       Self::deliver_to_terminal(&claude_terminal, &message_text, cx);
       cx.notify();
     }
   }
 
-  /// Text typed into `session`'s Claude pane reaches the session: the session
-  /// process runs, and the attach client has drawn its first frame since it
-  /// (re)started.
-  fn ready_for_input(session: &SessionState, cx: &App) -> bool {
-    session.live && session.claude_terminal.read(cx).has_output_since_spawn()
+  /// Text typed into `session`'s Claude pane reaches the session. jc: always,
+  /// its `claude` runs in the pane. jcc: the session process runs, and the
+  /// attach client has drawn its first frame since it (re)started.
+  fn ready_for_input(flavor: Flavor, session: &SessionState, cx: &App) -> bool {
+    match flavor {
+      Flavor::Jc => true,
+      Flavor::Jcc => session.live && session.claude_terminal.read(cx).has_output_since_spawn(),
+    }
   }
 
   /// Paste `message_text` into the Claude terminal, then submit with a delayed
@@ -1301,12 +1381,14 @@ impl Workspace {
     });
   }
 
-  /// Arm a timer to deliver a scheduled message at `when`; a past-due one
-  /// fires at once. Only sessions ready for input are armed
+  /// Arm a timer to deliver a scheduled message at `when`. In jcc a past-due
+  /// one fires at once: only sessions ready for input are armed
   /// ([`Self::reconcile_schedules`]), so a catch-up send at startup waits for
-  /// the session to come up rather than for a fixed grace. The timer re-reads
-  /// the live TODO at fire time, so a cancelled or rescheduled marker is
-  /// handled there rather than tracked here.
+  /// the session to come up. In jc a past-due one (a catch-up send re-armed at
+  /// startup) fires after a short grace, so a freshly-spawned Claude terminal
+  /// has time to reach its prompt. The timer re-reads the live TODO at fire
+  /// time, so a cancelled or rescheduled marker is handled there rather than
+  /// tracked here.
   fn arm_scheduled_send(
     &mut self,
     project_path: PathBuf,
@@ -1315,8 +1397,12 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    /// jc: grace before firing a past-due send, so a just-launched terminal is ready.
+    const CATCHUP_GRACE: StdDuration = StdDuration::from_secs(5);
+
     let now = chrono::Local::now().naive_local();
-    let delay = (when - now).to_std().unwrap_or(StdDuration::ZERO);
+    let raw = (when - now).to_std().unwrap_or(StdDuration::ZERO);
+    let delay = if raw.is_zero() && self.flavor == Flavor::Jc { CATCHUP_GRACE } else { raw };
     cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
       Timer::after(delay).await;
       let _ = this.update_in(cx, |ws, window, cx| {
@@ -1353,10 +1439,11 @@ impl Workspace {
     // terminal BEFORE `deliver_scheduled` consumes the marker, so a message is
     // never marked delivered (and lost) when there's nowhere to send it — the
     // marker stays pending and re-arms on a later tick.
-    let Some(claude_terminal) = self.projects[project_idx]
+    let flavor = self.flavor;
+    let Some((id, claude_terminal)) = self.projects[project_idx]
       .session_by_key(uuid)
-      .filter(|(_, s)| Self::ready_for_input(s, cx))
-      .map(|(_, s)| s.claude_terminal.clone())
+      .filter(|(_, s)| Self::ready_for_input(flavor, s, cx))
+      .map(|(id, s)| (id, s.claude_terminal.clone()))
     else {
       return;
     };
@@ -1367,6 +1454,11 @@ impl Workspace {
     match todo_view.update(cx, |tv, cx| tv.deliver_scheduled(uuid, now, window, cx)) {
       ScheduledFire::Deliver(body) => {
         Self::deliver_to_terminal(&claude_terminal, &body, cx);
+        if flavor == Flavor::Jc
+          && let Some(session) = self.projects[project_idx].sessions.get_mut(&id)
+        {
+          session.mark_user_input(cx);
+        }
         cx.notify();
       }
       ScheduledFire::Reschedule(new_when) => {
@@ -1406,6 +1498,7 @@ impl Workspace {
   /// can't catch. Restricted to headings whose session is actually running (see
   /// the filter below).
   fn reconcile_schedules(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let flavor = self.flavor;
     let pending: Vec<(PathBuf, String, NaiveDateTime)> = self
       .projects
       .iter()
@@ -1423,7 +1516,7 @@ impl Workspace {
           // highlight, and is armed on the first tick after the session comes
           // up (firing immediately if its time has already passed).
           .filter(|s| {
-            project.session_by_key(&s.id).is_some_and(|(_, r)| Self::ready_for_input(r, cx))
+            project.session_by_key(&s.id).is_some_and(|(_, r)| Self::ready_for_input(flavor, r, cx))
           })
           .filter_map(move |s| {
             s.pending_scheduled()
@@ -1505,12 +1598,33 @@ impl Workspace {
   // Hook events
   // ---------------------------------------------------------------------------
 
-  fn handle_hook_event(&mut self, event: HookEvent, _window: &mut Window, cx: &mut Context<Self>) {
+  fn handle_hook_event(&mut self, event: HookEvent, window: &mut Window, cx: &mut Context<Self>) {
+    // jc: a session start says nothing it needs (its panes run `claude`
+    // themselves).
+    if self.flavor == Flavor::Jc && matches!(event.kind, HookEventKind::SessionStart) {
+      return;
+    }
     eprintln!("hook: {:?} session={}", event.kind, event.session_id);
 
-    // Handle session clear: follow the session onto its new uuid.
+    // Handle session clear: follow the session onto its new uuid (jc also
+    // rewrites the heading's `> uuid=`).
     if let HookEventKind::SessionClear { ref old_session_id, ref new_session_id } = event.kind {
-      self.handle_session_clear(old_session_id, new_session_id);
+      match self.flavor {
+        Flavor::Jc => self.own_session_clear(old_session_id, new_session_id, window, cx),
+        Flavor::Jcc => self.handle_session_clear(old_session_id, new_session_id),
+      }
+      cx.notify();
+      return;
+    }
+
+    if self.flavor == Flavor::Jc {
+      // Every remaining event is addressed to a session identified by its
+      // uuid; one jc did not launch is not jc's.
+      let Some((project_name, session_label)) = self.own_apply_hook(&event, cx) else {
+        cx.notify();
+        return;
+      };
+      self.notify_blocked(&event, &project_name, &session_label);
       cx.notify();
       return;
     }
@@ -1527,8 +1641,13 @@ impl Workspace {
       }
       return;
     };
-    // Notify when the window is not active (user is in another app). Only a
-    // blocked session is worth interrupting for; Stop/IdlePrompt are ambient.
+    self.notify_blocked(&event, &project_name, &session_label);
+    cx.notify();
+  }
+
+  /// Notify when the window is not active (user is in another app). Only a
+  /// blocked session is worth interrupting for; Stop/IdlePrompt are ambient.
+  fn notify_blocked(&self, event: &HookEvent, project_name: &str, session_label: &str) {
     let message = match event.kind {
       HookEventKind::PermissionPrompt => Some("Permission needed"),
       HookEventKind::StopFailure => Some("API error"),
@@ -1540,8 +1659,6 @@ impl Workspace {
       let title = format!("{project_name} > {session_label}");
       crate::notify::notify(&title, message, &event.session_id);
     }
-
-    cx.notify();
   }
 
   /// Apply a hook event to the session it names (see
@@ -1603,7 +1720,7 @@ impl Workspace {
 impl Drop for Workspace {
   fn drop(&mut self) {
     for project in &self.projects {
-      let _ = jc_core::hooks_settings::uninstall_hooks(&project.path);
+      let _ = jc_core::hooks_settings::uninstall_hooks(self.flavor, &project.path);
     }
     if let Some(server) = &self._hook_server {
       server.shutdown();
