@@ -126,7 +126,8 @@ fn save_toml<T: Serialize>(filename: &str, value: &T) -> Result<()> {
 /// Replace `path` with `bytes`, written by `write` (a seam for tests) to a
 /// temporary file beside it, synced, then renamed over it: a save cut off
 /// part way (jc killed, the disk full) leaves the old file whole, never a
-/// truncated one that would not parse.
+/// truncated one that would not parse. The temporary name is per process, so
+/// each file must have one writer thread.
 fn write_replacing(
   path: &Path,
   bytes: &[u8],
@@ -147,8 +148,10 @@ fn write_replacing(
     let _ = fs::remove_file(&temp);
   }
   written?;
-  // The rename is durable once the directory is synced.
-  fs::File::open(dir)?.sync_all()
+  // The rename is durable once the directory is synced; the file is replaced
+  // either way, so a filesystem that cannot sync a directory fails no save.
+  let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+  Ok(())
 }
 
 pub fn save_config(config: &AppConfig) -> Result<()> {
