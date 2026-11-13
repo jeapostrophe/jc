@@ -428,13 +428,26 @@ impl Cira {
     self.call_at(at, strs(&["session", "label", "--json", "--", id, label]))
   }
 
+  /// `cira session shell`: the command that attaches to the session's shell
+  /// in Cira's own tmux server, which Cira makes first if it has none (Cira
+  /// DESIGN 12). Asked at each attach, so a shell Jay ended is made again.
+  pub fn session_shell(&self, at: &At, id: &str) -> Result<SessionShell, CallError> {
+    let out = self.call_at_out(at, strs(&["session", "shell", "--json", "--", id]))?;
+    serde_json::from_slice(&out).map_err(|e| CallError::Malformed(e.to_string()))
+  }
+
   /// A request about a session of `at`'s project: Cira finds a session's
   /// project by name, else by the caller's directory.
-  fn call_at(&self, at: &At, mut args: Vec<String>) -> Result<(), CallError> {
+  fn call_at(&self, at: &At, args: Vec<String>) -> Result<(), CallError> {
+    self.call_at_out(at, args).map(drop)
+  }
+
+  /// The same, with what it printed.
+  fn call_at_out(&self, at: &At, mut args: Vec<String>) -> Result<Vec<u8>, CallError> {
     if let Some(project) = &at.project {
       args.insert(2, format!("--project={project}"));
     }
-    self.call(&args, self.call, Some(&at.dir)).map(drop)
+    self.call(&args, self.call, Some(&at.dir))
   }
 
   /// How long a request may take: `cira` waits up to 12 s for a daemon to
@@ -580,6 +593,18 @@ pub struct Created {
   /// Under `--wait`: the session as `cira status --json` lists it.
   #[serde(default)]
   pub status: Option<Session>,
+}
+
+/// `cira session shell --json`'s answer, as much as jc uses.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SessionShell {
+  pub session: String,
+  /// What attaches to it, run as an argument list and never through a shell:
+  /// its `-t =s-<id>` would be a zsh `=` expansion.
+  pub argv: Vec<String>,
+  /// Cira made it for this ask (none ran).
+  #[serde(default)]
+  pub created: bool,
 }
 
 fn strs(v: &[&str]) -> Vec<String> {
@@ -1089,6 +1114,36 @@ mod tests {
       }
       other => panic!("expected exit 1 with the session, got {other:?}"),
     }
+  }
+
+  #[test]
+  fn session_shell_names_its_project_and_reads_the_argv_cira_answers() {
+    let dir = std::env::temp_dir().join(format!("jc-cira-shell-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("log");
+    // The shape of a real answer (Cira 7cae55b, `cira session shell --json`).
+    let answer = r#"{"project":"p","session":"c-1","name":"s-c-1","socket":"/h/tmux.sock","argv":["/opt/homebrew/bin/tmux","-u","-S","/h/tmux.sock","attach-session","-t","=s-c-1"],"created":true}"#;
+    let cira = Cira::new(
+      script("shell", &format!("printf '%s\\n' \"$@\" > '{}'; echo '{answer}'", log.display())),
+      Duration::from_secs(10),
+    );
+    let at = At { project: Some("p".into()), dir: dir.clone() };
+    let shell = cira.session_shell(&at, "-c1").unwrap();
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+      logged.lines().collect::<Vec<_>>(),
+      ["session", "shell", "--project=p", "--json", "--", "-c1"],
+      "the session after a double dash, in its project"
+    );
+    assert_eq!(shell.argv.last().map(String::as_str), Some("=s-c-1"), "argv kept word for word");
+    assert_eq!(shell.argv.len(), 7);
+    assert!(shell.created);
+    let removed = Cira::new(script("shell-removed", "echo 'session c-1 is removed' >&2; exit 5"), Duration::from_secs(10));
+    assert!(matches!(
+      removed.session_shell(&at, "c-1"),
+      Err(CallError::Refused { code: exit::INVALID, .. })
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   #[test]

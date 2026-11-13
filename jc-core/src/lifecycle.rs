@@ -4,7 +4,7 @@
 //! moved ([`label_sync`]). Pure: the workspace feeds them `cira status --json`
 //! and what it remembers ([`Records`], `sessions.toml` in jc's config dir).
 
-use crate::cira::{JobState, ModePending, Session};
+use crate::cira::{CallError, JobState, ModePending, Session, SessionShell, exit};
 use crate::todo::Mark;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -123,6 +123,37 @@ pub fn attach_delay(previous: Option<Duration>, lived: Duration) -> Duration {
   match previous {
     Some(previous) if lived < ATTACH_STABLE => (previous * 2).clamp(ATTACH_MIN, ATTACH_MAX),
     _ => ATTACH_MIN,
+  }
+}
+
+/// Whether a pane whose child `exited` (when, and the pause
+/// [`attach_delay`] gave it) is still waiting out that pause at `now`.
+pub fn backing_off(exited: Option<(SystemTime, Duration)>, now: SystemTime) -> bool {
+  exited.is_some_and(|(exited, delay)| now < exited + delay)
+}
+
+/// What the Terminal pane runs, from Cira's answer to `cira session shell`
+/// (Cira DESIGN 12, PLAN TMUX-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellChild {
+  /// Attach to the session's shell in Cira's tmux server: this argument list.
+  Shared(Vec<String>),
+  /// Cira gave no shell: run jc's own, marked "not shared", for this reason.
+  Own(String),
+  /// The session has no shell to give (removed through Cira): run nothing.
+  Held(String),
+}
+
+/// The Terminal pane's child for Cira's answer. jc only attaches: it never
+/// makes or ends a shell in Cira's server.
+pub fn shell_child(answer: Result<SessionShell, CallError>) -> ShellChild {
+  match answer {
+    Ok(shell) if !shell.argv.is_empty() => ShellChild::Shared(shell.argv),
+    Ok(_) => ShellChild::Own("Cira's answer names no command".into()),
+    Err(CallError::Refused { code: exit::INVALID, message, .. }) => {
+      ShellChild::Held(message.trim().to_string())
+    }
+    Err(e) => ShellChild::Own(e.to_string()),
   }
 }
 
@@ -335,6 +366,40 @@ mod tests {
     }
     assert_eq!(delay, ATTACH_MAX, "doubles up to the cap");
     assert_eq!(attach_delay(Some(ATTACH_MAX), ATTACH_STABLE), ATTACH_MIN);
+  }
+
+  #[test]
+  fn a_pane_waits_out_its_pause_after_its_child_exited() {
+    assert!(!backing_off(None, at(100)), "never exited");
+    assert!(backing_off(Some((at(100), Duration::from_secs(5))), at(104)));
+    assert!(!backing_off(Some((at(100), Duration::from_secs(5))), at(105)));
+  }
+
+  #[test]
+  fn the_terminal_pane_attaches_to_ciras_shell_and_says_when_it_cannot() {
+    let shell = |argv: &[&str]| SessionShell {
+      session: "c-1".into(),
+      argv: argv.iter().map(|w| w.to_string()).collect(),
+      created: false,
+    };
+    let argv = ["/t/tmux", "-u", "-S", "/h/tmux.sock", "attach-session", "-t", "=s-c-1"];
+    assert_eq!(
+      shell_child(Ok(shell(&argv))),
+      ShellChild::Shared(argv.iter().map(|w| w.to_string()).collect())
+    );
+    // An answer with nothing to run is not attached to.
+    assert!(matches!(shell_child(Ok(shell(&[]))), ShellChild::Own(_)));
+    // Cira unreachable, or tmux missing (exit 1): jc's own shell, saying why.
+    match shell_child(Err(CallError::Unreachable)) {
+      ShellChild::Own(why) => assert_eq!(why, "Cira is unreachable"),
+      other => panic!("{other:?}"),
+    }
+    let no_tmux = CallError::Refused { code: exit::ERROR, message: "no tmux\n".into(), stdout: vec![] };
+    assert!(matches!(shell_child(Err(no_tmux)), ShellChild::Own(why) if why.contains("no tmux")));
+    // A removed session has no shell; a stand-in would carry its id for nothing.
+    let removed =
+      CallError::Refused { code: exit::INVALID, message: "removed\n".into(), stdout: vec![] };
+    assert!(matches!(shell_child(Err(removed)), ShellChild::Held(why) if why.contains("removed")));
   }
 
   #[test]
