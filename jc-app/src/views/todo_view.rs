@@ -176,6 +176,18 @@ impl TodoView {
     self.set_text_and_save(new_text, window, cx);
   }
 
+  /// Mark `[DELETED]` the headings of `retire` and add one under the
+  /// section for each `(id, label)` of `add` (Cira PLAN TMUX-09), then save.
+  pub fn apply_cira_sync(
+    &mut self,
+    sync: &jc_core::lifecycle::TodoSync,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
+    let text = sync.apply(&self.editor_text(cx), self.flavor);
+    self.set_text_and_save(text, window, cx);
+  }
+
   /// Bound every session's message log to the most recent
   /// [`todo::MAX_MESSAGES`], dropping older entries and saving if any went.
   ///

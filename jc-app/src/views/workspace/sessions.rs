@@ -151,6 +151,7 @@ impl Workspace {
     }
     if let Some(status) = &status {
       changed |= self.open_todos(status, window, cx);
+      changed |= self.sync_todos(status, window, cx);
     }
     if status.is_some() {
       self.cira.status = status;
@@ -226,6 +227,78 @@ impl Workspace {
     }
     if changed {
       self.refresh_breadcrumb_observers(cx);
+    }
+    changed
+  }
+
+  /// Give each open TODO a heading, and a pane, for every live session Cira
+  /// runs for its project, and mark `[DELETED]` the headings of sessions Cira
+  /// removed, saying so once (`lifecycle::todo_sync`, Cira PLAN TMUX-09). Not
+  /// while a TODO has unsaved edits, nor while one of its sessions is being
+  /// asked for: Cira lists that session before jcc has written its heading.
+  /// What jcc writes is recorded as what it last saw, so no marker or label
+  /// it wrote becomes a request. Returns whether anything changed.
+  fn sync_todos(&mut self, status: &Status, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    if self.cira.records.is_none() {
+      return false;
+    }
+    let mut changed = false;
+    for pi in 0..self.projects.len() {
+      let project = &self.projects[pi];
+      let tv = project.todo_view.read(cx);
+      if !tv.is_open(cx)
+        || tv.is_dirty(cx)
+        || project.sessions.values().any(|s| s.asking || s.lost.is_some())
+      {
+        continue;
+      }
+      let Some(cira_project) = status.project_for(&project.path) else { continue };
+      let mut sync = lifecycle::todo_sync(cira_project, status, tv.document());
+      sync.retire.retain(|id| !self.cira.in_flight.contains(id));
+      if sync == lifecycle::TodoSync::default() {
+        continue;
+      }
+      let todo_view = project.todo_view.clone();
+      todo_view.update(cx, |tv, cx| tv.apply_cira_sync(&sync, window, cx));
+      for id in &sync.retire {
+        let label = status.session(id).and_then(|s| s.label.clone()).unwrap_or_else(|| id.clone());
+        eprintln!("cira: {id} was removed through Cira; its heading is marked [DELETED]");
+        self.notice(format!("Cira removed session “{label}”; its heading is now [DELETED]"), cx);
+        if let Some(record) = self.record_mut(id) {
+          record.mark = Some(jc_core::todo::Mark::Deleted);
+        }
+      }
+      let doc = todo_view.read(cx).document().clone();
+      let palette = super::palette_from_window(window);
+      for (id, label) in &sync.add {
+        eprintln!("cira: {id} has no heading; added one");
+        if let Some(record) = self.record_mut(id) {
+          record.mark = Some(jc_core::todo::Mark::Active);
+          record.label = Some(label.clone());
+        }
+        let Some(heading) = doc.session_by_id(id) else { continue };
+        let project = &mut self.projects[pi];
+        let sid = project.next_session_id;
+        project.next_session_id += 1;
+        let session = SessionState::create(
+          sid,
+          Heading::of(heading),
+          Start::Cira,
+          &project.path.clone(),
+          &palette,
+          window,
+          cx,
+        );
+        project.sessions.insert(sid, session);
+      }
+      if !sync.add.is_empty() {
+        self.observe_panes(pi, window, cx);
+        self.kick_cira();
+      }
+      changed = true;
+    }
+    if changed {
+      self.save_records();
     }
     changed
   }

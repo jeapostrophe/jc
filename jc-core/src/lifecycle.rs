@@ -111,6 +111,69 @@ pub fn lost_session<'a>(
   })
 }
 
+/// What jcc's todo.md must change to show what Cira runs for its project
+/// (Cira PLAN TMUX-09).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TodoSync {
+  /// Sessions to add a heading for: `(id, label)`.
+  pub add: Vec<(String, String)>,
+  /// Ids of headings whose session Cira removed, to mark `[DELETED]`.
+  pub retire: Vec<String>,
+}
+
+impl TodoSync {
+  /// `text` with `retire`'s headings marked `[DELETED]` and a heading under
+  /// the section for each of `add`.
+  pub fn apply(&self, text: &str, flavor: crate::flavor::Flavor) -> String {
+    let mut text = text.to_string();
+    for id in &self.retire {
+      let doc = crate::todo::parse(&text, flavor);
+      let index = doc.index_by_id(id);
+      if let Some(marked) = index.and_then(|i| crate::todo::mark_deleted_at(&text, &doc, i)) {
+        text = marked;
+      }
+    }
+    for (id, label) in &self.add {
+      let doc = crate::todo::parse(&text, flavor);
+      text = crate::todo::insert_session_heading(&text, &doc, label, id);
+    }
+    text
+  }
+}
+
+/// Compare `doc` (jcc's todo.md) with `project`, the Cira project it belongs
+/// to, and `status`: a live session Cira runs there (`owned`; one known only
+/// from its hooks has no job to attach) that no heading names gets one, under
+/// its label (its id when the label cannot be a heading:
+/// [`crate::todo::writable_label`]); a heading whose session Cira removed is
+/// retired. A heading names a session by its id, `[DELETED]` included, or,
+/// before its migration, by the conversation it continues (`> uuid=`).
+pub fn todo_sync(
+  project: &crate::cira::Project,
+  status: &Status,
+  doc: &crate::todo::TodoDocument,
+) -> TodoSync {
+  let headed = |id: &str| doc.session_by_id(id).is_some() || doc.deleted.iter().any(|d| d.id == id);
+  let named = |s: &Session| headed(&s.id) || s.uuid.as_deref().is_some_and(headed);
+  let add = project
+    .sessions
+    .iter()
+    .filter(|s| s.owned && s.removed_at.is_none() && !named(s))
+    .map(|s| {
+      let label = s.label.as_deref().filter(|l| crate::todo::writable_label(l));
+      (s.id.clone(), label.unwrap_or(&s.id).to_string())
+    })
+    .collect();
+  let mut retire: Vec<String> = Vec::new();
+  for id in doc.sessions.iter().filter_map(|h| h.cira()) {
+    let removed = status.session(id).is_some_and(|s| s.removed_at.is_some());
+    if removed && !retire.iter().any(|r| r == id) {
+      retire.push(id.to_string());
+    }
+  }
+  TodoSync { add, retire }
+}
+
 /// Bounds of the pause before a pane attaches again after its client exited:
 /// [`ATTACH_MIN`] after a client that ran at least [`ATTACH_STABLE`], doubling
 /// up to [`ATTACH_MAX`] while it keeps exiting sooner.
@@ -452,6 +515,56 @@ mod tests {
 
   fn attach(short: &str) -> PaneAction {
     PaneAction::Attach(short.into())
+  }
+
+  /// TMUX-09 (Jay, 2026-11-14): "The ported session doesn't show up at all
+  /// in jcc" (made with `cira session new --resume`, so no heading), and
+  /// "First", removed through Cira, kept its heading.
+  #[test]
+  fn jccs_todo_follows_the_sessions_cira_runs_for_its_project() {
+    let status = serde_json::json!({ "projects": [
+      { "name": "p", "path": "/w/p", "sessions": [
+        { "id": "c-new", "label": "orchestrator", "owned": true },
+        { "id": "c-had", "label": "had", "owned": true },
+        { "id": "c-first", "label": "First", "owned": true, "removed_at": "1970-01-01T00:01:00Z" },
+        { "id": "c-gone", "label": "gone", "owned": true, "removed_at": "1970-01-01T00:01:00Z" },
+        { "id": "c-hooked", "label": "foreground", "owned": false },
+        { "id": "c-legacy", "uuid": "u-1", "label": "legacy", "owned": true },
+        { "id": "c-marker", "label": "[DELETED] x", "owned": true },
+        { "id": "c-dead", "label": "dead", "owned": true },
+      ]},
+    ]});
+    let mut status = status;
+    for s in status["projects"][0]["sessions"].as_array_mut().unwrap() {
+      for (k, v) in
+        [("state", "idle"), ("state_since", "1970-01-01T00:01:00Z"), ("mode_pending", "none")]
+      {
+        s[k] = v.into();
+      }
+      s["dangerous"] = false.into();
+    }
+    let status = Status::parse(status.to_string().as_bytes()).unwrap();
+    let text = "# Cira\n## had\n> cira=c-had\n\n### WAIT\n\
+                ## First\n> cira=c-first\n\n### Message 0\nhello\n### WAIT\n\
+                ## legacy\n> uuid=u-1\n\n### WAIT\n\
+                ## [DELETED] dead\n> cira=c-dead\n";
+    let doc = crate::todo::parse(text, crate::flavor::Flavor::Jcc);
+    let sync = todo_sync(&status.projects[0], &status, &doc);
+    assert_eq!(
+      sync.add,
+      [("c-new".to_string(), "orchestrator".to_string()), ("c-marker".into(), "c-marker".into())],
+      "every live session Cira runs here that no heading names (a legacy heading names its \
+       conversation's; a hook-only session has no job; a label that reads as a marker is not one)"
+    );
+    assert_eq!(sync.retire, ["c-first"], "a heading whose session Cira removed");
+
+    // Applied, the file names every session once and the sync is done.
+    let out = sync.apply(text, crate::flavor::Flavor::Jcc);
+    let after = crate::todo::parse(&out, crate::flavor::Flavor::Jcc);
+    assert!(out.contains("## [DELETED] First\n> cira=c-first\n\n### Message 0\nhello\n"), "{out}");
+    assert!(out.contains("## orchestrator\n> cira=c-new\n"), "{out}");
+    assert!(after.session_by_id("c-had").is_some() && after.session_by_id("c-first").is_none());
+    assert_eq!(todo_sync(&status.projects[0], &status, &after), TodoSync::default());
   }
 
   #[test]

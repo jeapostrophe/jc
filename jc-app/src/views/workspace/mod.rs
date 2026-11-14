@@ -594,6 +594,11 @@ impl Workspace {
   /// Refuse an action: the beep, and why, in a banner for a few seconds.
   pub(super) fn refuse(&mut self, why: impl Into<String>, cx: &mut Context<Self>) {
     crate::notify::beep();
+    self.notice(why, cx);
+  }
+
+  /// Say something in the window's banner for a few seconds.
+  pub(super) fn notice(&mut self, why: impl Into<String>, cx: &mut Context<Self>) {
     let n = self.refusal.as_ref().map_or(0, |(n, _)| n + 1);
     self.refusal = Some((n, why.into()));
     cx.notify();

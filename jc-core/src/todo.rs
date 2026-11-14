@@ -828,6 +828,20 @@ pub fn update_session_uuid_at(
   Some(splice(text, session.id_byte_range.clone(), new_uuid))
 }
 
+/// Mark the heading at `index` `[DELETED]` (dropping a `[D]`), keeping its
+/// id line and messages.
+pub fn mark_deleted_at(text: &str, doc: &TodoDocument, index: usize) -> Option<String> {
+  let session = doc.sessions.get(index)?;
+  Some(splice(text, session.heading_byte_range.clone(), &format!("## [DELETED] {}", session.label)))
+}
+
+/// Whether `label` can be written as a heading's label: not empty, not one
+/// that would read as a marker (`[D] `, `[X] `, `[DELETED] `), on one line.
+pub fn writable_label(label: &str) -> bool {
+  let marker_like = ["[D] ", "[X] ", "[DELETED] "].iter().any(|m| label.starts_with(m));
+  !label.trim().is_empty() && !marker_like && !label.contains(['\n', '\r'])
+}
+
 /// Rename the heading at `index` to `label`, keeping its `[D]` marker. A
 /// label that would read as a marker (`[D] `, `[X] `, `[DELETED] `), is empty,
 /// or would split the heading line is not written (`None`).
@@ -837,8 +851,7 @@ pub fn rename_heading_at(
   index: usize,
   label: &str,
 ) -> Option<String> {
-  let marker_like = ["[D] ", "[X] ", "[DELETED] "].iter().any(|m| label.starts_with(m));
-  if label.trim().is_empty() || marker_like || label.contains(['\n', '\r']) {
+  if !writable_label(label) {
     return None;
   }
   let session = doc.sessions.get(index)?;
@@ -2670,6 +2683,24 @@ draft
     assert!(parse(jc, Flavor::Jc).sessions.is_empty(), "jc's section is `# Claude` only");
     let jc_made = insert_session_heading("", &parse("", Flavor::Jc), "S", "u-1");
     assert!(jc_made.starts_with("# Claude\n"), "{jc_made}");
+  }
+
+  /// TMUX-09: a heading whose session Cira removed becomes `[DELETED]`, so
+  /// it is no longer a session but keeps its messages, and its id is still
+  /// found (`deleted`).
+  #[test]
+  fn marking_a_heading_deleted_keeps_its_messages() {
+    let text =
+      "# Cira\n## [D] First\n> cira=c-1\n\n### Message 0\nhello\n### WAIT\n## Other\n> cira=c-2\n";
+    let doc = parse_jcc(text);
+    let out = mark_deleted_at(text, &doc, 0).expect("the heading is there");
+    assert!(
+      out.starts_with("# Cira\n## [DELETED] First\n> cira=c-1\n\n### Message 0\nhello\n"),
+      "{out}"
+    );
+    let after = parse_jcc(&out);
+    assert_eq!(after.sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["c-2"]);
+    assert!(after.deleted.iter().any(|d| d.id == "c-1"));
   }
 
   #[test]
