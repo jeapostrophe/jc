@@ -105,7 +105,7 @@ Sessions sort activity-first, then by recency; the session you're on sorts last,
 
 | | jc | jcc |
 |---|---|---|
-| TODO | the project's `TODO.md`, `##` headings under `# Claude` with `> uuid=` | `$CIRA_HOME/projects/<project>/todo.md`, `##` headings under `# Claude` with `> cira=` |
+| TODO | the project's `TODO.md`, `##` headings under `# Claude` with `> uuid=` | `$CIRA_HOME/projects/<project>/todo.md`, `##` headings under `# Cira` (a `# Claude` section there is read too) with `> cira=` |
 | Config and state (`state.toml` with its project list, `jc.sock`, jcc's `sessions.toml`) | `~/.config/jc` | `~/.config/jcc` |
 | Hooks in a project's `.claude/settings.local.json` | URLs under `/jc-hook/` | URLs under `/jcc-hook/` |
 | Bundle id (notifications) | `com.jc.app` | `com.jc.app.jcc` |
@@ -114,7 +114,7 @@ jc never reads or writes jcc's file, and jcc never the project's TODO.md. jc als
 
 **Saving.** You, jc and any other editor can all save the same TODO file. Every save first re-reads the file and merges in what someone else saved meanwhile (a three-way merge against what the pane last read); if the two edits conflict, nothing is written to the file: the pane's text goes to `<file>.conflict-<unix time>` beside it, at the conflict and again at every save while it lasts (a send, a schedule), and the banner names that copy. The conflict ends when Cmd-R reloads the file, or when the file goes back to what the pane last read. A save that fails for any other reason says why in the same banner until one works. Saves replace the file whole (a temporary file renamed over it), so no reader ever sees half of one; a symlinked file is written through to its target and keeps its permissions.
 
-**Moving a session from jc to jcc.** Cut its heading block from the project's TODO.md and paste it under `# Claude` in jcc's todo.md (`# Claude` is there once jcc has made one session; add it otherwise). jcc moves its conversation to Cira once (`cira session new --resume <uuid>`) and rewrites the line to `> cira=`, but not while a `claude` process still runs that conversation (jc's pane, found by its executable and command line, or Claude Code's session registry): the pane says so until you end it in jc.
+**Moving a session from jc to jcc.** Cut its heading block from the project's TODO.md and paste it under `# Cira` in jcc's todo.md (there once jcc has made one session; add it otherwise; a `# Claude` section there works too). jcc moves its conversation to Cira once (`cira session new --resume <uuid>`) and rewrites the line to `> cira=`, but not while a `claude` process still runs that conversation (jc's pane, found by its executable and command line, or Claude Code's session registry): the pane says so until you end it in jc.
 
 ## Views
 

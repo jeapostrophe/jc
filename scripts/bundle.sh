@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # One binary, two apps (Cira PLAN TMUX-07): jc.app runs it as `jc-app` (jc,
 # its own Claude sessions); jcc.app runs the same binary named `jcc`, which
 # makes it Cira's client, with its own bundle id (com.jc.app.jcc), config
-# directory (~/.config/jcc) and TODO.md section (`# Cira`).
+# directory (~/.config/jcc) and its own todo.md, whose section is `# Cira`.
 
 echo "Building jc-app (release)..."
 (cd "$PROJECT_ROOT" && cargo build --release -p jc-app)

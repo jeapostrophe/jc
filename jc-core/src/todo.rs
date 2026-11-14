@@ -13,10 +13,10 @@ use std::ops::Range;
 pub struct TodoDocument {
   /// Whose document this is (jc's project TODO.md, or jcc's todo.md in
   /// Cira's store: [`Flavor::todo_path`]): its sessions are the `##` headings
-  /// under `# Claude` whose id line the flavor owns ([`Flavor::owns`]), and
+  /// under the flavor's section ([`Flavor::sections`]) whose id line the flavor owns ([`Flavor::owns`]), and
   /// its writers write that flavor's id line.
   pub flavor: Flavor,
-  /// 1-based line of the `# Claude` heading.
+  /// 1-based line of the (last) section heading.
   pub section_line: Option<u32>,
   pub sessions: Vec<TodoSession>,
   /// `## [DELETED] …` headings that still name a session. They are never
@@ -447,7 +447,7 @@ pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
   // State: we're inside a session's metadata block (after `> uuid=`); each line
   // starting with `> ` is parsed as metadata until we hit a non-metadata line.
   let mut in_metadata = false;
-  // Only create sessions for `##` headings inside `# Claude`.
+  // Only create sessions for `##` headings inside a session section.
   let mut in_section = false;
 
   for (line_idx, line) in text.lines().enumerate() {
@@ -515,7 +515,7 @@ pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
     } else if line.starts_with("# ") {
       // Any top-level heading ends the current session and leaves the section.
       finalize_session(&mut doc, &mut current_session, line_start);
-      in_section = line == "# Claude";
+      in_section = flavor.sections().contains(&line);
 
       if in_section {
         doc.section_line = Some(line_num);
@@ -524,7 +524,7 @@ pub fn parse(text: &str, flavor: Flavor) -> TodoDocument {
       // Any second-level heading ends the current session.
       finalize_session(&mut doc, &mut current_session, line_start);
 
-      // Only treat `##` headings as sessions inside `# Claude`.
+      // Only treat `##` headings as sessions inside a session section.
       if !in_section {
         // Ignore — this heading is outside the Claude section.
       } else if after_h2.starts_with("[DELETED] ") {
@@ -698,8 +698,9 @@ pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
 /// Build new text with a `## <label>\n<id line>\n\n### WAIT\n` heading
 /// inserted, its id line the document flavor's (`> uuid=<id>` for jc,
 /// `> cira=<id>` for jcc: [`Flavor::id_kind`]).
-/// If a `# Claude` section exists, the heading goes right after it. Otherwise
-/// a `# Claude` section is appended at the end of the text.
+/// If a session section exists ([`Flavor::sections`]), the heading goes right
+/// after its heading. Otherwise the flavor's section is appended at the end of
+/// the text.
 ///
 /// `label` need not be unique: it is a display name, not an address (see
 /// [`SessionKey`]).
@@ -707,7 +708,7 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, id: &
   let heading = format!("## {label}\n{}{id}\n\n### WAIT\n", doc.flavor.id_kind().prefix());
 
   if let Some(claude_line) = doc.section_line {
-    // Find byte offset right after the `# Claude` line.
+    // Find byte offset right after the section's heading line.
     let mut offset = 0;
     for (i, line) in text.lines().enumerate() {
       offset += line.len();
@@ -730,7 +731,7 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, id: &
     }
   }
 
-  // No `# Claude` section; append one at the end.
+  // No section; append the flavor's at the end.
   let mut new_text = text.to_string();
   if !new_text.is_empty() && !new_text.ends_with('\n') {
     new_text.push('\n');
@@ -738,7 +739,8 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, id: &
   if !new_text.is_empty() {
     new_text.push('\n');
   }
-  new_text.push_str("# Claude\n");
+  new_text.push_str(doc.flavor.sections()[0]);
+  new_text.push('\n');
   new_text.push_str(&heading);
   new_text
 }
@@ -2647,6 +2649,29 @@ draft
 
   // `> cira=` replaces `> uuid=` (Cira PLAN TMUX-01/02): the id Cira minted
   // is the heading's address, and a `> uuid=` heading is legacy.
+  /// jcc's todo.md is its own (Q-199), so its sessions sit under `# Cira`
+  /// (Jay, 2026-11-13: "I see '# Claude' not '# Cira'"). A file jcc made
+  /// before, or a block pasted from jc's TODO.md, still reads under
+  /// `# Claude`; jc's own section stays `# Claude` only.
+  #[test]
+  fn jccs_section_is_cira_and_still_reads_claude() {
+    let made = insert_session_heading("", &parse("", Flavor::Jcc), "S", "c-1");
+    assert!(made.starts_with("# Cira\n## S\n> cira=c-1\n"), "{made}");
+    assert_eq!(parse(&made, Flavor::Jcc).sessions.len(), 1);
+
+    let before = "# Claude\n## Old\n> cira=c-0\n\n### WAIT\n";
+    let doc = parse(before, Flavor::Jcc);
+    assert_eq!(doc.sessions.len(), 1, "a file jcc made with `# Claude` still reads");
+    let added = insert_session_heading(before, &doc, "New", "c-2");
+    assert!(added.starts_with("# Claude\n## New\n> cira=c-2\n"), "{added}");
+    assert!(!added.contains("# Cira"), "no second section: {added}");
+
+    let jc = "# Cira\n## S\n> uuid=u-1\n\n### WAIT\n";
+    assert!(parse(jc, Flavor::Jc).sessions.is_empty(), "jc's section is `# Claude` only");
+    let jc_made = insert_session_heading("", &parse("", Flavor::Jc), "S", "u-1");
+    assert!(jc_made.starts_with("# Claude\n"), "{jc_made}");
+  }
+
   #[test]
   fn cira_line_is_the_session_address() {
     let text = "# Claude\n## S\n> cira=c-1\n> last=5\n\n### WAIT\n";
@@ -2958,12 +2983,12 @@ draft
   }
 
   #[test]
-  fn each_flavor_writes_its_own_id_line_under_claude() {
+  fn each_flavor_writes_its_own_id_line_under_its_section() {
     let out = insert_session_heading(JC_TODO, &parse_jc(JC_TODO), "new jc", "u-new");
     assert!(out.contains("# Claude\n## new jc\n> uuid=u-new\n"), "{out}");
-    // jcc makes its file on first use: an empty one gets a `# Claude` section.
+    // jcc makes its file on first use: an empty one gets a `# Cira` section.
     let out = insert_session_heading("", &parse_jcc(""), "first", "c-1");
-    assert_eq!(out, "# Claude\n## first\n> cira=c-1\n\n### WAIT\n");
+    assert_eq!(out, "# Cira\n## first\n> cira=c-1\n\n### WAIT\n");
     assert_eq!(ids(&parse_jcc(&out)), ["c-1"]);
   }
 }

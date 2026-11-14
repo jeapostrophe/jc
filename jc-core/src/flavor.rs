@@ -110,7 +110,18 @@ impl Flavor {
     }
   }
 
-  /// Does a `# Claude` heading with an id line of `kind` name one of its
+  /// The top-level headings whose `##` headings are sessions; the first is
+  /// the one this app writes. jc's is `# Claude`. jcc's todo.md is its own
+  /// (Q-199), so it writes `# Cira`, and still reads `# Claude`: files it made
+  /// before, and blocks pasted from jc's TODO.md.
+  pub fn sections(self) -> &'static [&'static str] {
+    match self {
+      Self::Jc => &["# Claude"],
+      Self::Jcc => &["# Cira", "# Claude"],
+    }
+  }
+
+  /// Does a session heading with an id line of `kind` name one of its
   /// sessions? jc never acts on a `> cira=` heading; jcc's own are `> cira=`,
   /// and a `> uuid=` heading pasted into its file is a conversation it
   /// migrates to Cira (Cira PLAN TMUX-01).
