@@ -27,6 +27,8 @@ pub struct PtyHandle {
   /// signal it; until then an exited child is an unreaped zombie and keeps
   /// its pid.
   closed: Arc<Mutex<bool>>,
+  /// The size a nudge in flight restores ([`PtyHandle::reassert_size`]).
+  nudging: Mutex<Option<PtySize>>,
 }
 
 /// A child running in a PTY: the handle, the bytes it prints, and its exit.
@@ -85,6 +87,7 @@ impl PtyChild {
       writer: Arc::new(Mutex::new(writer)),
       killer: Mutex::new(killer),
       closed: closed.clone(),
+      nudging: Mutex::new(None),
     });
 
     let (bytes_tx, bytes) = flume::unbounded::<Vec<u8>>();
@@ -136,18 +139,28 @@ impl PtyHandle {
 
 impl PtyHandle {
   /// Make the child send its size again although it has not changed: one
-  /// row less, then, after [`Self::NUDGE`] on a thread of its own, its size
-  /// back (unless it was resized meanwhile). A resize to the same size raises
-  /// no SIGWINCH, and two at once may reach the child as one.
+  /// row less (two rows for a one-row pane), then, after [`Self::NUDGE`] on a
+  /// thread of its own, its size back (unless it was resized meanwhile). A
+  /// resize to the same size raises no SIGWINCH, and two at once may reach
+  /// the child as one. While a nudge is in flight another changes nothing:
+  /// that one already re-asserts, and would read the nudged size as its own.
   pub fn reassert_size(self: &Arc<Self>) -> Result<()> {
+    let mut nudging = self.nudging.lock();
+    if nudging.is_some() {
+      return Ok(());
+    }
     let size = self.master.lock().get_size()?;
     let nudged = PtySize { rows: if size.rows > 1 { size.rows - 1 } else { 2 }, ..size };
     self.master.lock().resize(nudged)?;
+    *nudging = Some(size);
     let this = self.clone();
     std::thread::spawn(move || {
       std::thread::sleep(Self::NUDGE);
+      let mut nudging = this.nudging.lock();
       let master = this.master.lock();
-      if master.get_size().is_ok_and(|now| now == nudged) {
+      if let Some(size) = nudging.take()
+        && master.get_size().is_ok_and(|now| now == nudged)
+      {
         let _ = master.resize(size);
       }
     });
@@ -411,6 +424,21 @@ mod tests {
     assert!(nudged < out.find("size 24 80").unwrap(), "{out}");
     let size = child.handle.master.lock().get_size().unwrap();
     assert_eq!((size.cols, size.rows), (80, 24), "it ends at its own size");
+  }
+
+  /// A session switch shows the pane and then focuses it: two re-assertions
+  /// within one nudge must still end at the pane's own size.
+  #[test]
+  fn reasserting_twice_at_once_ends_at_its_size() {
+    let script =
+      r#"trap 'echo "size $(stty size)"' WINCH; echo ready; while :; do sleep 0.05; done"#;
+    let child = PtyChild::spawn(&sh(script), &[], 80, 24, None).unwrap();
+    read_until(&child, "ready");
+    child.handle.reassert_size().unwrap();
+    child.handle.reassert_size().unwrap();
+    std::thread::sleep(PtyHandle::NUDGE * 3);
+    let size = child.handle.master.lock().get_size().unwrap();
+    assert_eq!((size.cols, size.rows), (80, 24), "a second nudge took the first's size as its own");
   }
 
   #[test]
