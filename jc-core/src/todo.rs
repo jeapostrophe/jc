@@ -698,40 +698,33 @@ pub fn unique_label(doc: &TodoDocument, base: &str) -> String {
 /// Build new text with a `## <label>\n<id line>\n\n### WAIT\n` heading
 /// inserted, its id line the document flavor's (`> uuid=<id>` for jc,
 /// `> cira=<id>` for jcc: [`Flavor::id_kind`]).
-/// If a session section exists ([`Flavor::sections`]), the heading goes right
-/// after its heading. Otherwise the flavor's section is appended at the end of
-/// the text.
+/// The heading goes right after the flavor's own section heading (the first
+/// of [`Flavor::sections`]: jc's `# Claude`, jcc's `# Cira`), which is
+/// appended at the end of the text when the file has none.
 ///
 /// `label` need not be unique: it is a display name, not an address (see
 /// [`SessionKey`]).
 pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, id: &str) -> String {
   let heading = format!("## {label}\n{}{id}\n\n### WAIT\n", doc.flavor.id_kind().prefix());
+  let section = doc.flavor.sections()[0];
 
-  if let Some(claude_line) = doc.section_line {
-    // Find byte offset right after the section's heading line.
-    let mut offset = 0;
-    for (i, line) in text.lines().enumerate() {
-      offset += line.len();
-      // Skip past the newline character(s).
-      if text.as_bytes().get(offset) == Some(&b'\n') {
-        offset += 1;
-      } else if text.as_bytes().get(offset) == Some(&b'\r') {
-        offset += 1;
-        if text.as_bytes().get(offset) == Some(&b'\n') {
-          offset += 1;
-        }
+  // Right after the first line that is the flavor's own section heading.
+  let mut offset = 0;
+  for line in text.split_inclusive('\n') {
+    offset += line.len();
+    if line.trim_end_matches(['\n', '\r']) == section {
+      let mut new_text = String::with_capacity(text.len() + heading.len() + 1);
+      new_text.push_str(&text[..offset]);
+      if !line.ends_with('\n') {
+        new_text.push('\n');
       }
-      if i as u32 + 1 == claude_line {
-        let mut new_text = String::with_capacity(text.len() + heading.len());
-        new_text.push_str(&text[..offset]);
-        new_text.push_str(&heading);
-        new_text.push_str(&text[offset..]);
-        return new_text;
-      }
+      new_text.push_str(&heading);
+      new_text.push_str(&text[offset..]);
+      return new_text;
     }
   }
 
-  // No section; append the flavor's at the end.
+  // No such section; append it at the end.
   let mut new_text = text.to_string();
   if !new_text.is_empty() && !new_text.ends_with('\n') {
     new_text.push('\n');
@@ -739,7 +732,7 @@ pub fn insert_session_heading(text: &str, doc: &TodoDocument, label: &str, id: &
   if !new_text.is_empty() {
     new_text.push('\n');
   }
-  new_text.push_str(doc.flavor.sections()[0]);
+  new_text.push_str(section);
   new_text.push('\n');
   new_text.push_str(&heading);
   new_text
@@ -2675,9 +2668,16 @@ draft
     let before = "# Claude\n## Old\n> cira=c-0\n\n### WAIT\n";
     let doc = parse(before, Flavor::Jcc);
     assert_eq!(doc.sessions.len(), 1, "a file jcc made with `# Claude` still reads");
+    // What jcc writes goes under `# Cira`, made when missing (review).
     let added = insert_session_heading(before, &doc, "New", "c-2");
-    assert!(added.starts_with("# Claude\n## New\n> cira=c-2\n"), "{added}");
-    assert!(!added.contains("# Cira"), "no second section: {added}");
+    assert!(added.starts_with(before), "{added}");
+    assert!(added.ends_with("# Cira\n## New\n> cira=c-2\n\n### WAIT\n"), "{added}");
+    let both = "# Cira\n## A\n> cira=c-1\n\n# Claude\n## B\n> cira=c-0\n";
+    let added = insert_session_heading(both, &parse(both, Flavor::Jcc), "New", "c-2");
+    assert!(
+      added.starts_with("# Cira\n## New\n> cira=c-2\n"),
+      "under `# Cira`, not the last section: {added}"
+    );
 
     let jc = "# Cira\n## S\n> uuid=u-1\n\n### WAIT\n";
     assert!(parse(jc, Flavor::Jc).sessions.is_empty(), "jc's section is `# Claude` only");

@@ -39,6 +39,9 @@ pub struct ProjectState {
   pub active_session: Option<SessionId>,
   pub next_session_id: SessionId,
   pub todo_view: Entity<TodoView>,
+  /// jcc: added to jcc's list in this run, or named by `jcc <dir>`: only
+  /// such a project registers a Cira project (`lifecycle::plan_todos`).
+  pub added: bool,
   /// What waits on Jay in the Cira project this one belongs to, from the last
   /// `cira status --json`; `None` while Cira is unreachable or has no project
   /// containing this one.
@@ -77,6 +80,7 @@ impl ProjectState {
       active_session: None,
       next_session_id: 0,
       todo_view,
+      added: false,
       cira_open: None,
       cira_known: HashSet::new(),
       session_dirs,

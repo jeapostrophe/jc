@@ -198,6 +198,37 @@ fn contains_hook_url(value: &Value, prefix: &str) -> bool {
   }
 }
 
+/// A change to one project's hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookJob {
+  Install(std::path::PathBuf),
+  Uninstall(std::path::PathBuf),
+}
+
+/// Run `flavor`'s hook jobs in the order they are sent, on one thread of its
+/// own, until every sender is dropped. A project opened and closed in quick
+/// succession (a state.toml edit) must end uninstalled, which jobs on threads
+/// of their own do not promise. `failed` hears each job that did not work.
+pub fn hook_worker(
+  flavor: Flavor,
+  port: u16,
+  failed: impl Fn(String) + Send + 'static,
+) -> (flume::Sender<HookJob>, std::thread::JoinHandle<()>) {
+  let (tx, rx) = flume::unbounded::<HookJob>();
+  let worker = std::thread::spawn(move || {
+    for job in rx.iter() {
+      let (path, verb, result) = match &job {
+        HookJob::Install(path) => (path, "installed", install_hooks(flavor, path, port)),
+        HookJob::Uninstall(path) => (path, "removed", uninstall_hooks(flavor, path)),
+      };
+      if let Err(e) = result {
+        failed(format!("{}: hooks not {verb}: {e:#}", path.display()));
+      }
+    }
+  });
+  (tx, worker)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -213,6 +244,25 @@ mod tests {
       Flavor::Jc => 1111,
       Flavor::Jcc => 2222,
     }
+  }
+
+  /// Review P4: an install and an uninstall sent back to back end
+  /// uninstalled.
+  #[test]
+  fn hook_jobs_run_in_the_order_sent() {
+    let project = std::env::temp_dir().join(format!("jc-hooks-order-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&project);
+    std::fs::create_dir_all(&project).unwrap();
+    let (jobs, worker) = hook_worker(Flavor::Jc, port_of(Flavor::Jc), |e| panic!("{e}"));
+    for _ in 0..20 {
+      jobs.send(HookJob::Install(project.clone())).unwrap();
+      jobs.send(HookJob::Uninstall(project.clone())).unwrap();
+    }
+    jobs.send(HookJob::Install(project.clone())).unwrap();
+    drop(jobs);
+    worker.join().unwrap();
+    assert!(urls(&project, Flavor::Jc) > 0, "the last job was an install");
+    let _ = std::fs::remove_dir_all(&project);
   }
 
   #[test]

@@ -77,6 +77,19 @@ impl TodoView {
     self.reparse(cx);
   }
 
+  /// Close the file (jcc: Cira no longer lists its project), so no save
+  /// writes it again. Unsaved text stays in the pane.
+  pub fn close(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    self.code_view.update(cx, |cv, cx| cv.close_file(cx));
+    self.waiting = Some(
+      "Cira no longer lists this project, so jcc does not write its todo.md. `jcc .` in its \
+       directory registers it again."
+        .into(),
+    );
+    self.reparse(cx);
+    cx.notify();
+  }
+
   /// Say why the TODO is not open (jcc). Returns whether that changed.
   pub fn set_waiting(&mut self, why: Option<String>, cx: &mut Context<Self>) -> bool {
     let changed = self.waiting != why;

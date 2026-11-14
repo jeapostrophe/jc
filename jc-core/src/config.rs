@@ -142,7 +142,94 @@ pub struct StateChange {
   pub removed: Vec<PathBuf>,
 }
 
+/// What an app does about an open project `state.toml` no longer lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leaving {
+  /// Keep it: it is the only project open.
+  Stay,
+  /// Ask Jay first.
+  Ask,
+  /// Ask, once the dialog already shown closes (it is re-evaluated then).
+  Wait,
+  Close,
+}
+
+/// For a project `state.toml` dropped: with `open` projects open, `sessions`
+/// in it (jc's end when it closes, busy or idle), its buffers that could not
+/// be saved (`unsaved`), and whether a dialog is up already. jcc's sessions
+/// keep running in Cira, so it asks only about unsaved buffers.
+pub fn leaving(
+  flavor: Flavor,
+  open: usize,
+  sessions: usize,
+  unsaved: bool,
+  dialog_open: bool,
+) -> Leaving {
+  if open <= 1 {
+    return Leaving::Stay;
+  }
+  let ask = unsaved || (flavor == Flavor::Jc && sessions > 0);
+  match (ask, dialog_open) {
+    (false, _) => Leaving::Close,
+    (true, true) => Leaving::Wait,
+    (true, false) => Leaving::Ask,
+  }
+}
+
+/// Which `state.toml` read is the newest, so an older one that finishes
+/// later is not applied (review P5).
+#[derive(Debug, Default)]
+pub struct Reads {
+  issued: u64,
+}
+
+impl Reads {
+  /// Number a new read.
+  pub fn issue(&mut self) -> u64 {
+    self.issued += 1;
+    self.issued
+  }
+
+  /// Whether read `n` is the newest issued.
+  pub fn is_latest(&self, n: u64) -> bool {
+    n == self.issued
+  }
+}
+
+/// A `state.toml`'s projects as the app opens them.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Resolved {
+  /// Canonical paths, in order.
+  pub listed: Vec<PathBuf>,
+  /// Listed paths that do not exist, as written.
+  pub missing: Vec<PathBuf>,
+}
+
+impl Resolved {
+  /// Compare with the projects open now (canonical paths). A missing path
+  /// is not opened, and an open project listed only under it is not closed.
+  pub fn change_from(&self, open: &[PathBuf]) -> StateChange {
+    let listed = AppState { projects: self.listed.iter().cloned().map(Project::from).collect() };
+    let mut change = listed.change_from(open);
+    change.removed.retain(|p| !self.missing.contains(p));
+    change
+  }
+}
+
 impl AppState {
+  /// Canonicalize each listed path; does file-system calls.
+  pub fn resolve(&self) -> Resolved {
+    let mut resolved = Resolved::default();
+    for path in self.projects.iter().map(|p| &p.path) {
+      match fs::canonicalize(path) {
+        Ok(path) if !resolved.listed.contains(&path) => resolved.listed.push(path),
+        Ok(_) => {}
+        Err(_) => resolved.missing.push(path.clone()),
+      }
+    }
+    resolved
+  }
+
   /// Compare with the projects open now.
   pub fn change_from(&self, open: &[PathBuf]) -> StateChange {
     let listed: Vec<&PathBuf> = self.projects.iter().map(|p| &p.path).collect();
@@ -201,6 +288,49 @@ mod tests {
   /// TMUX-10 (Jay: "live-react to the state.toml file changing"). An app's
   /// own write lists exactly what it has open, so it asks for nothing: no
   /// echo.
+  #[test]
+  fn a_dropped_project_closes_unless_that_loses_something() {
+    use Leaving::*;
+    assert_eq!(leaving(Flavor::Jcc, 2, 3, false, false), Close, "jcc's sessions run on in Cira");
+    assert_eq!(leaving(Flavor::Jcc, 2, 0, false, true), Close, "not held up by another dialog");
+    assert_eq!(leaving(Flavor::Jcc, 2, 0, true, false), Ask, "an unsaved buffer");
+    assert_eq!(leaving(Flavor::Jc, 2, 1, false, false), Ask, "jc's sessions would end");
+    assert_eq!(leaving(Flavor::Jc, 2, 0, false, false), Close);
+    assert_eq!(leaving(Flavor::Jc, 2, 1, false, true), Wait, "asked once the dialog closes");
+    assert_eq!(leaving(Flavor::Jc, 1, 0, false, false), Stay, "the last project");
+  }
+
+  #[test]
+  fn only_the_newest_read_is_applied() {
+    let mut reads = Reads::default();
+    let first = reads.issue();
+    let second = reads.issue();
+    assert!(!reads.is_latest(first), "an older read that finishes later");
+    assert!(reads.is_latest(second));
+  }
+
+  /// Review: paths are compared as the app opens them (canonical), and one
+  /// that does not exist is neither opened nor a reason to close.
+  #[test]
+  fn listed_paths_are_canonical_and_missing_ones_are_set_aside() {
+    let dir = std::env::temp_dir().join(format!("jc-state-{}", std::process::id()));
+    let real = dir.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    let real = fs::canonicalize(&real).unwrap();
+    let state = AppState {
+      projects: [dir.join("real/../real"), dir.join("gone")]
+        .into_iter()
+        .map(Project::from)
+        .collect(),
+    };
+    let resolved = state.resolve();
+    assert_eq!(resolved.listed, std::slice::from_ref(&real));
+    assert_eq!(resolved.missing, [dir.join("gone")]);
+    let change = resolved.change_from(&[real.clone(), dir.join("gone")]);
+    assert_eq!(change, StateChange::default(), "an open project whose directory went stays");
+    let _ = fs::remove_dir_all(&dir);
+  }
+
   #[test]
   fn a_changed_state_file_names_what_to_open_and_close() {
     let state = |paths: &[&str]| AppState {

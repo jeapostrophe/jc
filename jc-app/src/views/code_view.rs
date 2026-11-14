@@ -70,6 +70,14 @@ impl CodeView {
     self.load_current(window, cx);
   }
 
+  /// Stop editing a file: nothing is saved to it or read from it again. The
+  /// buffer keeps its text.
+  pub fn close_file(&mut self, cx: &mut Context<Self>) {
+    self.file = None;
+    self._watcher = None;
+    cx.notify();
+  }
+
   /// Watch the file a symlink names, not the link: a TODO.md linked into a
   /// dot-files repo changes there.
   fn setup_watcher(&mut self, path: &Path, window: &Window, cx: &mut Context<Self>) {

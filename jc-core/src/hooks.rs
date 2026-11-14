@@ -97,6 +97,11 @@ impl HookServer {
     }
   }
 
+  /// Stop serving the project at `path`: one the app closed.
+  pub fn remove_project(&self, path: &Path) {
+    self.projects.lock().unwrap().retain(|p| p != path);
+  }
+
   pub fn shutdown(&self) {
     self.server.unblock();
   }
@@ -238,6 +243,11 @@ mod tests {
     post(server.port, "stop", r#"{"session_id":"s-1","cwd":"/w/b/sub"}"#);
     let event = server.rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
     assert_eq!(event.project_path, Some(PathBuf::from("/w/b")));
+    // Review P4: once closed, it is not served.
+    server.remove_project(Path::new("/w/b"));
+    post(server.port, "stop", r#"{"session_id":"s-1","cwd":"/w/b/sub"}"#);
+    let event = server.rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(event.project_path, None);
     server.shutdown();
   }
 }

@@ -175,9 +175,9 @@ impl PtyHandle {
     Ok(())
   }
 
-  /// How long the child is shown the other size: long enough to be read as
-  /// its own SIGWINCH.
-  const NUDGE: std::time::Duration = std::time::Duration::from_millis(100);
+  /// How long the child is shown the other size: long enough for it to read
+  /// that size at its SIGWINCH on a loaded machine.
+  const NUDGE: std::time::Duration = std::time::Duration::from_millis(250);
 }
 
 impl Drop for PtyHandle {
@@ -448,21 +448,34 @@ mod tests {
     let mut processor = alacritty_terminal::vte::ansi::Processor::<
       alacritty_terminal::vte::ansi::StdSyncHandler,
     >::default();
-    let mut feed = |until: std::time::Instant| {
-      while let Ok(bytes) =
-        child.bytes.recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
-      {
+    // Feed the emulator what the client prints until `done` holds of what it
+    // printed, or 30 s pass: fixed pauses lost the race on a loaded machine.
+    let mut seen = Vec::new();
+    let mut feed = |done: &dyn Fn(&[u8]) -> bool| {
+      let deadline = std::time::Instant::now() + Duration::from_secs(30);
+      while !done(&seen) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok(bytes) = child.bytes.recv_timeout(left) else { break };
         state.with_term_mut(|term| processor.advance(term, &bytes));
+        seen.extend(bytes);
       }
     };
-    let soon = || std::time::Instant::now() + Duration::from_millis(800);
-    feed(soon());
+    let has =
+      |needle: &'static [u8]| move |out: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+    feed(&has(b"clip-me-text"));
     // Press on column 1 of row 1, drag to column 8, release.
     for event in ["\x1b[<0;1;1M", "\x1b[<32;8;1M", "\x1b[<0;8;1m"] {
       child.handle.write_all(event.as_bytes()).unwrap();
-      feed(std::time::Instant::now() + Duration::from_millis(200));
+      std::thread::sleep(Duration::from_millis(200));
     }
-    feed(soon());
+    // Until the OSC 52 sequence is complete: BEL or ST after its start.
+    feed(&|out: &[u8]| {
+      let start = out.windows(5).position(|w| w == b"\x1b]52;");
+      start.is_some_and(|at| {
+        let rest = &out[at..];
+        rest.contains(&0x07) || rest.windows(2).any(|w| w == b"\x1b\\")
+      })
+    });
     let stored: Vec<String> = events
       .try_iter()
       .filter_map(|e| match e {

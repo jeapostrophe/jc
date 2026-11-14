@@ -37,6 +37,8 @@ pub(super) struct CiraView {
   /// jc projects jcc has asked Cira to register (`cira project add`), so
   /// each is asked once: a project gives jcc's todo.md its place.
   pub registering: std::collections::HashSet<PathBuf>,
+  /// The home directory, links resolved: jcc registers no project there.
+  pub home: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -177,17 +179,32 @@ impl Workspace {
   /// session new` would, so its TODO opens at a later read; a refusal shows in
   /// its TODO pane. Returns whether anything shown changed.
   fn open_todos(&mut self, status: &Status, window: &mut Window, cx: &mut Context<Self>) -> bool {
-    let projects: Vec<(PathBuf, Option<PathBuf>)> = self
+    let projects: Vec<lifecycle::TodoProject> = self
       .projects
       .iter()
-      .map(|p| {
-        (p.path.clone(), p.todo_view.read(cx).code_view().read(cx).file_path().map(PathBuf::from))
+      .map(|p| lifecycle::TodoProject {
+        path: p.path.clone(),
+        open: p.todo_view.read(cx).code_view().read(cx).file_path().map(PathBuf::from),
+        added: p.added,
       })
       .collect();
     let palette = super::palette_from_window(window);
     let mut changed = false;
-    for (pi, plan) in lifecycle::plan_todos(status, &projects) {
+    for (pi, plan) in lifecycle::plan_todos(status, &projects, self.cira.home.as_deref()) {
+      let todo_view = self.projects[pi].todo_view.clone();
       match plan {
+        lifecycle::TodoPlan::Unregistered(why) => {
+          let why = lifecycle::unregistered_text(why).to_string();
+          changed |= todo_view.update(cx, |tv, cx| tv.set_waiting(Some(why), cx));
+        }
+        lifecycle::TodoPlan::Unlisted => {
+          eprintln!(
+            "cira: no longer lists {}; its todo.md is closed",
+            self.projects[pi].path.display()
+          );
+          todo_view.update(cx, |tv, cx| tv.close(window, cx));
+          changed = true;
+        }
         lifecycle::TodoPlan::Open(todo) => {
           self.projects[pi].open_todo(todo, &palette, window, cx);
           changed = true;
@@ -214,8 +231,8 @@ impl Workspace {
             |ws, added, _window, cx| match added {
               Ok(()) => ws.kick_cira(),
               Err((name, path, e)) => {
-                let why = format!("jcc's TODO cannot open: `cira project add {name}` refused: {e}");
-                eprintln!("{why} ({})", path.display());
+                let why = lifecycle::unregistered_why(&name, &e);
+                eprintln!("cira: {why} ({})", path.display());
                 if let Some(pi) = ws.project_index(&path) {
                   ws.projects[pi].todo_view.update(cx, |tv, cx| tv.set_waiting(Some(why), cx));
                 }
@@ -246,14 +263,13 @@ impl Workspace {
     for pi in 0..self.projects.len() {
       let project = &self.projects[pi];
       let tv = project.todo_view.read(cx);
-      if !tv.is_open(cx)
-        || tv.is_dirty(cx)
-        || project.sessions.values().any(|s| s.asking || s.lost.is_some())
-      {
+      let asking = project.sessions.values().any(|s| s.asking || s.lost.is_some());
+      if !lifecycle::may_sync_todo(tv.is_open(cx), tv.is_dirty(cx), asking) {
         continue;
       }
       let Some(cira_project) = status.project_for(&project.path) else { continue };
-      let mut sync = lifecycle::todo_sync(cira_project, status, tv.document());
+      let running = |id: &str| project.session_by_key(id).is_some();
+      let mut sync = lifecycle::todo_sync(cira_project, status, tv.document(), running);
       sync.retire.retain(|id| !self.cira.in_flight.contains(id));
       if sync == lifecycle::TodoSync::default() {
         continue;
@@ -270,11 +286,14 @@ impl Workspace {
       }
       let doc = todo_view.read(cx).document().clone();
       let palette = super::palette_from_window(window);
-      for (id, label) in &sync.add {
+      for (id, _) in &sync.add {
         eprintln!("cira: {id} has no heading; added one");
+        // Cira's label as it is, which may be none: `label_sync` reads the
+        // heading made from it as agreeing.
+        let label = status.session(id).and_then(|s| s.label.clone());
         if let Some(record) = self.record_mut(id) {
           record.mark = Some(jc_core::todo::Mark::Active);
-          record.label = Some(label.clone());
+          record.label = label;
         }
         let Some(heading) = doc.session_by_id(id) else { continue };
         let project = &mut self.projects[pi];
@@ -598,7 +617,8 @@ impl Workspace {
       None => {
         // Its heading went while Cira was asked (deleted, or its id line
         // edited): nothing names the new session. One marked `[DELETED]`
-        // is removed in Cira too; any other is left for the page.
+        // is removed in Cira too; any other gets a heading of its own at a
+        // later read, as a session made elsewhere does (`sync_todos`).
         let deleted = doc.deleted.iter().any(|d| d.id == session.key);
         eprintln!("cira: the heading for {} went; session {id} is not recorded", session.key);
         self.remove_running_session(pi, sid, window, cx);
@@ -1194,9 +1214,9 @@ impl Workspace {
           continue;
         }
         let last = records.sessions.get(id).and_then(|r| r.label.as_deref());
-        match lifecycle::label_sync(&heading.label, listed.label.as_deref(), last) {
-          LabelSync::Agreed if last != Some(heading.label.as_str()) => {
-            agreed.push((id.to_string(), heading.label.clone()))
+        match lifecycle::label_sync(&heading.label, id, listed.label.as_deref(), last) {
+          LabelSync::Agreed if last != listed.label.as_deref() => {
+            agreed.push((id.to_string(), listed.label.clone()))
           }
           LabelSync::Agreed => {}
           LabelSync::Send => sends.push((pi, id.to_string(), heading.label.clone())),
@@ -1207,7 +1227,7 @@ impl Workspace {
     let record = !agreed.is_empty() || !writes.is_empty();
     for (id, label) in agreed {
       if let Some(r) = self.record_mut(&id) {
-        r.label = Some(label);
+        r.label = label;
       }
     }
     for (pi, index, id, label) in writes {

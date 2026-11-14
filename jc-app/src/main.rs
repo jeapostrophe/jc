@@ -67,12 +67,15 @@ fn main() -> anyhow::Result<()> {
   let config = config::load_config()?;
   let mut state = config::load_state()?;
 
+  // The project this start was asked to add (jcc registers a Cira project
+  // only for one added: `lifecycle::plan_todos`).
+  let mut added = None;
   if let Some(path) = &project_path {
-    state.register_project(path);
+    added = Some(state.register_project(path).path.clone());
     config::save_state(&state)?;
   } else if state.projects.is_empty() {
     let cwd = std::env::current_dir()?;
-    state.register_project(&cwd);
+    added = Some(state.register_project(&cwd).path.clone());
     config::save_state(&state)?;
   }
 
@@ -87,7 +90,9 @@ fn main() -> anyhow::Result<()> {
   // The GPUI event loop swallows Ctrl-C, so Drop doesn't always run.
   install_signal_handler(&state);
 
-  app::run(state, config, ipc_rx);
+  // The home directory, links resolved: Cira registers no project there.
+  let home = std::env::var_os("HOME").and_then(|h| std::fs::canonicalize(h).ok());
+  app::run(state, config, ipc_rx, added, home);
   Ok(())
 }
 

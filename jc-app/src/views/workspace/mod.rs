@@ -18,6 +18,7 @@ use jc_core::background::Claude;
 use jc_core::config::{AppConfig, AppState};
 use jc_core::flavor::Flavor;
 use jc_core::hooks::{HookEvent, HookEventKind, HookServer};
+use jc_core::hooks_settings::HookJob;
 use jc_core::theme::Appearance;
 use jc_core::todo::{SessionKey, TodoDocument};
 use jc_terminal::{Palette, TerminalView};
@@ -119,6 +120,11 @@ pub struct Workspace {
   closing: Closing,
   /// Watches `state.toml` (Cira PLAN TMUX-10).
   _state_watcher: Option<notify::RecommendedWatcher>,
+  /// The newest `state.toml` read; older ones are not applied.
+  state_reads: jc_core::config::Reads,
+  /// Bumped at each change of `state.toml`, which is read once it holds
+  /// still for `STATE_SETTLE`.
+  state_changes: u64,
   /// Which app this is (Cira PLAN TMUX-07): `jc` runs each session's
   /// `claude` itself (`own.rs`); `jcc` is Cira's client (`sessions.rs`).
   flavor: Flavor,
@@ -143,8 +149,9 @@ pub struct Workspace {
   /// until jc restarts, since its sessions send this app nothing.
   hook_warning: Option<String>,
   _hook_failure_task: Option<Task<()>>,
-  /// Where a hook install that failed is reported (`hook_warning`).
-  hook_failures_tx: flume::Sender<String>,
+  /// Installs and removes projects' hooks, in order, on its own thread; with
+  /// the hook server.
+  hook_jobs: Option<(flume::Sender<HookJob>, std::thread::JoinHandle<()>)>,
   /// Why the last action was refused, shown for a few seconds
   /// (`Workspace::refuse`), with a number so a later refusal's timer is not
   /// cleared by an earlier one's.
@@ -163,6 +170,8 @@ impl Workspace {
     state: AppState,
     config: AppConfig,
     ipc_rx: flume::Receiver<PathBuf>,
+    added: Option<PathBuf>,
+    home: Option<PathBuf>,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> Self {
@@ -190,6 +199,9 @@ impl Workspace {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unknown".into());
       projects.push(ProjectState::create(path, name, &palette, window, cx));
+    }
+    for project in &mut projects {
+      project.added = added.as_ref() == Some(&project.path);
     }
 
     // Create global TODO view (~/.claude/TODO.md) as a read-only CodeView.
@@ -244,23 +256,24 @@ impl Workspace {
     let (hook_failures_tx, hook_failures) = flume::unbounded::<String>();
     // Start hook server for Claude Code integration.
     let project_paths: Vec<PathBuf> = projects.iter().map(|p| p.path.clone()).collect();
+    let mut hook_jobs = None;
     let (hook_server, hook_poll_task) = match HookServer::start(flavor, project_paths.clone()) {
       Ok(server) => {
-        let port = server.port;
-        // Install hooks into each project's settings, off the main thread. A
-        // failure (a settings.local.json that does not parse is left alone)
-        // means no markers or notifications from that project: the window
-        // says so (`hook_warning`).
-        for path in &project_paths {
-          let path = path.clone();
-          let failed = hook_failures_tx.clone();
-          std::thread::spawn(move || {
-            if let Err(e) = jc_core::hooks_settings::install_hooks(flavor, &path, port) {
-              eprintln!("failed to install hooks for {}: {e:#}", path.display());
-              let _ = failed.send(format!("{}: hooks not installed: {e:#}", path.display()));
-            }
+        // Install hooks into each project's settings, off the main thread, in
+        // order with later installs and removals (`hook_worker`). A failure
+        // (a settings.local.json that does not parse is left alone) means no
+        // markers or notifications from that project: the window says so
+        // (`hook_warning`).
+        let failed = hook_failures_tx.clone();
+        let (jobs, worker) =
+          jc_core::hooks_settings::hook_worker(flavor, server.port, move |why: String| {
+            eprintln!("{why}");
+            let _ = failed.send(why);
           });
+        for path in &project_paths {
+          let _ = jobs.send(HookJob::Install(path.clone()));
         }
+        hook_jobs = Some((jobs, worker));
         // Spawn async task to consume hook events.
         let rx = server.rx.clone();
         let task =
@@ -401,17 +414,19 @@ impl Workspace {
       pre_close_confirm_focus: None,
       closing: Closing::Window,
       _state_watcher: None,
+      state_reads: Default::default(),
+      state_changes: 0,
       flavor,
       claude,
       cira_client,
-      cira: sessions::CiraView::default(),
+      cira: sessions::CiraView { home, ..Default::default() },
       cira_kick,
       records_tx,
       unmatched_hooks: VecDeque::new(),
       _cira_poll_task: cira_poll_task,
       hook_warning: None,
       _hook_failure_task: None,
-      hook_failures_tx,
+      hook_jobs,
       refusal: None,
     };
 
@@ -628,27 +643,36 @@ impl Workspace {
   /// conflict, which nothing saves over until it is reloaded, or a failed write.
   fn save_all_dirty(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<String> {
     let mut unsaved = Vec::new();
-    for project in &self.projects {
-      let named = |path: Option<&Path>| {
-        path.map(|p| p.strip_prefix(&project.path).unwrap_or(p).display().to_string())
-      };
-      if project.todo_view.read(cx).is_dirty(cx)
-        && !project.todo_view.update(cx, |tv, cx| tv.save(window, cx))
-      {
-        unsaved.extend(named(project.todo_view.read(cx).code_view().read(cx).file_path()));
-      }
-      for session in project.sessions.values() {
-        if session.code_view.read(cx).is_dirty(cx)
-          && !session.code_view.update(cx, |v, cx| v.save(window, cx))
-        {
-          unsaved.extend(named(session.code_view.read(cx).file_path()));
-        }
-      }
+    for pi in 0..self.projects.len() {
+      unsaved.extend(self.save_dirty_of(pi, window, cx));
     }
     if self.global_todo_view.read(cx).is_dirty(cx)
       && !self.global_todo_view.update(cx, |v, cx| v.save(window, cx))
     {
       unsaved.push("~/.claude/TODO.md".to_string());
+    }
+    unsaved
+  }
+
+  /// Save project `pi`'s dirty buffers (its TODO and code views); the files
+  /// that could not be saved (a conflict, a failed write).
+  fn save_dirty_of(&self, pi: usize, window: &mut Window, cx: &mut Context<Self>) -> Vec<String> {
+    let project = &self.projects[pi];
+    let named = |path: Option<&Path>| {
+      path.map(|p| p.strip_prefix(&project.path).unwrap_or(p).display().to_string())
+    };
+    let mut unsaved = Vec::new();
+    if project.todo_view.read(cx).is_dirty(cx)
+      && !project.todo_view.update(cx, |tv, cx| tv.save(window, cx))
+    {
+      unsaved.extend(named(project.todo_view.read(cx).code_view().read(cx).file_path()));
+    }
+    for session in project.sessions.values() {
+      if session.code_view.read(cx).is_dirty(cx)
+        && !session.code_view.update(cx, |v, cx| v.save(window, cx))
+      {
+        unsaved.extend(named(session.code_view.read(cx).file_path()));
+      }
     }
     unsaved
   }
@@ -673,14 +697,18 @@ impl Workspace {
           Closing::Project(path) => {
             this.restore_close_confirm_focus(window);
             this.close_project(&path, window, cx);
+            // Removals put off while the dialog was up are asked now.
+            this.read_state_file(window, cx);
           }
         }
         this.pre_close_confirm_focus = None;
       }
       CloseConfirmEvent::Cancelled => {
         this.close_confirm = None;
-        if let Closing::Project(path) = this.closing.clone() {
-          this.keep_project(path, window, cx);
+        match this.closing.clone() {
+          // Its own write of state.toml brings the next read.
+          Closing::Project(path) => this.keep_project(path, window, cx),
+          _ => this.read_state_file(window, cx),
         }
         this.restore_close_confirm_focus(window);
         cx.notify();
@@ -970,8 +998,12 @@ impl Workspace {
   pub fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
     let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
 
-    // If the project is already loaded, just switch to it.
+    // If the project is already loaded, just switch to it. Named by `jcc
+    // <dir>`, it may register a Cira project again.
     if let Some(idx) = self.projects.iter().position(|p| p.path == canonical) {
+      self.projects[idx].added = true;
+      self.cira.registering.remove(&canonical);
+      self.kick_cira();
       let active = self.projects[idx].active_session;
       self.switch_to_session(idx, active, window, cx);
       return;
@@ -992,15 +1024,20 @@ impl Workspace {
   /// Serve and install the hooks of a project opened while the app runs, as
   /// `Workspace::new` does for those open at start, off the main thread.
   fn install_project_hooks(&self, path: PathBuf) {
-    let Some(server) = &self._hook_server else { return };
+    let (Some(server), Some((jobs, _))) = (&self._hook_server, &self.hook_jobs) else { return };
     server.add_project(path.clone());
-    let (flavor, port, failed) = (self.flavor, server.port, self.hook_failures_tx.clone());
-    std::thread::spawn(move || {
-      if let Err(e) = jc_core::hooks_settings::install_hooks(flavor, &path, port) {
-        eprintln!("failed to install hooks for {}: {e:#}", path.display());
-        let _ = failed.send(format!("{}: hooks not installed: {e:#}", path.display()));
-      }
-    });
+    let _ = jobs.send(HookJob::Install(path));
+  }
+
+  /// Stop serving a closed project's hooks and remove them, after any
+  /// install still queued for it.
+  pub(super) fn remove_project_hooks(&self, path: PathBuf) {
+    if let Some(server) = &self._hook_server {
+      server.remove_project(&path);
+    }
+    if let Some((jobs, _)) = &self.hook_jobs {
+      let _ = jobs.send(HookJob::Uninstall(path));
+    }
   }
 
   /// Open the project at `canonical` without switching to it; its index.
@@ -1016,7 +1053,8 @@ impl Workspace {
       .map(|n| n.to_string_lossy().into_owned())
       .unwrap_or_else(|| "unknown".into());
     self.install_project_hooks(canonical.clone());
-    let project = ProjectState::create(canonical, name, &palette, window, cx);
+    let mut project = ProjectState::create(canonical, name, &palette, window, cx);
+    project.added = true;
     self.projects.push(project);
     let project_idx = self.projects.len() - 1;
     if self.flavor == Flavor::Jcc {
@@ -1806,8 +1844,17 @@ impl Workspace {
 
 impl Drop for Workspace {
   fn drop(&mut self) {
-    for project in &self.projects {
-      let _ = jc_core::hooks_settings::uninstall_hooks(self.flavor, &project.path);
+    // After every queued job, so no install queued earlier runs after these.
+    if let Some((jobs, worker)) = self.hook_jobs.take() {
+      for project in &self.projects {
+        let _ = jobs.send(HookJob::Uninstall(project.path.clone()));
+      }
+      drop(jobs);
+      let _ = worker.join();
+    } else {
+      for project in &self.projects {
+        let _ = jc_core::hooks_settings::uninstall_hooks(self.flavor, &project.path);
+      }
     }
     if let Some(server) = &self._hook_server {
       server.shutdown();

@@ -8,7 +8,7 @@ use crate::cira::{CallError, JobState, ModePending, Session, SessionShell, Statu
 use crate::todo::Mark;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 /// What a Claude pane does now.
@@ -141,24 +141,35 @@ impl TodoSync {
   }
 }
 
+/// Whether `Workspace::sync_todos` may change a TODO now: it is `open`, has no
+/// unsaved edits (`dirty`), and none of its sessions is being asked for or
+/// looked for (`asking`), since Cira lists such a session before jcc writes
+/// its heading.
+pub fn may_sync_todo(open: bool, dirty: bool, asking: bool) -> bool {
+  open && !dirty && !asking
+}
+
 /// Compare `doc` (jcc's todo.md) with `project`, the Cira project it belongs
 /// to, and `status`: a live session Cira runs there (`owned`; one known only
 /// from its hooks has no job to attach) that no heading names gets one, under
 /// its label (its id when the label cannot be a heading:
 /// [`crate::todo::writable_label`]); a heading whose session Cira removed is
 /// retired. A heading names a session by its id, `[DELETED]` included, or,
-/// before its migration, by the conversation it continues (`> uuid=`).
+/// before its migration, by the conversation it continues (`> uuid=`); one jcc
+/// already runs a pane for (`running`: its heading was cut, to be pasted) is
+/// not added again.
 pub fn todo_sync(
   project: &crate::cira::Project,
   status: &Status,
   doc: &crate::todo::TodoDocument,
+  running: impl Fn(&str) -> bool,
 ) -> TodoSync {
   let headed = |id: &str| doc.session_by_id(id).is_some() || doc.deleted.iter().any(|d| d.id == id);
   let named = |s: &Session| headed(&s.id) || s.uuid.as_deref().is_some_and(headed);
   let add = project
     .sessions
     .iter()
-    .filter(|s| s.owned && s.removed_at.is_none() && !named(s))
+    .filter(|s| s.owned && s.removed_at.is_none() && !named(s) && !running(&s.id))
     .map(|s| {
       let label = s.label.as_deref().filter(|l| crate::todo::writable_label(l));
       (s.id.clone(), label.unwrap_or(&s.id).to_string())
@@ -387,15 +398,20 @@ pub enum LabelSync {
   Write(String),
 }
 
-/// The heading says `heading`, Cira says `cira`, and the two last agreed on
-/// `last`. The label is Cira's (Q-159), so when both moved, or jc has no
-/// record of them agreeing, Cira's wins.
-pub fn label_sync(heading: &str, cira: Option<&str>, last: Option<&str>) -> LabelSync {
+/// The heading of session `id` says `heading`, Cira says `cira`, and jc
+/// last recorded Cira's label as `last`. The label is Cira's (Q-159), so when
+/// both moved, or jc has no record, Cira's wins. Where Cira has no label, or
+/// one that cannot be a heading ([`crate::todo::writable_label`]), the
+/// heading shows the id (`todo_sync`), which agrees with it.
+pub fn label_sync(heading: &str, id: &str, cira: Option<&str>, last: Option<&str>) -> LabelSync {
+  let shown = cira.filter(|l| crate::todo::writable_label(l)).unwrap_or(id);
+  if heading == shown {
+    return LabelSync::Agreed;
+  }
   match cira {
-    Some(cira) if cira == heading => LabelSync::Agreed,
     None => LabelSync::Send,
     Some(cira) if last == Some(cira) => LabelSync::Send,
-    Some(cira) => LabelSync::Write(cira.to_string()),
+    Some(_) => LabelSync::Write(shown.to_string()),
   }
 }
 
@@ -428,25 +444,90 @@ pub enum TodoPlan {
   HeldBy { todo: PathBuf, project: PathBuf },
   /// No Cira project holds the directory yet: register one.
   Register,
+  /// No Cira project holds it, and jcc registers none (`NoRegister`).
+  Unregistered(NoRegister),
+  /// Its todo.md is open, but Cira no longer names it for this project (the
+  /// project was removed): close it, so no save makes it again.
+  Unlisted,
 }
 
-/// jcc: for each project (`path`, the todo.md it has open), in order, what a
-/// status read means for one with none open. One todo.md is never open in two
-/// projects: the first to claim it, or the one that already has it, keeps it.
+/// Why jcc registers no Cira project for a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRegister {
+  /// It is the home directory, which Cira refuses (Cira PLAN SES-07).
+  Home,
+  /// It was in jcc's list before this run: jcc registers a project only when
+  /// it is added (`jcc <dir>`, or to state.toml), so one Jay removed in Cira
+  /// does not come back at the next start.
+  NotAdded,
+}
+
+/// What the TODO pane says when `cira project add NAME` did not register
+/// the directory. Cira refusing it (exit 5: a home directory, say, Cira PLAN
+/// SES-07) is an answer, not a failure.
+pub fn unregistered_why(name: &str, e: &CallError) -> String {
+  match e {
+    CallError::Refused { code: exit::INVALID, message, .. } => {
+      format!("Cira registers no project here: {}", message.trim())
+    }
+    e => format!("jcc's TODO cannot open: `cira project add {name}` failed: {e}"),
+  }
+}
+
+/// What the TODO pane says for a directory jcc registers no project for.
+pub fn unregistered_text(why: NoRegister) -> &'static str {
+  match why {
+    NoRegister::Home => {
+      "jcc keeps no TODO for the home directory: Cira registers no project there. Open a \
+       project's directory instead."
+    }
+    NoRegister::NotAdded => {
+      "Cira lists no project for this directory. jcc registers one only when you add it: \
+       `jcc .` in it."
+    }
+  }
+}
+
+/// A jcc project as [`plan_todos`] sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoProject {
+  pub path: PathBuf,
+  /// The todo.md it has open.
+  pub open: Option<PathBuf>,
+  /// It was added to jcc's list in this run (or `jcc <dir>` named it).
+  pub added: bool,
+}
+
+/// jcc: for each project, in order, what a status read means for it. One
+/// todo.md is never open in two projects: the first to claim it, or the one
+/// that already has it, keeps it. A directory no Cira project holds is
+/// registered only when it was `added`, and never at `home`.
 pub fn plan_todos(
   status: &Status,
-  projects: &[(PathBuf, Option<PathBuf>)],
+  projects: &[TodoProject],
+  home: Option<&Path>,
 ) -> Vec<(usize, TodoPlan)> {
   // Who holds each todo.md: those open already, then each claim in order.
   let mut held: Vec<(PathBuf, PathBuf)> =
-    projects.iter().filter_map(|(path, open)| Some((open.clone()?, path.clone()))).collect();
+    projects.iter().filter_map(|p| Some((p.open.clone()?, p.path.clone()))).collect();
   let mut plans = Vec::new();
-  for (i, (path, open)) in projects.iter().enumerate() {
-    if open.is_some() {
+  for (i, TodoProject { path, open, added }) in projects.iter().enumerate() {
+    let todo = status.todo_for(path);
+    if let Some(open) = open {
+      if todo.as_ref() != Some(open) {
+        plans.push((i, TodoPlan::Unlisted));
+      }
       continue;
     }
-    let Some(todo) = status.todo_for(path) else {
-      plans.push((i, TodoPlan::Register));
+    let Some(todo) = todo else {
+      let plan = if home == Some(path.as_path()) {
+        TodoPlan::Unregistered(NoRegister::Home)
+      } else if !added {
+        TodoPlan::Unregistered(NoRegister::NotAdded)
+      } else {
+        TodoPlan::Register
+      };
+      plans.push((i, plan));
       continue;
     };
     match held.iter().find(|(t, _)| *t == todo) {
@@ -474,7 +555,16 @@ mod tests {
     let inner = PathBuf::from("/w/cira/worktrees/x");
     let other = PathBuf::from("/elsewhere");
 
-    let plans = plan_todos(&status, &[(outer.clone(), None), (inner.clone(), None), (other, None)]);
+    let project = |path: &PathBuf, open: Option<&PathBuf>| TodoProject {
+      path: path.clone(),
+      open: open.cloned(),
+      added: true,
+    };
+    let plans = plan_todos(
+      &status,
+      &[project(&outer, None), project(&inner, None), project(&other, None)],
+      None,
+    );
     assert_eq!(plans[0], (0, TodoPlan::Open(todo.clone())));
     assert_eq!(
       plans[1],
@@ -484,8 +574,58 @@ mod tests {
     assert_eq!(plans[2], (2, TodoPlan::Register));
 
     // Whichever project already has it open keeps it.
-    let plans = plan_todos(&status, &[(outer.clone(), None), (inner.clone(), Some(todo.clone()))]);
+    let plans = plan_todos(&status, &[project(&outer, None), project(&inner, Some(&todo))], None);
     assert_eq!(plans, [(0, TodoPlan::HeldBy { todo, project: inner })]);
+  }
+
+  #[test]
+  fn ciras_refusal_to_register_reads_as_its_answer() {
+    let refused = CallError::Refused {
+      code: exit::INVALID,
+      message: "a project cannot be the home directory\n".into(),
+      stdout: Vec::new(),
+    };
+    assert_eq!(
+      unregistered_why("jay", &refused),
+      "Cira registers no project here: a project cannot be the home directory"
+    );
+    let failed = unregistered_why("p", &CallError::NoAnswer);
+    assert!(failed.starts_with("jcc's TODO cannot open: `cira project add p`"), "{failed}");
+  }
+
+  /// Cira SES-07: Cira refuses a project at the home directory, and one Jay
+  /// removed in Cira (`cira project rm`) must not come back at jcc's next
+  /// start, nor its todo.md be written again.
+  #[test]
+  fn jcc_registers_only_what_it_was_given_and_never_home() {
+    let status =
+      Status::parse(br#"{"home":"/store","projects":[{"name":"cira","path":"/w/cira"}]}"#).unwrap();
+    let p = |path: &str, open: Option<&str>, added: bool| TodoProject {
+      path: path.into(),
+      open: open.map(PathBuf::from),
+      added,
+    };
+    let home = Path::new("/Users/jay");
+    let plans = plan_todos(
+      &status,
+      &[
+        p("/Users/jay", None, true),
+        p("/w/listed-before", None, false),
+        p("/w/new", None, true),
+        p("/w/removed", Some("/store/projects/removed/todo.md"), false),
+        p("/w/cira", Some("/store/projects/cira/todo.md"), false),
+      ],
+      Some(home),
+    );
+    assert_eq!(
+      plans,
+      [
+        (0, TodoPlan::Unregistered(NoRegister::Home)),
+        (1, TodoPlan::Unregistered(NoRegister::NotAdded)),
+        (2, TodoPlan::Register),
+        (3, TodoPlan::Unlisted),
+      ]
+    );
   }
   use crate::cira::Status;
 
@@ -549,7 +689,7 @@ mod tests {
                 ## legacy\n> uuid=u-1\n\n### WAIT\n\
                 ## [DELETED] dead\n> cira=c-dead\n";
     let doc = crate::todo::parse(text, crate::flavor::Flavor::Jcc);
-    let sync = todo_sync(&status.projects[0], &status, &doc);
+    let sync = todo_sync(&status.projects[0], &status, &doc, |_| false);
     assert_eq!(
       sync.add,
       [("c-new".to_string(), "orchestrator".to_string()), ("c-marker".into(), "c-marker".into())],
@@ -564,7 +704,21 @@ mod tests {
     assert!(out.contains("## [DELETED] First\n> cira=c-first\n\n### Message 0\nhello\n"), "{out}");
     assert!(out.contains("## orchestrator\n> cira=c-new\n"), "{out}");
     assert!(after.session_by_id("c-had").is_some() && after.session_by_id("c-first").is_none());
-    assert_eq!(todo_sync(&status.projects[0], &status, &after), TodoSync::default());
+    assert_eq!(todo_sync(&status.projects[0], &status, &after, |_| false), TodoSync::default());
+
+    // Review P2: a session jcc already runs a pane for, whose heading was cut
+    // (to be pasted elsewhere), gets no second heading and no second pane.
+    let cut = todo_sync(&status.projects[0], &status, &doc, |id| id == "c-new");
+    assert_eq!(cut.add, [("c-marker".to_string(), "c-marker".to_string())]);
+  }
+
+  /// Review: the gating of `Workspace::sync_todos`.
+  #[test]
+  fn a_todo_is_synced_only_when_open_saved_and_not_asking() {
+    assert!(may_sync_todo(true, false, false));
+    assert!(!may_sync_todo(false, false, false), "not open yet");
+    assert!(!may_sync_todo(true, true, false), "unsaved edits");
+    assert!(!may_sync_todo(true, false, true), "a session is being asked for");
   }
 
   #[test]
@@ -848,12 +1002,31 @@ mod tests {
 
   #[test]
   fn the_side_that_moved_wins_and_cira_wins_a_tie() {
-    assert_eq!(label_sync("A", Some("A"), Some("old")), LabelSync::Agreed);
-    assert_eq!(label_sync("B", Some("A"), Some("A")), LabelSync::Send, "renamed in TODO.md");
-    assert_eq!(label_sync("A", Some("B"), Some("A")), LabelSync::Write("B".into()), "on the page");
-    assert_eq!(label_sync("C", Some("B"), Some("A")), LabelSync::Write("B".into()), "both");
-    assert_eq!(label_sync("C", Some("B"), None), LabelSync::Write("B".into()), "no record");
-    assert_eq!(label_sync("C", None, None), LabelSync::Send, "Cira has no label");
+    assert_eq!(label_sync("A", "c", Some("A"), Some("old")), LabelSync::Agreed);
+    assert_eq!(label_sync("B", "c", Some("A"), Some("A")), LabelSync::Send, "renamed in TODO.md");
+    assert_eq!(
+      label_sync("A", "c", Some("B"), Some("A")),
+      LabelSync::Write("B".into()),
+      "on the page"
+    );
+    assert_eq!(label_sync("C", "c", Some("B"), Some("A")), LabelSync::Write("B".into()), "both");
+    assert_eq!(label_sync("C", "c", Some("B"), None), LabelSync::Write("B".into()), "no record");
+    assert_eq!(label_sync("C", "c", None, None), LabelSync::Send, "Cira has no label");
+  }
+
+  /// Review P3: a heading jcc added under the session's id, because Cira has
+  /// no label for it or one that cannot be a heading, is what jcc shows for
+  /// Cira's label, not a rename to send back.
+  #[test]
+  fn a_fallback_heading_is_not_sent_as_a_rename() {
+    assert_eq!(label_sync("c-1", "c-1", None, None), LabelSync::Agreed, "no label");
+    assert_eq!(
+      label_sync("c-1", "c-1", Some("[DELETED] x"), Some("[DELETED] x")),
+      LabelSync::Agreed
+    );
+    assert_eq!(label_sync("c-1", "c-1", Some("[DELETED] x"), None), LabelSync::Agreed);
+    assert_eq!(label_sync("mine", "c-1", None, None), LabelSync::Send, "Jay named it");
+    assert_eq!(label_sync("c-1", "c-1", Some("page"), None), LabelSync::Write("page".into()));
   }
 
   #[test]
