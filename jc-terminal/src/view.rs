@@ -122,6 +122,12 @@ pub struct TerminalConfig {
   /// durations because what counts as settled is a fact about the child being
   /// run.
   pub launch_settle: Option<LaunchSettle>,
+  /// The child is one of several clients of something drawn at the size of
+  /// whichever client last sent one (`claude attach` to a job Cira's page
+  /// also attaches: Cira PLAN TMUX-08). The view sends its size again when it
+  /// is focused, shown, or its window becomes active
+  /// ([`PtyHandle::reassert_size`]).
+  pub shared_size: bool,
 }
 
 impl Default for TerminalConfig {
@@ -136,6 +142,7 @@ impl Default for TerminalConfig {
       child: Some(ChildSpec::Shell),
       env: Vec::new(),
       launch_settle: None,
+      shared_size: false,
     }
   }
 }
@@ -235,6 +242,11 @@ impl TerminalView {
     let _subscriptions = vec![
       cx.on_focus(&focus, _window, Self::on_focus),
       cx.on_blur(&focus, _window, Self::on_blur),
+      cx.observe_window_activation(_window, |this: &mut Self, window, _| {
+        if window.is_window_active() && this.visible.load(Ordering::Relaxed) {
+          this.reassert_shared_size();
+        }
+      }),
     ];
 
     let mut view = Self {
@@ -517,7 +529,17 @@ impl TerminalView {
   /// PTY bytes (so state is correct when switching back) but batch more
   /// aggressively and skip `cx.notify()` to reduce main-thread overhead.
   pub fn set_visible(&self, is_visible: bool) {
-    self.visible.store(is_visible, Ordering::Relaxed);
+    let was = self.visible.swap(is_visible, Ordering::Relaxed);
+    if is_visible && !was {
+      self.reassert_shared_size();
+    }
+  }
+
+  /// With [`TerminalConfig::shared_size`], have the child send its size again.
+  fn reassert_shared_size(&self) {
+    if let (true, Some(pty)) = (self.config.shared_size, &self.pty) {
+      let _ = pty.reassert_size();
+    }
   }
 
   fn write_pty(&self, bytes: &[u8]) {
@@ -613,6 +635,7 @@ impl TerminalView {
 
   fn on_focus(&mut self, _: &mut Window, cx: &mut Context<Self>) {
     self.focused = true;
+    self.reassert_shared_size();
     let send_focus = self.state.with_term_mut(|term| {
       term.is_focused = true;
       term.mode().contains(TermMode::FOCUS_IN_OUT)

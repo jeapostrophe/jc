@@ -134,6 +134,31 @@ impl PtyHandle {
   }
 }
 
+impl PtyHandle {
+  /// Make the child send its size again although it has not changed: one
+  /// row less, then, after [`Self::NUDGE`] on a thread of its own, its size
+  /// back (unless it was resized meanwhile). A resize to the same size raises
+  /// no SIGWINCH, and two at once may reach the child as one.
+  pub fn reassert_size(self: &Arc<Self>) -> Result<()> {
+    let size = self.master.lock().get_size()?;
+    let nudged = PtySize { rows: if size.rows > 1 { size.rows - 1 } else { 2 }, ..size };
+    self.master.lock().resize(nudged)?;
+    let this = self.clone();
+    std::thread::spawn(move || {
+      std::thread::sleep(Self::NUDGE);
+      let master = this.master.lock();
+      if master.get_size().is_ok_and(|now| now == nudged) {
+        let _ = master.resize(size);
+      }
+    });
+    Ok(())
+  }
+
+  /// How long the child is shown the other size: long enough to be read as
+  /// its own SIGWINCH.
+  const NUDGE: std::time::Duration = std::time::Duration::from_millis(100);
+}
+
 impl Drop for PtyHandle {
   /// The reader thread holds its own dup of the master, so dropping the master
   /// alone does not hang up the child. Signal it explicitly.
@@ -216,8 +241,9 @@ mod tests {
       .expect("the Terminal pane's tests attach to a real tmux: brew install tmux")
   }
 
-  /// Read `child`'s output until it contains `want`, or panic with what it printed.
-  fn read_until(child: &PtyChild, want: &str) {
+  /// Read `child`'s output until it contains `want`, or panic with what it
+  /// printed. Returns what it read.
+  fn read_until(child: &PtyChild, want: &str) -> String {
     let mut out = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !String::from_utf8_lossy(&out).contains(want) {
@@ -227,6 +253,7 @@ mod tests {
         Err(_) => panic!("no {want:?} in: {}", String::from_utf8_lossy(&out)),
       }
     }
+    String::from_utf8_lossy(&out).into_owned()
   }
 
   /// A tmux server set up as Cira's (its `tmux.conf`), on a private socket in
@@ -365,6 +392,25 @@ mod tests {
       })
       .collect();
     assert_eq!(stored, ["clip-me-"], "the drag's text, as the clipboard store");
+  }
+
+  /// TMUX-08: `claude attach` sends the job its size only when the size it
+  /// reads at a SIGWINCH differs from the last it sent (measured: a SIGWINCH
+  /// at an unchanged size leaves the job at another client's size), and the
+  /// job draws at the last size any client sent. Re-asserting must therefore
+  /// show the child a different size, then its own.
+  #[test]
+  fn reasserting_the_size_shows_the_child_a_change_and_ends_at_its_size() {
+    let script =
+      r#"trap 'echo "size $(stty size)"' WINCH; echo ready; while :; do sleep 0.05; done"#;
+    let child = PtyChild::spawn(&sh(script), &[], 80, 24, None).unwrap();
+    read_until(&child, "ready");
+    child.handle.reassert_size().unwrap();
+    let out = read_until(&child, "size 24 80");
+    let nudged = out.find("size 23 80").unwrap_or_else(|| panic!("no other size first: {out}"));
+    assert!(nudged < out.find("size 24 80").unwrap(), "{out}");
+    let size = child.handle.master.lock().get_size().unwrap();
+    assert_eq!((size.cols, size.rows), (80, 24), "it ends at its own size");
   }
 
   #[test]

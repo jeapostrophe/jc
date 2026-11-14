@@ -204,7 +204,13 @@ impl SessionState {
         TerminalConfig { palette: Some(palette.clone()), ..Default::default() },
       ),
       None => (
-        TerminalConfig { child: None, palette: Some(palette.clone()), ..Default::default() },
+        // Cira's page may attach to the same job (TMUX-08).
+        TerminalConfig {
+          child: None,
+          palette: Some(palette.clone()),
+          shared_size: true,
+          ..Default::default()
+        },
         // The shell pane attaches to the session's shell in Cira's tmux server
         // (TMUX-02), asked for by its Cira id at the first status read once Cira
         // has minted one (`ShellPane`).
