@@ -195,6 +195,12 @@ impl Render for Workspace {
       resizable.into_any_element()
     };
 
+    // Cira owns the sessions, so while it is down no Claude pane attaches
+    // anything new (Cira PLAN TMUX-01). A refusal that says the same is not
+    // shown twice.
+    let cira_banner = self.cira.reach.down().map(|down| down.to_string());
+    let refusal =
+      self.refusal.clone().map(|(_, why)| why).filter(|why| Some(why) != cira_banner.as_ref());
     div()
       .id("workspace")
       .key_context("Workspace")
@@ -228,23 +234,14 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::scroll_other_page_up))
       .on_action(cx.listener(Self::scroll_other_page_down))
       .child(self.render_title_bar(cx))
-      .when(self.cira.reachable == Some(false), |el| el.child(cira_unreachable_banner(cx)))
+      .when_some(cira_banner.clone(), |el, why| el.child(warning_banner(why.into(), cx)))
       .when_some(self.hook_warning.clone(), |el, why| el.child(warning_banner(why.into(), cx)))
-      .when_some(self.refusal.clone(), |el, (_, why)| el.child(warning_banner(why.into(), cx)))
+      .when_some(refusal, |el, why| el.child(warning_banner(why.into(), cx)))
       .child(pane_area)
       .when_some(self.active_picker.as_ref(), |el, v| el.child(modal_overlay(v)))
       .when_some(self.keybinding_help.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))
       .when_some(self.close_confirm.as_ref(), |el, (v, _)| el.child(modal_overlay(v)))
   }
-}
-
-/// Shown while `cira status` does not answer: Cira owns the sessions, so no
-/// Claude pane attaches anything new until it does (Cira PLAN TMUX-01).
-fn cira_unreachable_banner(cx: &App) -> Div {
-  warning_banner(
-    "Cira is unreachable: Claude panes attach nothing new until it answers (`cira status`)".into(),
-    cx,
-  )
 }
 
 /// One line on the warning color across the window.

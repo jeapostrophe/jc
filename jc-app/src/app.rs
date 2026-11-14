@@ -49,6 +49,14 @@ fn build_gpui_theme(unified: &ThemeConfig, mode: ThemeMode) -> gpui_component::t
   colors_json.insert("base.yellow".into(), serde_json::Value::String(p.yellow.clone()));
   colors_json.insert("base.magenta".into(), serde_json::Value::String(p.magenta.clone()));
   colors_json.insert("base.cyan".into(), serde_json::Value::String(p.cyan.clone()));
+  // Status fills (banners are `warning`), each with text that reads on it.
+  for (status, fill) in
+    [("warning", &p.yellow), ("danger", &p.red), ("info", &p.cyan), ("success", &p.green)]
+  {
+    let text = text_on(fill, [&p.background, &p.foreground]);
+    colors_json.insert(format!("{status}.background"), serde_json::Value::String(fill.clone()));
+    colors_json.insert(format!("{status}.foreground"), serde_json::Value::String(text));
+  }
   // Primary = blue from palette
   colors_json.insert("primary.background".into(), serde_json::Value::String(p.blue.clone()));
   colors_json.insert("caret".into(), serde_json::Value::String(p.cursor.clone()));
@@ -85,6 +93,28 @@ fn build_gpui_theme(unified: &ThemeConfig, mode: ThemeMode) -> gpui_component::t
     highlight: Some(highlight),
     ..Default::default()
   }
+}
+
+/// Text for a fill of `fill`: whichever of the theme's own `colors` contrasts
+/// most with it, if that reaches WCAG AA for body text (4.5:1), else black or
+/// white, whichever contrasts more. gpui-component's fallback, the theme's
+/// text colour, was light grey on yellow in the dark theme (Q-165).
+fn text_on(fill: &str, colors: [&String; 2]) -> String {
+  let luminance = |hex: &str| {
+    let gpui::Rgba { r, g, b, .. } = hex_to_hsla(hex).to_rgb();
+    let lin = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+  };
+  let fill = luminance(fill);
+  let ratio = |hex: &str| {
+    let l = luminance(hex);
+    (l.max(fill) + 0.05) / (l.min(fill) + 0.05)
+  };
+  let best = |candidates: &[&str]| {
+    candidates.iter().copied().max_by(|a, b| ratio(a).total_cmp(&ratio(b))).unwrap().to_string()
+  };
+  let own = best(&[colors[0], colors[1]]);
+  if ratio(&own) >= 4.5 { own } else { best(&["#000000", "#FFFFFF"]) }
 }
 
 fn build_syntax_colors(
@@ -215,4 +245,50 @@ pub fn run(state: AppState, config: AppConfig, ipc_rx: flume::Receiver<std::path
 
     cx.activate(true);
   });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::build_gpui_theme;
+  use gpui::{Hsla, Rgba};
+  use gpui_component::theme::{Theme, ThemeColor, ThemeMode};
+  use jc_core::theme::ThemeConfig;
+  use std::rc::Rc;
+
+  /// WCAG 2 relative luminance of an opaque colour.
+  fn luminance(c: Hsla) -> f32 {
+    let Rgba { r, g, b, .. } = c.to_rgb();
+    let lin = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+  }
+
+  fn contrast(a: Hsla, b: Hsla) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+  }
+
+  /// Q-165: jcc's banners were light grey on yellow in the dark theme
+  /// (`warning.foreground` fell back to the text colour), and Jay could not
+  /// read them. Every banner is `warning` text on `warning`; the other status
+  /// colours are filled the same way by gpui-component. The colours are the
+  /// ones gpui resolves from the themes jc ships, so a fallback counts.
+  #[test]
+  fn status_text_is_readable_on_its_fill_in_every_theme() {
+    for (unified, mode) in
+      [(ThemeConfig::dark(), ThemeMode::Dark), (ThemeConfig::light(), ThemeMode::Light)]
+    {
+      let mut theme = Theme::from(ThemeColor::dark().as_ref());
+      theme.apply_config(&Rc::new(build_gpui_theme(&unified, mode)));
+      for (what, fill, text) in [
+        ("warning", theme.warning, theme.warning_foreground),
+        ("danger", theme.danger, theme.danger_foreground),
+        ("info", theme.info, theme.info_foreground),
+        ("success", theme.success, theme.success_foreground),
+      ] {
+        assert_eq!(fill.a, 1.0, "{mode:?} {what}: an opaque fill");
+        let ratio = contrast(fill, text);
+        assert!(ratio >= 4.5, "{mode:?} {what}: contrast {ratio:.2} < 4.5 ({fill:?} on {text:?})");
+      }
+    }
+  }
 }

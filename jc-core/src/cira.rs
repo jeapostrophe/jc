@@ -394,16 +394,19 @@ impl Cira {
     Self { program: program.into(), timeout, call: Self::CALL }
   }
 
-  /// `cira status --json`, or `None` when Cira is unreachable: not installed,
-  /// no daemon, too slow, any failure exit, or output that does not parse.
+  /// `cira status --json`, or why Cira was not reached: not installed, no
+  /// daemon, too slow, any failure exit, or output that does not parse.
   /// Blocks for up to the timeout, so it is never called on the main thread.
-  pub fn status(&self) -> Option<Status> {
+  pub fn status(&self) -> Result<Status, Down> {
     let mut cmd = Command::new(&self.program);
-    let (code, out, _) = run_bounded(cmd.args(["status", "--json"]), self.timeout)?;
-    if code != Some(0) {
-      return None;
+    let (code, out, stderr) =
+      run_bounded(cmd.args(["status", "--json"]), self.timeout).map_err(Down::not_started)?;
+    match code {
+      Some(0) => Status::parse(&out).map_err(|e| Down::Unreadable(e.to_string())),
+      Some(exit::NOT_SENT) => Err(Down::NoDaemon(first_line(&stderr))),
+      None => Err(Down::Silent(self.timeout)),
+      code => Err(Down::Failed { code, message: first_line(&stderr) }),
     }
-    Status::parse(&out).ok()
   }
 
   /// The same, with `call` for each `cira session …` request.
@@ -489,10 +492,10 @@ impl Cira {
       cmd.current_dir(dir);
     }
     let run = run_bounded(&mut cmd, timeout);
-    let (code, stdout, stderr) = run.ok_or(CallError::Unreachable)?;
+    let (code, stdout, stderr) = run.map_err(|e| CallError::Unreachable(Down::not_started(e)))?;
     match code {
       Some(0) => Ok(stdout),
-      Some(exit::NOT_SENT) => Err(CallError::Unreachable),
+      Some(exit::NOT_SENT) => Err(CallError::Unreachable(Down::NoDaemon(first_line(&stderr)))),
       Some(exit::NO_ANSWER) | None => Err(CallError::NoAnswer),
       Some(code) => Err(CallError::Refused { code, message: stderr, stdout }),
     }
@@ -512,7 +515,7 @@ pub struct At {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
   /// Not installed, or no daemon accepted (exit 125): nothing was sent.
-  Unreachable,
+  Unreachable(Down),
   /// Sent, with no answer (exit 124, or jc stopped waiting): it may have been
   /// recorded.
   NoAnswer,
@@ -532,7 +535,7 @@ impl CallError {
   /// (conflict, invalid, not found) is an answer.
   pub fn retry(&self) -> bool {
     match self {
-      CallError::Unreachable | CallError::NoAnswer => true,
+      CallError::Unreachable(_) | CallError::NoAnswer => true,
       CallError::Refused { code, .. } => {
         matches!(*code, exit::ERROR | exit::NOT_RECORDED | exit::VERSION | exit::READ_ONLY)
       }
@@ -544,10 +547,104 @@ impl CallError {
 impl std::fmt::Display for CallError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      CallError::Unreachable => write!(f, "Cira is unreachable"),
+      CallError::Unreachable(down) => down.fmt(f),
       CallError::NoAnswer => write!(f, "Cira did not answer; it may have recorded the request"),
       CallError::Refused { code, message, .. } => write!(f, "{} (exit {code})", message.trim()),
       CallError::Malformed(e) => write!(f, "Cira's answer did not parse: {e}"),
+    }
+  }
+}
+
+/// Why a `cira` command did not reach Cira, said as what is wrong and what to
+/// do: jcc shows it in one banner, and on stderr (Cira PLAN SP-03, Q-165).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Down {
+  /// `cira` is not on `PATH`.
+  NotInstalled,
+  /// `cira` ran and said no daemon accepted (exit 125): its line, which names
+  /// the socket it tried.
+  NoDaemon(String),
+  /// No answer within jc's timeout (or killed by a signal): no daemon (`cira`
+  /// waits longer than jc does for one to accept), or a busy one.
+  Silent(Duration),
+  /// Any other failure: the exit code (`None`: not started) and the first
+  /// line `cira` printed on stderr.
+  Failed { code: Option<i32>, message: String },
+  /// It answered with output this build cannot read.
+  Unreadable(String),
+}
+
+impl Down {
+  fn not_started(e: std::io::Error) -> Self {
+    match e.kind() {
+      std::io::ErrorKind::NotFound => Down::NotInstalled,
+      _ => Down::Failed { code: None, message: format!("`cira` could not be started: {e}") },
+    }
+  }
+}
+
+/// How Jay installs Cira, which also starts its daemon (launchd agent
+/// `local.cira`): Cira's README.
+const INSTALL: &str = "`./make.sh install` in ~/Dev/cira installs it and starts its daemon";
+
+impl std::fmt::Display for Down {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Down::NotInstalled => {
+        write!(f, "Cira isn't installed: `cira` was not found on PATH. {INSTALL}")
+      }
+      Down::NoDaemon(line) => write!(f, "Cira isn't running: {line}"),
+      Down::Silent(t) => write!(
+        f,
+        "Cira isn't answering: `cira` gave no answer within {} s, so its daemon is not running \
+         or is busy. {INSTALL}",
+        t.as_secs_f32()
+      ),
+      Down::Failed { code: Some(code), message } => {
+        write!(f, "Cira failed: `cira` gave exit {code}: {message}")
+      }
+      Down::Failed { code: None, message } => write!(f, "Cira failed: {message}"),
+      Down::Unreadable(e) => write!(f, "Cira's answer did not parse: {e}"),
+    }
+  }
+}
+
+fn first_line(text: &str) -> String {
+  text.trim().lines().next().unwrap_or_default().to_string()
+}
+
+/// Whether jcc's last `cira status` reached Cira, and if not, why: what its
+/// one Cira banner says.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum Reach {
+  /// No read has finished yet.
+  #[default]
+  Unknown,
+  Up,
+  Down(Down),
+}
+
+impl Reach {
+  /// Take a read's outcome. Returns whether what jcc shows changed: a poll
+  /// that fails the same way again changes nothing, so it raises nothing new.
+  pub fn read(&mut self, read: &Result<Status, Down>) -> bool {
+    let next = match read {
+      Ok(_) => Reach::Up,
+      Err(down) => Reach::Down(down.clone()),
+    };
+    let changed = *self != next;
+    *self = next;
+    changed
+  }
+
+  pub fn is_up(&self) -> bool {
+    *self == Reach::Up
+  }
+
+  pub fn down(&self) -> Option<&Down> {
+    match self {
+      Reach::Down(down) => Some(down),
+      _ => None,
     }
   }
 }
@@ -655,14 +752,13 @@ fn mode_args(id: &str, dangerous: bool, from: bool) -> Vec<String> {
 }
 
 /// Run `cmd` with stdin closed, killing it after `timeout`: its exit code
-/// (`None` when killed or signalled), stdout and stderr. `None` when it could
-/// not be started.
+/// (`None` when killed or signalled), stdout and stderr; an error when it
+/// could not be started.
 pub(crate) fn run_bounded(
   cmd: &mut Command,
   timeout: Duration,
-) -> Option<(Option<i32>, Vec<u8>, String)> {
-  let mut child =
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().ok()?;
+) -> std::io::Result<(Option<i32>, Vec<u8>, String)> {
+  let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
   // Read on threads of their own, so a large answer cannot fill a pipe and
   // stall the child while this one waits for it to exit.
   let drain = |pipe: Option<Box<dyn Read + Send>>| {
@@ -690,7 +786,7 @@ pub(crate) fn run_bounded(
   };
   let stdout = stdout.join().unwrap_or_default();
   let stderr = String::from_utf8_lossy(&stderr.join().unwrap_or_default()).into_owned();
-  Some((exit.and_then(|e| e.code()), stdout, stderr))
+  Ok((exit.and_then(|e| e.code()), stdout, stderr))
 }
 
 /// Call `read` every `every`, on a thread of its own, and send each result.
@@ -972,19 +1068,55 @@ mod tests {
   }
 
   #[test]
-  fn an_unreachable_cira_reads_as_none() {
+  fn an_unreachable_cira_says_why() {
     let missing = Cira::new("/nonexistent/jc-test/cira", Duration::from_secs(1));
-    assert_eq!(missing.status(), None);
+    assert_eq!(missing.status(), Err(Down::NotInstalled));
     // A `cira` that exits 125, as one with no daemon does, after printing JSON.
-    let failing = script("failing", "echo '{\"projects\":[]}'; exit 125");
-    assert_eq!(Cira::new(failing, Duration::from_secs(5)).status(), None);
+    let failing =
+      script("failing", "echo '{\"projects\":[]}'; echo 'no daemon on /h/cira.sock' >&2; exit 125");
+    assert_eq!(
+      Cira::new(failing, Duration::from_secs(5)).status(),
+      Err(Down::NoDaemon("no daemon on /h/cira.sock".into()))
+    );
+    let broken = script("broken", "echo 'bad home' >&2; echo more >&2; exit 3");
+    assert_eq!(
+      Cira::new(broken, Duration::from_secs(5)).status(),
+      Err(Down::Failed { code: Some(3), message: "bad home".into() })
+    );
     let hanging = script("hanging", "exec sleep 30");
     let started = Instant::now();
-    assert_eq!(Cira::new(hanging, Duration::from_millis(300)).status(), None);
+    let t = Duration::from_millis(300);
+    assert_eq!(Cira::new(hanging, t).status(), Err(Down::Silent(t)));
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    let garbled = script("garbled", "echo nope");
+    assert!(matches!(
+      Cira::new(garbled, Duration::from_secs(5)).status(),
+      Err(Down::Unreadable(_))
+    ));
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/cira/status.json");
     let answering = script("answering", &format!("cat '{path}'"));
-    assert_eq!(Cira::new(answering, Duration::from_secs(5)).status(), Some(fixture().0));
+    assert_eq!(Cira::new(answering, Duration::from_secs(5)).status(), Ok(fixture().0));
+  }
+
+  /// Q-165: Jay saw "Cira is unreachable" with `cira` not installed, and
+  /// could not tell what was wrong or what to do.
+  #[test]
+  fn the_cira_down_message_names_the_cause_and_the_remedy() {
+    let missing = Cira::new("/nonexistent/jc-test/cira", Duration::from_secs(1));
+    let why = missing.status().unwrap_err().to_string();
+    assert!(why.contains("not found on PATH"), "{why}");
+    assert!(why.contains("./make.sh install"), "{why}");
+    let socket = "no daemon accepted a connection on /h/cira.sock within 12000 ms";
+    let why = Down::NoDaemon(socket.into()).to_string();
+    assert!(why.contains(socket), "cira's own line names the socket: {why}");
+    let why = Down::Silent(Cira::TIMEOUT).to_string();
+    assert!(why.contains("no answer within 3 s") && why.contains("daemon"), "{why}");
+    let why = Down::Failed { code: Some(3), message: "bad home".into() }.to_string();
+    assert!(why.contains("exit 3") && why.contains("bad home"), "{why}");
+    // A call says the same as the status read.
+    let at = At { project: None, dir: std::env::temp_dir() };
+    let call = missing.stop(&at, "c1").unwrap_err().to_string();
+    assert_eq!(call, Down::NotInstalled.to_string());
   }
 
   #[test]
@@ -1075,10 +1207,17 @@ mod tests {
     let t = Duration::from_secs(10);
     let at = At { project: None, dir: std::env::temp_dir() };
     let gone = Cira::new("/nonexistent/jc-test/cira", t);
-    assert_eq!(gone.stop(&at, "c1"), Err(CallError::Unreachable), "not installed");
+    assert_eq!(
+      gone.stop(&at, "c1"),
+      Err(CallError::Unreachable(Down::NotInstalled)),
+      "not installed"
+    );
     // 125: no daemon accepted; nothing was sent.
     let no_daemon = Cira::new(script("no-daemon", "echo 'no daemon' >&2; exit 125"), t);
-    assert_eq!(no_daemon.stop(&at, "c1"), Err(CallError::Unreachable));
+    assert_eq!(
+      no_daemon.stop(&at, "c1"),
+      Err(CallError::Unreachable(Down::NoDaemon("no daemon".into())))
+    );
     let conflict = Cira::new(script("conflict", "echo 'mode is dangerous' >&2; exit 4"), t);
     match conflict.set_mode(&at, "c1", true, false) {
       Err(CallError::Refused { code: exit::CONFLICT, message, .. }) => {
@@ -1101,7 +1240,7 @@ mod tests {
     for code in [exit::ERROR, exit::NOT_RECORDED, exit::VERSION, exit::READ_ONLY] {
       assert!(refused(code).retry(), "exit {code}");
     }
-    assert!(CallError::Unreachable.retry());
+    assert!(CallError::Unreachable(Down::NotInstalled).retry());
     assert!(CallError::NoAnswer.retry());
     for code in [exit::CONFLICT, exit::INVALID, exit::NOT_FOUND, 2] {
       assert!(!refused(code).retry(), "exit {code} answers the request");

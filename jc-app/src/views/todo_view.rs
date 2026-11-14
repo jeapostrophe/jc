@@ -35,6 +35,9 @@ pub struct TodoView {
   flavor: Flavor,
   /// jcc, while no file is open: why, if more than waiting for Cira.
   waiting: Option<String>,
+  /// jcc: Cira was not reached at the last read, which the window's banner
+  /// says.
+  cira_down: bool,
   active_key: Option<String>,
   _editor_subscription: Subscription,
 }
@@ -67,7 +70,15 @@ impl TodoView {
     let flavor = Flavor::current();
     let document = todo::parse(&text, flavor);
 
-    Self { code_view, document, flavor, waiting: None, active_key: None, _editor_subscription }
+    Self {
+      code_view,
+      document,
+      flavor,
+      waiting: None,
+      cira_down: false,
+      active_key: None,
+      _editor_subscription,
+    }
   }
 
   /// Open `todo`, for a view made with none (jcc, once Cira names the project).
@@ -85,6 +96,14 @@ impl TodoView {
       cx.notify();
     }
     changed
+  }
+
+  /// Whether Cira was reached at the last read (jcc).
+  pub fn set_cira_down(&mut self, down: bool, cx: &mut Context<Self>) {
+    if self.cira_down != down {
+      self.cira_down = down;
+      cx.notify();
+    }
   }
 
   pub fn is_open(&self, cx: &App) -> bool {
@@ -441,12 +460,7 @@ impl TodoView {
 
 impl Render for TodoView {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    let waiting = (!self.is_open(cx)).then(|| {
-      self
-        .waiting
-        .clone()
-        .unwrap_or_else(|| "jcc's TODO opens once Cira names this project (`cira status`)".into())
-    });
+    let waiting = waiting_banner(self.is_open(cx), self.waiting.as_deref(), self.cira_down);
     div()
       .id("todo-view")
       .size_full()
@@ -468,8 +482,45 @@ impl Render for TodoView {
   }
 }
 
+/// The banner over a TODO: none once it is open, nor while Cira is down,
+/// which the window's one Cira banner says (Q-165: one TODO pane each and the
+/// window's banner made three for one cause); else why it is not open.
+fn waiting_banner(open: bool, why: Option<&str>, cira_down: bool) -> Option<String> {
+  (!open && !cira_down).then(|| {
+    why.unwrap_or("jcc's TODO opens once Cira names this project (`cira status`)").to_string()
+  })
+}
+
 impl Focusable for TodoView {
   fn focus_handle(&self, cx: &App) -> FocusHandle {
     self.code_view.read(cx).focus_handle(cx)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::waiting_banner;
+  use jc_core::cira::{Down, Reach, Status};
+
+  /// Q-165: with `cira` not installed, jcc opened with three banners: the
+  /// window's, and one on each of the two panes showing the TODO.
+  #[test]
+  fn repeated_cira_failures_raise_one_banner() {
+    let mut reach = Reach::default();
+    let down = Err(Down::NotInstalled);
+    let raised = (0..3).filter(|_| reach.read(&down)).count();
+    assert_eq!(raised, 1, "a poll that fails the same way again raises nothing new");
+    let window = reach.down().map(Down::to_string);
+    let todo_panes = [false, false].map(|open| waiting_banner(open, None, reach.down().is_some()));
+    let shown: Vec<String> = window.into_iter().chain(todo_panes.into_iter().flatten()).collect();
+    assert_eq!(shown.len(), 1, "one banner for one cause: {shown:?}");
+    assert!(shown[0].contains("not found on PATH"), "{shown:?}");
+
+    // Back: the Cira banner clears, and a TODO not open yet says why.
+    let up = Status::parse(br#"{"home":"/store","projects":[]}"#).map_err(|_| Down::NotInstalled);
+    assert!(reach.read(&up));
+    assert_eq!(reach.down(), None);
+    assert!(waiting_banner(false, None, false).is_some());
+    assert_eq!(waiting_banner(true, None, false), None);
   }
 }

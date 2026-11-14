@@ -12,7 +12,7 @@ use crate::views::project_state::ProjectState;
 use crate::views::session_state::{Heading, SessionId, SessionState, Start};
 use gpui::*;
 use jc_core::background::{Poll, Settled};
-use jc_core::cira::{At, CallError, Created, NewSession, Status, exit};
+use jc_core::cira::{At, CallError, Created, Down, NewSession, Reach, Status, exit};
 use jc_core::lifecycle::{self, LabelSync, MarkRequest, PaneAction, Records};
 use jc_core::todo::{SessionKey, TodoSession};
 use jc_terminal::{ChildEvent, TerminalView};
@@ -25,8 +25,9 @@ pub(super) struct CiraView {
   /// The last `cira status --json` that answered, and when its read began.
   pub status: Option<Status>,
   pub read_at: Option<SystemTime>,
-  /// Whether the last read reached Cira; `None` before the first.
-  pub reachable: Option<bool>,
+  /// Whether the last read reached Cira, and why not: the window's one Cira
+  /// banner.
+  pub reach: Reach,
   /// What jc remembers per Cira id (`sessions.toml`); `None` until loaded, and
   /// for good when it could not be read or kept aside (nothing is acted on).
   pub records: Option<Records>,
@@ -108,7 +109,7 @@ impl Workspace {
   }
 
   fn cira_reachable(&self) -> bool {
-    self.cira.reachable == Some(true)
+    self.cira.reach.is_up()
   }
 
   /// Keep what jc remembers, on the saver thread.
@@ -135,21 +136,29 @@ impl Workspace {
   // Each status read
   // ---------------------------------------------------------------------------
 
-  /// A `cira status --json` read that began at `read_at` (`None`: Cira is
-  /// unreachable): show it, then act on it.
+  /// A `cira status --json` read that began at `read_at` (or why Cira was
+  /// not reached): show it, then act on it. A cause is said once, in the
+  /// window's banner and on stderr, however many reads repeat it.
   pub(super) fn on_cira(
     &mut self,
     read_at: SystemTime,
-    status: Option<Status>,
+    status: Result<Status, Down>,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
     let mut changed = false;
-    if self.cira.reachable != Some(status.is_some()) {
-      self.cira.reachable = Some(status.is_some());
-      eprintln!("cira: {}", if status.is_some() { "reachable" } else { "unreachable" });
+    if self.cira.reach.read(&status) {
+      match self.cira.reach.down() {
+        Some(down) => eprintln!("cira: {down}"),
+        None => eprintln!("cira: reachable"),
+      }
+      let down = self.cira.reach.down().is_some();
+      for project in &self.projects {
+        project.todo_view.update(cx, |tv, cx| tv.set_cira_down(down, cx));
+      }
       changed = true;
     }
+    let status = status.ok();
     for project in &mut self.projects {
       changed |= project.apply_cira(status.as_ref());
     }
@@ -577,6 +586,18 @@ impl Workspace {
     id
   }
 
+  /// Refuse what needs the project's TODO open, which it is not: while Cira
+  /// is down, with the window's Cira banner (so it is said once), else
+  /// pointing at the TODO pane, which says why.
+  fn refuse_todo_closed(&mut self, what: &str, cx: &mut Context<Self>) {
+    match self.cira.reach.down() {
+      Some(down) => self.refuse(down.to_string(), cx),
+      None => {
+        self.refuse(format!("{what}: jcc's TODO for this project is not open (see its pane)"), cx)
+      }
+    }
+  }
+
   /// A brand-new session: Cira mints it and starts its job; its heading is
   /// written as soon as Cira answers with the id.
   pub(super) fn cira_new_session(
@@ -588,7 +609,7 @@ impl Workspace {
     // Its heading goes into jcc's todo.md, which opens once Cira names the
     // project: until then there is nowhere to write it.
     if !self.projects[pi].todo_open(cx) {
-      self.refuse("No new session yet: jcc's TODO for this project is not open (see its pane)", cx);
+      self.refuse_todo_closed("No new session yet", cx);
       return;
     }
     // Cosmetic only — nothing addresses a session by label (see
@@ -614,7 +635,7 @@ impl Workspace {
     // two headings).
     let in_flight = |s: &SessionState| s.adopting.as_deref() == Some(uuid.as_str());
     if !self.projects[pi].todo_open(cx) {
-      self.refuse("Not adopted: jcc's TODO for this project is not open (see its pane)", cx);
+      self.refuse_todo_closed("Not adopted", cx);
       return;
     }
     if self.projects[pi].sessions.values().any(in_flight) {

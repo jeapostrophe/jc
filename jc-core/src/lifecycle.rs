@@ -605,8 +605,8 @@ mod tests {
     assert_eq!(shell_child(Ok(listed_shell(&argv)), false), shared);
     assert!(matches!(shell_child(Ok(listed_shell(&[])), false), ShellChild::Own(_)));
     assert_eq!(
-      shell_child(Err(CallError::Unreachable), false),
-      ShellChild::Own("Cira is unreachable".into())
+      shell_child(Err(CallError::Unreachable(crate::cira::Down::NotInstalled)), false),
+      ShellChild::Own(crate::cira::Down::NotInstalled.to_string())
     );
     let no_tmux = refused(exit::ERROR, "no tmux");
     assert!(
@@ -663,7 +663,12 @@ mod tests {
     let mut pane = ShellPane::default();
     assert!(pane.ask("c-1", at(100)));
     assert!(matches!(
-      pane.answered("c-1", Err(CallError::Unreachable), false, at(100)),
+      pane.answered(
+        "c-1",
+        Err(CallError::Unreachable(crate::cira::Down::NotInstalled)),
+        false,
+        at(100)
+      ),
       Some(ShellChild::Own(_))
     ));
     assert_eq!(pane.run(), ShellRun::Own);
