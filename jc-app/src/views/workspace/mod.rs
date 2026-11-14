@@ -2,8 +2,9 @@ mod own;
 mod pickers;
 mod render;
 mod sessions;
+mod state_file;
 
-use crate::views::close_confirm::{CloseConfirm, CloseConfirmEvent};
+use crate::views::close_confirm::{CloseConfirm, CloseConfirmEvent, Closing};
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
 use crate::views::pane::{Pane, PaneContent, PaneContentKind};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
@@ -114,8 +115,10 @@ pub struct Workspace {
   _notification_poll_task: Option<Task<()>>,
   close_confirm: Option<(AnyView, Subscription)>,
   pre_close_confirm_focus: Option<FocusHandle>,
-  /// Whether the pending close is a quit (vs window close).
-  close_confirm_is_quit: bool,
+  /// What the pending close confirmation closes.
+  closing: Closing,
+  /// Watches `state.toml` (Cira PLAN TMUX-10).
+  _state_watcher: Option<notify::RecommendedWatcher>,
   /// Which app this is (Cira PLAN TMUX-07): `jc` runs each session's
   /// `claude` itself (`own.rs`); `jcc` is Cira's client (`sessions.rs`).
   flavor: Flavor,
@@ -394,7 +397,8 @@ impl Workspace {
       _notification_poll_task: Some(notification_poll_task),
       close_confirm: None,
       pre_close_confirm_focus: None,
-      close_confirm_is_quit: false,
+      closing: Closing::Window,
+      _state_watcher: None,
       flavor,
       claude,
       cira_client,
@@ -423,6 +427,7 @@ impl Workspace {
           }
         }
       }));
+    ws._state_watcher = ws.watch_state_file(window, cx);
     ws.refresh_breadcrumb_observers(cx);
     ws.reconcile_schedules(window, cx);
     ws.start_schedule_reconcile_loop(window, cx);
@@ -578,7 +583,8 @@ impl Workspace {
         window.remove_window();
       }
     } else {
-      self.show_close_confirm(active, conflicts, is_quit, window, cx);
+      let closing = if is_quit { Closing::Quit } else { Closing::Window };
+      self.show_close_confirm(active, conflicts, closing, window, cx);
     }
   }
 
@@ -648,34 +654,44 @@ impl Workspace {
     &mut self,
     session_count: usize,
     conflicts: Vec<String>,
-    is_quit: bool,
+    closing: Closing,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    self.close_confirm_is_quit = is_quit;
+    self.closing = closing.clone();
     self.pre_close_confirm_focus = window.focused(cx);
-    let view = cx.new(|cx| CloseConfirm::new(session_count, conflicts, is_quit, cx));
+    let view = cx.new(|cx| CloseConfirm::new(session_count, conflicts, closing, cx));
     let sub = cx.subscribe_in(&view, window, |this: &mut Self, _, event, window, cx| match event {
       CloseConfirmEvent::Confirmed => {
         this.close_confirm = None;
-        this.pre_close_confirm_focus = None;
-        if this.close_confirm_is_quit {
-          cx.quit();
-        } else {
-          window.remove_window();
+        match this.closing.clone() {
+          Closing::Quit => cx.quit(),
+          Closing::Window => window.remove_window(),
+          Closing::Project(path) => {
+            this.restore_close_confirm_focus(window);
+            this.close_project(&path, window, cx);
+          }
         }
+        this.pre_close_confirm_focus = None;
       }
       CloseConfirmEvent::Cancelled => {
         this.close_confirm = None;
-        if let Some(focus) = this.pre_close_confirm_focus.take() {
-          focus.focus(window);
+        if let Closing::Project(path) = this.closing.clone() {
+          this.keep_project(path, window, cx);
         }
+        this.restore_close_confirm_focus(window);
         cx.notify();
       }
     });
     view.read(cx).focus_handle(cx).focus(window);
     self.close_confirm = Some((view.into(), sub));
     cx.notify();
+  }
+
+  fn restore_close_confirm_focus(&mut self, window: &mut Window) {
+    if let Some(focus) = self.pre_close_confirm_focus.take() {
+      focus.focus(window);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -959,20 +975,7 @@ impl Workspace {
     }
 
     // Create a new ProjectState and switch to it.
-    let palette = palette_from_window(window);
-    let name = canonical
-      .file_name()
-      .map(|n| n.to_string_lossy().into_owned())
-      .unwrap_or_else(|| "unknown".into());
-
-    let project = ProjectState::create(canonical.clone(), name, &palette, window, cx);
-    self.projects.push(project);
-
-    let project_idx = self.projects.len() - 1;
-    if self.flavor == Flavor::Jcc {
-      self.observe_panes(project_idx, window, cx);
-      self.kick_cira();
-    }
+    let project_idx = self.add_project(canonical.clone(), window, cx);
     let active = self.projects[project_idx].active_session;
     self.switch_to_session(project_idx, active, window, cx);
 
@@ -981,6 +984,28 @@ impl Workspace {
       state.register_project(&canonical);
       let _ = jc_core::config::save_state(&state);
     }
+  }
+
+  /// Open the project at `canonical` without switching to it; its index.
+  fn add_project(
+    &mut self,
+    canonical: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> usize {
+    let palette = palette_from_window(window);
+    let name = canonical
+      .file_name()
+      .map(|n| n.to_string_lossy().into_owned())
+      .unwrap_or_else(|| "unknown".into());
+    let project = ProjectState::create(canonical, name, &palette, window, cx);
+    self.projects.push(project);
+    let project_idx = self.projects.len() - 1;
+    if self.flavor == Flavor::Jcc {
+      self.observe_panes(project_idx, window, cx);
+      self.kick_cira();
+    }
+    project_idx
   }
 
   // ---------------------------------------------------------------------------

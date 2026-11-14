@@ -386,3 +386,5 @@ macOS native via `objc2`:
 ## IPC
 
 Unix socket at `~/.config/jc/jc.sock` (`$JC_CONFIG_DIR/jc.sock` when that is set; see `config::config_dir`). Protocol: JSON messages. Primary use: `open_project` command so multiple `jc .` invocations converge to one running instance.
+
+The app also follows its own `state.toml` (`workspace/state_file.rs`, Cira PLAN TMUX-10): `file_watcher::watch_dir` on the config directory, the file read off the main thread, then `AppState::change_from` against the open projects. A project the file adds opens without being switched to (`Workspace::add_project`); one it drops closes (`Workspace::close_project`: panes and sessions go, its hooks are removed). jcc closes at once, its sessions running on in Cira; jc asks first (`Closing::Project`) when the project has sessions, since closing ends their `claude`, and Cancel lists the project in the file again. A file that lists no project, or would close the last one open, changes nothing. The app's own writes list exactly what it has open, so they ask for nothing.

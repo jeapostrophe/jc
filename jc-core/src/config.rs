@@ -133,6 +133,26 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
   save_toml("config.toml", config)
 }
 
+/// What a changed `state.toml` asks of the projects an app has open (Cira
+/// PLAN TMUX-10): those it lists that are not open, and those open that it no
+/// longer lists, each in order.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StateChange {
+  pub added: Vec<PathBuf>,
+  pub removed: Vec<PathBuf>,
+}
+
+impl AppState {
+  /// Compare with the projects open now.
+  pub fn change_from(&self, open: &[PathBuf]) -> StateChange {
+    let listed: Vec<&PathBuf> = self.projects.iter().map(|p| &p.path).collect();
+    StateChange {
+      added: listed.iter().filter(|p| !open.contains(p)).map(|p| (*p).clone()).collect(),
+      removed: open.iter().filter(|p| !listed.contains(p)).cloned().collect(),
+    }
+  }
+}
+
 pub fn load_state() -> Result<AppState> {
   load_toml(&state_path())
 }
@@ -177,6 +197,26 @@ pub fn save_sessions(records: &crate::lifecycle::Records) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// TMUX-10 (Jay: "live-react to the state.toml file changing"). An app's
+  /// own write lists exactly what it has open, so it asks for nothing: no
+  /// echo.
+  #[test]
+  fn a_changed_state_file_names_what_to_open_and_close() {
+    let state = |paths: &[&str]| AppState {
+      projects: paths.iter().map(|p| Project::from(PathBuf::from(p))).collect(),
+    };
+    let open = [PathBuf::from("/w/a"), PathBuf::from("/w/b")];
+    assert_eq!(
+      state(&["/w/a", "/w/b"]).change_from(&open),
+      StateChange::default(),
+      "its own write"
+    );
+    assert_eq!(state(&["/w/b", "/w/a"]).change_from(&open), StateChange::default(), "order alone");
+    let change = state(&["/w/b", "/w/c"]).change_from(&open);
+    assert_eq!(change.added, [PathBuf::from("/w/c")]);
+    assert_eq!(change.removed, [PathBuf::from("/w/a")]);
+  }
 
   #[test]
   fn a_records_file_that_does_not_parse_is_kept_aside() {

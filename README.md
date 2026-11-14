@@ -45,7 +45,7 @@ cargo run -p jc-app
 cargo run -p jc-app -- .
 ```
 
-Config and state live in `~/.config/jc/` (`config.toml`, `state.toml`, `theme.toml`), or `$JC_CONFIG_DIR` when it is set. `./make.sh` also builds `jcc.app`, jc as Cira's client: see [jcc](#jcc-jc-as-ciras-client).
+Config and state live in `~/.config/jc/` (`config.toml`, `state.toml`, `theme.toml`), or `$JC_CONFIG_DIR` when it is set. The app follows `state.toml` while it runs: a project added to its list opens (without switching to it), and one removed closes; jc asks first when that project has sessions, since closing ends them, and jcc's keep running in Cira. `./make.sh` also builds `jcc.app`, jc as Cira's client: see [jcc](#jcc-jc-as-ciras-client).
 
 ## Core Concepts
 

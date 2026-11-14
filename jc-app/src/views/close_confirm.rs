@@ -15,23 +15,52 @@ pub enum CloseConfirmEvent {
   Cancelled,
 }
 
+/// What is being closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Closing {
+  Window,
+  Quit,
+  /// jc: the project at this path, which `state.toml` no longer lists (Cira
+  /// PLAN TMUX-10).
+  Project(std::path::PathBuf),
+}
+
+impl Closing {
+  fn title(&self) -> String {
+    match self {
+      Closing::Window => "Close?".into(),
+      Closing::Quit => "Quit?".into(),
+      Closing::Project(path) => {
+        let name = path
+          .file_name()
+          .map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        format!("Close project {name}? state.toml no longer lists it.")
+      }
+    }
+  }
+
+  fn verb(&self) -> &'static str {
+    if *self == Closing::Quit { "quit" } else { "close" }
+  }
+}
+
 pub struct CloseConfirm {
   focus: FocusHandle,
-  /// jc: Claude sessions still working, which quitting terminates. Always 0
+  /// jc: Claude sessions still working, which closing terminates. Always 0
   /// for jcc, whose sessions Cira keeps running.
   session_count: usize,
   conflicts: Vec<String>,
-  is_quit: bool,
+  closing: Closing,
 }
 
 impl CloseConfirm {
   pub fn new(
     session_count: usize,
     conflicts: Vec<String>,
-    is_quit: bool,
+    closing: Closing,
     cx: &mut Context<Self>,
   ) -> Self {
-    Self { focus: cx.focus_handle(), session_count, conflicts, is_quit }
+    Self { focus: cx.focus_handle(), session_count, conflicts, closing }
   }
 }
 
@@ -46,8 +75,6 @@ impl Focusable for CloseConfirm {
 impl Render for CloseConfirm {
   fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let theme = cx.theme();
-
-    let action = if self.is_quit { "Quit" } else { "Close" };
 
     let mut messages: Vec<String> = Vec::new();
 
@@ -95,7 +122,7 @@ impl Render for CloseConfirm {
               .text_base()
               .font_weight(FontWeight::BOLD)
               .text_color(theme.foreground)
-              .child(format!("{action}?")),
+              .child(self.closing.title()),
           )
           .children(messages.into_iter().map(|msg| div().text_color(theme.foreground).child(msg)))
           .child(
@@ -108,7 +135,7 @@ impl Render for CloseConfirm {
               .text_color(theme.muted_foreground)
               .child("Esc to cancel")
               .child("·")
-              .child(format!("Enter to {}", action.to_lowercase())),
+              .child(format!("Enter to {}", self.closing.verb())),
           ),
       )
   }
