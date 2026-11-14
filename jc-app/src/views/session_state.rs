@@ -95,6 +95,9 @@ pub struct SessionState {
   /// When the Claude pane last attached, or Jay last asked it to: a stop
   /// through Cira after this is not undone by attaching.
   pub attach_since: Option<SystemTime>,
+  /// Whether `sessions.toml` was asked if its pane was attached when jcc
+  /// last ran (`lifecycle::since_at_start`, Cira PLAN TMUX-14).
+  pub start_restored: bool,
   /// When its attach client last exited, and the pause before the next
   /// attach.
   pub exited: Backoff,
@@ -250,6 +253,7 @@ impl SessionState {
       adopting: None,
       cira_session: None,
       attach_since: None,
+      start_restored: false,
       exited: Backoff::default(),
       shown: None,
       cira_state: None,

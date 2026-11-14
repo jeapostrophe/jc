@@ -89,6 +89,14 @@ impl Flavor {
     }
   }
 
+  /// Whether a project another invocation hands the running app (`jc DIR`,
+  /// `jcc DIR` while it runs) becomes the one shown (jc), or is only added to
+  /// the project list (jcc, Cira PLAN TMUX-13), leaving the session shown as
+  /// it was.
+  pub fn ipc_switches(self) -> bool {
+    self == Self::Jc
+  }
+
   /// The TODO file this app keeps for the project at `project`, the only one
   /// it reads or writes: jc's is the project's own `TODO.md`; jcc's is
   /// `todo.md` beside the scratch pad of the Cira project holding `project`
@@ -136,6 +144,14 @@ impl Flavor {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Cira PLAN TMUX-13: `jcc DIR` while jcc runs only adds DIR to the
+  /// project list; `jc DIR` still switches to it.
+  #[test]
+  fn jcc_dir_while_running_only_adds() {
+    assert!(!Flavor::Jcc.ipc_switches(), "jcc DIR changed the session shown");
+    assert!(Flavor::Jc.ipc_switches());
+  }
 
   #[test]
   fn the_program_name_chooses_the_flavor() {

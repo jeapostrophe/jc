@@ -1,5 +1,6 @@
 use crate::views::code_view::CodeView;
 use crate::views::pane::PaneContentKind;
+use crate::views::scratch_view::ScratchView;
 use crate::views::session_state::{Heading, SessionId, SessionState, Start};
 use crate::views::todo_view::TodoView;
 use gpui::*;
@@ -39,6 +40,9 @@ pub struct ProjectState {
   pub active_session: Option<SessionId>,
   pub next_session_id: SessionId,
   pub todo_view: Entity<TodoView>,
+  /// jcc: the Cira project's scratch pad (Cira PLAN TMUX-11), named at the
+  /// Cira read that names the project.
+  pub scratch_view: Entity<ScratchView>,
   /// jcc: added to jcc's list in this run, or named by `jcc <dir>`: only
   /// such a project registers a Cira project (`lifecycle::plan_todos`).
   pub added: bool,
@@ -67,6 +71,7 @@ impl ProjectState {
     // store, opened once a status read names the Cira project (`open_todo`).
     let todo = flavor.todo_path(&path, None);
     let todo_view = cx.new(|cx| TodoView::new(todo, window, cx));
+    let scratch_view = cx.new(|cx| ScratchView::new(window, cx));
     // jc: one bucket scan for the whole project, cached on the struct and
     // reused by every later `launch_for`.
     let session_dirs = match flavor {
@@ -80,6 +85,7 @@ impl ProjectState {
       active_session: None,
       next_session_id: 0,
       todo_view,
+      scratch_view,
       added: false,
       cira_open: None,
       cira_known: HashSet::new(),

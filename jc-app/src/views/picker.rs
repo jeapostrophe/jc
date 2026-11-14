@@ -368,7 +368,7 @@ pub enum OpenPickerResult {
 
 pub struct OpenPickerDelegate {
   labels: Vec<String>,
-  /// First N items are panes (N = PaneContentKind::ALL.len()), rest are files.
+  /// First N items are panes (those `PaneContentKind::offered`), rest are files.
   pane_count: usize,
   kinds: Vec<PaneContentKind>,
   code_view: Entity<CodeView>,
@@ -384,7 +384,7 @@ impl OpenPickerDelegate {
     code_view: Entity<CodeView>,
     recent_files: Vec<PathBuf>,
   ) -> Self {
-    let kinds: Vec<PaneContentKind> = PaneContentKind::ALL.to_vec();
+    let kinds = PaneContentKind::offered(jc_core::flavor::Flavor::current());
     let pane_count = kinds.len();
 
     let mut labels: Vec<String> = kinds.iter().map(|k| k.label().to_string()).collect();

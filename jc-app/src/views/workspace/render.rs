@@ -89,6 +89,13 @@ impl Workspace {
         let title = format!("Global TODO{dirty}");
         PaneHeader { title, breadcrumbs: cv.breadcrumb().to_vec() }
       }
+      Some(PaneContentKind::Scratch) => {
+        let name = project.scratch_view.read(cx).project().map(|p| format!(" · {p}"));
+        PaneHeader {
+          title: format!("Scratch{}", name.unwrap_or_default()),
+          breadcrumbs: Vec::new(),
+        }
+      }
       Some(PaneContentKind::GeneralTerminal)
         if project.active_session().is_some_and(|s| s.shell_not_shared()) =>
       {

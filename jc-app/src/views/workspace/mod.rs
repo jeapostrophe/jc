@@ -6,7 +6,7 @@ mod state_file;
 
 use crate::views::close_confirm::{CloseConfirm, CloseConfirmEvent, Closing};
 use crate::views::keybinding_help::{DismissHelpEvent, KeybindingHelp};
-use crate::views::pane::{Pane, PaneContent, PaneContentKind};
+use crate::views::pane::{Pane, PaneContent, PaneContentKind, default_kinds};
 use crate::views::project_state::{ProjectState, SavedPaneLayout};
 use crate::views::session_state::{SavedViewState, SessionId, SessionState};
 use crate::views::todo_view::ScheduledFire;
@@ -158,6 +158,37 @@ pub struct Workspace {
   refusal: Option<(u64, String)>,
 }
 
+/// What a pane shows as `kind` for `project`'s active session; `None` for a
+/// session's view when it has none.
+fn pane_content(
+  kind: PaneContentKind,
+  project: &ProjectState,
+  global_todo_view: &Entity<crate::views::code_view::CodeView>,
+  cx: &App,
+) -> Option<PaneContent> {
+  let (view, focus): (AnyView, FocusHandle) = match kind {
+    PaneContentKind::ClaudeTerminal => project
+      .active_session()
+      .map(|s| (s.claude_terminal.clone().into(), s.claude_terminal.read(cx).focus_handle(cx)))?,
+    PaneContentKind::GeneralTerminal => project
+      .active_session()
+      .map(|s| (s.general_terminal.clone().into(), s.general_terminal.read(cx).focus_handle(cx)))?,
+    PaneContentKind::CodeViewer => project
+      .active_session()
+      .map(|s| (s.code_view.clone().into(), s.code_view.read(cx).focus_handle(cx)))?,
+    PaneContentKind::TodoEditor => {
+      (project.todo_view.clone().into(), project.todo_view.read(cx).focus_handle(cx))
+    }
+    PaneContentKind::GlobalTodo => {
+      (global_todo_view.clone().into(), global_todo_view.read(cx).focus_handle(cx))
+    }
+    PaneContentKind::Scratch => {
+      (project.scratch_view.clone().into(), project.scratch_view.read(cx).focus_handle(cx))
+    }
+  };
+  Some(PaneContent { kind, view, focus })
+}
+
 /// Unmatched hooks kept for re-dispatch; older ones are dropped.
 const UNMATCHED_HOOKS_MAX: usize = 32;
 /// How long a refusal's reason stays on screen.
@@ -216,7 +247,7 @@ impl Workspace {
     });
 
     // Determine initial pane content from first project's first session.
-    let initial_contents = Self::initial_pane_contents(&projects[0], &global_todo_view, cx);
+    let initial_contents = Self::initial_pane_contents(&projects[0], &global_todo_view, flavor, cx);
     let panes: Vec<Entity<Pane>> = initial_contents
       .into_iter()
       .map(|content| cx.new(|cx| Pane::with_content(content, cx)))
@@ -232,8 +263,13 @@ impl Workspace {
 
     // Track window activation so notifications only fire when jc is in the background.
     let window_activation_subscription =
-      cx.observe_window_activation(window, move |this: &mut Self, window, _cx| {
+      cx.observe_window_activation(window, move |this: &mut Self, window, cx| {
         this.window_active = window.is_window_active();
+        // The daemon announces no change to a pad: read it again on coming back.
+        if this.window_active {
+          let scratch = this.active_project().scratch_view.clone();
+          scratch.update(cx, |v, cx| v.refresh(window, cx));
+        }
       });
 
     let mut focus_in_subscriptions = Vec::new();
@@ -304,8 +340,12 @@ impl Workspace {
         while let Ok(path) = ipc_rx.recv_async().await {
           let Ok(should_continue) = cx.update(|window, cx| {
             if let Some(entity) = this.upgrade() {
-              entity.update(cx, |ws, cx| ws.open_project(path, window, cx));
-              window.activate_window();
+              if Flavor::current().ipc_switches() {
+                entity.update(cx, |ws, cx| ws.open_project(path, window, cx));
+                window.activate_window();
+              } else {
+                entity.update(cx, |ws, cx| ws.list_project(path, window, cx));
+              }
               true
             } else {
               false
@@ -464,43 +504,17 @@ impl Workspace {
   fn initial_pane_contents(
     project: &ProjectState,
     global_todo_view: &Entity<crate::views::code_view::CodeView>,
+    flavor: Flavor,
     cx: &App,
   ) -> Vec<PaneContent> {
-    let first = if let Some(session) = project.active_session() {
-      let focus = session.claude_terminal.read(cx).focus_handle(cx);
-      PaneContent {
-        kind: PaneContentKind::ClaudeTerminal,
-        view: session.claude_terminal.clone().into(),
-        focus,
-      }
-    } else {
-      let focus = project.todo_view.read(cx).focus_handle(cx);
-      PaneContent {
-        kind: PaneContentKind::TodoEditor,
-        view: project.todo_view.clone().into(),
-        focus,
-      }
-    };
-
-    let second = {
-      let focus = project.todo_view.read(cx).focus_handle(cx);
-      PaneContent {
-        kind: PaneContentKind::TodoEditor,
-        view: project.todo_view.clone().into(),
-        focus,
-      }
-    };
-
-    let third = {
-      let focus = global_todo_view.read(cx).focus_handle(cx);
-      PaneContent {
-        kind: PaneContentKind::GlobalTodo,
-        view: global_todo_view.clone().into(),
-        focus,
-      }
-    };
-
-    vec![first, second, third]
+    let kinds = default_kinds(flavor, project.active_session().is_some());
+    kinds
+      .into_iter()
+      .map(|kind| {
+        pane_content(kind, project, global_todo_view, cx)
+          .expect("default_kinds names a session's view only when there is a session")
+      })
+      .collect()
   }
 
   /// Observe CodeView entities so the pane header re-renders when breadcrumbs change.
@@ -667,6 +681,9 @@ impl Workspace {
     {
       unsaved.extend(named(project.todo_view.read(cx).code_view().read(cx).file_path()));
     }
+    if !project.scratch_view.update(cx, |v, cx| v.flush(cx)) {
+      unsaved.push(format!("the scratch pad of {}", project.name));
+    }
     for session in project.sessions.values() {
       if session.code_view.read(cx).is_dirty(cx)
         && !session.code_view.update(cx, |v, cx| v.save(window, cx))
@@ -802,6 +819,9 @@ impl Workspace {
       PaneContentKind::GlobalTodo => {
         Some(OtherPaneScrollable::Editor(self.global_todo_view.read(cx).editor().clone()))
       }
+      PaneContentKind::Scratch => {
+        Some(OtherPaneScrollable::Editor(project.scratch_view.read(cx).editor().clone()))
+      }
       PaneContentKind::ClaudeTerminal => {
         project.active_session().map(|s| OtherPaneScrollable::Terminal(s.claude_terminal.clone()))
       }
@@ -918,6 +938,11 @@ impl Workspace {
     self.set_pane_view(pane_idx, kind, cx);
     self.active_pane_index = pane_idx;
 
+    if kind == PaneContentKind::Scratch {
+      let scratch = self.projects[self.active_project_index].scratch_view.clone();
+      scratch.update(cx, |v, cx| v.refresh(window, cx));
+    }
+
     // When switching to the TODO editor, ensure a WAIT section exists and scroll to it.
     if kind == PaneContentKind::TodoEditor {
       let project = &self.projects[self.active_project_index];
@@ -996,29 +1021,45 @@ impl Workspace {
   // ---------------------------------------------------------------------------
 
   pub fn open_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-    let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    let (idx, _) = self.name_project(path, window, cx);
+    let active = self.projects[idx].active_session;
+    self.switch_to_session(idx, active, window, cx);
+  }
 
-    // If the project is already loaded, just switch to it. Named by `jcc
-    // <dir>`, it may register a Cira project again.
+  /// jcc's `jcc DIR` while it runs (Cira PLAN TMUX-13): add the project to
+  /// the list without showing it; Cmd-P reaches it.
+  pub fn list_project(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    let (idx, added) = self.name_project(path, window, cx);
+    let name = self.projects[idx].path.display().to_string();
+    match added {
+      true => self.notice(format!("Added {name} to the project list (Cmd-P)"), cx),
+      false => self.notice(format!("{name} is already in the project list (Cmd-P)"), cx),
+    }
+  }
+
+  /// The project `path` names on the command line (`jc DIR`), added to the
+  /// list and to `state.toml` when it is not there: its index, and whether it
+  /// was added. Named again, a listed project may register a Cira project
+  /// again.
+  fn name_project(
+    &mut self,
+    path: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> (usize, bool) {
+    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
     if let Some(idx) = self.projects.iter().position(|p| p.path == canonical) {
       self.projects[idx].added = true;
       self.cira.registering.remove(&canonical);
       self.kick_cira();
-      let active = self.projects[idx].active_session;
-      self.switch_to_session(idx, active, window, cx);
-      return;
+      return (idx, false);
     }
-
-    // Create a new ProjectState and switch to it.
-    let project_idx = self.add_project(canonical.clone(), window, cx);
-    let active = self.projects[project_idx].active_session;
-    self.switch_to_session(project_idx, active, window, cx);
-
-    // Persist to state.toml.
+    let idx = self.add_project(canonical.clone(), window, cx);
     if let Ok(mut state) = jc_core::config::load_state() {
       state.register_project(&canonical);
       let _ = jc_core::config::save_state(&state);
     }
+    (idx, true)
   }
 
   /// Serve and install the hooks of a project opened while the app runs, as
@@ -1139,6 +1180,10 @@ impl Workspace {
 
     self.restore_or_default_panes(window, cx);
 
+    if self.flavor == Flavor::Jcc {
+      self.cira.focus_settled = true;
+      self.note_focus();
+    }
     cx.notify();
   }
 
@@ -1209,14 +1254,13 @@ impl Workspace {
       // whatever it had — including the terminal of a session just detached,
       // which the stale `AnyView` would also keep alive and focusable. Show the
       // project's TODO instead, which needs no session.
-      let first = if self.active_project().active_session().is_some() {
-        PaneContentKind::ClaudeTerminal
-      } else {
-        PaneContentKind::TodoEditor
-      };
-      self.set_pane_view(0, first, cx);
-      self.set_pane_view(1, PaneContentKind::TodoEditor, cx);
-      self.set_pane_view(2, PaneContentKind::GlobalTodo, cx);
+      let kinds = default_kinds(self.flavor, self.active_project().active_session().is_some());
+      for (i, kind) in kinds.into_iter().enumerate() {
+        self.set_pane_view(i, kind, cx);
+      }
+      if kinds.contains(&PaneContentKind::GeneralTerminal) {
+        self.kick_cira(); // a shell pane shown for the first time asks for its shell
+      }
       self.panes[0].read(cx).focus_content(window);
       self.active_pane_index = 0;
     }
@@ -1225,33 +1269,8 @@ impl Workspace {
   /// Set a specific pane to show a view kind from the active project/session.
   fn set_pane_view(&mut self, pane_idx: usize, kind: PaneContentKind, cx: &mut App) {
     let project = &self.projects[self.active_project_index];
-    let result: Option<(AnyView, FocusHandle)> = match kind {
-      PaneContentKind::ClaudeTerminal => project.active_session().map(|s| {
-        let focus = s.claude_terminal.read(cx).focus_handle(cx);
-        (s.claude_terminal.clone().into(), focus)
-      }),
-      PaneContentKind::GeneralTerminal => project.active_session().map(|s| {
-        let focus = s.general_terminal.read(cx).focus_handle(cx);
-        (s.general_terminal.clone().into(), focus)
-      }),
-      PaneContentKind::CodeViewer => project.active_session().map(|s| {
-        let focus = s.code_view.read(cx).focus_handle(cx);
-        (s.code_view.clone().into(), focus)
-      }),
-      PaneContentKind::TodoEditor => {
-        let focus = project.todo_view.read(cx).focus_handle(cx);
-        Some((project.todo_view.clone().into(), focus))
-      }
-      PaneContentKind::GlobalTodo => {
-        let focus = self.global_todo_view.read(cx).focus_handle(cx);
-        Some((self.global_todo_view.clone().into(), focus))
-      }
-    };
-
-    if let Some((view, focus)) = result {
-      self.panes[pane_idx].update(cx, |p, cx| {
-        p.set_content(PaneContent { kind, view, focus }, cx);
-      });
+    if let Some(content) = pane_content(kind, project, &self.global_todo_view, cx) {
+      self.panes[pane_idx].update(cx, |p, cx| p.set_content(content, cx));
     }
   }
 
@@ -1398,6 +1417,9 @@ impl Workspace {
       }
       Some(PaneContentKind::GlobalTodo) => {
         self.global_todo_view.update(cx, |v, cx| v.save(window, cx));
+      }
+      Some(PaneContentKind::Scratch) => {
+        project.scratch_view.update(cx, |v, cx| v.save_now(window, cx));
       }
       _ => {}
     }

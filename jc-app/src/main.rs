@@ -61,6 +61,13 @@ fn main() -> anyhow::Result<()> {
   if let Some(path) = &project_path
     && ipc::try_send_to_running(path)
   {
+    if !flavor.ipc_switches() {
+      println!(
+        "{}: {} is in the running app's project list (Cmd-P)",
+        flavor.name(),
+        path.display()
+      );
+    }
     return Ok(());
   }
 

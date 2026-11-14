@@ -212,6 +212,7 @@ pub fn run(
     workspace::init(cx);
     picker::init(cx);
     code_view::init(cx);
+    crate::views::scratch_view::init(cx);
     keybinding_help::init(cx);
     close_confirm::init(cx);
 

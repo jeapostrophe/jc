@@ -39,6 +39,9 @@ pub(super) struct CiraView {
   pub registering: std::collections::HashSet<PathBuf>,
   /// The home directory, links resolved: jcc registers no project there.
   pub home: Option<PathBuf>,
+  /// The start's focus is settled: shown (`Workspace::restore_focus`), or
+  /// Jay switched first.
+  pub focus_settled: bool,
 }
 
 impl Workspace {
@@ -154,6 +157,7 @@ impl Workspace {
     if let Some(status) = &status {
       changed |= self.open_todos(status, window, cx);
       changed |= self.sync_todos(status, window, cx);
+      self.name_scratch_pads(status, window, cx);
     }
     if status.is_some() {
       self.cira.status = status;
@@ -161,6 +165,10 @@ impl Workspace {
     self.cira.read_at = Some(read_at);
     self.retry_unmatched_hooks(window, cx);
     self.drive_sessions(read_at, window, cx);
+    self.restore_focus(window, cx);
+    if self.cira.focus_settled {
+      self.note_focus(); // the shown session may have its Cira id only now (a migration)
+    }
     self.drive_shells(window, cx);
     if self.cira_reachable(cx) {
       self.reconcile_marks(window, cx);
@@ -168,6 +176,67 @@ impl Workspace {
     }
     if changed {
       cx.notify();
+    }
+  }
+
+  /// Give each project's Scratch panel the pad of the Cira project holding
+  /// it, read through the daemon's socket in the store's home.
+  fn name_scratch_pads(&mut self, status: &Status, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(home) = &status.home else { return };
+    for project in &self.projects {
+      let Some(cira) = status.project_for(&project.path) else { continue };
+      let target = crate::views::scratch_view::Target {
+        socket: jc_core::scratch::socket(home),
+        project: cira.name.clone(),
+      };
+      project.scratch_view.update(cx, |v, cx| v.set_target(target, window, cx));
+    }
+  }
+
+  /// At start, once the records are read and a todo.md is open, show the
+  /// session jcc showed last (Cira PLAN TMUX-14): the project
+  /// `lifecycle::start_project` picks, then that session by Cira id, else the
+  /// project's most recent one, laid out as a switch lays it out. Settled
+  /// once; any switch made before settles it too.
+  fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.cira.focus_settled {
+      return;
+    }
+    let Some(records) = &self.cira.records else { return };
+    let open: Vec<(&Path, bool)> =
+      self.projects.iter().map(|p| (p.path.as_path(), p.todo_open(cx))).collect();
+    let Some(pi) = lifecycle::start_project(records.focus.as_ref(), &open) else { return };
+    let project = &self.projects[pi];
+    let last = records
+      .focus
+      .as_ref()
+      .filter(|f| f.project == project.path)
+      .and_then(|f| f.session.as_deref())
+      .and_then(|id| project.sessions.iter().find(|(_, s)| s.cira.as_deref() == Some(id)))
+      .map(|(sid, _)| *sid);
+    let sid = last.or(project.active_session);
+    // Nothing was shown yet: the panes still hold the start's (the TODO), so
+    // the switch must not keep them as the outgoing session's layout, which
+    // it would restore when that session is the one shown.
+    let shown = self.active_project_index;
+    let outgoing = self.projects[shown].active_session.take();
+    self.switch_to_session(pi, sid, window, cx);
+    if pi != shown {
+      self.projects[shown].active_session = outgoing;
+    }
+  }
+
+  /// Keep what jcc shows now as what the next start shows.
+  pub(super) fn note_focus(&mut self) {
+    let project = &self.projects[self.active_project_index];
+    let focus = lifecycle::Focus {
+      project: project.path.clone(),
+      session: project.active_session().and_then(|s| s.cira.clone()),
+    };
+    let Some(records) = self.cira.records.as_mut() else { return };
+    if records.focus.as_ref() != Some(&focus) {
+      records.focus = Some(focus);
+      self.save_records();
     }
   }
 
@@ -329,8 +398,19 @@ impl Workspace {
     let now = SystemTime::now();
     let mut migrate = Vec::new();
     let mut lost = Vec::new();
+    let mut noted = false;
     for project in &mut self.projects {
       for session in project.sessions.values_mut() {
+        // At its first decision once the records are read, a pane attached
+        // when jcc last ran attaches again (Cira PLAN TMUX-14).
+        if let (Some(records), Some(id)) = (&self.cira.records, &session.cira)
+          && !session.start_restored
+        {
+          session.start_restored = true;
+          if session.attach_since.is_none() {
+            session.attach_since = lifecycle::since_at_start(records.sessions.get(id));
+          }
+        }
         if session.asking || session.failed {
           continue;
         }
@@ -359,17 +439,25 @@ impl Workspace {
           continue; // a read from before the exit, or still backing off
         }
         let attached = (!session.bg.is_empty()).then_some(session.bg.as_str());
-        match lifecycle::pane_action(
+        let action = lifecycle::pane_action(
           session.cira_session.as_ref(),
           reachable,
           attached,
           session.attach_since,
-        ) {
+        );
+        if let (Some(records), Some(id)) = (self.cira.records.as_mut(), &session.cira) {
+          noted |=
+            lifecycle::note_attach(records.sessions.entry(id.clone()).or_default(), &action, now);
+        }
+        match action {
           PaneAction::Attach(short) => session.attach(&short, &self.claude, cx),
           PaneAction::Keep => {}
           PaneAction::Wait(why) | PaneAction::Hold(why) => session.show_once(&why, cx),
         }
       }
+    }
+    if noted {
+      self.save_records();
     }
     for (path, sid) in migrate {
       self.migrate(path, sid, window, cx);

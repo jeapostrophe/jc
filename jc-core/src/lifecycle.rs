@@ -420,6 +420,8 @@ pub fn label_sync(heading: &str, id: &str, cira: Option<&str>, last: Option<&str
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Records {
+  /// What was shown last, which the next start shows (Cira PLAN TMUX-14).
+  pub focus: Option<Focus>,
   pub sessions: BTreeMap<String, Record>,
 }
 
@@ -430,6 +432,52 @@ pub struct Record {
   pub mark: Option<Mark>,
   /// The label the heading and Cira last agreed on.
   pub label: Option<String>,
+  /// When its pane last attached, in Unix milliseconds, while it stays
+  /// attached ([`note_attach`]): the next start attaches it again unless
+  /// Cira recorded a stop after it ([`since_at_start`]).
+  pub attached_at: Option<u64>,
+}
+
+/// The project, and the session of it by Cira id, that jcc showed last.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Focus {
+  pub project: PathBuf,
+  pub session: Option<String>,
+}
+
+/// The `since` a pane starts with ([`pane_action`]; Cira PLAN TMUX-14): when
+/// it last attached, if it was attached when jcc last ran. So it attaches
+/// again although its job no longer runs (Claude Code retires an idle one,
+/// which Cira does not record as a stop), unless Cira's `stopped_at` (a
+/// `cira session stop` from Jay, the page or the CLI) is later (Q-275);
+/// any other is held if it was ever stopped through Cira.
+pub fn since_at_start(record: Option<&Record>) -> Option<SystemTime> {
+  let ms = record?.attached_at?;
+  Some(SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
+}
+
+/// Note in `record` whether `action`, decided at `now`, leaves its pane
+/// attached: an attach does, from `now`; a hold (stopped or removed through
+/// Cira, a failed start) does not; waiting or keeping changes nothing.
+/// Whether the record changed.
+pub fn note_attach(record: &mut Record, action: &PaneAction, now: SystemTime) -> bool {
+  let attached_at = match action {
+    PaneAction::Attach(_) => {
+      Some(now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+    }
+    PaneAction::Hold(_) => None,
+    PaneAction::Keep | PaneAction::Wait(_) => return false,
+  };
+  std::mem::replace(&mut record.attached_at, attached_at) != attached_at
+}
+
+/// The index of the project shown at start, given each project's path and
+/// whether its todo.md is open: the one focused last, else the first open
+/// one (the focused one is gone, or its todo.md does not open: another
+/// project holds it, or Cira refused it); `None` while none is open.
+pub fn start_project(focus: Option<&Focus>, projects: &[(&Path, bool)]) -> Option<usize> {
+  let focused = focus.and_then(|f| projects.iter().position(|(p, _)| *p == f.project));
+  focused.filter(|&i| projects[i].1).or_else(|| projects.iter().position(|(_, open)| *open))
 }
 
 /// What a jcc project whose todo.md is not open yet does with a status read
@@ -756,6 +804,64 @@ mod tests {
     assert_eq!(pane_action(Some(&s), true, None, None), attach("aaaa1111"));
   }
 
+  /// Cira PLAN TMUX-14, Q-275: a session whose pane was attached when jcc
+  /// quit attaches again at the next start, even though its job no longer
+  /// runs (retired idle); not one stopped on purpose through Cira since
+  /// (`stopped_at` after the attach), nor one held when jcc last decided.
+  #[test]
+  fn a_session_attached_at_quit_attaches_again_unless_stopped_since() {
+    let stopped_on_purpose = session(serde_json::json!({
+      "job": job("aaaa1111", "stopped"), "stopped_at": STOPPED_AT_200
+    }));
+    let retired = session(serde_json::json!({ "job": job("aaaa1111", "stopped") }));
+    let start = |attached_at: u64| {
+      let mut record = Record::default();
+      assert!(note_attach(&mut record, &attach("aaaa1111"), at(attached_at)), "an attach is noted");
+      assert!(!note_attach(&mut record, &PaneAction::Keep, at(attached_at + 50)));
+      since_at_start(Some(&record))
+    };
+    // Attached at 100, quit, then retired idle: attached again.
+    assert_eq!(
+      pane_action(Some(&retired), true, None, start(100)),
+      attach("aaaa1111"),
+      "not restored"
+    );
+    // Attached at 100, quit, then stopped through Cira at 200: left stopped.
+    assert!(
+      matches!(pane_action(Some(&stopped_on_purpose), true, None, start(100)), PaneAction::Hold(_)),
+      "a stop made through Cira after jcc quit was undone"
+    );
+    // Stopped at 200, then attached again at 300 (Jay asked): attached again.
+    assert_eq!(pane_action(Some(&stopped_on_purpose), true, None, start(300)), attach("aaaa1111"));
+    // Held when last decided: held at start too.
+    let mut record = Record::default();
+    note_attach(&mut record, &attach("aaaa1111"), at(100));
+    assert!(note_attach(&mut record, &PaneAction::Hold("stopped".into()), at(250)));
+    let since = since_at_start(Some(&record));
+    assert!(matches!(
+      pane_action(Some(&stopped_on_purpose), true, None, since),
+      PaneAction::Hold(_)
+    ));
+    let none = since_at_start(None);
+    assert!(matches!(
+      pane_action(Some(&stopped_on_purpose), true, None, none),
+      PaneAction::Hold(_)
+    ));
+  }
+
+  #[test]
+  fn jcc_starts_on_the_project_it_showed_last() {
+    let (a, b) = (Path::new("/a"), Path::new("/b"));
+    let focus = |p: &str| Focus { project: p.into(), session: Some("c-1".into()) };
+    assert_eq!(start_project(Some(&focus("/b")), &[(a, true), (b, true)]), Some(1));
+    assert_eq!(start_project(Some(&focus("/gone")), &[(a, true), (b, true)]), Some(0));
+    assert_eq!(start_project(None, &[(a, true), (b, true)]), Some(0));
+    // Review P3: the focused project's todo.md does not open (another project
+    // holds it): the start shows another rather than waiting for good.
+    assert_eq!(start_project(Some(&focus("/a")), &[(a, false), (b, true)]), Some(1));
+    assert_eq!(start_project(Some(&focus("/a")), &[(a, false), (b, false)]), None);
+  }
+
   #[test]
   fn a_session_stopped_through_cira_is_not_resumed_by_attaching() {
     let s = session(serde_json::json!({
@@ -1061,8 +1167,13 @@ mod tests {
     let mut records = Records::default();
     records.sessions.insert(
       "c-1".into(),
-      Record { mark: Some(Mark::Disabled), label: Some("a \"quoted\" label".into()) },
+      Record {
+        mark: Some(Mark::Disabled),
+        label: Some("a \"quoted\" label".into()),
+        attached_at: Some(1_700_000_000_123),
+      },
     );
+    records.focus = Some(Focus { project: "/w/b".into(), session: Some("c-1".into()) });
     records.sessions.insert("c-2".into(), Record::default());
     let text = toml::to_string_pretty(&records).unwrap();
     assert_eq!(toml::from_str::<Records>(&text).unwrap(), records, "{text}");
