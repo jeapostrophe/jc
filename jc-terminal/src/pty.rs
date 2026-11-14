@@ -317,8 +317,14 @@ mod tests {
       self.dir.join("tmux.sock").to_str().unwrap().to_string()
     }
 
+    /// Run tmux on this server. Without `EDITOR` and `VISUAL`, as Cira's
+    /// daemon runs under launchd: tmux picks its copy-mode keys from them when
+    /// the server starts (vi keys copy a drag one column further), and Cira's
+    /// tmux.conf does not set `mode-keys`.
     fn run(&self, args: &[&str]) -> std::process::Output {
-      std::process::Command::new(&self.tmux).arg("-S").arg(self.sock()).args(args).output().unwrap()
+      let mut tmux = std::process::Command::new(&self.tmux);
+      tmux.env_remove("EDITOR").env_remove("VISUAL");
+      tmux.arg("-S").arg(self.sock()).args(args).output().unwrap()
     }
 
     /// A fake `cira` that answers `session shell` for `id` as Cira does: its
@@ -464,7 +470,7 @@ mod tests {
         _ => None,
       })
       .collect();
-    assert_eq!(stored, ["clip-me-"], "the drag's text, as the clipboard store");
+    assert_eq!(stored, ["clip-me"], "the drag's text, as the clipboard store");
   }
 
   /// A child that prints `size ROWS COLS` at each SIGWINCH as it arrives
