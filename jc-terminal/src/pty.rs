@@ -80,7 +80,15 @@ impl PtyChild {
     let killer = child.clone_killer();
 
     let mut reader = pair.master.try_clone_reader()?;
-    let writer = pair.master.take_writer()?;
+    // Not `take_writer`: portable-pty's writer types a newline and the EOF
+    // character into the PTY when it is dropped. A tmux client passes them to
+    // Cira's shell, which exits, ending the shell jc only meant to detach
+    // from; `claude attach` passes them to the session.
+    let fd = pair.master.as_raw_fd().ok_or_else(|| anyhow::anyhow!("the PTY has no descriptor"))?;
+    // SAFETY: `fd` is the master's, open while `pair.master` is, which this
+    // function holds.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+    let writer: Box<dyn Write + Send> = Box::new(std::fs::File::from(fd));
     let closed = Arc::new(Mutex::new(false));
     let handle = Arc::new(PtyHandle {
       master: Mutex::new(pair.master),
@@ -369,6 +377,58 @@ mod tests {
     assert_eq!(code, Some(0), "an exit is not a failure (lifecycle::ShellPane::exited)");
   }
 
+  /// Attach jc's Terminal pane to Cira's shell `id` and wait until tmux
+  /// lists it as a client.
+  fn attach(t: &CiraTmux, id: &str) -> PtyChild {
+    let child = PtyChild::spawn(&ChildSpec::Command(t.attach_argv(id)), &[], 80, 24, None).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while t.run(&["list-clients"]).stdout.is_empty() {
+      assert!(std::time::Instant::now() < deadline, "the pane never attached");
+      std::thread::sleep(Duration::from_millis(20));
+    }
+    child
+  }
+
+  /// Hang up the pane's client, as quitting jc does, and wait for it to exit.
+  fn hang_up(child: PtyChild) {
+    let exited = child.exited.clone();
+    drop(child);
+    exited.recv_timeout(Duration::from_secs(10)).expect("the client exits");
+  }
+
+  fn assert_alive(t: &CiraTmux, id: &str) {
+    let alive = t.run(&["has-session", "-t", &format!("=s-{id}")]);
+    let why = String::from_utf8_lossy(&alive.stderr);
+    assert!(alive.status.success(), "quitting ended Cira's shell: {why}");
+  }
+
+  /// Jay, after quitting jcc: "the session had been killed again". Quitting
+  /// hangs up each pane's child; for the Terminal pane that is a tmux client
+  /// of Cira's shell, whose session must outlive it. portable-pty's writer
+  /// typed a newline and EOF into the PTY as it was dropped, and the shell
+  /// read them.
+  #[test]
+  fn hanging_up_the_terminal_pane_leaves_ciras_shell_running() {
+    let id = "c-quit-1";
+    let t = CiraTmux::new("quit", id, "exec sh");
+    hang_up(attach(&t, id));
+    assert_alive(&t, id);
+  }
+
+  /// "The Terminal wasn't the same terminal" after restarting jcc: the next
+  /// start attaches to the same shell, with what it showed.
+  #[test]
+  fn a_restart_attaches_to_the_same_shell() {
+    let id = "c-quit-2";
+    let t = CiraTmux::new("again", id, "exec sh");
+    let child = attach(&t, id);
+    child.handle.write_all(b"echo before-quit-$((6*7))\r").unwrap();
+    read_until(&child, "before-quit-42");
+    hang_up(child);
+    assert_alive(&t, id);
+    read_until(&attach(&t, id), "before-quit-42");
+  }
+
   #[test]
   fn a_drag_in_ciras_tmux_reaches_the_terminal_as_a_clipboard_store() {
     // Cira's tmux.conf turns the mouse on, so a drag selects in tmux, which
@@ -407,6 +467,11 @@ mod tests {
     assert_eq!(stored, ["clip-me-"], "the drag's text, as the clipboard store");
   }
 
+  /// A child that prints `size ROWS COLS` at each SIGWINCH as it arrives
+  /// (perl's handler runs between ops; a shell's trap waits out its
+  /// foreground `sleep`, which can merge two signals).
+  const WINCH_REPORTER: &str = r#"exec perl -e '$| = 1; $SIG{WINCH} = sub { print "size ", `stty size` }; print "ready\n"; sleep 1 while 1'"#;
+
   /// TMUX-08: `claude attach` sends the job its size only when the size it
   /// reads at a SIGWINCH differs from the last it sent (measured: a SIGWINCH
   /// at an unchanged size leaves the job at another client's size), and the
@@ -414,8 +479,7 @@ mod tests {
   /// show the child a different size, then its own.
   #[test]
   fn reasserting_the_size_shows_the_child_a_change_and_ends_at_its_size() {
-    let script =
-      r#"trap 'echo "size $(stty size)"' WINCH; echo ready; while :; do sleep 0.05; done"#;
+    let script = WINCH_REPORTER;
     let child = PtyChild::spawn(&sh(script), &[], 80, 24, None).unwrap();
     read_until(&child, "ready");
     child.handle.reassert_size().unwrap();
@@ -430,8 +494,7 @@ mod tests {
   /// within one nudge must still end at the pane's own size.
   #[test]
   fn reasserting_twice_at_once_ends_at_its_size() {
-    let script =
-      r#"trap 'echo "size $(stty size)"' WINCH; echo ready; while :; do sleep 0.05; done"#;
+    let script = WINCH_REPORTER;
     let child = PtyChild::spawn(&sh(script), &[], 80, 24, None).unwrap();
     read_until(&child, "ready");
     child.handle.reassert_size().unwrap();
