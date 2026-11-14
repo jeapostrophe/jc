@@ -143,6 +143,8 @@ pub struct Workspace {
   /// until jc restarts, since its sessions send this app nothing.
   hook_warning: Option<String>,
   _hook_failure_task: Option<Task<()>>,
+  /// Where a hook install that failed is reported (`hook_warning`).
+  hook_failures_tx: flume::Sender<String>,
   /// Why the last action was refused, shown for a few seconds
   /// (`Workspace::refuse`), with a number so a later refusal's timer is not
   /// cleared by an earlier one's.
@@ -409,6 +411,7 @@ impl Workspace {
       _cira_poll_task: cira_poll_task,
       hook_warning: None,
       _hook_failure_task: None,
+      hook_failures_tx,
       refusal: None,
     };
 
@@ -986,6 +989,20 @@ impl Workspace {
     }
   }
 
+  /// Serve and install the hooks of a project opened while the app runs, as
+  /// `Workspace::new` does for those open at start, off the main thread.
+  fn install_project_hooks(&self, path: PathBuf) {
+    let Some(server) = &self._hook_server else { return };
+    server.add_project(path.clone());
+    let (flavor, port, failed) = (self.flavor, server.port, self.hook_failures_tx.clone());
+    std::thread::spawn(move || {
+      if let Err(e) = jc_core::hooks_settings::install_hooks(flavor, &path, port) {
+        eprintln!("failed to install hooks for {}: {e:#}", path.display());
+        let _ = failed.send(format!("{}: hooks not installed: {e:#}", path.display()));
+      }
+    });
+  }
+
   /// Open the project at `canonical` without switching to it; its index.
   fn add_project(
     &mut self,
@@ -998,6 +1015,7 @@ impl Workspace {
       .file_name()
       .map(|n| n.to_string_lossy().into_owned())
       .unwrap_or_else(|| "unknown".into());
+    self.install_project_hooks(canonical.clone());
     let project = ProjectState::create(canonical, name, &palette, window, cx);
     self.projects.push(project);
     let project_idx = self.projects.len() - 1;

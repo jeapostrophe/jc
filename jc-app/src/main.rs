@@ -119,11 +119,20 @@ static SIGNAL_PIPE: AtomicI32 = AtomicI32::new(-1);
 
 /// On SIGINT or SIGTERM, remove this app's hooks from every project and its
 /// IPC socket, then die of the signal. The GPUI event loop swallows Ctrl-C, so
-/// Drop doesn't always run.
+/// Drop doesn't always run. The projects are those open at start and those
+/// `state.toml` lists by then, which covers one opened while running.
 fn install_signal_handler(state: &config::AppState) {
   let paths: Vec<PathBuf> = state.projects.iter().map(|p| p.path.clone()).collect();
   let cleanup = move || {
     ipc::cleanup_socket();
+    let mut paths = paths;
+    if let Ok(now) = config::load_state() {
+      for path in now.projects.into_iter().map(|p| p.path) {
+        if !paths.contains(&path) {
+          paths.push(path);
+        }
+      }
+    }
     for path in &paths {
       let _ = jc_core::hooks_settings::uninstall_hooks(Flavor::current(), path);
     }

@@ -41,6 +41,8 @@ pub struct HookServer {
   pub port: u16,
   pub rx: flume::Receiver<HookEvent>,
   server: std::sync::Arc<tiny_http::Server>,
+  /// The projects whose hooks it serves, read at each request.
+  projects: std::sync::Arc<Mutex<Vec<PathBuf>>>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -76,13 +78,23 @@ impl HookServer {
     let (tx, rx) = flume::unbounded();
 
     let listener = server.clone();
+    let projects = std::sync::Arc::new(Mutex::new(project_paths));
+    let served = projects.clone();
     std::thread::spawn(move || {
-      accept_loop(&listener, tx, flavor.hook_prefix(), &project_paths);
+      accept_loop(&listener, tx, flavor.hook_prefix(), &served);
     });
 
     eprintln!("hook server listening on port {port}");
 
-    Ok(Self { port, rx, server })
+    Ok(Self { port, rx, server, projects })
+  }
+
+  /// Serve the project at `path` too: one opened while the app runs.
+  pub fn add_project(&self, path: PathBuf) {
+    let mut projects = self.projects.lock().unwrap();
+    if !projects.contains(&path) {
+      projects.push(path);
+    }
   }
 
   pub fn shutdown(&self) {
@@ -94,7 +106,7 @@ fn accept_loop(
   server: &tiny_http::Server,
   tx: flume::Sender<HookEvent>,
   prefix: &str,
-  project_paths: &[PathBuf],
+  project_paths: &Mutex<Vec<PathBuf>>,
 ) {
   // Stash for correlating SessionEnd(clear) → SessionStart(clear) pairs.
   // Keyed by project path; entries expire after 10 seconds.
@@ -124,7 +136,7 @@ fn accept_loop(
     // Match project from cwd
     let project_path = payload.cwd.as_deref().and_then(|cwd| {
       let cwd = Path::new(cwd);
-      project_paths.iter().find(|p| cwd.starts_with(p)).cloned()
+      project_paths.lock().unwrap().iter().find(|p| cwd.starts_with(p)).cloned()
     });
 
     let kind = match route {
@@ -198,5 +210,34 @@ fn parse_notification_kind(notification_type: &Option<String>) -> Option<HookEve
     Some("permission_prompt") => Some(HookEventKind::PermissionPrompt),
     // Ignore auth_success, elicitation_dialog, etc.
     _ => None,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::io::Write;
+
+  /// POST `body` to the server's `route`, as a Claude Code hook does.
+  fn post(port: u16, route: &str, body: &str) {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let request = format!(
+      "POST /jc-hook/{route} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+      body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let _ = std::io::Read::read_to_end(&mut stream, &mut Vec::new());
+  }
+
+  /// A project opened while the app runs (`jc .`, or state.toml: Cira PLAN
+  /// TMUX-10) is served like one open at start: its hooks name it.
+  #[test]
+  fn a_project_added_while_running_is_served() {
+    let server = HookServer::start(Flavor::Jc, vec![PathBuf::from("/w/a")]).unwrap();
+    server.add_project(PathBuf::from("/w/b"));
+    post(server.port, "stop", r#"{"session_id":"s-1","cwd":"/w/b/sub"}"#);
+    let event = server.rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    assert_eq!(event.project_path, Some(PathBuf::from("/w/b")));
+    server.shutdown();
   }
 }
