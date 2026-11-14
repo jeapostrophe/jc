@@ -53,7 +53,7 @@ fn build_gpui_theme(unified: &ThemeConfig, mode: ThemeMode) -> gpui_component::t
   for (status, fill) in
     [("warning", &p.yellow), ("danger", &p.red), ("info", &p.cyan), ("success", &p.green)]
   {
-    let text = text_on(fill, [&p.background, &p.foreground]);
+    let text = text_on(fill, &[&p.background, &p.foreground]);
     colors_json.insert(format!("{status}.background"), serde_json::Value::String(fill.clone()));
     colors_json.insert(format!("{status}.foreground"), serde_json::Value::String(text));
   }
@@ -99,7 +99,7 @@ fn build_gpui_theme(unified: &ThemeConfig, mode: ThemeMode) -> gpui_component::t
 /// most with it, if that reaches WCAG AA for body text (4.5:1), else black or
 /// white, whichever contrasts more. gpui-component's fallback, the theme's
 /// text colour, was light grey on yellow in the dark theme (Q-165).
-fn text_on(fill: &str, colors: [&String; 2]) -> String {
+fn text_on(fill: &str, colors: &[&str]) -> String {
   let luminance = |hex: &str| {
     let gpui::Rgba { r, g, b, .. } = hex_to_hsla(hex).to_rgb();
     let lin = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
@@ -113,7 +113,7 @@ fn text_on(fill: &str, colors: [&String; 2]) -> String {
   let best = |candidates: &[&str]| {
     candidates.iter().copied().max_by(|a, b| ratio(a).total_cmp(&ratio(b))).unwrap().to_string()
   };
-  let own = best(&[colors[0], colors[1]]);
+  let own = best(colors);
   if ratio(&own) >= 4.5 { own } else { best(&["#000000", "#FFFFFF"]) }
 }
 

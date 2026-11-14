@@ -514,7 +514,8 @@ pub struct At {
 /// Why a `cira session …` request did not succeed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
-  /// Not installed, or no daemon accepted (exit 125): nothing was sent.
+  /// Cira was not reached, so nothing was sent: `cira` is not installed or
+  /// could not be started, or no daemon accepted (exit 125).
   Unreachable(Down),
   /// Sent, with no answer (exit 124, or jc stopped waiting): it may have been
   /// recorded.
@@ -550,7 +551,7 @@ impl std::fmt::Display for CallError {
       CallError::Unreachable(down) => down.fmt(f),
       CallError::NoAnswer => write!(f, "Cira did not answer; it may have recorded the request"),
       CallError::Refused { code, message, .. } => write!(f, "{} (exit {code})", message.trim()),
-      CallError::Malformed(e) => write!(f, "Cira's answer did not parse: {e}"),
+      CallError::Malformed(e) => unreadable(f, e),
     }
   }
 }
@@ -564,8 +565,9 @@ pub enum Down {
   /// `cira` ran and said no daemon accepted (exit 125): its line, which names
   /// the socket it tried.
   NoDaemon(String),
-  /// No answer within jc's timeout (or killed by a signal): no daemon (`cira`
-  /// waits longer than jc does for one to accept), or a busy one.
+  /// No answer within jc's timeout, or killed by a signal (`run_bounded`
+  /// cannot tell them apart): no daemon (`cira` waits longer than jc does for
+  /// one to accept), or a busy one.
   Silent(Duration),
   /// Any other failure: the exit code (`None`: not started) and the first
   /// line `cira` printed on stderr.
@@ -575,6 +577,15 @@ pub enum Down {
 }
 
 impl Down {
+  /// Whether `other` is this cause again. `cira`'s exit-125 line carries the
+  /// milliseconds it waited, which differ between reads of one outage.
+  pub fn same_cause(&self, other: &Down) -> bool {
+    match (self, other) {
+      (Down::NoDaemon(_), Down::NoDaemon(_)) => true,
+      _ => self == other,
+    }
+  }
+
   fn not_started(e: std::io::Error) -> Self {
     match e.kind() {
       std::io::ErrorKind::NotFound => Down::NotInstalled,
@@ -596,17 +607,21 @@ impl std::fmt::Display for Down {
       Down::NoDaemon(line) => write!(f, "Cira isn't running: {line}"),
       Down::Silent(t) => write!(
         f,
-        "Cira isn't answering: `cira` gave no answer within {} s, so its daemon is not running \
-         or is busy. {INSTALL}",
+        "Cira isn't answering: `cira` gave no answer within {} s or was killed; its daemon may \
+         not be running, or be busy. {INSTALL}",
         t.as_secs_f32()
       ),
       Down::Failed { code: Some(code), message } => {
         write!(f, "Cira failed: `cira` gave exit {code}: {message}")
       }
       Down::Failed { code: None, message } => write!(f, "Cira failed: {message}"),
-      Down::Unreadable(e) => write!(f, "Cira's answer did not parse: {e}"),
+      Down::Unreadable(e) => unreadable(f, e),
     }
   }
+}
+
+fn unreadable(f: &mut std::fmt::Formatter<'_>, e: &str) -> std::fmt::Result {
+  write!(f, "Cira's answer did not parse: {e}")
 }
 
 fn first_line(text: &str) -> String {
@@ -626,15 +641,21 @@ pub enum Reach {
 
 impl Reach {
   /// Take a read's outcome. Returns whether what jcc shows changed: a poll
-  /// that fails the same way again changes nothing, so it raises nothing new.
+  /// that fails for the same cause again changes nothing, so it raises
+  /// nothing new.
   pub fn read(&mut self, read: &Result<Status, Down>) -> bool {
-    let next = match read {
-      Ok(_) => Reach::Up,
-      Err(down) => Reach::Down(down.clone()),
+    let same = match (&*self, read) {
+      (Reach::Up, Ok(_)) => true,
+      (Reach::Down(was), Err(now)) => was.same_cause(now),
+      _ => false,
     };
-    let changed = *self != next;
-    *self = next;
-    changed
+    if !same {
+      *self = match read {
+        Ok(_) => Reach::Up,
+        Err(down) => Reach::Down(down.clone()),
+      };
+    }
+    !same
   }
 
   pub fn is_up(&self) -> bool {
@@ -1100,6 +1121,17 @@ mod tests {
 
   /// Q-165: Jay saw "Cira is unreachable" with `cira` not installed, and
   /// could not tell what was wrong or what to do.
+  /// The review's P2: `cira`'s exit-125 line names the milliseconds it
+  /// waited, so two reads of one outage differ only in that number.
+  #[test]
+  fn reads_that_differ_only_in_the_wait_are_one_cause() {
+    let line = |ms: u32| format!("no daemon accepted a connection on /h/cira.sock within {ms} ms");
+    let mut reach = Reach::default();
+    assert!(reach.read(&Err(Down::NoDaemon(line(1500)))));
+    assert!(!reach.read(&Err(Down::NoDaemon(line(1503)))), "the same cause again");
+    assert!(reach.read(&Err(Down::NotInstalled)), "another cause is a change");
+  }
+
   #[test]
   fn the_cira_down_message_names_the_cause_and_the_remedy() {
     let missing = Cira::new("/nonexistent/jc-test/cira", Duration::from_secs(1));

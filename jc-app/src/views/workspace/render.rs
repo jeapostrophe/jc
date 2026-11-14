@@ -195,10 +195,8 @@ impl Render for Workspace {
       resizable.into_any_element()
     };
 
-    // Cira owns the sessions, so while it is down no Claude pane attaches
-    // anything new (Cira PLAN TMUX-01). A refusal that says the same is not
-    // shown twice.
-    let cira_banner = self.cira.reach.down().map(|down| down.to_string());
+    // A refusal that says what the Cira banner says is not shown twice.
+    let cira_banner = crate::views::cira_banner(cx);
     let refusal =
       self.refusal.clone().map(|(_, why)| why).filter(|why| Some(why) != cira_banner.as_ref());
     div()

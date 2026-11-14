@@ -47,7 +47,7 @@ pub fn pane_action(
     None => PaneAction::Wait(why.to_string()),
   };
   if !reachable {
-    return wait("Cira is unreachable; this pane attaches once it answers");
+    return wait("Cira is down (the window's banner says why); this pane attaches once it answers");
   }
   let Some(s) = session else {
     return wait("Cira does not list this session");

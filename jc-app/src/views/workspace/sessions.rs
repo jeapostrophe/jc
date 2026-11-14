@@ -12,7 +12,7 @@ use crate::views::project_state::ProjectState;
 use crate::views::session_state::{Heading, SessionId, SessionState, Start};
 use gpui::*;
 use jc_core::background::{Poll, Settled};
-use jc_core::cira::{At, CallError, Created, Down, NewSession, Reach, Status, exit};
+use jc_core::cira::{At, CallError, Created, Down, NewSession, Status, exit};
 use jc_core::lifecycle::{self, LabelSync, MarkRequest, PaneAction, Records};
 use jc_core::todo::{SessionKey, TodoSession};
 use jc_terminal::{ChildEvent, TerminalView};
@@ -25,9 +25,6 @@ pub(super) struct CiraView {
   /// The last `cira status --json` that answered, and when its read began.
   pub status: Option<Status>,
   pub read_at: Option<SystemTime>,
-  /// Whether the last read reached Cira, and why not: the window's one Cira
-  /// banner.
-  pub reach: Reach,
   /// What jc remembers per Cira id (`sessions.toml`); `None` until loaded, and
   /// for good when it could not be read or kept aside (nothing is acted on).
   pub records: Option<Records>,
@@ -108,8 +105,8 @@ impl Workspace {
     }
   }
 
-  fn cira_reachable(&self) -> bool {
-    self.cira.reach.is_up()
+  fn cira_reachable(&self, cx: &App) -> bool {
+    crate::views::cira_reach(cx).is_up()
   }
 
   /// Keep what jc remembers, on the saver thread.
@@ -146,18 +143,8 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
-    let mut changed = false;
-    if self.cira.reach.read(&status) {
-      match self.cira.reach.down() {
-        Some(down) => eprintln!("cira: {down}"),
-        None => eprintln!("cira: reachable"),
-      }
-      let down = self.cira.reach.down().is_some();
-      for project in &self.projects {
-        project.todo_view.update(cx, |tv, cx| tv.set_cira_down(down, cx));
-      }
-      changed = true;
-    }
+    let todo_views = self.projects.iter().map(|p| p.todo_view.clone()).collect::<Vec<_>>();
+    let mut changed = crate::views::read_cira(&status, todo_views, cx);
     let status = status.ok();
     for project in &mut self.projects {
       changed |= project.apply_cira(status.as_ref());
@@ -172,7 +159,7 @@ impl Workspace {
     self.retry_unmatched_hooks(window, cx);
     self.drive_sessions(read_at, window, cx);
     self.drive_shells(window, cx);
-    if self.cira_reachable() {
+    if self.cira_reachable(cx) {
       self.reconcile_marks(window, cx);
       self.sync_labels(window, cx);
     }
@@ -246,7 +233,7 @@ impl Workspace {
   /// Bring every Claude pane in line with Cira: migrate a legacy heading,
   /// attach to the job Cira names, or say why not ([`lifecycle::pane_action`]).
   fn drive_sessions(&mut self, read_at: SystemTime, window: &mut Window, cx: &mut Context<Self>) {
-    let reachable = self.cira_reachable();
+    let reachable = self.cira_reachable(cx);
     let now = SystemTime::now();
     let mut migrate = Vec::new();
     let mut lost = Vec::new();
@@ -269,7 +256,7 @@ impl Workspace {
               migrate.push((project.path.clone(), session.id));
             } else {
               session
-                .show_once("Cira is unreachable; this session moves to Cira once it answers", cx);
+                .show_once("Cira is down (the window's banner says why); this session moves to Cira once it answers", cx);
             }
           }
           continue;
@@ -590,8 +577,8 @@ impl Workspace {
   /// is down, with the window's Cira banner (so it is said once), else
   /// pointing at the TODO pane, which says why.
   fn refuse_todo_closed(&mut self, what: &str, cx: &mut Context<Self>) {
-    match self.cira.reach.down() {
-      Some(down) => self.refuse(down.to_string(), cx),
+    match crate::views::cira_banner(cx) {
+      Some(down) => self.refuse(down, cx),
       None => {
         self.refuse(format!("{what}: jcc's TODO for this project is not open (see its pane)"), cx)
       }

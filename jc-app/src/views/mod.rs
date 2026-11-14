@@ -13,6 +13,7 @@ use gpui_component::ActiveTheme;
 use gpui_component::input::InputState;
 
 use crate::language::Language;
+use jc_core::cira::{Down, Reach, Status};
 
 /// Trait for views that support line search via `LineSearchPickerDelegate`.
 pub trait LineSearchable: Sized + 'static {
@@ -37,6 +38,47 @@ pub fn scroll_editor_to_line<V: 'static>(
     editor.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
     editor.scroll_to_center_line(line, cx);
   });
+}
+
+/// jcc's one record of whether its last `cira status` reached Cira. Views
+/// read it when they render, so one made during an outage knows. jc never
+/// sets it.
+#[derive(Default)]
+pub struct CiraReach(Reach);
+
+impl Global for CiraReach {}
+
+/// Whether Cira was reached at the last read; `Reach::Unknown` in jc.
+pub fn cira_reach(cx: &App) -> &Reach {
+  static UNKNOWN: Reach = Reach::Unknown;
+  cx.try_global::<CiraReach>().map_or(&UNKNOWN, |g| &g.0)
+}
+
+/// The window's Cira banner: why Cira is down, while it is.
+pub fn cira_banner(cx: &App) -> Option<String> {
+  cira_reach(cx).down().map(Down::to_string)
+}
+
+/// Take a read's outcome (`Reach::read`). When what is shown changed, say it
+/// on stderr and re-render `todo_views`, whose banners depend on it; returns
+/// whether it changed.
+pub fn read_cira(
+  read: &Result<Status, Down>,
+  todo_views: impl IntoIterator<Item = Entity<todo_view::TodoView>>,
+  cx: &mut App,
+) -> bool {
+  let reach = &mut cx.default_global::<CiraReach>().0;
+  if !reach.read(read) {
+    return false;
+  }
+  match reach.down() {
+    Some(down) => eprintln!("cira: {down}"),
+    None => eprintln!("cira: reachable"),
+  }
+  for tv in todo_views {
+    tv.update(cx, |_, cx| cx.notify());
+  }
+  true
 }
 
 /// One warning line over an editor pane: a conflict, or a save that failed

@@ -32,3 +32,6 @@ objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
 objc2-user-notifications.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

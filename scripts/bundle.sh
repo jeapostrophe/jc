@@ -48,8 +48,10 @@ icns() {
     rm -rf "$ICON_TMP"
   fi
 }
-icns "$PROJECT_ROOT/icon.png" "$PROJECT_ROOT/target/release/AppIcon.icns"
-icns "$PROJECT_ROOT/icon-jcc.png" "$PROJECT_ROOT/target/release/AppIcon-jcc.icns"
+JC_ICNS="$PROJECT_ROOT/target/release/AppIcon.icns"
+JCC_ICNS="$PROJECT_ROOT/target/release/AppIcon-jcc.icns"
+icns "$PROJECT_ROOT/icon.png" "$JC_ICNS"
+icns "$PROJECT_ROOT/icon-jcc.png" "$JCC_ICNS"
 
 # bundle APP EXECUTABLE PLIST ICNS: one app bundle around the release binary.
 bundle() {
@@ -58,11 +60,11 @@ bundle() {
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
   cp "$PROJECT_ROOT/jc-app/$3" "$app/Contents/Info.plist"
   cp "$PROJECT_ROOT/target/release/jc-app" "$app/Contents/MacOS/$2"
-  cp "$PROJECT_ROOT/target/release/$4" "$app/Contents/Resources/AppIcon.icns"
+  cp "$4" "$app/Contents/Resources/AppIcon.icns"
   # Ad-hoc codesign
   codesign --force --sign - "$app"
   echo "Bundle created at: $app"
 }
 
-bundle jc.app jc-app Info.plist AppIcon.icns
-bundle jcc.app jcc Info-jcc.plist AppIcon-jcc.icns
+bundle jc.app jc-app Info.plist "$JC_ICNS"
+bundle jcc.app jcc Info-jcc.plist "$JCC_ICNS"
