@@ -130,7 +130,7 @@ Every Claude pane is a client of a Claude Code **background session that Cira ow
 |---|---|
 | bold red `!` | A permission dialog is waiting, seen or not |
 | red `*` | It finished a turn since it was last on screen |
-| grey `~` (on a running session) | Its turn is over; background agents are still running |
+| grey `…` | Its turn is over; background agents are still running |
 | grey `x` | The session process has ended |
 | green `>` | The active session |
 | yellow `~` | In TODO.md but not running — confirming adopts it |
@@ -139,7 +139,7 @@ Every Claude pane is a client of a Claude Code **background session that Cira ow
 
 Each row's right side also carries its project's open Cira blocks (`4 blocks`, `jc_core::cira::blocks_label`), and the TODO pane header says `TODO · 4 blocks` (`blocks_suffix`).
 
-**jc's marker is terminal activity:** red `*` alone (the legend says `activity`), for a running session with unseen Claude terminal output. The rows below this paragraph's table that name `!`, `~` and `x`, the blocks count and the mode badge are jcc's.
+**jc's marker is terminal activity:** red `*` alone (the legend says `activity`), for a running session with unseen Claude terminal output. The rows below this paragraph's table that name `!`, `…` and `x`, the blocks count and the mode badge are jcc's.
 
 **jc: the activity marker.** `TerminalView` keeps two counters: `output_batches`, bumped by the VTE background thread once per coalesced batch it parses (hidden terminals still parse, so a backgrounded session still records activity), and `seen_batches`, the value `clear_output_seen` snapshotted. `TerminalView::has_unseen_output` is just the two being unequal. The counters themselves are private to `jc-terminal`; the app crate sees only `has_unseen_output`, which the picker reads on each session's *Claude* terminal, and `clear_output_seen`. The baseline is taken from two places.
 

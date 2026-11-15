@@ -65,6 +65,11 @@ fn picker_marker_base() -> Div {
   div().text_xs().font_weight(FontWeight::BOLD).w(px(22.0)).flex_shrink_0().flex().justify_end()
 }
 
+/// The mark of a TODO.md session that is not running: yellow to adopt, grey
+/// when disabled. A running session's `Marker` must never share it, or a live
+/// session reads as a disabled one (Cira PLAN TMUX-17).
+const UNADOPTED_GLYPH: &str = "~";
+
 /// A small `marker label` pair for footer legends.
 fn legend_item(marker: &str, marker_color: Hsla, label: &str, label_color: Hsla) -> Div {
   div().flex().items_center().gap_0p5().children([
@@ -934,11 +939,11 @@ impl PickerDelegate for SessionPickerDelegate {
       }
       (SessionPickerEntryKind::Unadopted { status: SessionStatus::Disabled, .. }, _) => {
         let color = if selected { theme.accent_foreground } else { theme.muted_foreground };
-        picker_marker_base().text_color(color).child("~")
+        picker_marker_base().text_color(color).child(UNADOPTED_GLYPH)
       }
       (SessionPickerEntryKind::Unadopted { .. }, _) => {
         let color = if selected { theme.accent_foreground } else { theme.yellow };
-        picker_marker_base().text_color(color).child("~")
+        picker_marker_base().text_color(color).child(UNADOPTED_GLYPH)
       }
       (SessionPickerEntryKind::Session(_), Some(marker)) => {
         let color = match marker {
@@ -997,16 +1002,16 @@ impl PickerDelegate for SessionPickerDelegate {
         .children(match jc_core::flavor::Flavor::current() {
           jc_core::flavor::Flavor::Jc => vec![legend_item("*", theme.red, "activity", muted)],
           jc_core::flavor::Flavor::Jcc => vec![
-            legend_item("!", theme.red, "permission", muted),
-            legend_item("*", theme.red, "finished", muted),
-            legend_item("~", muted, "agents", muted),
-            legend_item("x", muted, "gone", muted),
+            legend_item(Marker::Dialog.glyph(), theme.red, "permission", muted),
+            legend_item(Marker::Finished.glyph(), theme.red, "finished", muted),
+            legend_item(Marker::Waiting.glyph(), muted, "agents", muted),
+            legend_item(Marker::Gone.glyph(), muted, "gone", muted),
           ],
         })
         .children([
           legend_item(">", theme.green, "active", muted),
-          legend_item("~", theme.yellow, "adopt", muted),
-          legend_item("~", theme.muted_foreground, "disabled", muted),
+          legend_item(UNADOPTED_GLYPH, theme.yellow, "adopt", muted),
+          legend_item(UNADOPTED_GLYPH, theme.muted_foreground, "disabled", muted),
           legend_item("+", theme.blue, "new", muted),
           div().child("Cmd-Shift-Bksp: toggle disable"),
         ]),
@@ -1491,8 +1496,20 @@ fn format_relative_time(time: std::time::SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::{Row, sort_rank};
+  use super::{Row, UNADOPTED_GLYPH, sort_rank};
   use jc_core::cira::Marker;
+
+  #[test]
+  fn no_running_session_mark_reads_as_a_disabled_one() {
+    let all = [Marker::Dialog, Marker::Finished, Marker::Waiting, Marker::Gone];
+    for marker in all {
+      // A new variant fails to compile here until it joins `all`.
+      match marker {
+        Marker::Dialog | Marker::Finished | Marker::Waiting | Marker::Gone => {}
+      }
+      assert_ne!(marker.glyph(), UNADOPTED_GLYPH, "{marker:?} shares the disabled/adopt mark");
+    }
+  }
 
   #[test]
   fn a_dialog_sorts_first_then_finished_sessions() {

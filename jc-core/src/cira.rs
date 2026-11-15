@@ -260,7 +260,7 @@ pub enum Marker {
   Dialog,
   /// `*`: it finished a turn since it was last on screen.
   Finished,
-  /// `~`: its turn is over and background agents are still running.
+  /// `…`: its turn is over and background agents are still running.
   Waiting,
   /// `x`: the session process has ended.
   Gone,
@@ -271,7 +271,7 @@ impl Marker {
     match self {
       Marker::Dialog => "!",
       Marker::Finished => "*",
-      Marker::Waiting => "~",
+      Marker::Waiting => "…",
       Marker::Gone => "x",
     }
   }
