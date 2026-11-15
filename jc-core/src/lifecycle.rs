@@ -99,18 +99,32 @@ pub fn pane_action(
 }
 
 /// Whether the pane offers "Start this session again" (`cira session start`,
-/// Cira PLAN TMUX-16): Cira runs the session, has not removed it, and Claude
-/// Code no longer has its job. Only Jay's asking starts it, a session he
-/// stopped included.
+/// Cira PLAN TMUX-16): Cira runs the session, has not removed it, Claude Code
+/// no longer has its job, no other session holds that job or continues it
+/// (Cira would start nothing), and no operation or fork is under way. Only
+/// Jay's asking starts it, a session he stopped included.
 pub fn can_start_again(session: Option<&Session>) -> bool {
   session.is_some_and(|s| {
-    s.owned && s.removed_at.is_none() && s.job.as_ref().is_some_and(|j| j.state == JobState::Absent)
+    s.owned
+      && s.removed_at.is_none()
+      && s.held_by.is_none()
+      && s.continued_by.is_none()
+      && !s.op_running()
+      && s.mode_pending != ModePending::Due
+      && s.job.as_ref().is_some_and(|j| j.state == JobState::Absent)
   })
 }
 
 /// What a pane whose job is gone says ([`can_start_again`]).
 fn gone(s: &Session, short: &str) -> String {
   let gone = format!("its job {short} is gone");
+  if let Some(h) = &s.held_by {
+    let name = h.label.as_deref().unwrap_or(&h.session);
+    return format!("{gone}; session {name} (project {}) holds it now", h.project);
+  }
+  if let Some(by) = &s.continued_by {
+    return format!("{gone}; session {by} continues its conversation");
+  }
   if !can_start_again(Some(s)) {
     return gone;
   }
@@ -963,10 +977,26 @@ mod tests {
       "job": job("eb3c2f7e", "absent"), "removed_at": STOPPED_AT_200
     }));
     let foreign = session(serde_json::json!({ "job": job("eb3c2f7e", "absent"), "owned": false }));
-    for s in [&running, &removed, &foreign] {
+    let op = serde_json::json!({ "op": "mode", "running": true, "at": "x" });
+    let busy = session(serde_json::json!({ "job": job("eb3c2f7e", "absent"), "op": op }));
+    let due =
+      session(serde_json::json!({ "job": job("eb3c2f7e", "absent"), "mode_pending": "due" }));
+    for s in [&running, &removed, &foreign, &busy, &due] {
       assert!(!can_start_again(Some(s)), "{s:?}");
     }
     assert!(!can_start_again(None));
+    // Review P1: another session holds its job or continues it (Cira PLAN SES-12): Cira
+    // would answer `held` and start nothing, so nothing is offered, and the pane names that
+    // session instead.
+    let holder = serde_json::json!({ "project": "p", "session": "c-2", "label": "newer" });
+    let held = session(serde_json::json!({ "job": job("eb3c2f7e", "absent"), "held_by": holder }));
+    let continued =
+      session(serde_json::json!({ "job": job("eb3c2f7e", "absent"), "continued_by": "c-3" }));
+    for (s, other) in [(&held, "newer"), (&continued, "c-3")] {
+      assert!(!can_start_again(Some(s)), "{s:?}");
+      let why = hold(s);
+      assert!(!why.contains("Start this session again") && why.contains(other), "{why}");
+    }
   }
 
   #[test]

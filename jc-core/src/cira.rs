@@ -90,6 +90,22 @@ pub struct Session {
   /// When it was removed, RFC 3339: terminal.
   #[serde(default)]
   pub removed_at: Option<String>,
+  /// Another session not removed that names the same job and holds it (Cira
+  /// PLAN SES-12): Cira acts on that job only for that one.
+  #[serde(default)]
+  pub held_by: Option<Holder>,
+  /// The session that continues this gone one, carrying its conversation on.
+  #[serde(default)]
+  pub continued_by: Option<String>,
+}
+
+/// The session holding a job another names (`held_by`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Holder {
+  pub project: String,
+  pub session: String,
+  #[serde(default)]
+  pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -447,12 +463,14 @@ impl Cira {
   }
 
   /// `cira session start` (Cira PLAN TMUX-16): run the session's job again
-  /// in the mode it has. Cira lists Claude's jobs and starts a new one,
-  /// continuing its conversation, if Claude no longer has it; being Jay's, it
-  /// clears a stop of his.
-  pub fn start(&self, at: &At, id: &str) -> Result<Started, CallError> {
-    let out = self.call_at_out(at, jays_args("start", id))?;
-    serde_json::from_slice(&out).map_err(|e| CallError::Malformed(e.to_string()))
+  /// in the mode it has, clearing a stop of Jay's. Its answer is Cira's own
+  /// line saying what it does (a new job if Claude no longer has the old one,
+  /// or why nothing starts), shown as it is rather than worded again here.
+  pub fn start(&self, at: &At, id: &str) -> Result<String, CallError> {
+    let mut args = jays_args("start", id);
+    args.retain(|a| a != "--json");
+    let out = self.call_at_out(at, args)?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
   }
 
   /// `cira session label`: the label is Cira's (Q-159).
@@ -753,55 +771,6 @@ pub struct Created {
   /// Under `--wait`: the session as `cira status --json` lists it.
   #[serde(default)]
   pub status: Option<Session>,
-}
-
-/// `cira session start --json`'s answer, as much as jc uses.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct Started {
-  pub next: NextJob,
-  /// The job bound when Cira answered.
-  #[serde(default)]
-  pub job: Option<String>,
-}
-
-/// What becomes of a session's job (Cira's `cira_proto::session::NextJob`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NextJob {
-  /// No job is bound, or its start failed: one starts.
-  Starts,
-  /// Cira lists Claude's jobs, and starts a new one if the bound one is gone.
-  StartsIfGone,
-  /// Jay stopped it and the caller is not Jay (never jc, which says
-  /// `--from-jay`): nothing starts.
-  Stopped,
-  /// Another session holds its job or continues it: nothing starts.
-  Held,
-  /// Cira does not run its job: nothing starts.
-  Nothing,
-  #[serde(other)]
-  Unknown,
-}
-
-impl Started {
-  /// What Cira does, for the pane.
-  pub fn said(&self) -> String {
-    let job = self.job.as_deref().unwrap_or("(none)");
-    match self.next {
-      NextJob::Starts => "Cira starts its job".into(),
-      NextJob::StartsIfGone => format!(
-        "Cira looks at Claude's jobs and starts a new job, continuing its conversation, if job \
-         {job} is gone"
-      ),
-      NextJob::Stopped => "Cira keeps it stopped, so nothing starts".into(),
-      NextJob::Held => {
-        "another session holds its job or continues it (Cira's page names it), so nothing starts"
-          .into()
-      }
-      NextJob::Nothing => "Cira does not run its job, so nothing starts".into(),
-      NextJob::Unknown => "Cira did not say what becomes of its job".into(),
-    }
-  }
 }
 
 /// `cira session shell --json`'s answer, as much as jc uses.
@@ -1369,40 +1338,30 @@ mod tests {
   }
 
   /// Cira PLAN TMUX-16: "Start this session again" is `cira session start`,
-  /// Jay's, in the project, by the session's id; its answer says what Cira
-  /// does, never that a job starts when none will.
+  /// Jay's, in the project, by the session's id; what Cira prints is what
+  /// the pane says.
   #[test]
-  fn start_asks_by_the_sessions_id_and_says_what_cira_does() {
+  fn start_asks_by_the_sessions_id_and_says_what_cira_says() {
     let dir = std::env::temp_dir().join(format!("jc-cira-start-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let log = dir.join("log");
-    let answer = r#"{"project":"p","session":"c1","dangerous":false,"recorded":true,"next":"starts_if_gone","job":"eb3c2f7e"}"#;
     let cira = Cira::new(
-      script("start", &format!("printf '%s\\n' \"$@\" > '{}'; echo '{answer}'", log.display())),
+      script(
+        "start",
+        &format!(
+          "printf '%s\\n' \"$@\" > '{}'; echo 'session c1: Cira looks at its jobs'",
+          log.display()
+        ),
+      ),
       Duration::from_secs(10),
     );
     let at = At { project: Some("p".into()), dir: dir.clone() };
-    let started = cira.start(&at, "c1").unwrap();
+    assert_eq!(cira.start(&at, "c1").unwrap(), "session c1: Cira looks at its jobs");
     let args = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
       args.lines().collect::<Vec<_>>(),
-      ["session", "start", "--project=p", "--json", "--from-jay", "--", "c1"]
+      ["session", "start", "--project=p", "--from-jay", "--", "c1"]
     );
-    assert_eq!(started, Started { next: NextJob::StartsIfGone, job: Some("eb3c2f7e".into()) });
-    assert!(
-      started.said().contains("new job") && started.said().contains("eb3c2f7e"),
-      "{}",
-      started.said()
-    );
-    for (next, says) in [
-      (NextJob::Starts, "starts"),
-      (NextJob::Held, "nothing starts"),
-      (NextJob::Nothing, "nothing starts"),
-      (NextJob::Stopped, "nothing starts"),
-    ] {
-      let said = Started { next, job: None }.said();
-      assert!(said.contains(says), "{next:?}: {said}");
-    }
     let _ = std::fs::remove_dir_all(&dir);
   }
 

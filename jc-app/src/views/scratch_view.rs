@@ -104,7 +104,7 @@ impl ScratchView {
 
   /// A notice from the change feed: a save of this pad that it does not
   /// hold yet (another client's), or a feed that started over, reads it
-  /// again. Its own save, told back, reads nothing.
+  /// again. Its own save, told back, reads nothing once its answer is in.
   pub fn told(&mut self, notice: &Notice, window: &mut Window, cx: &mut Context<Self>) {
     let news = match notice {
       Notice::Saved { project, version } => {

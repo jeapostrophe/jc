@@ -999,10 +999,10 @@ impl Workspace {
       move |ws, result, _window, cx| {
         let Some(session) = ws.session_mut(&path, sid) else { return };
         match result {
-          Ok(started) => {
+          Ok(said) => {
             session.attach_since = Some(SystemTime::now());
             session.exited.clear();
-            session.status(&format!("asked Cira to start it again: {}", started.said()), cx);
+            session.status(&format!("asked Cira to start it again: {said}"), cx);
           }
           Err(e) => session.status(&format!("could not start it again: {e}"), cx),
         }

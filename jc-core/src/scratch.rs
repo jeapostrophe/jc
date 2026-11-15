@@ -99,6 +99,21 @@ fn query_value(value: &str) -> String {
     .collect()
 }
 
+/// A request's head, for `body` (JSON, when not empty); one request per
+/// connection.
+fn request_head(method: &str, path: &str, body: &[u8]) -> String {
+  let mut head = format!(
+    "{method} {path} HTTP/1.1\r\nHost: cira\r\ncira-protocol: {PROTOCOL}\r\nConnection: close\r\n\
+     Content-Length: {}\r\n",
+    body.len()
+  );
+  if !body.is_empty() {
+    head.push_str("Content-Type: application/json\r\n");
+  }
+  head.push_str("\r\n");
+  head
+}
+
 fn connect(socket: &Path) -> Result<UnixStream, Failure> {
   UnixStream::connect(socket).map_err(|e| match e.kind() {
     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
@@ -120,15 +135,7 @@ fn request(
   stream.set_read_timeout(Some(TIMEOUT)).map_err(failed)?;
   stream.set_write_timeout(Some(TIMEOUT)).map_err(failed)?;
   let body = body.unwrap_or_default();
-  let mut head = format!(
-    "{method} {path} HTTP/1.1\r\nHost: cira\r\ncira-protocol: {PROTOCOL}\r\nConnection: close\r\n\
-     Content-Length: {}\r\n",
-    body.len()
-  );
-  if !body.is_empty() {
-    head.push_str("Content-Type: application/json\r\n");
-  }
-  head.push_str("\r\n");
+  let head = request_head(method, path, body);
   stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body)).map_err(failed)?;
   let mut answer = Vec::new();
   stream.read_to_end(&mut answer).map_err(failed)?;
@@ -153,46 +160,49 @@ fn request(
 /// A whole HTTP/1.1 response read to its end: its status and body (a chunked
 /// one put together). Only a Cira daemon's (it names its build) is taken.
 fn response(raw: &[u8]) -> Result<(u16, Vec<u8>), Failure> {
-  let bad = |why: &str| Failure::Failed(format!("not an answer from Cira: {why}"));
-  let end = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| bad("no end of head"))?;
-  let head = std::str::from_utf8(&raw[..end]).map_err(|_| bad("head is not text"))?;
-  let mut lines = head.split("\r\n");
-  let status = lines
-    .next()
-    .and_then(|l| l.split(' ').nth(1))
-    .and_then(|s| s.parse().ok())
-    .ok_or_else(|| bad("no status"))?;
-  let mut chunked = false;
-  let mut cira = false;
-  for line in lines {
+  let mut reader = raw;
+  let (status, chunked) = head(&mut reader)?;
+  if !chunked {
+    return Ok((status, reader.to_vec()));
+  }
+  let bad = |e: std::io::Error| Failure::Failed(format!("not an answer from Cira: {e}"));
+  let mut out = Vec::new();
+  while let Some(chunk) = next_chunk(&mut reader).map_err(bad)? {
+    out.extend_from_slice(&chunk);
+  }
+  Ok((status, out))
+}
+
+/// An answer's head, read through: its status and whether its body is
+/// chunked. Only a Cira daemon's (it names its build) is taken.
+fn head(reader: &mut impl std::io::BufRead) -> Result<(u16, bool), Failure> {
+  let bad = |why: String| Failure::Failed(format!("not an answer from Cira: {why}"));
+  let (mut status, mut chunked, mut cira) = (None, false, false);
+  loop {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+      Ok(0) => return Err(bad("no end of head".into())),
+      Ok(_) => {}
+      Err(e) => return Err(bad(e.to_string())),
+    }
+    let line = line.trim_end();
+    if line.is_empty() {
+      break;
+    }
+    if status.is_none() {
+      status = Some(line.split(' ').nth(1).and_then(|s| s.parse::<u16>().ok()));
+      continue;
+    }
     let Some((name, value)) = line.split_once(':') else { continue };
     let name = name.trim().to_ascii_lowercase();
     chunked |= name == "transfer-encoding" && value.trim().eq_ignore_ascii_case("chunked");
     cira |= name == "cira-build";
   }
+  let status = status.flatten().ok_or_else(|| bad("no status".into()))?;
   if !cira {
-    return Err(bad("no cira-build header"));
+    return Err(bad("no cira-build header".into()));
   }
-  let body = &raw[end + 4..];
-  if !chunked {
-    return Ok((status, body.to_vec()));
-  }
-  let mut out = Vec::new();
-  let mut rest = body;
-  loop {
-    let eol = rest.windows(2).position(|w| w == b"\r\n").ok_or_else(|| bad("bad chunk"))?;
-    let size = std::str::from_utf8(&rest[..eol])
-      .ok()
-      .and_then(|s| usize::from_str_radix(s.split(';').next()?.trim(), 16).ok())
-      .ok_or_else(|| bad("bad chunk size"))?;
-    rest = &rest[eol + 2..];
-    if size == 0 {
-      return Ok((status, out));
-    }
-    let chunk = rest.get(..size).ok_or_else(|| bad("short chunk"))?;
-    out.extend_from_slice(chunk);
-    rest = rest.get(size + 2..).ok_or_else(|| bad("short chunk"))?;
-  }
+  Ok((status, chunked))
 }
 
 /// What the daemon's change feed (`GET /v1/events`, server-sent events)
@@ -208,8 +218,8 @@ pub enum Notice {
   Missed,
 }
 
-/// How long the feed may say nothing before it counts as dead: the daemon
-/// sends a keep-alive every 15 s.
+/// How long the feed may say nothing (keep-alives included) before it counts
+/// as dead.
 const FEED_SILENCE: Duration = Duration::from_secs(60);
 /// The pause before following the feed again after it ended or failed.
 const FEED_RETRY: Duration = Duration::from_secs(2);
@@ -223,8 +233,14 @@ pub fn feed(socket: PathBuf) -> flume::Receiver<Notice> {
   std::thread::Builder::new()
     .name("jcc-scratch-feed".into())
     .spawn(move || {
+      let mut said = None;
       while !tx.is_disconnected() {
-        follow(&socket, |n| tx.send(n).is_ok());
+        let why = follow(&socket, |n| tx.send(n).is_ok()).to_string();
+        // Once per cause: a daemon that stays down would say it every retry.
+        if said.as_ref() != Some(&why) {
+          eprintln!("jcc: Cira's change feed: {why}; following it again every {FEED_RETRY:?}");
+          said = Some(why);
+        }
         std::thread::sleep(FEED_RETRY);
       }
     })
@@ -240,19 +256,20 @@ pub fn follow(socket: &Path, mut on: impl FnMut(Notice) -> bool) -> Failure {
     Err(e) => return e,
   };
   let failed = |e: std::io::Error| Failure::Failed(format!("the feed broke: {e}"));
-  let head = format!(
-    "GET /v1/events HTTP/1.1\r\nHost: cira\r\ncira-protocol: {PROTOCOL}\r\naccept: text/event-stream\r\n\r\n"
-  );
   if let Err(e) = stream
     .set_read_timeout(Some(FEED_SILENCE))
     .and_then(|()| stream.set_write_timeout(Some(TIMEOUT)))
-    .and_then(|()| stream.write_all(head.as_bytes()))
+    .and_then(|()| stream.write_all(request_head("GET", "/v1/events", &[]).as_bytes()))
   {
     return failed(e);
   }
   let mut reader = std::io::BufReader::new(stream);
-  if let Err(e) = feed_head(&mut reader) {
-    return e;
+  match head(&mut reader) {
+    Ok((200, true)) => {}
+    Ok((status, _)) => {
+      return Failure::Failed(format!("Cira's feed answered {status}, not a stream"));
+    }
+    Err(e) => return e,
   }
   let mut events = Events::default();
   loop {
@@ -282,39 +299,6 @@ pub fn follow(socket: &Path, mut on: impl FnMut(Notice) -> bool) -> Failure {
 struct Changed {
   project: String,
   version: String,
-}
-
-/// The feed answer's head, read through. Only a Cira daemon's 200 is taken,
-/// and its stream comes chunked (it has no length).
-fn feed_head(reader: &mut impl std::io::BufRead) -> Result<(), Failure> {
-  let bad = |why: String| Failure::Failed(format!("not Cira's feed: {why}"));
-  let (mut status, mut chunked, mut cira) = (None, false, false);
-  loop {
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-      Ok(0) => return Err(bad("no end of head".into())),
-      Ok(_) => {}
-      Err(e) => return Err(bad(e.to_string())),
-    }
-    let line = line.trim_end();
-    if line.is_empty() {
-      break;
-    }
-    if status.is_none() {
-      status = Some(line.split(' ').nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0));
-      continue;
-    }
-    let Some((name, value)) = line.split_once(':') else { continue };
-    let name = name.trim().to_ascii_lowercase();
-    chunked |= name == "transfer-encoding" && value.trim().eq_ignore_ascii_case("chunked");
-    cira |= name == "cira-build";
-  }
-  match status {
-    _ if !cira => Err(bad("no cira-build header".into())),
-    Some(200) if chunked => Ok(()),
-    Some(200) => Err(bad("not chunked".into())),
-    other => Err(bad(format!("status {}", other.unwrap_or(0)))),
-  }
 }
 
 /// The next chunk of a chunked body; `None` at its end.
@@ -417,7 +401,8 @@ impl Pad {
 
   /// A notice that the pad was saved as `version` ([`Notice::Saved`]) is
   /// news to this panel: it holds another, or none yet. Its own save, told
-  /// back, is not.
+  /// back once its answer is in, is not (a notice ahead of the answer costs
+  /// one more read).
   pub fn stale(&self, version: &str) -> bool {
     self.kept.as_ref().is_none_or(|k| k.version != version)
   }
