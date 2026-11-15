@@ -1503,7 +1503,7 @@ mod tests {
   fn no_running_session_mark_reads_as_a_disabled_one() {
     let all = [Marker::Dialog, Marker::Finished, Marker::Waiting, Marker::Gone];
     for marker in all {
-      // A new variant fails to compile here until it joins `all`.
+      // A new variant fails to compile here until it joins this match; add it to `all` too.
       match marker {
         Marker::Dialog | Marker::Finished | Marker::Waiting | Marker::Gone => {}
       }
