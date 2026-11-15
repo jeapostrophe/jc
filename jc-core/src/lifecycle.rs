@@ -84,7 +84,7 @@ pub fn pane_action(
   let woke = turn && stopped.is_some_and(|stop| s.since().is_some_and(|at| at > stop));
   match job.state {
     JobState::Running => PaneAction::Attach(job.short.clone()),
-    JobState::Absent => PaneAction::Hold(format!("its job {} is gone", job.short)),
+    JobState::Absent => PaneAction::Hold(gone(s, &job.short)),
     JobState::Failed => {
       PaneAction::Hold(s.op_error().unwrap_or("its job failed to start").to_string())
     }
@@ -96,6 +96,33 @@ pub fn pane_action(
     ),
     JobState::Stopped | JobState::Unknown => PaneAction::Attach(job.short.clone()),
   }
+}
+
+/// Whether the pane offers "Start this session again" (`cira session start`,
+/// Cira PLAN TMUX-16): Cira runs the session, has not removed it, and Claude
+/// Code no longer has its job. Only Jay's asking starts it, a session he
+/// stopped included.
+pub fn can_start_again(session: Option<&Session>) -> bool {
+  session.is_some_and(|s| {
+    s.owned && s.removed_at.is_none() && s.job.as_ref().is_some_and(|j| j.state == JobState::Absent)
+  })
+}
+
+/// What a pane whose job is gone says ([`can_start_again`]).
+fn gone(s: &Session, short: &str) -> String {
+  let gone = format!("its job {short} is gone");
+  if !can_start_again(Some(s)) {
+    return gone;
+  }
+  let mode = if s.dangerous { "dangerous" } else { "auto" };
+  let stopped = match s.stopped() {
+    Some(_) => " (it was stopped through Cira: this clears the stop)",
+    None => "",
+  };
+  format!(
+    "{gone}; Cmd-Shift-P → \"Start this session again\" asks Cira for a new job continuing its \
+     conversation, {mode} as before{stopped}"
+  )
 }
 
 /// The session `cira session new` made for a heading labelled `label` when jc
@@ -903,6 +930,43 @@ mod tests {
       "state": "working", "state_since": "1970-01-01T00:05:00Z"
     }));
     assert!(matches!(pane_action(Some(&s), true, None, Some(at(100))), PaneAction::Hold(_)));
+  }
+
+  /// Cira PLAN TMUX-16 (Jay, 2026-11-14): jcc printed "its job eb3c2f7e is
+  /// gone" with nothing to do there, and he had to leave for a terminal. The
+  /// pane offers the way back and says what Cira will do, in the mode the
+  /// session has; it never starts it by itself, a stop through Cira
+  /// included, which the offer says it clears.
+  #[test]
+  fn a_gone_job_offers_to_start_it_again_and_says_what_cira_will_do() {
+    let hold = |s: &Session| match pane_action(Some(s), true, None, Some(at(100))) {
+      PaneAction::Hold(why) => why,
+      other => panic!("not held: {other:?}"),
+    };
+    let s = session(serde_json::json!({ "job": job("eb3c2f7e", "absent") }));
+    let why = hold(&s);
+    assert!(
+      why.contains("eb3c2f7e") && why.contains("Start this session again") && why.contains("auto"),
+      "{why}"
+    );
+    assert!(can_start_again(Some(&s)));
+    let s = session(serde_json::json!({ "job": job("eb3c2f7e", "absent"), "dangerous": true }));
+    assert!(hold(&s).contains("dangerous"), "{}", hold(&s));
+    let s = session(serde_json::json!({
+      "job": job("eb3c2f7e", "absent"), "stopped_at": STOPPED_AT_200
+    }));
+    assert!(hold(&s).contains("clears the stop"), "{}", hold(&s));
+    assert!(can_start_again(Some(&s)), "Jay may start a session he stopped");
+    // Nothing to offer: a running job, a removed session, one Cira does not run.
+    let running = session(serde_json::json!({ "job": job("eb3c2f7e", "running") }));
+    let removed = session(serde_json::json!({
+      "job": job("eb3c2f7e", "absent"), "removed_at": STOPPED_AT_200
+    }));
+    let foreign = session(serde_json::json!({ "job": job("eb3c2f7e", "absent"), "owned": false }));
+    for s in [&running, &removed, &foreign] {
+      assert!(!can_start_again(Some(s)), "{s:?}");
+    }
+    assert!(!can_start_again(None));
   }
 
   #[test]

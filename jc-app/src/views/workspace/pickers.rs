@@ -231,6 +231,7 @@ impl Workspace {
               }
               ProjectActionsResult::ToggleDangerous => this.toggle_active_dangerous(window, cx),
               ProjectActionsResult::AttachAgain => this.attach_active_again(window, cx),
+              ProjectActionsResult::StartAgain => this.start_active_again(window, cx),
             }
             cx.notify();
           }

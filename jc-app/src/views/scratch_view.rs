@@ -2,12 +2,14 @@
 //! edited here and saved through Cira's daemon half a second after typing
 //! stops, one save at a time. The decisions are `jc_core::scratch::Pad`'s;
 //! this view runs the requests off the main thread and applies the answers.
-//! It is read when its project is named, when it is shown, and when the
-//! window becomes active (the daemon announces no change to a pad).
+//! It is read when its project is named, when it is shown, when the window
+//! becomes active, and when the daemon's change feed says its pad was saved
+//! elsewhere (Cira PLAN TMUX-15: the workspace follows it,
+//! `jc_core::scratch::feed`).
 
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
-use jc_core::scratch::{self, Failure, Pad, Saved, Scratch, Ticket};
+use jc_core::scratch::{self, Failure, Notice, Pad, Saved, Scratch, Ticket};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -98,6 +100,21 @@ impl ScratchView {
       let _ = this.update_in(cx, |v, window, cx| v.on_read(ticket, got, window, cx));
     })
     .detach();
+  }
+
+  /// A notice from the change feed: a save of this pad that it does not
+  /// hold yet (another client's), or a feed that started over, reads it
+  /// again. Its own save, told back, reads nothing.
+  pub fn told(&mut self, notice: &Notice, window: &mut Window, cx: &mut Context<Self>) {
+    let news = match notice {
+      Notice::Saved { project, version } => {
+        self.project() == Some(project.as_str()) && self.pad.stale(version)
+      }
+      Notice::Missed => true,
+    };
+    if news {
+      self.refresh(window, cx);
+    }
   }
 
   fn on_read(

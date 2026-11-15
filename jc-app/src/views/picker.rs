@@ -1070,6 +1070,8 @@ pub enum ProjectActionsResult {
   ToggleDangerous,
   /// Attach the active session's Claude pane again.
   AttachAgain,
+  /// Ask Cira to start the active session's gone job again (Cira PLAN TMUX-16).
+  StartAgain,
 }
 
 enum ProjectActionsEntry {
@@ -1085,6 +1087,7 @@ enum ProjectActionsEntry {
     to: bool,
   },
   AttachAgain,
+  StartAgain,
   /// A JSONL session not referenced in TODO.md.
   Unattached {
     uuid: String,
@@ -1144,6 +1147,10 @@ impl ProjectActionsPickerDelegate {
       if session.cira.is_some() {
         labels.push("> Attach this session".to_string());
         entries.push(ProjectActionsEntry::AttachAgain);
+      }
+      if jc_core::lifecycle::can_start_again(session.cira_session.as_ref()) {
+        labels.push("> Start this session again".to_string());
+        entries.push(ProjectActionsEntry::StartAgain);
       }
     }
 
@@ -1235,6 +1242,7 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
       ProjectActionsEntry::NewSession => ProjectActionsResult::CreateNew,
       ProjectActionsEntry::Mode { .. } => ProjectActionsResult::ToggleDangerous,
       ProjectActionsEntry::AttachAgain => ProjectActionsResult::AttachAgain,
+      ProjectActionsEntry::StartAgain => ProjectActionsResult::StartAgain,
       ProjectActionsEntry::Unattached { uuid, summary } => {
         ProjectActionsResult::AdoptJsonlSession(uuid.clone(), summary.clone())
       }
@@ -1266,6 +1274,11 @@ impl PickerDelegate for ProjectActionsPickerDelegate {
         let marker_color = if selected { theme.accent_foreground } else { theme.green };
         let marker = picker_marker_base().text_color(marker_color).child(">");
         row.child(marker).child("Attach this session".to_string())
+      }
+      ProjectActionsEntry::StartAgain => {
+        let marker_color = if selected { theme.accent_foreground } else { theme.green };
+        let marker = picker_marker_base().text_color(marker_color).child(">");
+        row.child(marker).child("Start this session again".to_string())
       }
       ProjectActionsEntry::Unattached { summary, .. } => {
         let marker_color = if selected { theme.accent_foreground } else { theme.yellow };

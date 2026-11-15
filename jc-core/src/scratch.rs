@@ -7,7 +7,9 @@
 //! text) the edit started from: a save on an older copy is refused
 //! (`conflict`), so a stale window never overwrites newer notes. The `cira`
 //! CLI has no command for it, so jcc speaks to the socket itself, one request
-//! per connection.
+//! per connection. A save by any client is told on the daemon's change feed
+//! (`GET /v1/events`, a `scratch` event; Cira PLAN TMUX-15), which [`feed`]
+//! follows so a note typed on Cira's page shows here at once.
 //!
 //! [`Pad`] holds every decision, so it is tested without a window; the panel
 //! only applies its answers. The rules follow the page's pad (Cira DESIGN 9)
@@ -97,6 +99,15 @@ fn query_value(value: &str) -> String {
     .collect()
 }
 
+fn connect(socket: &Path) -> Result<UnixStream, Failure> {
+  UnixStream::connect(socket).map_err(|e| match e.kind() {
+    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+      Failure::NoDaemon(format!("{}: {e}", socket.display()))
+    }
+    _ => Failure::Failed(format!("cannot connect to {}: {e}", socket.display())),
+  })
+}
+
 /// One request on a connection of its own; the body of a success.
 fn request(
   socket: &Path,
@@ -104,12 +115,7 @@ fn request(
   path: &str,
   body: Option<&[u8]>,
 ) -> Result<Vec<u8>, Failure> {
-  let mut stream = UnixStream::connect(socket).map_err(|e| match e.kind() {
-    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-      Failure::NoDaemon(format!("{}: {e}", socket.display()))
-    }
-    _ => Failure::Failed(format!("cannot connect to {}: {e}", socket.display())),
-  })?;
+  let mut stream = connect(socket)?;
   let failed = |e: std::io::Error| Failure::Failed(format!("no answer from Cira: {e}"));
   stream.set_read_timeout(Some(TIMEOUT)).map_err(failed)?;
   stream.set_write_timeout(Some(TIMEOUT)).map_err(failed)?;
@@ -189,6 +195,180 @@ fn response(raw: &[u8]) -> Result<(u16, Vec<u8>), Failure> {
   }
 }
 
+/// What the daemon's change feed (`GET /v1/events`, server-sent events)
+/// says of the pads (Cira PLAN TMUX-15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+  /// `project`'s pad was saved as `version`, by any client (a `scratch`
+  /// event): a panel holding another version reads it again.
+  Saved { project: String, version: String },
+  /// The feed started over (`resync`, the first event of every connection,
+  /// and whenever the daemon could not replay): a save may have gone
+  /// untold, so every pad is read again.
+  Missed,
+}
+
+/// How long the feed may say nothing before it counts as dead: the daemon
+/// sends a keep-alive every 15 s.
+const FEED_SILENCE: Duration = Duration::from_secs(60);
+/// The pause before following the feed again after it ended or failed.
+const FEED_RETRY: Duration = Duration::from_secs(2);
+
+/// Follow the feed on a thread of its own, from now on, reconnecting after
+/// [`FEED_RETRY`] whenever it ends (the daemon restarted or is down). The
+/// thread ends at the first notice, or reconnect, after the receiver is
+/// dropped.
+pub fn feed(socket: PathBuf) -> flume::Receiver<Notice> {
+  let (tx, rx) = flume::unbounded();
+  std::thread::Builder::new()
+    .name("jcc-scratch-feed".into())
+    .spawn(move || {
+      while !tx.is_disconnected() {
+        follow(&socket, |n| tx.send(n).is_ok());
+        std::thread::sleep(FEED_RETRY);
+      }
+    })
+    .expect("spawning the scratch feed thread");
+  rx
+}
+
+/// Follow the feed on `socket`, giving `on` each notice, until the stream
+/// ends or fails, or `on` returns false; why it ended. Blocks.
+pub fn follow(socket: &Path, mut on: impl FnMut(Notice) -> bool) -> Failure {
+  let mut stream = match connect(socket) {
+    Ok(s) => s,
+    Err(e) => return e,
+  };
+  let failed = |e: std::io::Error| Failure::Failed(format!("the feed broke: {e}"));
+  let head = format!(
+    "GET /v1/events HTTP/1.1\r\nHost: cira\r\ncira-protocol: {PROTOCOL}\r\naccept: text/event-stream\r\n\r\n"
+  );
+  if let Err(e) = stream
+    .set_read_timeout(Some(FEED_SILENCE))
+    .and_then(|()| stream.set_write_timeout(Some(TIMEOUT)))
+    .and_then(|()| stream.write_all(head.as_bytes()))
+  {
+    return failed(e);
+  }
+  let mut reader = std::io::BufReader::new(stream);
+  if let Err(e) = feed_head(&mut reader) {
+    return e;
+  }
+  let mut events = Events::default();
+  loop {
+    let bytes = match next_chunk(&mut reader) {
+      Ok(Some(b)) => b,
+      Ok(None) => return Failure::Failed("the feed ended".into()),
+      Err(e) => return failed(e),
+    };
+    for (name, data) in events.push(&bytes) {
+      let notice = match name.as_str() {
+        "resync" => Notice::Missed,
+        "scratch" => match serde_json::from_str::<Changed>(&data) {
+          Ok(Changed { project, version }) => Notice::Saved { project, version },
+          Err(e) => return Failure::Failed(format!("not a scratch notice: {e}")),
+        },
+        _ => continue,
+      };
+      if !on(notice) {
+        return Failure::Failed("no longer followed".into());
+      }
+    }
+  }
+}
+
+/// A `scratch` event's data (Cira's `cira_proto::ScratchChanged`).
+#[derive(Deserialize)]
+struct Changed {
+  project: String,
+  version: String,
+}
+
+/// The feed answer's head, read through. Only a Cira daemon's 200 is taken,
+/// and its stream comes chunked (it has no length).
+fn feed_head(reader: &mut impl std::io::BufRead) -> Result<(), Failure> {
+  let bad = |why: String| Failure::Failed(format!("not Cira's feed: {why}"));
+  let (mut status, mut chunked, mut cira) = (None, false, false);
+  loop {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+      Ok(0) => return Err(bad("no end of head".into())),
+      Ok(_) => {}
+      Err(e) => return Err(bad(e.to_string())),
+    }
+    let line = line.trim_end();
+    if line.is_empty() {
+      break;
+    }
+    if status.is_none() {
+      status = Some(line.split(' ').nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0));
+      continue;
+    }
+    let Some((name, value)) = line.split_once(':') else { continue };
+    let name = name.trim().to_ascii_lowercase();
+    chunked |= name == "transfer-encoding" && value.trim().eq_ignore_ascii_case("chunked");
+    cira |= name == "cira-build";
+  }
+  match status {
+    _ if !cira => Err(bad("no cira-build header".into())),
+    Some(200) if chunked => Ok(()),
+    Some(200) => Err(bad("not chunked".into())),
+    other => Err(bad(format!("status {}", other.unwrap_or(0)))),
+  }
+}
+
+/// The next chunk of a chunked body; `None` at its end.
+fn next_chunk(reader: &mut impl std::io::BufRead) -> std::io::Result<Option<Vec<u8>>> {
+  let mut line = String::new();
+  if reader.read_line(&mut line)? == 0 {
+    return Ok(None);
+  }
+  let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or_default(), 16)
+    .map_err(|_| std::io::Error::other(format!("bad chunk size {line:?}")))?;
+  if size == 0 {
+    return Ok(None);
+  }
+  let mut chunk = vec![0; size + 2]; // and its CRLF
+  reader.read_exact(&mut chunk)?;
+  chunk.truncate(size);
+  Ok(Some(chunk))
+}
+
+/// Server-sent events put together from the body's bytes as they come: each
+/// event's name and data, once the blank line ending it has come.
+#[derive(Default)]
+struct Events {
+  partial: Vec<u8>,
+  name: String,
+  data: String,
+}
+
+impl Events {
+  fn push(&mut self, bytes: &[u8]) -> Vec<(String, String)> {
+    self.partial.extend_from_slice(bytes);
+    let mut out = Vec::new();
+    while let Some(eol) = self.partial.iter().position(|&b| b == b'\n') {
+      let line: Vec<u8> = self.partial.drain(..=eol).collect();
+      let line = String::from_utf8_lossy(&line);
+      let line = line.trim_end_matches(['\n', '\r']);
+      if line.is_empty() {
+        if !self.name.is_empty() || !self.data.is_empty() {
+          out.push((std::mem::take(&mut self.name), std::mem::take(&mut self.data)));
+        }
+      } else if let Some(v) = line.strip_prefix("event:") {
+        self.name = v.trim_start().to_string();
+      } else if let Some(v) = line.strip_prefix("data:") {
+        if !self.data.is_empty() {
+          self.data.push('\n');
+        }
+        self.data.push_str(v.strip_prefix(' ').unwrap_or(v));
+      }
+      // `id:` and `:` comments (keep-alives) are not the pad's.
+    }
+    out
+  }
+}
+
 /// The panel's pad: what the daemon last agreed it keeps, and what is owed.
 /// One request is in flight at a time, as on Cira's page: a read asked while
 /// a save is out waits for its answer, so no answer is applied out of order.
@@ -233,6 +413,13 @@ impl Pad {
   /// A read has succeeded: the panel takes typing.
   pub fn ready(&self) -> bool {
     self.kept.is_some()
+  }
+
+  /// A notice that the pad was saved as `version` ([`Notice::Saved`]) is
+  /// news to this panel: it holds another, or none yet. Its own save, told
+  /// back, is not.
+  pub fn stale(&self, version: &str) -> bool {
+    self.kept.as_ref().is_none_or(|k| k.version != version)
   }
 
   /// `ours` holds edits the daemon does not keep.
@@ -583,6 +770,48 @@ mod tests {
     let body: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(body, serde_json::json!({ "project": "p", "text": "t\n", "base": "v1" }));
     assert!(req.starts_with("POST /v1/scratch HTTP/1.1\r\n"), "{req}");
+  }
+
+  /// PLAN TMUX-15: the change feed tells a save made elsewhere (the page's)
+  /// as a `scratch` event, and starts with `resync`, after which every pad
+  /// is read again; other events are not the pad's. An event may be split
+  /// across chunks.
+  #[test]
+  fn the_feed_tells_saves_and_resyncs_and_nothing_else() {
+    let (sock, got) = serve(
+      b"HTTP/1.1 200 OK\r\ncira-build: 0.1.0+x\r\ncontent-type: text/event-stream\r\n\
+        transfer-encoding: chunked\r\n\r\n\
+        32\r\nevent: resync\nid: b:3\ndata: {\"boot\":\"b\",\"seq\":3}\n\n\r\n\
+        20\r\nevent: change\nid: b:4\ndata: {}\n\n\r\n\
+        3\r\n:\n\n\r\n\
+        22\r\nevent: scratch\nid: b:4\ndata: {\"pro\r\n\
+        1b\r\nject\":\"p\",\"version\":\"v2\"}\n\n\r\n0\r\n\r\n",
+    );
+    let mut told = Vec::new();
+    let ended = super::follow(&sock, |n| {
+      told.push(n);
+      true
+    });
+    assert_eq!(ended, Failure::Failed("the feed ended".into()));
+    assert_eq!(
+      told,
+      [Notice::Missed, Notice::Saved { project: "p".into(), version: "v2".into() }],
+      "the feed's notices were not read as the pad's"
+    );
+    let req = got.join().unwrap();
+    assert!(req.starts_with("GET /v1/events HTTP/1.1\r\n"), "{req}");
+    assert!(req.contains("cira-protocol: 2\r\n"), "{req}");
+  }
+
+  /// A notice of the version the pad holds (its own save, told back) reads
+  /// nothing; any other reads it again.
+  #[test]
+  fn only_a_version_the_pad_does_not_hold_is_stale() {
+    let mut p = Pad::default();
+    assert!(p.stale("v1"), "a pad never read takes any notice");
+    read(&mut p, "", Ok(pad("a", "v1")));
+    assert!(!p.stale("v1"), "its own save read it again");
+    assert!(p.stale("v2"));
   }
 
   #[test]

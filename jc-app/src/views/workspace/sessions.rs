@@ -1,7 +1,7 @@
 //! jcc's Claude panes, as clients of Cira (Cira DESIGN 12, PLAN TMUX-01/02,
 //! TMUX-07; none of this runs in jc, whose own lifecycle is `own.rs`): Cira
 //! owns each session's lifecycle, and jc asks it for every change
-//! (`cira session new|mode|stop|rm|label`), attaches each Claude pane to the
+//! (`cira session new|mode|stop|start|rm|label`), attaches each Claude pane to the
 //! job `cira status --json` names, and turns TODO.md marker edits and renames
 //! into requests. Each session's shell pane attaches to the shell Cira keeps
 //! for it (`cira session shell`), else runs jc's own, marked not shared.
@@ -42,6 +42,9 @@ pub(super) struct CiraView {
   /// The start's focus is settled: shown (`Workspace::restore_focus`), or
   /// Jay switched first.
   pub focus_settled: bool,
+  /// The daemon socket whose change feed is followed for the scratch pads'
+  /// notices (Cira PLAN TMUX-15), and the task applying them.
+  pub scratch_feed: Option<(PathBuf, Task<()>)>,
 }
 
 impl Workspace {
@@ -183,14 +186,38 @@ impl Workspace {
   /// it, read through the daemon's socket in the store's home.
   fn name_scratch_pads(&mut self, status: &Status, window: &mut Window, cx: &mut Context<Self>) {
     let Some(home) = &status.home else { return };
+    let socket = jc_core::scratch::socket(home);
     for project in &self.projects {
       let Some(cira) = status.project_for(&project.path) else { continue };
-      let target = crate::views::scratch_view::Target {
-        socket: jc_core::scratch::socket(home),
-        project: cira.name.clone(),
-      };
+      let target =
+        crate::views::scratch_view::Target { socket: socket.clone(), project: cira.name.clone() };
       project.scratch_view.update(cx, |v, cx| v.set_target(target, window, cx));
     }
+    if self.cira.scratch_feed.as_ref().is_none_or(|(followed, _)| *followed != socket) {
+      self.follow_scratch_feed(socket, window, cx);
+    }
+  }
+
+  /// Follow the daemon's change feed for the pads' notices (Cira PLAN
+  /// TMUX-15), so a note typed on Cira's page shows in a Scratch panel at
+  /// once: a save there reads the pad of that project again, and a feed
+  /// that started over (each connection does) reads every pad again.
+  /// Replacing the task drops the previous feed's receiver.
+  fn follow_scratch_feed(&mut self, socket: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    let notices = jc_core::scratch::feed(socket.clone());
+    let task = cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
+      while let Ok(notice) = notices.recv_async().await {
+        let applied = this.update_in(cx, |ws, window, cx| {
+          for project in &ws.projects {
+            project.scratch_view.update(cx, |v, cx| v.told(&notice, window, cx));
+          }
+        });
+        if applied.is_err() {
+          break;
+        }
+      }
+    });
+    self.cira.scratch_feed = Some((socket, task));
   }
 
   /// At start, once the records are read and a todo.md is open, show the
@@ -950,6 +977,38 @@ impl Workspace {
     session.shown = None;
     self.kick_cira();
     self.panes[self.active_pane_index].read(cx).focus_content(window);
+  }
+
+  /// "Start this session again" (Cira PLAN TMUX-16): ask Cira to run the
+  /// active session's gone job again, in its mode (`cira session start`).
+  /// Jay asked, so the pane attaches to the job Cira binds even if he had
+  /// stopped it; the pane says what Cira does.
+  pub(super) fn start_active_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let pi = self.active_project_index;
+    self.panes[self.active_pane_index].read(cx).focus_content(window);
+    let path = self.projects[pi].path.clone();
+    let Some(session) = self.projects[pi].active_session() else { return };
+    let Some(id) = session.cira.clone() else { return };
+    let sid = session.id;
+    let Some(cira) = self.cira_client.clone() else { return };
+    let at = self.at(pi, &id);
+    self.run_blocking(
+      window,
+      cx,
+      move || cira.start(&at, &id),
+      move |ws, result, _window, cx| {
+        let Some(session) = ws.session_mut(&path, sid) else { return };
+        match result {
+          Ok(started) => {
+            session.attach_since = Some(SystemTime::now());
+            session.exited.clear();
+            session.status(&format!("asked Cira to start it again: {}", started.said()), cx);
+          }
+          Err(e) => session.status(&format!("could not start it again: {e}"), cx),
+        }
+        ws.kick_cira();
+      },
+    );
   }
 
   /// Ask Cira to run the active session in the other mode (Cira Q-155): a
