@@ -158,11 +158,11 @@ pub struct Workspace {
   /// (`Workspace::refuse`), with a number so a later refusal's timer is not
   /// cleared by an earlier one's.
   refusal: Option<(u64, String)>,
-  /// jcc: what the right pane showed before Cmd-\ put Scratch there, and
-  /// which pane that was (Cira PLAN TMUX-24).
-  scratch_before: Option<(usize, PaneContentKind)>,
-  /// jcc: the Dock badge's count as last set (Cira PLAN TMUX-21).
-  dock_blocks: u64,
+  /// jcc: per session (project index, session), what the right pane showed
+  /// before Cmd-\ put Scratch there (Cira PLAN TMUX-24).
+  scratch_returns: crate::views::pane::ScratchReturns<(usize, Option<SessionId>)>,
+  /// jcc: the Dock badge as last set.
+  dock_badge: Option<String>,
 }
 
 /// What a pane shows as `kind` for `project`'s active session; `None` for a
@@ -471,8 +471,8 @@ impl Workspace {
       records_tx,
       unmatched_hooks: VecDeque::new(),
       _cira_poll_task: cira_poll_task,
-      scratch_before: None,
-      dock_blocks: 0,
+      scratch_returns: Default::default(),
+      dock_badge: None,
       hook_warning: None,
       _hook_failure_task: None,
       hook_jobs,
@@ -1202,13 +1202,15 @@ impl Workspace {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
+    if self.flavor == Flavor::Jcc && !self.cira_reachable(cx) {
+      let why = crate::views::cira_banner(cx).unwrap_or_else(|| "Cira is unreachable".into());
+      self.refuse(why, cx);
+      return;
+    }
     // Build a flat list of (project_index, session_id) in deterministic order.
-    // Skip projects with no attached sessions, and in jcc those with no open
-    // Cira blocks (Cira PLAN TMUX-22).
     let mut slots: Vec<(usize, Option<SessionId>)> = Vec::new();
     for (pi, project) in self.projects.iter().enumerate() {
-      let waiting = project.cira_open.is_some_and(|o| o.blocks > 0);
-      if project.sessions.is_empty() || (self.flavor == Flavor::Jcc && !waiting) {
+      if !rotates(self.flavor, project) {
         continue;
       }
       let mut ids: Vec<SessionId> = project.sessions.keys().copied().collect();
@@ -1219,7 +1221,7 @@ impl Workspace {
     }
     let current =
       (self.active_project_index, self.projects[self.active_project_index].active_session);
-    if let Some((next_pi, next_sid)) = next_slot(&slots, current) {
+    if let Some((next_pi, next_sid)) = next_slot(self.flavor, &slots, current) {
       self.switch_to_session(next_pi, next_sid, window, cx);
     }
   }
@@ -1228,16 +1230,12 @@ impl Workspace {
   /// does, what it showed before (else its default). Focus stays where it is,
   /// unless it was in that pane.
   fn toggle_scratch(&mut self, _: &ToggleScratch, window: &mut Window, cx: &mut Context<Self>) {
-    if self.flavor != Flavor::Jcc {
-      return;
-    }
     let idx = self.visible_pane_count() - 1;
     let shown = self.panes[idx].read(cx).content_kind();
-    let before = self.scratch_before.filter(|(pane, _)| *pane == idx).map(|(_, kind)| kind);
-    let fallback =
-      default_kinds(self.flavor, self.active_project().active_session().is_some())[idx];
-    let (to, before) = crate::views::pane::scratch_toggle(shown, before, fallback);
-    self.scratch_before = before.map(|kind| (idx, kind));
+    let session = self.active_project().active_session;
+    let fallback = default_kinds(self.flavor, session.is_some())[idx];
+    let to =
+      self.scratch_returns.toggle((self.active_project_index, session), idx, shown, fallback);
     if self.focused_pane_index(window, cx) == Some(idx) {
       self.show_in_pane(idx, to, window, cx);
     } else {
@@ -1254,29 +1252,39 @@ impl Workspace {
   }
 
   /// jcc's Cmd-, (Cira PLAN TMUX-23): Cira's page on this project, in Safari.
-  fn open_cira_page(&mut self, _: &OpenCiraPage, _: &mut Window, cx: &mut Context<Self>) {
-    if self.flavor != Flavor::Jcc {
+  fn open_cira_page(&mut self, _: &OpenCiraPage, window: &mut Window, cx: &mut Context<Self>) {
+    if !self.cira_reachable(cx) {
+      let why = crate::views::cira_banner(cx).unwrap_or_else(|| "Cira is unreachable".into());
+      self.refuse(why, cx);
       return;
     }
     let path = &self.active_project().path;
-    let Some((status, cira)) =
-      self.cira.status.as_ref().and_then(|s| Some((s, s.project_for(path)?)))
+    let Some(url) =
+      self.cira.status.as_ref().and_then(|s| Some(s.page_url(&s.project_for(path)?.name)))
     else {
-      let why = crate::views::cira_banner(cx)
-        .unwrap_or_else(|| "Cira's page: no Cira project holds this one".to_string());
-      self.refuse(why, cx);
+      self.refuse("Cira's page: no Cira project holds this one", cx);
       return;
     };
-    let url = status.page_url(&cira.name);
-    std::thread::spawn(move || {
-      let opened = std::process::Command::new("open")
-        .args(["-a", "/Applications/Safari.app", &url])
-        .stdin(std::process::Stdio::null())
-        .status();
-      if !opened.as_ref().is_ok_and(|s| s.success()) {
-        eprintln!("jcc: open -a Safari {url}: {opened:?}");
-      }
-    });
+    self.run_blocking(
+      window,
+      cx,
+      move || {
+        let opened = std::process::Command::new("open")
+          .args(["-a", "/Applications/Safari.app", &url])
+          .stdin(std::process::Stdio::null())
+          .output();
+        match opened {
+          Ok(out) if out.status.success() => None,
+          Ok(out) => Some(format!("Safari: {}", String::from_utf8_lossy(&out.stderr).trim())),
+          Err(e) => Some(format!("Safari: open: {e}")),
+        }
+      },
+      |ws, failed, _, cx| {
+        if let Some(why) = failed {
+          ws.refuse(why, cx);
+        }
+      },
+    );
   }
 
   /// The open blocks of every session jcc has attached, the title bar's first
@@ -1285,17 +1293,12 @@ impl Workspace {
     self.projects.iter().flat_map(|p| p.sessions.values()).map(SessionState::open_blocks).sum()
   }
 
-  /// Keep the Dock badge on the open blocks of the Cira projects holding the
-  /// open projects (Cira PLAN TMUX-21); none while Cira is unreachable.
-  pub(super) fn update_dock_badge(&mut self) {
-    let blocks = match &self.cira.status {
-      Some(status) if self.projects.iter().any(|p| p.cira_open.is_some()) => {
-        status.open_blocks_of(self.projects.iter().map(|p| p.path.as_path()))
-      }
-      _ => 0,
-    };
-    if std::mem::replace(&mut self.dock_blocks, blocks) != blocks {
-      crate::notify::set_badge(jc_core::cira::badge_label(blocks).as_deref());
+  /// Keep the Dock badge on Cira's last read, `status` (`None`: unreachable).
+  pub(super) fn update_dock_badge(&mut self, status: Option<&jc_core::cira::Status>) {
+    let badge = jc_core::cira::dock_badge(status, self.projects.iter().map(|p| p.path.as_path()));
+    if self.dock_badge != badge {
+      crate::notify::set_badge(badge.as_deref());
+      self.dock_badge = badge;
     }
   }
 
@@ -1973,6 +1976,14 @@ impl Focusable for Workspace {
 }
 
 pub fn init(cx: &mut App) {
+  if Flavor::current() == Flavor::Jcc {
+    for context in ["Workspace", "Input"] {
+      cx.bind_keys([
+        KeyBinding::new("cmd-\\", ToggleScratch, Some(context)),
+        KeyBinding::new("cmd-,", OpenCiraPage, Some(context)),
+      ]);
+    }
+  }
   cx.bind_keys([
     KeyBinding::new("cmd-w", CloseWindow, Some("Workspace")),
     KeyBinding::new("cmd-m", MinimizeWindow, Some("Workspace")),
@@ -1988,8 +1999,6 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-.", JumpToWait, Some("Workspace")),
     KeyBinding::new("cmd-shift-p", crate::views::picker::ProjectActionsPicker, Some("Workspace")),
     KeyBinding::new("cmd-`", RotateNextProject, Some("Workspace")),
-    KeyBinding::new("cmd-\\", ToggleScratch, Some("Workspace")),
-    KeyBinding::new("cmd-,", OpenCiraPage, Some("Workspace")),
     KeyBinding::new("cmd-?", ShowKeybindingHelp, Some("Workspace")),
     KeyBinding::new("cmd-alt-up", ScrollOtherUp, Some("Workspace")),
     KeyBinding::new("cmd-alt-down", ScrollOtherDown, Some("Workspace")),
@@ -2004,8 +2013,6 @@ pub fn init(cx: &mut App) {
     KeyBinding::new("cmd-enter", SendToTerminal, Some("Input")),
     KeyBinding::new("cmd-.", JumpToWait, Some("Input")),
     KeyBinding::new("cmd-`", RotateNextProject, Some("Input")),
-    KeyBinding::new("cmd-\\", ToggleScratch, Some("Input")),
-    KeyBinding::new("cmd-,", OpenCiraPage, Some("Input")),
     KeyBinding::new("cmd-alt-up", ScrollOtherUp, Some("Input")),
     KeyBinding::new("cmd-alt-down", ScrollOtherDown, Some("Input")),
     KeyBinding::new("cmd-alt-pageup", ScrollOtherPageUp, Some("Input")),
@@ -2013,28 +2020,52 @@ pub fn init(cx: &mut App) {
   ]);
 }
 
-/// Cmd-`'s next stop after `current` among `slots`: the one after it, or the
-/// first when `current` is not among them; none when there is nowhere else.
-fn next_slot<T: Copy + PartialEq>(slots: &[T], current: T) -> Option<T> {
-  match slots.iter().position(|s| *s == current) {
-    Some(_) if slots.len() == 1 => None,
-    Some(pos) => Some(slots[(pos + 1) % slots.len()]),
-    None => slots.first().copied(),
+/// Whether Cmd-` stops at `project`'s sessions: any it has attached, and in
+/// jcc only while Cira says blocks wait there (Cira PLAN TMUX-22).
+fn rotates(flavor: Flavor, project: &ProjectState) -> bool {
+  !project.sessions.is_empty() && (flavor == Flavor::Jc || project.open_blocks() > 0)
+}
+
+/// Cmd-`'s next stop after `current` among `slots`. jc: the one after it (the
+/// second when `current` is not among them), none with fewer than two. jcc,
+/// whose rotation leaves out projects with no open blocks: the first when
+/// `current` is not among them, so a lone project with blocks is reached.
+fn next_slot<T: Copy + PartialEq>(flavor: Flavor, slots: &[T], current: T) -> Option<T> {
+  let pos = slots.iter().position(|s| *s == current);
+  match (flavor, pos) {
+    (Flavor::Jc, _) if slots.len() <= 1 => None,
+    (Flavor::Jc, pos) => Some(slots[(pos.unwrap_or(0) + 1) % slots.len()]),
+    (Flavor::Jcc, Some(_)) if slots.len() == 1 => None,
+    (Flavor::Jcc, Some(pos)) => Some(slots[(pos + 1) % slots.len()]),
+    (Flavor::Jcc, None) => slots.first().copied(),
   }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::next_slot;
+  use super::{Flavor, next_slot};
 
   /// Cira PLAN TMUX-22: from a project left out of the rotation (no open
-  /// blocks), Cmd-` goes to the first that is in it, even when it is the only one.
+  /// blocks), jcc's Cmd-` goes to the first that is in it, even when it is the
+  /// only one.
   #[test]
-  fn cmd_backtick_goes_to_the_next_slot() {
-    assert_eq!(next_slot(&[1, 2, 3], 2), Some(3));
-    assert_eq!(next_slot(&[1, 2, 3], 3), Some(1));
-    assert_eq!(next_slot(&[4], 9), Some(4), "the one project with blocks, from one without");
-    assert_eq!(next_slot(&[4], 4), None, "already there");
-    assert_eq!(next_slot::<u8>(&[], 4), None, "no project has open blocks");
+  fn jccs_cmd_backtick_goes_to_the_next_slot() {
+    let next = |slots: &[u8], current| next_slot(Flavor::Jcc, slots, current);
+    assert_eq!(next(&[1, 2, 3], 2), Some(3));
+    assert_eq!(next(&[1, 2, 3], 3), Some(1));
+    assert_eq!(next(&[4], 9), Some(4), "the one project with blocks, from one without");
+    assert_eq!(next(&[4], 4), None, "already there");
+    assert_eq!(next(&[], 4), None, "no project has open blocks");
+  }
+
+  /// jc's Cmd-` is as it was before TMUX-22.
+  #[test]
+  fn jcs_cmd_backtick_is_unchanged() {
+    let next = |slots: &[u8], current| next_slot(Flavor::Jc, slots, current);
+    assert_eq!(next(&[1, 2, 3], 2), Some(3));
+    assert_eq!(next(&[1, 2, 3], 3), Some(1));
+    assert_eq!(next(&[1, 2, 3], 9), Some(2), "from no slot, the second");
+    assert_eq!(next(&[4], 9), None, "one session: nowhere to go");
+    assert_eq!(next(&[], 4), None);
   }
 }

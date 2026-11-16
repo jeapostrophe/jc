@@ -50,10 +50,6 @@ pub struct ProjectState {
   /// `cira status --json`; `None` while Cira is unreachable or has no project
   /// containing this one.
   pub cira_open: Option<OpenCounts>,
-  /// The open blocks each session of that Cira project holds, by Cira id
-  /// (only those holding some): the picker's count for a heading jcc has not
-  /// attached.
-  pub cira_blocks: HashMap<String, u64>,
   /// Conversation uuids and job short ids of the sessions Cira lists for
   /// this project, so the transcript picker does not offer them again.
   pub cira_known: HashSet<String>,
@@ -92,7 +88,6 @@ impl ProjectState {
       scratch_view,
       added: false,
       cira_open: None,
-      cira_blocks: HashMap::new(),
       cira_known: HashSet::new(),
       session_dirs,
     };
@@ -279,13 +274,6 @@ impl ProjectState {
     let project = status.and_then(|s| s.project_for(&self.path));
     let open = project.map(|p| p.open);
     let mut changed = std::mem::replace(&mut self.cira_open, open) != open;
-    let blocks: HashMap<_, _> = project
-      .into_iter()
-      .flat_map(|p| &p.sessions)
-      .filter(|s| s.open.blocks > 0)
-      .map(|s| (s.id.clone(), s.open.blocks))
-      .collect();
-    changed |= std::mem::replace(&mut self.cira_blocks, blocks) != self.cira_blocks;
     self.cira_known = project
       .into_iter()
       .flat_map(|p| &p.sessions)
@@ -313,6 +301,11 @@ impl ProjectState {
       }
     }
     changed
+  }
+
+  /// The open blocks of the Cira project holding it; none while unknown.
+  pub fn open_blocks(&self) -> u64 {
+    self.cira_open.map_or(0, |o| o.blocks)
   }
 
   /// Find a session by its heading id.

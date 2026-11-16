@@ -113,7 +113,7 @@ impl Workspace {
     }
   }
 
-  fn cira_reachable(&self, cx: &App) -> bool {
+  pub(super) fn cira_reachable(&self, cx: &App) -> bool {
     crate::views::cira_reach(cx).is_up()
   }
 
@@ -162,10 +162,10 @@ impl Workspace {
       changed |= self.sync_todos(status, window, cx);
       self.name_scratch_pads(status, window, cx);
     }
+    self.update_dock_badge(status.as_ref());
     if status.is_some() {
       self.cira.status = status;
     }
-    self.update_dock_badge();
     self.cira.read_at = Some(read_at);
     self.retry_unmatched_hooks(window, cx);
     self.drive_sessions(read_at, window, cx);

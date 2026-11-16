@@ -1,3 +1,4 @@
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::ActiveTheme;
 
@@ -12,6 +13,16 @@ struct Section {
   bindings: &'static [(&'static str, &'static str)],
 }
 
+/// jcc's own keys, shown under Global in jcc alone.
+const JCC: Section = Section {
+  title: "jcc",
+  bindings: &[
+    ("Cmd-`", "Next session with open blocks"),
+    ("Cmd-\\", "Right pane: Scratch / back"),
+    ("Cmd-,", "This project in Cira's page (Safari)"),
+  ],
+};
+
 const SECTIONS: &[Section] = &[
   Section {
     title: "Global",
@@ -23,9 +34,7 @@ const SECTIONS: &[Section] = &[
       ("Cmd-]", "Focus next pane"),
       ("Cmd-O", "Open pane / file"),
       ("Cmd-Shift-O", "Pane drill-down"),
-      ("Cmd-`", "Next session (jcc: with open blocks)"),
-      ("Cmd-\\", "Scratch / back (jcc)"),
-      ("Cmd-,", "Cira's page in Safari (jcc)"),
+      ("Cmd-`", "Next session"),
       ("Cmd-P", "Session picker"),
       ("Cmd-Shift-P", "Project actions"),
       ("Cmd-F", "Search lines"),
@@ -119,7 +128,14 @@ impl Render for KeybindingHelp {
     let theme = cx.theme();
 
     // Left column: Global bindings. Right column: everything else.
-    let left = div().flex().flex_col().gap_4().child(render_section(&SECTIONS[0], theme));
+    let left = div()
+      .flex()
+      .flex_col()
+      .gap_4()
+      .child(render_section(&SECTIONS[0], theme))
+      .when(jc_core::flavor::Flavor::current() == jc_core::flavor::Flavor::Jcc, |d| {
+        d.child(render_section(&JCC, theme))
+      });
 
     let mut right = div().flex().flex_col().gap_4();
     for section in &SECTIONS[1..] {

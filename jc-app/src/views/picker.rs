@@ -772,6 +772,7 @@ impl SessionPickerDelegate {
     projects: &[ProjectState],
     active_project_index: usize,
     todo_documents: &[&TodoDocument],
+    status: Option<&cira::Status>,
     cx: &App,
   ) -> Self {
     let mut entries = Vec::new();
@@ -788,7 +789,7 @@ impl SessionPickerDelegate {
           label: String::new(),
           key: None,
           marker: None,
-          blocks: cira::blocks_label(project.cira_open.map_or(0, |o| o.blocks)),
+          blocks: cira::blocks_label(project.open_blocks()),
           mode: "",
           last_active: 0,
         });
@@ -848,7 +849,7 @@ impl SessionPickerDelegate {
             key: Some(todo_session.key(index)),
             marker: None,
             blocks: cira::blocks_label(
-              project.cira_blocks.get(&todo_session.id).copied().unwrap_or(0),
+              status.and_then(|s| s.session(&todo_session.id)).map_or(0, |s| s.open.blocks),
             ),
             mode: "",
             last_active: todo_session.last_active.unwrap_or(0),

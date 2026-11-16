@@ -65,6 +65,36 @@ pub fn scratch_toggle(
   }
 }
 
+/// jcc's Cmd-\ memory: per session `S`, the pane Scratch was put in and
+/// what that pane showed before.
+pub struct ScratchReturns<S> {
+  before: std::collections::HashMap<S, (usize, PaneContentKind)>,
+}
+
+impl<S> Default for ScratchReturns<S> {
+  fn default() -> Self {
+    Self { before: std::collections::HashMap::new() }
+  }
+}
+
+impl<S: Eq + std::hash::Hash> ScratchReturns<S> {
+  /// Cmd-\ on pane `pane` of `session`, showing `shown`: what it shows next.
+  pub fn toggle(
+    &mut self,
+    session: S,
+    pane: usize,
+    shown: Option<PaneContentKind>,
+    fallback: PaneContentKind,
+  ) -> PaneContentKind {
+    let before = self.before.remove(&session).filter(|(p, _)| *p == pane).map(|(_, kind)| kind);
+    let (to, keep) = scratch_toggle(shown, before, fallback);
+    if let Some(kind) = keep {
+      self.before.insert(session, (pane, kind));
+    }
+    to
+  }
+}
+
 pub struct PaneContent {
   pub kind: PaneContentKind,
   pub view: AnyView,
@@ -124,7 +154,19 @@ impl Render for Pane {
 
 #[cfg(test)]
 mod tests {
-  use super::{Flavor, PaneContentKind, default_kinds, scratch_toggle};
+  use super::{Flavor, PaneContentKind, ScratchReturns, default_kinds, scratch_toggle};
+
+  /// Each session goes back to its own view, whatever another session did
+  /// with Cmd-\ meanwhile.
+  #[test]
+  fn cmd_backslash_remembers_per_session() {
+    use PaneContentKind::*;
+    let mut returns = ScratchReturns::default();
+    assert_eq!(returns.toggle("a", 2, Some(GeneralTerminal), GeneralTerminal), Scratch);
+    assert_eq!(returns.toggle("b", 2, Some(CodeViewer), GeneralTerminal), Scratch);
+    assert_eq!(returns.toggle("a", 2, Some(Scratch), GeneralTerminal), GeneralTerminal, "a's own");
+    assert_eq!(returns.toggle("b", 2, Some(Scratch), GeneralTerminal), CodeViewer, "b's own");
+  }
 
   /// Cira PLAN TMUX-24: Cmd-\ twice is where it started.
   #[test]

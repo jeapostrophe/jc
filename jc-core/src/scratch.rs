@@ -71,7 +71,7 @@ impl std::fmt::Display for Failure {
 
 /// `GET /v1/scratch`: `project`'s pad.
 pub fn read(socket: &Path, project: &str) -> Result<Scratch, Failure> {
-  let path = format!("/v1/scratch?project={}", query_value(project));
+  let path = format!("/v1/scratch?project={}", percent_encode(project));
   parse(&request(socket, "GET", &path, None)?)
 }
 
@@ -86,8 +86,9 @@ fn parse(body: &[u8]) -> Result<Scratch, Failure> {
   serde_json::from_slice(body).map_err(|e| Failure::Failed(format!("not a scratch pad: {e}")))
 }
 
-/// A query value, percent-encoded but for the unreserved characters.
-fn query_value(value: &str) -> String {
+/// `value` percent-encoded but for the unreserved characters: a query value,
+/// or a part of Cira's page address, which the page decodes.
+pub(crate) fn percent_encode(value: &str) -> String {
   value
     .bytes()
     .map(|b| match b {

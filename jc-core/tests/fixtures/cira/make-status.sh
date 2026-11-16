@@ -79,7 +79,7 @@ J
 # new SESSION-LABEL [FLAGS]: a session Cira runs, its id printed once its job is bound.
 new() { label=$1; shift; "$CIRA" session new --cwd "$OWNED" --label "$label" --wait --json "$@" |
   python3 -c 'import json,sys; print(json.load(sys.stdin)["session"])'; }
-new owned-running >/dev/null
+new owned-running --auto >/dev/null
 new owned-dangerous --dangerous >/dev/null
 s=$(new owned-stopped); "$CIRA" session stop "$s" --project owned >/dev/null
 s=$(new owned-removed); "$CIRA" session rm "$s" --project owned >/dev/null

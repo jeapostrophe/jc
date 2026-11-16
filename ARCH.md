@@ -137,7 +137,7 @@ Every Claude pane is a client of a Claude Code **background session that Cira ow
 | grey `~` | Same, but disabled (`[D]`) |
 | blue `+` | Registered project with no sessions |
 
-Each row's right side also carries the open Cira blocks its session holds (`4 blocks`, `jc_core::cira::blocks_label`): an attached session's from its Cira session's `open` (`SessionState::open_blocks`), a heading not attached by its Cira id (`ProjectState::cira_blocks`), a project with no sessions its project's. Cira counts a block for the session holding it, the end of a continuation chain (Cira PLAN TMUX-19).
+Each row's right side also carries the open Cira blocks its session holds (`4 blocks`, `jc_core::cira::blocks_label`): an attached session's from its Cira session's `open` (`SessionState::open_blocks`), a heading not attached by its Cira id in the last status read, a project with no sessions its project's (`ProjectState::open_blocks`). Cira counts a block for the session holding it, the end of a continuation chain (Cira PLAN TMUX-19).
 
 **jc's marker is terminal activity:** red `*` alone (the legend says `activity`), for a running session with unseen Claude terminal output. The rows below this paragraph's table that name `!`, `…` and `x`, the blocks count and the mode badge are jcc's.
 
@@ -166,9 +166,9 @@ The poll: `Workspace::new` starts `cira::poll`, which calls `Cira::status` (`cir
 
 **Sort order.** Groups, in order: current project's sessions, other projects' sessions, unadopted sessions (current project first), empty projects, and finally the active session, which always sorts last since you are already there. A session showing a permission dialog, in any project, sorts above all of these. Within both session groups — this project's and the others' — finished sessions come first; "where did the work move while I was elsewhere" is mostly a cross-project question. Every sub-group then sorts by `> last=` descending (`picker::sort_rank`).
 
-The title bar shows `project > session`; jcc's is `jcc [X blocks] · project > session [N blocks]` (`jc_core::cira::header`, Cira PLAN TMUX-18): X the open blocks of every attached session (`Workspace::attached_blocks`), N the shown one's, each left out at zero. jcc's Dock badge (`Workspace::update_dock_badge`, `NSDockTile.badgeLabel` through `notify::set_badge`, Cira PLAN TMUX-21) counts each Cira project holding an open project once (`Status::open_blocks_of`). Per-pane headers carry the `[+]` dirty marker.
+The title bar shows `project > session`; jcc's is `jcc [X blocks] · project > session [N blocks]` (`jc_core::cira::header`, Cira PLAN TMUX-18): X the open blocks of every attached session (`Workspace::attached_blocks`), N the shown one's, each left out at zero. jcc's Dock badge (`jc_core::cira::dock_badge`, set through `notify::set_badge`, Cira PLAN TMUX-21) counts each Cira project holding an open project once, and is cleared by a read that finds Cira unreachable. Per-pane headers carry the `[+]` dirty marker.
 
-jcc's keys: Cmd-` rotates only among projects with open blocks (`next_slot`; none: nothing happens), Cmd-\\ toggles the right pane between Scratch and what it showed (`pane::scratch_toggle`, remembered per pane in `Workspace::scratch_before`), Cmd-, opens `Status::page_url` (`web_port`, else 7812; the project `encodeURIComponent`-escaped) with `open -a /Applications/Safari.app` on a thread of its own.
+jcc's keys, bound in jcc alone and listed in its Cmd-? help: Cmd-` rotates only among projects with open blocks (`rotates`, `next_slot`; none: nothing happens; Cira down: a refusal naming why; jc's rotation is unchanged), Cmd-\\ toggles the right pane between Scratch and what it showed, remembered per session (`pane::ScratchReturns`), and Cmd-, opens `Status::page_url` (`web_port`, else 7812) with `open -a /Applications/Safari.app`, refusing while Cira is unreachable and saying so when Safari does not open.
 
 ### Project Actions Picker
 

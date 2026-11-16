@@ -225,7 +225,7 @@ impl Status {
   /// Cira's default when it is older than the field, as `cira watch` does.
   pub fn page_url(&self, project: &str) -> String {
     let port = self.web_port.unwrap_or(DEFAULT_WEB_PORT);
-    format!("http://127.0.0.1:{port}/#/{}", uri_component(project))
+    format!("http://127.0.0.1:{port}/#/{}", crate::scratch::percent_encode(project))
   }
 
   pub fn project_for(&self, path: &Path) -> Option<&Project> {
@@ -280,20 +280,6 @@ impl Session {
 /// Cira's page's port when the daemon does not say (Cira's `cira watch`).
 const DEFAULT_WEB_PORT: u16 = 7812;
 
-/// `text` escaped as JavaScript's `encodeURIComponent` does, which the page
-/// undoes on each part of its address.
-fn uri_component(text: &str) -> String {
-  let mut out = String::new();
-  for b in text.bytes() {
-    if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
-      out.push(b as char);
-    } else {
-      out.push_str(&format!("%{b:02X}"));
-    }
-  }
-  out
-}
-
 /// A count of open blocks, `4 blocks` or `1 block`: empty for none.
 pub fn blocks_label(n: u64) -> String {
   match n {
@@ -319,8 +305,14 @@ pub fn header(project: &str, session: Option<(&str, u64)>, attached: u64) -> Str
   title
 }
 
-/// The Dock badge for `n` open blocks: none for none.
-pub fn badge_label(n: u64) -> Option<String> {
+/// The Dock badge (Cira PLAN TMUX-21): the open blocks of the Cira projects
+/// holding the jc projects at `paths` ([`Status::open_blocks_of`]); none for
+/// none, and while Cira is unreachable (`status` is `None`).
+pub fn dock_badge<'a>(
+  status: Option<&Status>,
+  paths: impl IntoIterator<Item = &'a Path>,
+) -> Option<String> {
+  let n = status.map_or(0, |s| s.open_blocks_of(paths));
   (n > 0).then(|| n.to_string())
 }
 
@@ -1117,9 +1109,11 @@ mod tests {
     // Two jc projects inside `outer` (the repository and a directory of it) are one Cira
     // project; a directory no project holds counts nothing.
     let paths = [path("outer"), path("outer").join("sub"), PathBuf::from("/nowhere")];
-    assert_eq!(status.open_blocks_of(paths.iter().map(PathBuf::as_path)), outer);
-    assert_eq!(badge_label(0), None);
-    assert_eq!(badge_label(12).as_deref(), Some("12"));
+    let paths = || paths.iter().map(PathBuf::as_path);
+    assert_eq!(status.open_blocks_of(paths()), outer);
+    assert_eq!(dock_badge(Some(&status), paths()), Some(outer.to_string()));
+    assert_eq!(dock_badge(None, paths()), None, "Cira unreachable: no badge");
+    assert_eq!(dock_badge(Some(&status), [Path::new("/nowhere")]), None, "none for none");
   }
 
   #[test]
