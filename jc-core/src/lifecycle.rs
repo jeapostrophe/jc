@@ -66,6 +66,9 @@ pub fn pane_action(
   }
   let Some(job) = &s.job else {
     return match s.op_error() {
+      Some(error) if can_start_again(Some(s)) => {
+        PaneAction::Hold(format!("{error}. {START_AGAIN} asks Cira to start it again"))
+      }
       Some(error) => PaneAction::Hold(error.to_string()),
       None => wait("waiting for Cira to start its job…"),
     };
@@ -98,11 +101,15 @@ pub fn pane_action(
   }
 }
 
+/// How Jay asks for [`can_start_again`].
+const START_AGAIN: &str = "Cmd-Shift-P → \"Start this session again\"";
+
 /// Whether the pane offers "Start this session again" (`cira session start`,
 /// Cira PLAN TMUX-16): Cira runs the session, has not removed it, Claude Code
-/// no longer has its job, no other session holds that job or continues it
-/// (Cira would start nothing), and no operation or fork is under way. Only
-/// Jay's asking starts it, a session he stopped included.
+/// no longer has its job (or Cira's start of one failed: TMUX-25), no other
+/// session holds that job or continues it (Cira would start nothing), and no
+/// operation or fork is under way. Only Jay's asking starts it, a session he
+/// stopped included.
 pub fn can_start_again(session: Option<&Session>) -> bool {
   session.is_some_and(|s| {
     s.owned
@@ -111,7 +118,10 @@ pub fn can_start_again(session: Option<&Session>) -> bool {
       && s.continued_by.is_none()
       && !s.op_running()
       && s.mode_pending != ModePending::Due
-      && s.job.as_ref().is_some_and(|j| j.state == JobState::Absent)
+      && match &s.job {
+        Some(job) => job.state == JobState::Absent,
+        None => s.op_error().is_some(),
+      }
   })
 }
 
@@ -134,8 +144,8 @@ fn gone(s: &Session, short: &str) -> String {
     None => "",
   };
   format!(
-    "{gone}; Cmd-Shift-P → \"Start this session again\" asks Cira for a new job continuing its \
-     conversation, {mode} as before{stopped}"
+    "{gone}; {START_AGAIN} asks Cira for a new job continuing its conversation, {mode} as \
+     before{stopped}"
   )
 }
 
@@ -150,6 +160,24 @@ pub fn lost_session<'a>(
   project.sessions.iter().find(|s| {
     s.owned && s.removed_at.is_none() && s.label.as_deref() == Some(label) && !named(&s.id)
   })
+}
+
+/// `cira session new`'s answer, with a refusal that names a session taken as
+/// made: under `--wait`, Cira's exit 1 says it made the session but did not
+/// start its job, and prints the session with that start's error. It is the
+/// heading's session all the same (Cira PLAN TMUX-25): its pane holds on the
+/// error ([`pane_action`]) until "Start this session again"
+/// ([`can_start_again`]); left unnamed, the next read would give it a heading
+/// of its own ([`todo_sync`]).
+pub fn session_made(
+  answer: Result<crate::cira::Created, CallError>,
+) -> Result<crate::cira::Created, CallError> {
+  match answer {
+    Err(CallError::Refused { code: exit::ERROR, ref stdout, .. }) => {
+      serde_json::from_slice(stdout).map_err(|_| answer.unwrap_err())
+    }
+    answer => answer,
+  }
 }
 
 /// What jcc's todo.md must change to show what Cira runs for its project
@@ -801,6 +829,122 @@ mod tests {
     assert_eq!(cut.add, [("c-marker".to_string(), "c-marker".to_string())]);
   }
 
+  /// Cira's answer to a `cira session new --wait` whose job it would not
+  /// start ("held": jc still ran the conversation, tbm 2026-11-16), and the
+  /// status that lists the session it made: no job, no uuid yet, the start's
+  /// error.
+  fn refused_start(id: &str, label: &str, resume: &str) -> (CallError, Status) {
+    let held = format!(
+      "held: conversation {resume} runs in another Claude Code process, and resuming it \
+       would start a copy; end that process, then ask again (`cira session new --resume`)"
+    );
+    let listed = serde_json::json!({
+      "id": id, "label": label, "owned": true, "dangerous": false,
+      "state": "idle", "state_since": "1970-01-01T00:01:00Z", "mode_pending": "none",
+      "op": { "op": "start", "running": false, "error": held },
+    });
+    let stdout = serde_json::json!({ "session": id, "status": listed }).to_string().into_bytes();
+    let refused = CallError::Refused { code: exit::ERROR, message: held.clone(), stdout };
+    let status = serde_json::json!({ "projects": [
+      { "name": "tbm", "path": "/w/tbm", "sessions": [listed] },
+    ]});
+    (refused, Status::parse(status.to_string().as_bytes()).unwrap())
+  }
+
+  /// What jcc's todo.md holds after `Workspace::session_answered` takes
+  /// `answer` for the heading `asked` (`None`: a new session, labelled
+  /// `label`) and the next status read is synced into it, and the panes it
+  /// then runs: the one that asked, plus one per heading the sync adds.
+  fn after_answer(
+    text: &str,
+    asked: Option<crate::todo::SessionKey>,
+    label: &str,
+    answer: CallError,
+    status: &Status,
+  ) -> (crate::todo::TodoDocument, usize) {
+    let jcc = crate::flavor::Flavor::Jcc;
+    let doc = crate::todo::parse(text, jcc);
+    // The app's heading choice (`session_answered`): the heading asked for,
+    // else a new one. A refusal leaves the file alone and the pane failed.
+    let (text, key) = match session_made(Err(answer)) {
+      Ok(made) => {
+        let text = match &asked {
+          Some(key) => {
+            let index = doc.index_of(key).expect("the heading that asked");
+            crate::todo::bind_cira_at(text, &doc, index, &made.session).unwrap()
+          }
+          None => crate::todo::insert_session_heading(text, &doc, label, &made.session),
+        };
+        (text, made.session)
+      }
+      Err(_) => {
+        let key = match asked {
+          Some(crate::todo::SessionKey::Id(id)) => id,
+          _ => String::new(),
+        };
+        (text.to_string(), key)
+      }
+    };
+    let doc = crate::todo::parse(&text, jcc);
+    let sync = todo_sync(&status.projects[0], status, &doc, |id| id == key);
+    let panes = 1 + sync.add.len();
+    (crate::todo::parse(&sync.apply(&text, jcc), jcc), panes)
+  }
+
+  /// Cira PLAN TMUX-25 (tbm, 2026-11-16): Onboarding, moved from jc, showed
+  /// twice in jcc once a retry worked. Cira's refusal had made the session;
+  /// with no heading naming it (its job never ran, so it has no uuid to match
+  /// the legacy `> uuid=`), the next read gave it a heading and a pane of
+  /// its own beside the failed one.
+  #[test]
+  fn a_refused_move_leaves_one_heading_and_one_session() {
+    let uuid = "7623c801-099a-4824-b212-4dcb1b3d1c7d";
+    let (refused, status) = refused_start("cira-99550bde1b9e", "Onboarding", uuid);
+    let text = format!("# Cira\n## Onboarding\n> uuid={uuid}\n\n### WAIT\n");
+    let key = crate::todo::SessionKey::Id(uuid.into());
+    let (doc, panes) = after_answer(&text, Some(key), "Onboarding", refused, &status);
+    let headings: Vec<_> = doc.sessions.iter().map(|s| (s.label.as_str(), s.id.as_str())).collect();
+    assert_eq!(
+      (headings.as_slice(), panes),
+      ([("Onboarding", "cira-99550bde1b9e")].as_slice(), 1),
+      "the moved heading names the session Cira made for it, and nothing else does"
+    );
+  }
+
+  /// TMUX-25's review: a new session, and an unbound heading adopted, that
+  /// Cira refuses to start likewise get one heading and one pane.
+  #[test]
+  fn a_refused_new_session_or_unbound_adopt_leaves_one_heading_and_one_session() {
+    let (refused, status) = refused_start("c-new", "New Session", "");
+    let (doc, panes) = after_answer("# Cira\n", None, "New Session", refused, &status);
+    let headings: Vec<_> = doc.sessions.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!((headings.as_slice(), panes), (["c-new"].as_slice(), 1), "a new session");
+
+    let (refused, status) = refused_start("c-old", "Old", "");
+    let text = "# Cira\n## Old\n> cira=\n\n### WAIT\n";
+    let key = crate::todo::SessionKey::Unbound { index: 0, label: "Old".into() };
+    let (doc, panes) = after_answer(text, Some(key), "Old", refused, &status);
+    let headings: Vec<_> = doc.sessions.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!((headings.as_slice(), panes), (["c-old"].as_slice(), 1), "an unbound heading");
+  }
+
+  /// A session whose start Cira refused has no job to attach: its pane holds
+  /// on Cira's error and offers "Start this session again", which asks Cira
+  /// for the job it would not start (`cira session start`).
+  #[test]
+  fn a_session_whose_start_failed_can_be_started_again() {
+    let (_, status) = refused_start("c-1", "x", "u-1");
+    let s = status.session("c-1");
+    assert!(can_start_again(s), "a failed start with no job");
+    match pane_action(s, true, None, None) {
+      PaneAction::Hold(why) => {
+        assert!(why.starts_with("held: conversation u-1"), "{why}");
+        assert!(why.contains("\"Start this session again\""), "{why}");
+      }
+      other => panic!("{other:?}"),
+    }
+  }
+
   /// Review: the gating of `Workspace::sync_todos`.
   #[test]
   fn a_todo_is_synced_only_when_open_saved_and_not_asking() {
@@ -1009,7 +1153,8 @@ mod tests {
     assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Hold(_)));
     let failed = serde_json::json!({ "op": "start", "running": false, "error": "held", "at": "x" });
     let s = session(serde_json::json!({ "op": failed }));
-    assert_eq!(pane_action(Some(&s), true, None, None), PaneAction::Hold("held".into()));
+    let start_again = format!("held. {START_AGAIN} asks Cira to start it again");
+    assert_eq!(pane_action(Some(&s), true, None, None), PaneAction::Hold(start_again));
     // No job yet and nothing failed: its start is on its way.
     let s = session(serde_json::json!({}));
     assert!(matches!(pane_action(Some(&s), true, None, None), PaneAction::Wait(_)));

@@ -579,9 +579,11 @@ impl Workspace {
   /// Move legacy heading `sid` (`> uuid=U`, a block Jay cut from jc's TODO.md
   /// and pasted into jcc's todo.md) to a session Cira runs: `cira session new --resume U
   /// --wait`, carrying `> dangerous`. A conversation with no transcript (it
-  /// never took a prompt) starts fresh. Its heading is rewritten only once
-  /// Cira has a job for it, so a failed start is asked again — which retries
-  /// it — at the next jcc start or adoption. Not while a `claude` process
+  /// never took a prompt) starts fresh. Its heading is rewritten once Cira
+  /// has made the session, even if Cira did not start its job
+  /// ([`lifecycle::session_made`]): the pane then says why, and "Start this
+  /// session again" retries the start. A request Cira made nothing for is
+  /// asked again at the next jcc start or adoption. Not while a `claude` process
   /// still runs U in the foreground (jc's pane, most likely): resuming it in
   /// Cira too would run one conversation twice, so the pane says so and the
   /// next status read asks again.
@@ -690,7 +692,7 @@ impl Workspace {
     let todo_view = project.todo_view.clone();
     let Some(session) = project.sessions.get_mut(&sid) else { return };
     session.asking = false;
-    let created = match made {
+    let created = match lifecycle::session_made(made) {
       Ok(created) => created,
       Err(CallError::NoAnswer) if fresh => {
         // Asking again could make a second session: look for this one first.
@@ -699,17 +701,8 @@ impl Workspace {
         return;
       }
       Err(e) => {
-        let why = match &e {
-          CallError::Refused { code: exit::ERROR, stdout, .. } => {
-            let failed = serde_json::from_slice::<Created>(stdout).ok().and_then(|c| c.status);
-            let error = failed.as_ref().and_then(|s| s.op_error()).map(str::to_string);
-            format!(
-              "Cira could not start this session's job: {}. Adopt it again to retry.",
-              error.unwrap_or_else(|| e.to_string())
-            )
-          }
-          e => format!("could not ask Cira for a session: {e}"),
-        };
+        // Nothing was made: a refusal that names a session is one made.
+        let why = format!("could not ask Cira for a session: {e}");
         session.failed = true;
         session.adopting = None;
         session.status(&why, cx);
