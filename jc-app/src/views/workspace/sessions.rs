@@ -165,6 +165,7 @@ impl Workspace {
     if status.is_some() {
       self.cira.status = status;
     }
+    self.update_dock_badge();
     self.cira.read_at = Some(read_at);
     self.retry_unmatched_hooks(window, cx);
     self.drive_sessions(read_at, window, cx);

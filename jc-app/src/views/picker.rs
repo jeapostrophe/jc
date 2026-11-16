@@ -725,9 +725,10 @@ struct SessionPickerEntry {
   /// The session's state mark (Cira PLAN TMUX-06); `None` for rows that are
   /// not running sessions.
   marker: Option<Marker>,
-  /// The project's open Cira blocks (`4 blocks`), empty when none.
+  /// The open Cira blocks the row's session holds (`4 blocks`; for a project
+  /// with no sessions, the project's), empty when none.
   blocks: String,
-  /// The session's mode badge from Cira (`dangerous`), empty when auto.
+  /// The session's mode warning from Cira (`bypass (drift)`), else empty.
   mode: &'static str,
   /// Unix timestamp of the last TODO submit (from `> last=`). `0` if unknown.
   last_active: u64,
@@ -778,7 +779,6 @@ impl SessionPickerDelegate {
     let flavor = jc_core::flavor::Flavor::current();
 
     for (pi, project) in projects.iter().enumerate() {
-      let blocks = cira::blocks_label(project.cira_open);
       let has_adoptable = todo_documents.get(pi).is_some_and(|d| !d.sessions.is_empty());
       if project.sessions.is_empty() && !has_adoptable {
         entries.push(SessionPickerEntry {
@@ -788,7 +788,7 @@ impl SessionPickerDelegate {
           label: String::new(),
           key: None,
           marker: None,
-          blocks: blocks.clone(),
+          blocks: cira::blocks_label(project.cira_open.map_or(0, |o| o.blocks)),
           mode: "",
           last_active: 0,
         });
@@ -826,7 +826,7 @@ impl SessionPickerDelegate {
               session.marker(last_active).filter(|m| !is_active || *m == Marker::Dialog)
             }
           },
-          blocks: blocks.clone(),
+          blocks: cira::blocks_label(session.open_blocks()),
           mode: session.cira_session.as_ref().map_or("", mode_badge),
           last_active,
         });
@@ -847,7 +847,9 @@ impl SessionPickerDelegate {
             // re-verified against the live document at write time.
             key: Some(todo_session.key(index)),
             marker: None,
-            blocks: blocks.clone(),
+            blocks: cira::blocks_label(
+              project.cira_blocks.get(&todo_session.id).copied().unwrap_or(0),
+            ),
             mode: "",
             last_active: todo_session.last_active.unwrap_or(0),
           });
@@ -1019,14 +1021,11 @@ impl PickerDelegate for SessionPickerDelegate {
   }
 }
 
-/// A running session's mode as the picker shows it: Cira's desired mode, and
-/// a drift (bypass Cira did not ask for) when its hooks report one.
+/// A running session's mode as the picker shows it: only a drift (bypass Cira
+/// did not ask for) when its hooks report one. The mode Cira keeps it in is
+/// the Claude pane's to show (Cira PLAN TMUX-20).
 fn mode_badge(session: &cira::Session) -> &'static str {
-  match (session.dangerous, session.drift) {
-    (_, true) => "bypass (drift)",
-    (true, false) => "dangerous",
-    (false, false) => "",
-  }
+  if session.drift { "bypass (drift)" } else { "" }
 }
 
 /// What a session-picker row is, for [`sort_rank`].
@@ -1509,8 +1508,25 @@ fn format_relative_time(time: std::time::SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::{Row, UNADOPTED_GLYPH, sort_rank};
+  use super::{Row, UNADOPTED_GLYPH, mode_badge, sort_rank};
   use jc_core::cira::Marker;
+
+  /// Cira PLAN TMUX-20: a dangerous session is not marked so in the picker;
+  /// only a drift Cira did not ask for is.
+  #[test]
+  fn the_picker_names_a_drift_and_not_the_mode() {
+    let session = |dangerous: bool, drift: bool| -> jc_core::cira::Session {
+      serde_json::from_value(serde_json::json!({
+        "id": "s", "state": "idle", "state_since": "2026-11-15T00:00:00Z",
+        "dangerous": dangerous, "drift": drift,
+      }))
+      .unwrap()
+    };
+    assert_eq!(mode_badge(&session(true, false)), "", "dangerous is the Claude pane's to show");
+    assert_eq!(mode_badge(&session(false, false)), "");
+    assert_eq!(mode_badge(&session(false, true)), "bypass (drift)");
+    assert_eq!(mode_badge(&session(true, true)), "bypass (drift)");
+  }
 
   #[test]
   fn no_running_session_mark_reads_as_a_disabled_one() {

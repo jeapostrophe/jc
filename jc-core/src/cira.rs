@@ -26,6 +26,10 @@ pub struct Status {
   /// resolved it.
   #[serde(default)]
   pub home: Option<PathBuf>,
+  /// The port Cira's page is on, on 127.0.0.1, as the daemon bound it; absent
+  /// from a daemon older than the field.
+  #[serde(default)]
+  pub web_port: Option<u16>,
   #[serde(default)]
   pub projects: Vec<Project>,
 }
@@ -64,6 +68,10 @@ pub struct Session {
   pub short: Option<String>,
   #[serde(default)]
   pub uuid: Option<String>,
+  /// What waits on Jay in the blocks it holds (its own, or a session's it
+  /// continues); zero from a Cira older than the field.
+  #[serde(default)]
+  pub open: OpenCounts,
   /// Its name, Cira's (Q-159); jc shows it and sends renames.
   #[serde(default)]
   pub label: Option<String>,
@@ -200,6 +208,26 @@ impl Status {
     Some(self.home.as_ref()?.join("projects").join(name).join("todo.md"))
   }
 
+  /// The open blocks of the Cira projects holding the jc projects at `paths`,
+  /// each Cira project once however many jc projects it holds: the Dock
+  /// badge's count (Cira PLAN TMUX-21).
+  pub fn open_blocks_of<'a>(&self, paths: impl IntoIterator<Item = &'a Path>) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    paths
+      .into_iter()
+      .filter_map(|path| self.project_for(path))
+      .filter(|p| seen.insert(p.name.as_str()))
+      .map(|p| p.open.blocks)
+      .sum()
+  }
+
+  /// Cira's page on `project` (Cira PLAN TMUX-23): the daemon's port, else
+  /// Cira's default when it is older than the field, as `cira watch` does.
+  pub fn page_url(&self, project: &str) -> String {
+    let port = self.web_port.unwrap_or(DEFAULT_WEB_PORT);
+    format!("http://127.0.0.1:{port}/#/{}", uri_component(project))
+  }
+
   pub fn project_for(&self, path: &Path) -> Option<&Project> {
     self
       .projects
@@ -249,20 +277,51 @@ impl Session {
   }
 }
 
-/// The picker's per-project count, `4 blocks`: empty when there are none or
-/// Cira is unreachable.
-pub fn blocks_label(open: Option<OpenCounts>) -> String {
-  match open.map_or(0, |o| o.blocks) {
+/// Cira's page's port when the daemon does not say (Cira's `cira watch`).
+const DEFAULT_WEB_PORT: u16 = 7812;
+
+/// `text` escaped as JavaScript's `encodeURIComponent` does, which the page
+/// undoes on each part of its address.
+fn uri_component(text: &str) -> String {
+  let mut out = String::new();
+  for b in text.bytes() {
+    if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+      out.push(b as char);
+    } else {
+      out.push_str(&format!("%{b:02X}"));
+    }
+  }
+  out
+}
+
+/// A count of open blocks, `4 blocks` or `1 block`: empty for none.
+pub fn blocks_label(n: u64) -> String {
+  match n {
     0 => String::new(),
     1 => "1 block".to_string(),
     n => format!("{n} blocks"),
   }
 }
 
-/// The TODO pane header's suffix, as in `TODO · 4 blocks`.
-pub fn blocks_suffix(open: Option<OpenCounts>) -> String {
-  let label = blocks_label(open);
-  if label.is_empty() { label } else { format!(" · {label}") }
+/// ` [4 blocks]` after a name; empty for none.
+fn bracket(n: u64) -> String {
+  if n == 0 { String::new() } else { format!(" [{}]", blocks_label(n)) }
+}
+
+/// jcc's title bar (Cira PLAN TMUX-18): `jcc [3 blocks] · cira > orchestrator
+/// [1 block]`, `attached` the open blocks of every session jcc has attached,
+/// `session` the one shown, with its own. A count of none is left out.
+pub fn header(project: &str, session: Option<(&str, u64)>, attached: u64) -> String {
+  let mut title = format!("jcc{} · {project}", bracket(attached));
+  if let Some((label, blocks)) = session {
+    title.push_str(&format!(" > {label}{}", bracket(blocks)));
+  }
+  title
+}
+
+/// The Dock badge for `n` open blocks: none for none.
+pub fn badge_label(n: u64) -> Option<String> {
+  (n > 0).then(|| n.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,14 +1077,61 @@ mod tests {
 
   #[test]
   fn header_and_picker_counts() {
-    let (status, _) = fixture();
-    let open = status.projects.iter().map(|p| p.open).find(|o| o.blocks > 1).unwrap();
-    assert_eq!(blocks_suffix(Some(open)), format!(" · {} blocks", open.blocks));
-    assert_eq!(blocks_label(Some(open)), format!("{} blocks", open.blocks));
-    assert_eq!(blocks_suffix(Some(OpenCounts { blocks: 1, ..open })), " · 1 block");
-    assert_eq!(blocks_suffix(Some(OpenCounts::default())), "");
-    assert_eq!(blocks_suffix(None), "");
-    assert_eq!(blocks_label(None), "");
+    assert_eq!(blocks_label(4), "4 blocks");
+    assert_eq!(blocks_label(1), "1 block");
+    assert_eq!(blocks_label(0), "");
+    assert_eq!(
+      header("cira", Some(("orchestrator", 1)), 3),
+      "jcc [3 blocks] · cira > orchestrator [1 block]"
+    );
+    assert_eq!(header("cira", Some(("orchestrator", 0)), 1), "jcc [1 block] · cira > orchestrator");
+    assert_eq!(header("cira", Some(("orchestrator", 0)), 0), "jcc · cira > orchestrator");
+    assert_eq!(header("cira", None, 2), "jcc [2 blocks] · cira");
+  }
+
+  #[test]
+  fn each_session_carries_the_blocks_it_holds() {
+    let (status, raw) = fixture();
+    let raw_sessions =
+      raw["projects"].as_array().unwrap().iter().flat_map(|p| p["sessions"].as_array().unwrap());
+    let mut held = 0;
+    for rs in raw_sessions {
+      let s = status.session(rs["id"].as_str().unwrap()).unwrap();
+      assert_eq!(Some(s.open.blocks), rs["open"]["blocks"].as_u64(), "{}", s.id);
+      held += s.open.blocks;
+    }
+    // The generator's fx-idle posted both of the fixture's blocks.
+    assert_eq!(status.session("fx-idle").map(|s| s.open.blocks), Some(2));
+    assert_eq!(held, status.projects.iter().map(|p| p.open.blocks).sum::<u64>());
+  }
+
+  #[test]
+  fn the_dock_counts_each_cira_project_once() {
+    let (status, raw) = fixture();
+    let path = |name: &str| {
+      let p = raw["projects"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap();
+      PathBuf::from(p["path"].as_str().unwrap())
+    };
+    let outer = status.projects.iter().find(|p| p.name == "outer").unwrap().open.blocks;
+    assert!(outer > 0);
+    // Two jc projects inside `outer` (the repository and a directory of it) are one Cira
+    // project; a directory no project holds counts nothing.
+    let paths = [path("outer"), path("outer").join("sub"), PathBuf::from("/nowhere")];
+    assert_eq!(status.open_blocks_of(paths.iter().map(PathBuf::as_path)), outer);
+    assert_eq!(badge_label(0), None);
+    assert_eq!(badge_label(12).as_deref(), Some("12"));
+  }
+
+  #[test]
+  fn the_page_of_a_project_is_on_the_daemon_s_port() {
+    let (status, raw) = fixture();
+    let port = raw["web_port"].as_u64().unwrap();
+    assert!(port > 0);
+    assert_eq!(status.page_url("cira"), format!("http://127.0.0.1:{port}/#/cira"));
+    // The page decodes each part of its address (`decodeURIComponent`).
+    assert_eq!(status.page_url("a b/c?é"), format!("http://127.0.0.1:{port}/#/a%20b%2Fc%3F%C3%A9"));
+    let older = Status { web_port: None, ..status };
+    assert_eq!(older.page_url("cira"), "http://127.0.0.1:7812/#/cira");
   }
 
   fn at(secs: u64) -> SystemTime {

@@ -17,6 +17,14 @@ pub fn beep() {
   objc2_app_kit::NSBeep();
 }
 
+/// Show `label` on the app's Dock icon, or no badge for `None`
+/// (`NSDockTile.badgeLabel`, which AppKit draws). Main thread only.
+pub fn set_badge(label: Option<&str>) {
+  let Some(mtm) = MainThreadMarker::new() else { return };
+  let label = label.map(NSString::from_str);
+  NSApplication::sharedApplication(mtm).dockTile().setBadgeLabel(label.as_deref());
+}
+
 /// Returns a receiver for session IDs from notification clicks.
 /// Call once at startup before `init()`.
 pub fn action_receiver() -> flume::Receiver<String> {

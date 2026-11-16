@@ -174,6 +174,11 @@ impl SessionState {
       || job.is_some_and(|short| background::hook_matches(short, "", hook_session))
   }
 
+  /// The open blocks it holds, as Cira last said (Cira PLAN TMUX-18).
+  pub fn open_blocks(&self) -> u64 {
+    self.cira_session.as_ref().map_or(0, |s| s.open.blocks)
+  }
+
   /// Cira's desired mode for it, once Cira lists it.
   pub fn dangerous(&self) -> Option<bool> {
     self.cira_session.as_ref().map(|s| s.dangerous)

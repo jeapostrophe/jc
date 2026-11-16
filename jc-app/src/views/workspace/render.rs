@@ -78,8 +78,7 @@ impl Workspace {
       Some(PaneContentKind::TodoEditor) => {
         let tv = project.todo_view.read(cx);
         let dirty = if tv.is_dirty(cx) { " [+]" } else { "" };
-        let blocks = jc_core::cira::blocks_suffix(project.cira_open);
-        let title = format!("TODO{blocks}{dirty}");
+        let title = format!("TODO{dirty}");
         let breadcrumbs = tv.code_view().read(cx).breadcrumb().to_vec();
         PaneHeader { title, breadcrumbs }
       }
@@ -110,14 +109,20 @@ impl Workspace {
     let theme = cx.theme();
     let project = self.active_project();
 
-    let mut title = project.name.clone();
-    // jcc says which app it is, so it is never mistaken for jc beside it.
-    if self.flavor == jc_core::flavor::Flavor::Jcc {
-      title = format!("jcc · {title}");
-    }
-    if let Some(session) = project.active_session() {
-      title = format!("{} > {}", title, session.label);
-    }
+    let session = project.active_session();
+    // jcc says which app it is, so it is never mistaken for jc beside it, and
+    // carries the open blocks (Cira PLAN TMUX-18).
+    let title = match self.flavor {
+      jc_core::flavor::Flavor::Jcc => jc_core::cira::header(
+        &project.name,
+        session.map(|s| (s.label.as_str(), s.open_blocks())),
+        self.attached_blocks(),
+      ),
+      jc_core::flavor::Flavor::Jc => match session {
+        Some(session) => format!("{} > {}", project.name, session.label),
+        None => project.name.clone(),
+      },
+    };
 
     TitleBar::new().font_family("Lilex").child(
       div()
@@ -233,6 +238,8 @@ impl Render for Workspace {
       .on_action(cx.listener(Self::send_to_terminal))
       .on_action(cx.listener(Self::jump_to_wait))
       .on_action(cx.listener(Self::rotate_next_project))
+      .on_action(cx.listener(Self::toggle_scratch))
+      .on_action(cx.listener(Self::open_cira_page))
       .on_action(cx.listener(Self::toggle_keybinding_help))
       .on_action(cx.listener(Self::scroll_other_up))
       .on_action(cx.listener(Self::scroll_other_down))

@@ -51,6 +51,20 @@ pub fn default_kinds(flavor: Flavor, has_session: bool) -> [PaneContentKind; 3] 
   }
 }
 
+/// jcc's Cmd-\ on a pane showing `shown` (Cira PLAN TMUX-24): what it shows
+/// next, and what to remember it showed. Scratch goes back to `before`, else
+/// `fallback`; anything else, or nothing, gives way to Scratch.
+pub fn scratch_toggle(
+  shown: Option<PaneContentKind>,
+  before: Option<PaneContentKind>,
+  fallback: PaneContentKind,
+) -> (PaneContentKind, Option<PaneContentKind>) {
+  match shown {
+    Some(PaneContentKind::Scratch) => (before.unwrap_or(fallback), None),
+    shown => (PaneContentKind::Scratch, shown),
+  }
+}
+
 pub struct PaneContent {
   pub kind: PaneContentKind,
   pub view: AnyView,
@@ -110,7 +124,21 @@ impl Render for Pane {
 
 #[cfg(test)]
 mod tests {
-  use super::{Flavor, PaneContentKind, default_kinds};
+  use super::{Flavor, PaneContentKind, default_kinds, scratch_toggle};
+
+  /// Cira PLAN TMUX-24: Cmd-\ twice is where it started.
+  #[test]
+  fn cmd_backslash_goes_to_scratch_and_back() {
+    use PaneContentKind::*;
+    let (to, before) = scratch_toggle(Some(GeneralTerminal), None, GeneralTerminal);
+    assert_eq!((to, before), (Scratch, Some(GeneralTerminal)));
+    assert_eq!(scratch_toggle(Some(to), before, GeneralTerminal), (GeneralTerminal, None));
+    let (to, before) = scratch_toggle(Some(CodeViewer), None, GeneralTerminal);
+    assert_eq!(scratch_toggle(Some(to), before, GeneralTerminal).0, CodeViewer, "not the default");
+    // Scratch put there another way (Cmd-O) goes back to the pane's default.
+    assert_eq!(scratch_toggle(Some(Scratch), None, GeneralTerminal), (GeneralTerminal, None));
+    assert_eq!(scratch_toggle(None, None, GeneralTerminal), (Scratch, None));
+  }
 
   /// Cira PLAN TMUX-12: jcc's right panel starts on the session's Terminal;
   /// jc's stays on the Global TODO.
