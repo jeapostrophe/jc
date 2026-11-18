@@ -1030,7 +1030,7 @@ fn mode_badge(session: &cira::Session) -> &'static str {
   if session.drift { "bypass (drift)" } else { "" }
 }
 
-/// How a running session's mark is coloured, in the row and in the legend.
+/// How a session's mark is coloured, in the row and in the legend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tone {
   /// Red: it wants you.

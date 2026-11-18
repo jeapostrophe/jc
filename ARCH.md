@@ -130,7 +130,7 @@ Every Claude pane is a client of a Claude Code **background session that Cira ow
 |---|---|
 | bold red `!` | A permission dialog is waiting, seen or not |
 | red `*` | It finished a turn since it was last on screen |
-| grey `…` | Its turn is over; background agents are still running |
+| green `…` | Its turn is over; background agents are still running (green as `>` is, so it never reads as gone; `marker_tone`) |
 | grey `x` | The session process has ended |
 | green `>` | The active session |
 | yellow `~` | In TODO.md but not running — confirming adopts it |
@@ -164,7 +164,7 @@ Four properties the window holds, each of which was once a bug:
 
 The poll: `Workspace::new` starts `cira::poll`, which calls `Cira::status` (`cira status --json`, given `Cira::TIMEOUT`) on its own thread every `CIRA_POLL`; a main-thread task applies each read (`Workspace::on_cira`, `ProjectState::apply_cira`) and notifies only when something shown changed. Any failure reads as unreachable, with its cause (`cira::Down`): counts disappear and markers fall back to the hooks. `cira` is found on `PATH`, like `claude`, and finds its daemon through `CIRA_HOME` in jc's environment, else `~/.cira`.
 
-**Sort order.** Groups, in order: current project's sessions, other projects' sessions, unadopted sessions (current project first), empty projects, and finally the active session, which always sorts last since you are already there. A session showing a permission dialog, in any project, sorts above all of these. Within both session groups — this project's and the others' — finished sessions come first; "where did the work move while I was elsewhere" is mostly a cross-project question. Every sub-group then sorts by `> last=` descending (`picker::sort_rank`).
+**Sort order.** Groups, in order: current project's sessions, other projects' sessions, unadopted sessions (current project first), empty projects, and finally the active session, which always sorts last since you are already there. A session showing a permission dialog, in any project, sorts above all of these. Within both session groups — this project's and the others' — finished sessions come first; "where did the work move while I was elsewhere" is mostly a cross-project question. A `…` or `x` row keeps its place among the unmarked sessions. Every sub-group then sorts by `> last=` descending (`picker::sort_rank`).
 
 The title bar shows `project > session`; jcc's is `jcc [X blocks] · project > session [N blocks]` (`jc_core::cira::header`, Cira PLAN TMUX-18): X the open blocks of every attached session (`Workspace::attached_blocks`), N the shown one's, each left out at zero. jcc's Dock badge (`jc_core::cira::dock_badge`, set through `notify::set_badge`, Cira PLAN TMUX-21) counts each Cira project holding an open project once, and is cleared by a read that finds Cira unreachable. Per-pane headers carry the `[+]` dirty marker.
 
