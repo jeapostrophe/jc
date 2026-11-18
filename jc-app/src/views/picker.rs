@@ -949,11 +949,8 @@ impl PickerDelegate for SessionPickerDelegate {
         picker_marker_base().text_color(color).child(UNADOPTED_GLYPH)
       }
       (SessionPickerEntryKind::Session(_), Some(marker)) => {
-        let color = match marker {
-          _ if selected => theme.accent_foreground,
-          Marker::Dialog | Marker::Finished => theme.red,
-          Marker::Waiting | Marker::Gone => theme.muted_foreground,
-        };
+        let color =
+          if selected { theme.accent_foreground } else { marker_tone(marker).color(theme) };
         let base = picker_marker_base().text_color(color);
         let base = if marker == Marker::Dialog { base.font_weight(FontWeight::BOLD) } else { base };
         base.child(marker.glyph())
@@ -1004,12 +1001,16 @@ impl PickerDelegate for SessionPickerDelegate {
         .text_color(muted)
         .children(match jc_core::flavor::Flavor::current() {
           jc_core::flavor::Flavor::Jc => vec![legend_item("*", theme.red, "activity", muted)],
-          jc_core::flavor::Flavor::Jcc => vec![
-            legend_item(Marker::Dialog.glyph(), theme.red, "permission", muted),
-            legend_item(Marker::Finished.glyph(), theme.red, "finished", muted),
-            legend_item(Marker::Waiting.glyph(), muted, "agents", muted),
-            legend_item(Marker::Gone.glyph(), muted, "gone", muted),
-          ],
+          jc_core::flavor::Flavor::Jcc => {
+            let mark =
+              |m: Marker, label| legend_item(m.glyph(), marker_tone(m).color(theme), label, muted);
+            vec![
+              mark(Marker::Dialog, "permission"),
+              mark(Marker::Finished, "finished"),
+              mark(Marker::Waiting, "agents"),
+              mark(Marker::Gone, "gone"),
+            ]
+          }
         })
         .children([
           legend_item(">", theme.green, "active", muted),
@@ -1029,6 +1030,35 @@ fn mode_badge(session: &cira::Session) -> &'static str {
   if session.drift { "bypass (drift)" } else { "" }
 }
 
+/// How a running session's mark is coloured, in the row and in the legend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tone {
+  /// Red: it wants you.
+  Alert,
+  /// Green, as `>` (active): it is working, so it must never read as gone.
+  Alive,
+  /// Muted: nothing is running.
+  Muted,
+}
+
+impl Tone {
+  fn color(self, theme: &gpui_component::Theme) -> Hsla {
+    match self {
+      Tone::Alert => theme.red,
+      Tone::Alive => theme.green,
+      Tone::Muted => theme.muted_foreground,
+    }
+  }
+}
+
+fn marker_tone(marker: Marker) -> Tone {
+  match marker {
+    Marker::Dialog | Marker::Finished => Tone::Alert,
+    Marker::Waiting => Tone::Alive,
+    Marker::Gone => Tone::Muted,
+  }
+}
+
 /// What a session-picker row is, for [`sort_rank`].
 #[derive(Clone, Copy)]
 enum Row {
@@ -1046,6 +1076,9 @@ enum Row {
 ///   - sessions in TODO.md that are not running, this project's first;
 ///   - empty projects;
 ///   - the active session, always last: you are already there.
+///
+/// A waiting session (`…`, its sub-agents still running) and a gone one (`x`)
+/// rank as an unmarked session: their colour tells them apart, not their place.
 fn sort_rank(row: Row, is_this: bool, is_active: bool) -> (u8, u8) {
   let other = u8::from(!is_this);
   match row {
@@ -1509,7 +1542,7 @@ fn format_relative_time(time: std::time::SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-  use super::{Row, UNADOPTED_GLYPH, mode_badge, sort_rank};
+  use super::{Row, Tone, UNADOPTED_GLYPH, marker_tone, mode_badge, sort_rank};
   use jc_core::cira::Marker;
 
   /// Cira PLAN TMUX-20: a dangerous session is not marked so in the picker;
@@ -1539,6 +1572,15 @@ mod tests {
       }
       assert_ne!(marker.glyph(), UNADOPTED_GLYPH, "{marker:?} shares the disabled/adopt mark");
     }
+  }
+
+  /// Cira PLAN WEB-63: a session whose sub-agents still run (`…`) is drawn
+  /// alive, never in the muted colour of a gone one (`x`).
+  #[test]
+  fn a_waiting_session_does_not_look_gone() {
+    assert_eq!(marker_tone(Marker::Waiting), Tone::Alive);
+    assert_ne!(marker_tone(Marker::Waiting), marker_tone(Marker::Gone));
+    assert_eq!(marker_tone(Marker::Gone), Tone::Muted);
   }
 
   #[test]
