@@ -444,36 +444,56 @@ pub fn attention_over(cira: Option<(State, Option<SystemTime>)>, asked: SystemTi
   }
 }
 
-/// The Dock bounces jc asked for a session's permission dialogs, ended once
-/// Cira says they were answered ([`attention_over`]).
+/// What jc asked of macOS for a session's permission dialogs: Dock bounces,
+/// and notifications delivered to Notification Center, ended once Cira says
+/// the dialogs were answered ([`attention_over`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Attention {
   asked: Option<SystemTime>,
-  requests: Vec<isize>,
+  bounces: Vec<isize>,
+  notices: Vec<String>,
+}
+
+/// What to end: bounces by their request id, notifications by identifier.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ended {
+  pub bounces: Vec<isize>,
+  pub notices: Vec<String>,
 }
 
 impl Attention {
-  /// Note bounce `request`, asked at `at`. The first ask stands: a later one
-  /// is the same dialog's `permission_prompt`, about 6 s on, which may reach
-  /// jc after the answer, or another dialog, which keeps Cira at `dialog`.
-  pub fn note(&mut self, at: SystemTime, request: isize) {
+  /// Note `bounce` and notification `notice`, asked at `at`. The first ask
+  /// stands: a later one is the same dialog's `permission_prompt`, about 6 s
+  /// on, which may reach jc after the answer, or another dialog, which keeps
+  /// Cira at `dialog`.
+  pub fn note(&mut self, at: SystemTime, bounce: Option<isize>, notice: Option<String>) {
+    if bounce.is_none() && notice.is_none() {
+      return;
+    }
     self.asked.get_or_insert(at);
-    self.requests.push(request);
+    self.bounces.extend(bounce);
+    self.notices.extend(notice);
   }
 
-  /// The bounces to end now that Cira says `cira` of the session: all of
-  /// them, once it left its dialog after they were asked.
-  pub fn ended(&mut self, cira: Option<(State, Option<SystemTime>)>) -> Vec<isize> {
+  /// What to end now that Cira says `cira` of the session: all of it, once
+  /// it left its dialog after it was asked.
+  pub fn ended(&mut self, cira: Option<(State, Option<SystemTime>)>) -> Ended {
     match self.asked {
-      Some(asked) if attention_over(cira, asked) => self.take(),
-      _ => Vec::new(),
+      Some(asked) if attention_over(cira, asked) => {
+        self.asked = None;
+        Ended {
+          bounces: std::mem::take(&mut self.bounces),
+          notices: std::mem::take(&mut self.notices),
+        }
+      }
+      _ => Ended::default(),
     }
   }
 
-  /// Every bounce, to end whatever Cira says.
-  pub fn take(&mut self) -> Vec<isize> {
-    self.asked = None;
-    std::mem::take(&mut self.requests)
+  /// The bounces, once jc is focused (which ends them): its notifications
+  /// stay until the dialog is answered.
+  pub fn bounces_ended(&mut self) -> Vec<isize> {
+    std::mem::take(&mut self.bounces)
   }
 }
 
@@ -1257,18 +1277,30 @@ mod tests {
   #[test]
   fn a_dialogs_later_notice_does_not_outlast_its_answer() {
     let mut a = Attention::default();
-    a.note(at(100), 1);
+    a.note(at(100), Some(1), Some("jc-1".into()));
     // Claude Code's `permission_prompt` about 6 s on, reaching jc just after
     // Jay answered on Cira's page at 105.
-    a.note(at(106), 2);
-    assert_eq!(a.ended(Some((State::Dialog, Some(at(100))))), Vec::<isize>::new());
-    assert_eq!(
-      a.ended(Some((State::Working, Some(at(105))))),
-      [1, 2],
-      "the bounce outlived the answer"
-    );
+    a.note(at(106), Some(2), Some("jc-2".into()));
+    assert_eq!(a.ended(Some((State::Dialog, Some(at(100))))), Ended::default());
+    let ended = a.ended(Some((State::Working, Some(at(105)))));
+    assert_eq!(ended.bounces, [1, 2], "the bounce outlived the answer");
+    assert_eq!(ended.notices, ["jc-1", "jc-2"], "its notifications outlived the answer");
     assert_eq!(a, Attention::default());
-    assert_eq!(a.ended(Some((State::Working, Some(at(105))))), Vec::<isize>::new());
+    assert_eq!(a.ended(Some((State::Working, Some(at(105))))), Ended::default());
+  }
+
+  #[test]
+  fn focus_ends_the_bounces_and_the_answer_the_notifications() {
+    let mut a = Attention::default();
+    a.note(at(100), Some(1), Some("jc-1".into()));
+    assert_eq!(a.bounces_ended(), [1]);
+    // A notification of a dialog still up stays in Notification Center.
+    assert_eq!(a.ended(Some((State::Dialog, Some(at(100))))), Ended::default());
+    let ended = a.ended(Some((State::Idle, Some(at(120)))));
+    assert_eq!(ended, Ended { bounces: vec![], notices: vec!["jc-1".into()] });
+    // jc active (no bounce) and banners not allowed (no notification): nothing.
+    a.note(at(130), None, None);
+    assert_eq!(a, Attention::default());
   }
 
   #[test]

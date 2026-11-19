@@ -1890,25 +1890,30 @@ impl Workspace {
     };
     let Some(message) = message.filter(|_| !self.window_active) else { return };
     let title = format!("{project_name} > {session_label}");
-    let request = crate::notify::notify(&title, message, &event.session_id);
-    if let (HookEventKind::PermissionPrompt, Some(request)) = (&event.kind, request)
+    let (bounce, notice) = crate::notify::notify(&title, message, &event.session_id);
+    if matches!(event.kind, HookEventKind::PermissionPrompt)
       && let Some((pi, sid)) = self.session_for_hook(&event.session_id)
       && let Some(session) = self.projects[pi].sessions.get_mut(&sid)
     {
-      session.attention.note(event.received, request);
+      session.attention.note(event.received, bounce, notice);
     }
   }
 
-  /// End the Dock bounce of each permission dialog Cira says was answered,
-  /// on its page or in any terminal (Cira PLAN TMUX-27). With `all`, every
-  /// one: jc was focused, which ends them anyway.
-  pub(super) fn end_answered_attention(&mut self, all: bool) {
+  /// End the Dock bounce, and remove the notification, of each permission
+  /// dialog Cira says was answered, on its page or in any terminal (Cira PLAN
+  /// TMUX-27). With `focused`, every bounce: jc was focused, which ends them
+  /// anyway; the notifications stay until the answer.
+  pub(super) fn end_answered_attention(&mut self, focused: bool) {
     for session in self.projects.iter_mut().flat_map(|p| p.sessions.values_mut()) {
-      let ended =
-        if all { session.attention.take() } else { session.attention.ended(session.cira_state) };
-      for request in ended {
-        crate::notify::cancel_attention(request);
+      let ended = if focused {
+        jc_core::cira::Ended { bounces: session.attention.bounces_ended(), notices: Vec::new() }
+      } else {
+        session.attention.ended(session.cira_state)
+      };
+      for bounce in ended.bounces {
+        crate::notify::cancel_attention(bounce);
       }
+      crate::notify::remove_notifications(&ended.notices);
     }
   }
 

@@ -6,7 +6,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, AnyProtocol, Bool, ClassBuilder, Sel};
 use objc2::{MainThreadMarker, msg_send, sel};
 use objc2_app_kit::{NSApplication, NSRequestUserAttentionType};
-use objc2_foundation::NSString;
+use objc2_foundation::{NSArray, NSString};
 
 static ACTION_TX: OnceLock<flume::Sender<String>> = OnceLock::new();
 static AUTHORIZED: AtomicBool = AtomicBool::new(false);
@@ -75,26 +75,51 @@ pub fn init() {
 /// jc only notifies for a session Claude has stopped on (permission prompt, API
 /// error), so every notification is a critical attention request, which
 /// bounces the Dock icon until jc is focused or [`cancel_attention`] ends it.
-/// Returns that request's id: none while jc is active (AppKit makes none)
-/// or off the main thread.
-pub fn notify(title: &str, message: &str, session_id: &str) -> Option<isize> {
+/// Returns that request's id, none while jc is active (AppKit makes none) or
+/// off the main thread, and the notification's identifier, none when banners
+/// aren't authorized ([`remove_notifications`] takes it).
+pub fn notify(title: &str, message: &str, session_id: &str) -> (Option<isize>, Option<String>) {
   eprintln!("notify: {title} — {message}");
   let request = bounce_dock_icon();
 
   if !AUTHORIZED.load(Ordering::Relaxed) {
-    return request;
+    return (request, None);
   }
 
   let title = title.to_string();
   let message = message.to_string();
   let session_id = session_id.to_string();
+  let ts = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_nanos();
+  let id = format!("jc-{ts}");
+  let notice = id.clone();
 
   // Post from a background thread to avoid blocking the UI.
   std::thread::spawn(move || {
     // SAFETY: All ObjC calls here create new objects; no shared mutable state.
-    unsafe { post_notification(&title, &message, &session_id) };
+    unsafe { post_notification(&id, &title, &message, &session_id) };
   });
-  request
+  (request, Some(notice))
+}
+
+/// Remove the notifications `ids` (`notify`'s identifiers) from Notification
+/// Center, and any not delivered yet.
+pub fn remove_notifications(ids: &[String]) {
+  if ids.is_empty() {
+    return;
+  }
+  let ids: Vec<Retained<NSString>> = ids.iter().map(|id| NSString::from_str(id)).collect();
+  let ids = NSArray::from_retained_slice(&ids);
+  // SAFETY: both methods take an NSArray of NSString; the center is
+  // thread-safe, as `post_notification` relies on.
+  unsafe {
+    let center: Retained<AnyObject> =
+      msg_send![AnyClass::get(c"UNUserNotificationCenter").unwrap(), currentNotificationCenter];
+    let () = msg_send![&*center, removeDeliveredNotificationsWithIdentifiers: &*ids];
+    let () = msg_send![&*center, removePendingNotificationRequestsWithIdentifiers: &*ids];
+  }
 }
 
 /// End the Dock bounce of attention request `request` (`notify`'s id); one
@@ -105,7 +130,7 @@ pub fn cancel_attention(request: isize) {
   }
 }
 
-unsafe fn post_notification(title: &str, message: &str, session_id: &str) {
+unsafe fn post_notification(id: &str, title: &str, message: &str, session_id: &str) {
   let content: Retained<AnyObject> =
     msg_send![AnyClass::get(c"UNMutableNotificationContent").unwrap(), new];
 
@@ -133,12 +158,7 @@ unsafe fn post_notification(title: &str, message: &str, session_id: &str) {
   ];
   let () = msg_send![&*content, setUserInfo: &*user_info];
 
-  // Unique request identifier.
-  let ts = std::time::SystemTime::now()
-    .duration_since(std::time::UNIX_EPOCH)
-    .unwrap_or_default()
-    .as_nanos();
-  let request_id = NSString::from_str(&format!("jc-{ts}"));
+  let request_id = NSString::from_str(id);
   let null: *const AnyObject = std::ptr::null();
   let request: Retained<AnyObject> = msg_send![
     AnyClass::get(c"UNNotificationRequest").unwrap(),
