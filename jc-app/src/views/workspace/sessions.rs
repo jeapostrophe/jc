@@ -168,6 +168,7 @@ impl Workspace {
     }
     self.cira.read_at = Some(read_at);
     self.retry_unmatched_hooks(window, cx);
+    self.end_answered_attention(false);
     self.drive_sessions(read_at, window, cx);
     self.restore_focus(window, cx);
     if self.cira.focus_settled {

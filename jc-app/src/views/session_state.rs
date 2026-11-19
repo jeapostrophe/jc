@@ -108,6 +108,9 @@ pub struct SessionState {
   pub cira_state: Option<(cira::State, Option<SystemTime>)>,
   /// The state jc's own hooks last reported, and when it changed to it.
   pub hook_state: Option<(HookState, SystemTime)>,
+  /// The Dock bounces jc asked for this session's permission dialogs (Cira
+  /// PLAN TMUX-27).
+  pub attention: cira::Attention,
   /// When the session was last on screen: set as jc switches away from it.
   /// `None` until then, and the marker falls back to `> last=`.
   pub seen: Option<SystemTime>,
@@ -263,6 +266,7 @@ impl SessionState {
       shown: None,
       cira_state: None,
       hook_state: None,
+      attention: cira::Attention::default(),
       seen: None,
       label,
       claude_terminal,

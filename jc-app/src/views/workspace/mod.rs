@@ -274,6 +274,7 @@ impl Workspace {
         this.window_active = window.is_window_active();
         // The daemon announces no change to a pad: read it again on coming back.
         if this.window_active {
+          this.end_answered_attention(true);
           let scratch = this.active_project().scratch_view.clone();
           scratch.update(cx, |v, cx| v.refresh(window, cx));
         }
@@ -1879,17 +1880,35 @@ impl Workspace {
 
   /// Notify when the window is not active (user is in another app). Only a
   /// blocked session is worth interrupting for; Stop/IdlePrompt are ambient.
-  fn notify_blocked(&self, event: &HookEvent, project_name: &str, session_label: &str) {
+  /// A permission dialog's Dock bounce is kept, to end once it is answered
+  /// anywhere ([`Self::end_answered_attention`]).
+  fn notify_blocked(&mut self, event: &HookEvent, project_name: &str, session_label: &str) {
     let message = match event.kind {
       HookEventKind::PermissionPrompt => Some("Permission needed"),
       HookEventKind::StopFailure => Some("API error"),
       _ => None,
     };
-    if let Some(message) = message
-      && !self.window_active
+    let Some(message) = message.filter(|_| !self.window_active) else { return };
+    let title = format!("{project_name} > {session_label}");
+    let request = crate::notify::notify(&title, message, &event.session_id);
+    if let (HookEventKind::PermissionPrompt, Some(request)) = (&event.kind, request)
+      && let Some((pi, sid)) = self.session_for_hook(&event.session_id)
+      && let Some(session) = self.projects[pi].sessions.get_mut(&sid)
     {
-      let title = format!("{project_name} > {session_label}");
-      crate::notify::notify(&title, message, &event.session_id);
+      session.attention.note(event.received, request);
+    }
+  }
+
+  /// End the Dock bounce of each permission dialog Cira says was answered,
+  /// on its page or in any terminal (Cira PLAN TMUX-27). With `all`, every
+  /// one: jc was focused, which ends them anyway.
+  pub(super) fn end_answered_attention(&mut self, all: bool) {
+    for session in self.projects.iter_mut().flat_map(|p| p.sessions.values_mut()) {
+      let ended =
+        if all { session.attention.take() } else { session.attention.ended(session.cira_state) };
+      for request in ended {
+        crate::notify::cancel_attention(request);
+      }
     }
   }
 

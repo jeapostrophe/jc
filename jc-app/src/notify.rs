@@ -73,13 +73,16 @@ pub fn init() {
 /// Post a notification. Falls back to dock bounce if banners aren't authorized.
 ///
 /// jc only notifies for a session Claude has stopped on (permission prompt, API
-/// error), so every notification is a critical attention request.
-pub fn notify(title: &str, message: &str, session_id: &str) {
+/// error), so every notification is a critical attention request, which
+/// bounces the Dock icon until jc is focused or [`cancel_attention`] ends it.
+/// Returns that request's id: none while jc is active (AppKit makes none)
+/// or off the main thread.
+pub fn notify(title: &str, message: &str, session_id: &str) -> Option<isize> {
   eprintln!("notify: {title} — {message}");
-  bounce_dock_icon();
+  let request = bounce_dock_icon();
 
   if !AUTHORIZED.load(Ordering::Relaxed) {
-    return;
+    return request;
   }
 
   let title = title.to_string();
@@ -91,6 +94,15 @@ pub fn notify(title: &str, message: &str, session_id: &str) {
     // SAFETY: All ObjC calls here create new objects; no shared mutable state.
     unsafe { post_notification(&title, &message, &session_id) };
   });
+  request
+}
+
+/// End the Dock bounce of attention request `request` (`notify`'s id); one
+/// already over is ignored. Main thread only.
+pub fn cancel_attention(request: isize) {
+  if let Some(mtm) = MainThreadMarker::new() {
+    NSApplication::sharedApplication(mtm).cancelUserAttentionRequest(request);
+  }
 }
 
 unsafe fn post_notification(title: &str, message: &str, session_id: &str) {
@@ -145,11 +157,11 @@ unsafe fn post_notification(title: &str, message: &str, session_id: &str) {
   ];
 }
 
-fn bounce_dock_icon() {
-  if let Some(mtm) = MainThreadMarker::new() {
-    let app = NSApplication::sharedApplication(mtm);
-    app.requestUserAttention(NSRequestUserAttentionType::CriticalRequest);
-  }
+fn bounce_dock_icon() -> Option<isize> {
+  let mtm = MainThreadMarker::new()?;
+  let app = NSApplication::sharedApplication(mtm);
+  let request = app.requestUserAttention(NSRequestUserAttentionType::CriticalRequest);
+  (request != 0).then_some(request)
 }
 
 // --- Notification delegate ---

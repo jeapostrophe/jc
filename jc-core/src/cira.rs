@@ -430,6 +430,53 @@ pub fn marker(
   }
 }
 
+/// Whether the Dock bounce jcc asked at `asked` for a session's permission
+/// dialog is over (Cira PLAN TMUX-27): Cira, which sees the dialog answered
+/// anywhere (its page, any terminal, a stop), says the session left `dialog`
+/// after `asked`. Cira's `dialog` stays while any of its dialogs is open, so
+/// another one still up keeps the bounce. Without Cira's word (unreachable, a
+/// session it does not know, a state newer than this build) the bounce runs
+/// until jcc is focused, as macOS ends it.
+pub fn attention_over(cira: Option<(State, Option<SystemTime>)>, asked: SystemTime) -> bool {
+  match cira {
+    Some((State::Dialog | State::Unknown, _)) | None => false,
+    Some((_, since)) => since.is_some_and(|since| since > asked),
+  }
+}
+
+/// The Dock bounces jc asked for a session's permission dialogs, ended once
+/// Cira says they were answered ([`attention_over`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Attention {
+  asked: Option<SystemTime>,
+  requests: Vec<isize>,
+}
+
+impl Attention {
+  /// Note bounce `request`, asked at `at`. The first ask stands: a later one
+  /// is the same dialog's `permission_prompt`, about 6 s on, which may reach
+  /// jc after the answer, or another dialog, which keeps Cira at `dialog`.
+  pub fn note(&mut self, at: SystemTime, request: isize) {
+    self.asked.get_or_insert(at);
+    self.requests.push(request);
+  }
+
+  /// The bounces to end now that Cira says `cira` of the session: all of
+  /// them, once it left its dialog after they were asked.
+  pub fn ended(&mut self, cira: Option<(State, Option<SystemTime>)>) -> Vec<isize> {
+    match self.asked {
+      Some(asked) if attention_over(cira, asked) => self.take(),
+      _ => Vec::new(),
+    }
+  }
+
+  /// Every bounce, to end whatever Cira says.
+  pub fn take(&mut self) -> Vec<isize> {
+    self.asked = None;
+    std::mem::take(&mut self.requests)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Reading Cira
 // ---------------------------------------------------------------------------
@@ -1184,6 +1231,44 @@ mod tests {
     assert_eq!(marker(None, Some((HookState::Idle, at(50))), seen), None);
     assert_eq!(marker(None, Some((HookState::Working, at(150))), seen), None);
     assert_eq!(marker(None, None, seen), None);
+  }
+
+  #[test]
+  fn the_bounce_ends_once_cira_says_the_session_left_its_dialog_after_it() {
+    let asked = at(100);
+    let over = |state, since| attention_over(Some((state, Some(at(since)))), asked);
+    // Answered anywhere: the session went on working, or to its prompt.
+    assert!(over(State::Working, 120), "answered, the session works");
+    assert!(over(State::Idle, 120), "answered, at its prompt");
+    assert!(over(State::Waiting, 120));
+    assert!(over(State::Gone, 120));
+    // Still up (this dialog or another), so the bounce goes on.
+    assert!(!over(State::Dialog, 90));
+    assert!(!over(State::Dialog, 120));
+    // A read from before Cira recorded the dialog jc's hook just heard of.
+    assert!(!over(State::Working, 90), "the state from before the dialog");
+    assert!(!over(State::Idle, 100));
+    // No word from Cira.
+    assert!(!attention_over(None, asked));
+    assert!(!attention_over(Some((State::Working, None)), asked));
+    assert!(!over(State::Unknown, 120));
+  }
+
+  #[test]
+  fn a_dialogs_later_notice_does_not_outlast_its_answer() {
+    let mut a = Attention::default();
+    a.note(at(100), 1);
+    // Claude Code's `permission_prompt` about 6 s on, reaching jc just after
+    // Jay answered on Cira's page at 105.
+    a.note(at(106), 2);
+    assert_eq!(a.ended(Some((State::Dialog, Some(at(100))))), Vec::<isize>::new());
+    assert_eq!(
+      a.ended(Some((State::Working, Some(at(105))))),
+      [1, 2],
+      "the bounce outlived the answer"
+    );
+    assert_eq!(a, Attention::default());
+    assert_eq!(a.ended(Some((State::Working, Some(at(105))))), Vec::<isize>::new());
   }
 
   #[test]
